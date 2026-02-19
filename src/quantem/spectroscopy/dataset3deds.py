@@ -33,7 +33,7 @@ class Dataset3deds(Dataset3dspectroscopy):
     """
 
     element_info = None
-    element_info_path = "xray_lines.json"
+    element_info_path = "x_ray_lines.csv"
     dataset_type = "EDS"
 
     def __init__(
@@ -163,14 +163,18 @@ class Dataset3deds(Dataset3dspectroscopy):
             for element_name, lines_info in model_elements.items():
                 element_key = str(element_name)
                 if isinstance(lines_info, dict) and len(lines_info) > 0:
-                    parsed[element_key] = builtins.set(str(line_name) for line_name in lines_info.keys())
+                    parsed[element_key] = builtins.set(
+                        str(line_name) for line_name in lines_info.keys()
+                    )
                 else:
                     parsed[element_key] = None
 
             return parsed if len(parsed) > 0 else None
 
         requested_edge_filters = _parse_requested_elements_with_edges(elements)
-        saved_model_edge_filters = _edge_filters_from_saved_model(getattr(self, "model_elements", None))
+        saved_model_edge_filters = _edge_filters_from_saved_model(
+            getattr(self, "model_elements", None)
+        )
         using_saved_model_elements = False
         if requested_edge_filters is None and elements is None:
             if saved_model_edge_filters is not None:
@@ -236,11 +240,11 @@ class Dataset3deds(Dataset3dspectroscopy):
             initial_snrs.append(height / background_std)
 
         if len(initial_snrs) > 0:
-            snr_median = float(np.nanmedian(initial_snrs))
+            # snr_median = float(np.nanmedian(initial_snrs))
             snr_75th = float(np.nanpercentile(initial_snrs, 75))
             num_high_snr_peaks = int(np.sum(np.array(initial_snrs) > 50))
         else:
-            snr_median = 0.0
+            # snr_median = 0.0
             snr_75th = 0.0
             num_high_snr_peaks = 0
 
@@ -303,7 +307,9 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         def _peak_confidence(snr_value, line_weight, distance_value):
             quality = max(0.0, 1.0 - (distance_value / max(tolerance, 1e-9)))
-            return np.log1p(max(float(snr_value), 0.0)) * (0.5 + float(line_weight)) * (0.5 + quality)
+            return (
+                np.log1p(max(float(snr_value), 0.0)) * (0.5 + float(line_weight)) * (0.5 + quality)
+            )
 
         def _line_allowed_for_element(element_name, line_name, edge_filters=None):
             if edge_filters is None:
@@ -338,7 +344,11 @@ class Dataset3deds(Dataset3dspectroscopy):
                     is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
                     effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
 
-                    if line_weight > 0.3 and distance <= effective_tolerance and distance < best_distance:
+                    if (
+                        line_weight > 0.3
+                        and distance <= effective_tolerance
+                        and distance < best_distance
+                    ):
                         best_distance = distance
                         best_element = element_name
                         best_line_name = line_name
@@ -355,7 +365,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             search_elements = None
 
         for peak_idx, height, peak_energy, snr in display_peaks:
-            best_match_info = _best_line_match(peak_energy, search_elements, requested_edge_filters)
+            best_match_info = _best_line_match(
+                peak_energy, search_elements, requested_edge_filters
+            )
             if best_match_info is not None:
                 best_element, best_line_name, best_line_weight, best_distance = best_match_info
                 best_element = str(best_element)
@@ -443,7 +455,9 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         if element_confidence:
             conf_values = np.array(list(element_confidence.values()), dtype=float)
-            confidence_cutoff = max(np.percentile(conf_values, 45), 0.30 * float(conf_values.max()))
+            confidence_cutoff = max(
+                np.percentile(conf_values, 45), 0.30 * float(conf_values.max())
+            )
 
             for element_name, confidence in element_confidence.items():
                 stats = element_stats[element_name]
@@ -463,7 +477,11 @@ class Dataset3deds(Dataset3dspectroscopy):
                     and confidence >= 0.45 * confidence_cutoff
                 )
 
-                if is_supported or is_near_cutoff_but_consistent or is_high_energy_singleton_anchor:
+                if (
+                    is_supported
+                    or is_near_cutoff_but_consistent
+                    or is_high_energy_singleton_anchor
+                ):
                     detected_elements.add(element_name)
 
         refined_peak_matches = []
@@ -562,7 +580,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         # at least one matched peak after rematching.
         matched_elements = {str(match[4]) for match in peak_matches}
         detected_elements = {
-            str(element_name) for element_name in detected_elements if str(element_name) in matched_elements
+            str(element_name)
+            for element_name in detected_elements
+            if str(element_name) in matched_elements
         }
         if ignored_elements:
             detected_elements = {
@@ -610,8 +630,14 @@ class Dataset3deds(Dataset3dspectroscopy):
                     formatted.append(str(element_name))
             return ", ".join(formatted)
 
-        model_elements_header = "Saved Model Elements (Plotted):\n" if using_saved_model_elements else "Saved Model Elements (Not Plotted When Elements Specified):\n"
-        print(f"\n{model_elements_header} {_format_saved_model_elements(saved_model_edge_filters)}")
+        model_elements_header = (
+            "Saved Model Elements (Plotted):\n"
+            if using_saved_model_elements
+            else "Saved Model Elements (Not Plotted When Elements Specified):\n"
+        )
+        print(
+            f"\n{model_elements_header} {_format_saved_model_elements(saved_model_edge_filters)}"
+        )
 
         if detected_elements:
             print(f"\nAutodetected: {_format_elements_with_lines(detected_elements)}")
@@ -651,8 +677,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             for i in range(max(1, len(sorted_elements_for_colors)))
         ]
         element_color_map = {
-            element: color_palette[i]
-            for i, element in enumerate(sorted_elements_for_colors)
+            element: color_palette[i] for i, element in enumerate(sorted_elements_for_colors)
         }
 
         table_rows = []
@@ -832,7 +857,9 @@ class Dataset3deds(Dataset3dspectroscopy):
 
                 candidate_lines = []
                 for line_name, line_info in lines_info.items():
-                    if not _line_allowed_for_element(element_key, line_name, requested_edge_filters):
+                    if not _line_allowed_for_element(
+                        element_key, line_name, requested_edge_filters
+                    ):
                         continue
                     if not isinstance(line_info, dict):
                         continue
@@ -855,13 +882,20 @@ class Dataset3deds(Dataset3dspectroscopy):
                 # Keep meaningful requested-element lines while avoiding excessive clutter.
                 filtered_lines = [line for line in candidate_lines if line[2] >= 0.05]
                 if len(filtered_lines) == 0:
-                    filtered_lines = sorted(candidate_lines, key=lambda item: item[2], reverse=True)[:1]
+                    filtered_lines = sorted(
+                        candidate_lines, key=lambda item: item[2], reverse=True
+                    )[:1]
                 else:
-                    filtered_lines = sorted(filtered_lines, key=lambda item: item[2], reverse=True)[:6]
+                    filtered_lines = sorted(
+                        filtered_lines, key=lambda item: item[2], reverse=True
+                    )[:6]
 
                 for line_name, line_energy, line_weight in filtered_lines:
                     matched_energies = existing_matches_by_element.get(element_key, [])
-                    if any(abs(line_energy - matched_energy) <= max(0.05, 0.5 * tolerance) for matched_energy in matched_energies):
+                    if any(
+                        abs(line_energy - matched_energy) <= max(0.05, 0.5 * tolerance)
+                        for matched_energy in matched_energies
+                    ):
                         continue
 
                     line_color = element_color_map.get(element_key, "black")
@@ -902,7 +936,9 @@ class Dataset3deds(Dataset3dspectroscopy):
                 line_weight,
                 match_confidence,
             ) in peak_matches:
-                if element_name in detected_elements and detected_sample_peaks.get(peak_energy, False):
+                if element_name in detected_elements and detected_sample_peaks.get(
+                    peak_energy, False
+                ):
                     line_name = match_str.split()[-1] if match_str else ""
                     label_text = f"{element_name} {line_name}" if line_name else element_name
                     color = element_color_map.get(element_name, "black")
@@ -973,9 +1009,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                         y_pos = max(item[3] for item in group) + label_vertical_offset
                         merged_text = ", ".join(item[1] for item in group)
                         first_color = group[0][2]
-                        all_same_color = all(
-                            _same_color(item[2], first_color) for item in group
-                        )
+                        all_same_color = all(_same_color(item[2], first_color) for item in group)
                         if all_same_color:
                             ax_spec.text(
                                 x_pos,

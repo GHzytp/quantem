@@ -1,9 +1,10 @@
-import json
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+from quantem.spectroscopy.utils import load_xray_lines_database
 
 
 def inverse_softplus(x: torch.Tensor, min_value: float = 1e-8) -> torch.Tensor:
@@ -114,8 +115,7 @@ class GaussianPeaks(nn.Module):
         super().__init__()
 
         current_dir = Path(__file__).parent
-        with open(current_dir / "xray_lines.json", "r") as f:
-            data = json.load(f)
+        data = load_xray_lines_database(current_dir / "x_ray_lines.csv")
 
         energy_axis_tensor = (
             energy_axis.float()
@@ -131,7 +131,7 @@ class GaussianPeaks(nn.Module):
 
         # Parse and filter elements
         all_element_data = {}
-        for elem, lines in data["elements"].items():
+        for elem, lines in data.items():
             if len(lines) > 0:
                 energies = []
                 weights = []

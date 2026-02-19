@@ -9,12 +9,13 @@ from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 
 from quantem.core.datastructures.dataset3d import Dataset3d
+from quantem.spectroscopy.utils import load_xray_lines_database
 
 
 class Dataset3dspectroscopy(Dataset3d):
     # stores the element line info so you don't need to reload each time
     element_info = None
-    element_info_path = "xray_lines.json"
+    element_info_path = "x_ray_lines.csv"
     atomic_weights = None
     atomic_weights_path = "atomic_weights.json"
     dataset_type = "EDS"
@@ -54,17 +55,20 @@ class Dataset3dspectroscopy(Dataset3d):
         if class_type == "eels":
             path = "eels_binding_energies.json"
         elif class_type == "eds":
-            path = "xray_lines.json"
+            path = getattr(cls, "element_info_path", "x_ray_lines.csv")
         else:
-            path = getattr(cls, "element_info_path", "xray_lines.json")
+            path = getattr(cls, "element_info_path", "x_ray_lines.csv")
 
         if cls.element_info is not None:
             # don't reload if already loaded
             return
         base_dir = os.path.dirname(os.path.abspath(__file__))
         full_path = os.path.join(base_dir, path)
-        with open(full_path, "r") as f:
-            cls.element_info = json.load(f)["elements"]
+        if str(path).lower().endswith(".csv"):
+            cls.element_info = load_xray_lines_database(full_path)
+        else:
+            with open(full_path, "r") as f:
+                cls.element_info = json.load(f)["elements"]
 
     @classmethod
     def load_atomic_weights(cls):
@@ -406,7 +410,7 @@ class Dataset3dspectroscopy(Dataset3d):
     def clear_attached_spectra(self):
         self.attached_spectra = None
 
-    def plot_attached_spectrum(self, data_type='eds',spectrum_index=0):
+    def plot_attached_spectrum(self, data_type="eds", spectrum_index=0):
         fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
 
         ax_spec.plot(
@@ -414,9 +418,9 @@ class Dataset3dspectroscopy(Dataset3d):
             self.attached_spectra[spectrum_index][0],
             linewidth=1.5,
         )
-        if data_type =='eds':            
+        if data_type == "eds":
             ax_spec.set_xlabel("Energy (keV)")
-        elif data_type == 'eels':
+        elif data_type == "eels":
             ax_spec.set_xlabel("Energy (eV)")
         ax_spec.set_ylabel("Intensity")
         ax_spec.set_title(f"Spectrum in index {spectrum_index}")
@@ -681,7 +685,7 @@ class Dataset3dspectroscopy(Dataset3d):
         spectrum_data = self._extract_spectrum_for_quantification(roi, mask)
         spec = spectrum_data["spectrum"]
         E = spectrum_data["energy"]
-        
+
         # Determine max usable energy from the actual dataset
         max_energy = float(E.max()) if len(E) > 0 else 20.0
 
@@ -753,7 +757,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
     def _integrate_element_intensity(self, element, spectrum, energy, shell="K"):
         """Integrate X-ray intensity for a specific element using characteristic lines from the specified shell.
-        
+
         Parameters
         ----------
         element : str
@@ -774,13 +778,13 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # Filter lines by the specified shell (K, L, or M)
         # For K-shell: Ka, Kb lines
-        # For L-shell: La, Lb, Lg lines  
+        # For L-shell: La, Lb, Lg lines
         # For M-shell: Ma, Mb lines
         shell_lines = []
         for line_name, info in element_lines.items():
             line_energy = info["energy (keV)"]
             line_weight = info["weight"]
-            
+
             # Check if line belongs to the specified shell
             if shell == "K" and ("Ka" in line_name or "Kb" in line_name):
                 shell_lines.append((line_weight, line_energy, line_name))
@@ -788,7 +792,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 shell_lines.append((line_weight, line_energy, line_name))
             elif shell == "M" and ("Ma" in line_name or "Mb" in line_name):
                 shell_lines.append((line_weight, line_energy, line_name))
-        
+
         # Sort by weight (highest first) and ignore lines beyond detector range
         shell_lines = [(w, e, n) for w, e, n in shell_lines if e <= 12.0]
         shell_lines.sort(reverse=True)
@@ -819,7 +823,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
     def _determine_element_shells(self, elements, max_energy):
         """Determine the appropriate X-ray shell (K, L, or M) for each element based on available lines.
-        
+
         Parameters
         ----------
         elements : list
@@ -829,28 +833,29 @@ class Dataset3dspectroscopy(Dataset3d):
         """
         all_info = type(self).element_info
         element_shells = {}
-        
+
         for element in elements:
             if element not in all_info:
                 element_shells[element] = "K"  # Default
                 continue
-                
+
             element_lines = all_info[element]
-            
+
             # Check which X-ray series is present AND within usable energy range
             has_usable_k_lines = any(
                 ("Ka" in line or "Kb" in line) and info["energy (keV)"] <= max_energy
                 for line, info in element_lines.items()
             )
             has_usable_l_lines = any(
-                ("La" in line or "Lb" in line or "Lg" in line) and info["energy (keV)"] <= max_energy
+                ("La" in line or "Lb" in line or "Lg" in line)
+                and info["energy (keV)"] <= max_energy
                 for line, info in element_lines.items()
             )
             has_usable_m_lines = any(
                 ("Ma" in line or "Mb" in line) and info["energy (keV)"] <= max_energy
                 for line, info in element_lines.items()
             )
-            
+
             # Prioritize K-lines, then L-lines, then M-lines (only if within usable range)
             if has_usable_k_lines:
                 element_shells[element] = "K"
@@ -860,7 +865,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 element_shells[element] = "M"
             else:
                 element_shells[element] = "K"  # Default fallback
-        
+
         return element_shells
 
     def _normalize_k_factors(self, elements, k_factors, element_shells=None):
@@ -901,9 +906,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 if value is not None:
                     return value
 
-            raise ValueError(
-                f"k_factors['{elem}'] has no usable positive shell value in K/L/M"
-            )
+            raise ValueError(f"k_factors['{elem}'] has no usable positive shell value in K/L/M")
 
         if isinstance(k_factors, dict):
             missing = [elem for elem in elements if elem not in k_factors]
@@ -1429,7 +1432,7 @@ class Dataset3dspectroscopy(Dataset3d):
         plt.colorbar(im, ax=ax_img)
 
         # RIGHT PLOT: Show spectrum
-        spectrum_line, = ax_spec.plot(E, spec, linewidth=1.5)
+        (spectrum_line,) = ax_spec.plot(E, spec, linewidth=1.5)
         spectrum_color = spectrum_line.get_color()
         if data_type == "eds":
             ax_spec.set_xlabel("Energy (keV)")
@@ -1547,7 +1550,9 @@ class Dataset3dspectroscopy(Dataset3d):
         emin = float(energy_window[0])
         emax = float(energy_window[1])
         if not np.isfinite(emin) or not np.isfinite(emax) or emin >= emax:
-            raise ValueError("Invalid energy_window. Expected [min_energy, max_energy] with min < max")
+            raise ValueError(
+                "Invalid energy_window. Expected [min_energy, max_energy] with min < max"
+            )
 
         # Parse ROI (for optional overlay only)
         if roi is None:
