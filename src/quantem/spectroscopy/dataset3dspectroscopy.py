@@ -1426,7 +1426,7 @@ class Dataset3dspectroscopy(Dataset3d):
         ax_img.add_patch(rect)
 
         # Add colorbar for the image
-        plt.colorbar(im, ax=ax_img, label="Intensity")
+        plt.colorbar(im, ax=ax_img)
 
         # RIGHT PLOT: Show spectrum
         spectrum_line, = ax_spec.plot(E, spec, linewidth=1.5)
