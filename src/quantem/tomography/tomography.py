@@ -167,7 +167,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 
-                batch_loss = batch_consistency_loss.float() + soft_constraints_loss.detach()
+                batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
 
                 batch_loss.backward()
                 # Clip gradients
