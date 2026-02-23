@@ -1106,6 +1106,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         default_lr_adam,
         default_lr_lbfgs,
         verbose=False,
+        independent_shell_concentrations=False,
     ):
         target = spectrum_raw
         spectrum_offset = torch.tensor(0.0, dtype=spectrum_raw.dtype, device=spectrum_raw.device)
@@ -1116,7 +1117,12 @@ class Dataset3deds(Dataset3dspectroscopy):
             target = (spectrum_raw - spectrum_offset) / spectrum_scale
 
         background = PolynomialBackground(energy_axis, degree=polynomial_background_degree)
-        peaks = GaussianPeaks(energy_axis, peak_width=peak_width, elements_to_fit=elements_to_fit)
+        peaks = GaussianPeaks(
+            energy_axis,
+            peak_width=peak_width,
+            elements_to_fit=elements_to_fit,
+            independent_shell_concentrations=independent_shell_concentrations,
+        )
         model = EDSModel(peaks, background, energy_axis=energy_axis)
         model = model.to(device=energy_axis.device, dtype=energy_axis.dtype)
         if len(model.peak_model.element_names) == 0:
@@ -1193,20 +1199,152 @@ class Dataset3deds(Dataset3dspectroscopy):
         polynomial_background_degree=3,
         optimizer="lbfgs",
         device=None,
+        independent_shell_concentrations=True,
     ):
-        return self.fit_spectrum_pytorch(
-            energy_range=energy_range,
+        if not independent_shell_concentrations:
+            return self.fit_spectrum_pytorch(
+                energy_range=energy_range,
+                elements_to_fit=elements_to_fit,
+                peak_width=peak_width,
+                num_iters=num_iters,
+                lr=lr,
+                polynomial_background_degree=polynomial_background_degree,
+                optimizer=optimizer,
+                loss="mse",
+                fit_mean_only=True,
+                show_plot=True,
+                device=device,
+            )
+
+        optimizer_name = str(optimizer).lower()
+        if optimizer_name not in {"adam", "lbfgs"}:
+            raise ValueError("optimizer must be 'lbfgs' or 'adam'")
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            device = torch.device(device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
+
+        energy_axis_np = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
+        energy_axis = torch.tensor(energy_axis_np, dtype=torch.float32, device=device)
+        spectra = torch.tensor(self.array, dtype=torch.float32, device=device)
+
+        if energy_range is not None:
+            ind = (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
+            energy_axis = energy_axis[ind]
+            spectra = spectra[ind]
+        else:
+            energy_range = [float(energy_axis.min().item()), float(energy_axis.max().item())]
+
+        print("fitting spectrum globally")
+        spectrum_raw = spectra.sum((-1, -2))
+        mean_fit = self._fit_mean_model_pytorch(
+            energy_axis=energy_axis,
+            spectrum_raw=spectrum_raw,
             elements_to_fit=elements_to_fit,
             peak_width=peak_width,
-            num_iters=num_iters,
-            lr=lr,
             polynomial_background_degree=polynomial_background_degree,
-            optimizer=optimizer,
-            loss="mse",
-            fit_mean_only=True,
-            show_plot=True,
-            device=device,
+            num_iters=num_iters,
+            optimizer=optimizer_name,
+            lr=lr,
+            loss_name="mse",
+            normalize_target=True,
+            default_lr_adam=1e-3,
+            default_lr_lbfgs=1.0,
+            verbose=True,
+            independent_shell_concentrations=True,
         )
+
+        model = mean_fit["model"]
+        loss_history = mean_fit["loss_history"]
+        spectrum_offset = mean_fit["spectrum_offset"]
+        spectrum_scale = mean_fit["spectrum_scale"]
+        with torch.no_grad():
+            final_pred = mean_fit["final_pred_raw"].cpu().numpy()
+            shell_concs = (
+                nn.functional.softplus(model.peak_model.concentrations).detach().cpu().numpy()
+            )
+            shell_names = list(model.peak_model.shell_group_names)
+            shell_element_indices = (
+                model.peak_model.shell_group_element_indices.detach().cpu().numpy()
+            )
+            concs = np.zeros(len(model.peak_model.element_names), dtype=np.float32)
+            np.add.at(concs, shell_element_indices, shell_concs)
+            final_fwhm = (
+                torch.nn.functional.softplus(model.peak_model.peak_width_by_peak)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            background_fit = (
+                (model.background_model().detach() * spectrum_scale + spectrum_offset)
+                .cpu()
+                .numpy()
+            )
+
+        print(
+            f"\nFinal: width median={np.median(final_fwhm):.3f} keV, "
+            f"min={final_fwhm.min():.3f}, max={final_fwhm.max():.3f}"
+        )
+
+        top_n = max(10, len(elements_to_fit) if elements_to_fit is not None else 0)
+        sorted_indices = np.argsort(concs)[::-1]
+        print("\nTop elements:")
+        for i, idx in enumerate(sorted_indices[:top_n], 1):
+            elem = model.peak_model.element_names[idx]
+            conc = concs[idx]
+            print(f"{i:2d}. {elem:2s}: {conc:.3f}")
+
+        shell_top_n = max(10, min(len(shell_names), top_n))
+        shell_sorted_indices = np.argsort(shell_concs)[::-1]
+        print("\nTop edge groups:")
+        for i, idx in enumerate(shell_sorted_indices[:shell_top_n], 1):
+            shell_name = shell_names[idx]
+            shell_conc = shell_concs[idx]
+            print(f"{i:2d}. {shell_name:>6s}: {shell_conc:.3f}")
+
+        energy_axis_plot = energy_axis.detach().cpu().numpy()
+        spectrum_raw_plot = spectrum_raw.detach().cpu().numpy()
+        fig, ax = plt.subplots(2, 1, figsize=(10, 6))
+        ax[0].plot(np.arange(loss_history.shape[0]), loss_history, color="k")
+        ax[0].set_title("loss")
+        ax[0].set_xlabel("iterations")
+        ax[0].set_ylabel("loss")
+        ax[0].set_yscale("log")
+
+        ax[1].plot(energy_axis_plot, spectrum_raw_plot, "k-", label="Data", linewidth=1)
+        ax[1].plot(energy_axis_plot, final_pred, "r-", label="Fit", linewidth=2)
+        ax[1].plot(
+            energy_axis_plot,
+            background_fit,
+            "b--",
+            label="Background",
+            linewidth=1.5,
+        )
+        ax[1].set_xlim(energy_range[0], energy_range[1])
+        ax[1].legend()
+        ax[1].set_title("fit spectrum")
+        ax[1].set_xlabel("Energy (keV)")
+        ax[1].set_ylabel("Counts")
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            "loss_history": loss_history,
+            "fitted_spectrum": final_pred,
+            "input_spectrum": spectrum_raw_plot,
+            "background_spectrum": background_fit,
+            "concentrations": concs,
+            "element_names": model.peak_model.element_names,
+            "edge_concentrations": shell_concs,
+            "edge_names": shell_names,
+            "edge_element_indices": shell_element_indices,
+            "peak_widths": final_fwhm,
+            "energy_axis": energy_axis_plot,
+            "fit_range": energy_range,
+        }
 
     def fit_spectrum_pytorch(
         self,
