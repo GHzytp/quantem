@@ -238,9 +238,7 @@ class TomographyPixDataset(TomographyDatasetBase):
     """
     Dataset class for pixel-based tomography, i.e AD, SIRT, WBP, etc...
 
-    TODO:
-     - What should the forward pass return? In AD, it should be both the tilt image and the pose.
-       In SIRT, it's only the tilt image.
+    These algorithms only require the tilt image in the forward call.
     """
 
     def __init__(
