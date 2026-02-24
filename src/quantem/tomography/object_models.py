@@ -358,12 +358,13 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         return pred
 
+    # --- Optimization Parameters ---
     @property
     def params(self) -> Generator[torch.nn.Parameter, None, None]:
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self):
-        return self.params
+    def get_optimization_parameters(self) -> list[nn.Parameter]:
+        return list(self.params)
 
     # Pretraining
     @property
