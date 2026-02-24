@@ -216,6 +216,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._device = device
 
     # --- Helper Functions ---
+    @abstractmethod
     def to(self, device: str):
         """
         Moves the dataset to the device, and also insantiates the aux params to the device.
