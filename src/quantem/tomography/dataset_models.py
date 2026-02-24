@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generator
 
 import numpy as np
 import torch
@@ -108,10 +108,21 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         )
 
     # --- Optimization Parameters ---
-    # @property
-    # def params(self):
-    #     # TODO: Need to double check if this is correct way, also need to implement get_optimization_parameters @Arthur!!
-    #     raise NotImplementedError("This method should be implemented in subclasses.")
+
+    @property
+    def params(self) -> Generator[torch.nn.Parameter, None, None]:
+        """
+        Returns the parameters that should be optimized for this dataset.
+
+        Should be implemented in subclasses.
+        """
+        raise NotImplementedError("This method should be implemented in subclasses.")
+
+    def get_optimization_parameters(self) -> list[nn.Parameter]:
+        """
+        Get the parameters that should be optimized for this model.
+        """
+        return list(self.params)
 
     # --- Forward pass ---
     @abstractmethod
@@ -182,15 +193,6 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._learnable_tilts = learnable_tilts
 
     @property
-    def params(self) -> dict[str, torch.nn.Parameter]:
-        """
-        Returns the parameters that should be optimized for this dataset.
-
-        Should be implemented in subclasses.
-        """
-        raise NotImplementedError("This method should be implemented in subclasses.")
-
-    @property
     def z1_params(self) -> torch.nn.Parameter:
         return self._z1_params
 
@@ -239,12 +241,6 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._shifts_ref = self._shifts_ref.to(device)
 
         self.device = device
-
-    def get_optimization_parameters(self) -> list[nn.Parameter]:
-        """
-        Get the parameters that should be optimized for this model.
-        """
-        return list[nn.Parameter](self.params)
 
 
 class TomographyPixDataset(TomographyDatasetBase):
@@ -305,9 +301,9 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
         seed: int = 42,
-        token: object | None = None,
+        _token: object | None = None,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, token)
+        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token=_token)
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):

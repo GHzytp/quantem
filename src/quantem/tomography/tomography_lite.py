@@ -27,7 +27,7 @@ class TomographyLiteINR(Tomography):
         dset_model = dset
 
         # Define the object model
-        model = HSiren(alpha=1, winner_initialization=True)
+        model = HSiren(alpha=1, winner_initialization=72)
         obj_model = ObjectINR.from_model(
             model=model,
             shape=(
