@@ -449,12 +449,6 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         pixel_i = remaining // self.tilt_stack.shape[1]
         pixel_j = remaining % self.tilt_stack.shape[1]
 
-        # return DatasetValue(
-        #     target=self.tilt_stack[projection_idx, pixel_i, pixel_j],
-        #     tilt_angle=self.tilt_angles[projection_idx],
-        #     projection_idx=projection_idx,
-        #     pixel_loc=(pixel_i, pixel_j),
-        # )
         return {
             "projection_idx": torch.tensor(projection_idx),
             "pixel_i": torch.tensor(pixel_i),
