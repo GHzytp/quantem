@@ -849,7 +849,7 @@ def _build_edges(phi, reliability, mask=None, wrap_around=True):
         inc = _find_wrap(phi_f[i1], phi_f[i2])
         rel = rel_f[i1] + rel_f[i2]
 
-        edges.append(  # ty:ignore[possibly-missing-attribute]
+        edges.append(  # type: ignore[attr-defined]
             torch.stack([i1, i2, rel, inc], dim=1)
         )
 
@@ -1099,7 +1099,7 @@ def background_subtract(
     sigma: Optional[float] = None,
     num_iter: int = 10,
     plot_result: bool = True,
-    axsize: Tuple[int, int] = (3.1, 3),
+    axsize: Tuple[int, int] = (3, 3),
     cmap: str = "turbo",
     return_background_and_mask: bool = False,
     **show_kwargs,
