@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Self, Tuple
+from typing import Literal, Optional, Self
 
 import numpy as np
 import torch
@@ -51,8 +51,8 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = {},
         constraints: dict = {},  # TODO: What to pass into the constraints?
-        loss_func: Tuple[str, Optional[float]] = ("smooth_l1", 0.07),
-        num_samples_per_ray: int | List[Tuple[int, int]] = None,
+        loss_func: tuple[str, Optional[float]] = ("smooth_l1", 0.07),
+        num_samples_per_ray: int | list[tuple[int, int]] = None,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
         # reset_dset: bool = False,
@@ -65,10 +65,10 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
         # TODO: Prior to reconstruction, it is assumed that object + dataset are both in the correct devices. Need to implement a way to check this.
 
-        # if self.obj_model.device != self.dset.device:
-        #     raise ValueError(
-        #         f"Should never happen! obj_model and dset must be on the same device, got {self.obj_model.device} and {self.dset.device}"
-        #     )
+        # Check device consistency
+        self.obj_model.to(self.device)
+        self.dset.to(self.device)
+
         if profiling_mode:
             if self.global_rank == 0:
                 print("Profiling mode enabled.")

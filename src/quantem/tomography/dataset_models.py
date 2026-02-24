@@ -220,6 +220,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         """
         Moves the dataset to the device, and also insantiates the aux params to the device.
         """
+
         self.tilt_stack = self.tilt_stack.to(device)
         self.tilt_angles = self.tilt_angles.to(device)
 
@@ -467,6 +468,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return self.tilt_stack.shape[0] * N * N
 
     def to(self, device: str):
+        super().to(device)
         self._z1_params = nn.Parameter(self._z1_angles.to(device))
         self._z3_params = nn.Parameter(self._z3_angles.to(device))
         self._shifts_params = nn.Parameter(self._shifts.to(device))
