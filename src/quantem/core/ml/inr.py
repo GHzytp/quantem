@@ -115,11 +115,11 @@ class Siren(nn.Module):
                 rng = torch.Generator()
                 rng.manual_seed(self.winner_initialization)
             with torch.no_grad():
-                self.net[0].linear.weight += (
-                    torch.randn_like(self.net[0].linear.weight) * 5 / self.first_omega_0
+                self.net[0].linear.weight += (  # pyright: ignore[reportAttributeAccessIssue]
+                    torch.randn_like(self.net[0].linear.weight) * 5 / self.first_omega_0  # type:ignore
                 )
-                self.net[1].linear.weight += (
-                    torch.randn_like(self.net[1].linear.weight) * 0.1 / self.hidden_omega_0
+                self.net[1].linear.weight += (  # pyright: ignore[reportAttributeAccessIssue]
+                    torch.randn_like(self.net[1].linear.weight) * 0.1 / self.hidden_omega_0  # type:ignore
                 )
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
