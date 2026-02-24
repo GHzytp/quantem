@@ -67,7 +67,6 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
         # Check device consistency
         self.obj_model.to(self.device)
-        self.dset.to(self.device)
 
         if profiling_mode:
             if self.global_rank == 0:

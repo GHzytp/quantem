@@ -221,18 +221,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         Moves the dataset to the device, and also insantiates the aux params to the device.
         """
 
-        self.tilt_stack = self.tilt_stack.to(device)
-        self.tilt_angles = self.tilt_angles.to(device)
-
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
-
-        self._z1_ref = self._z1_ref.to(device)
-        self._z3_ref = self._z3_ref.to(device)
-        self._shifts_ref = self._shifts_ref.to(device)
-
-        self.device = device
+        raise NotImplementedError("This method should be implemented in subclasses.")
 
 
 class TomographyPixDataset(TomographyDatasetBase):
@@ -272,6 +261,23 @@ class TomographyPixDataset(TomographyDatasetBase):
             tilt_angle=self.tilt_angles[proj_idx],
             pixel_loc=None,
         )
+
+    def to(self, device: str):
+        """
+        Moves the tilt stack and tilt_angles to the device, along with other nn.Parameters to the device.
+        """
+        self.tilt_stack = self.tilt_stack.to(device)
+        self.tilt_angles = self.tilt_angles.to(device)
+
+        self._z1_params = nn.Parameter(self._z1_angles.to(device))
+        self._z3_params = nn.Parameter(self._z3_angles.to(device))
+        self._shifts_params = nn.Parameter(self._shifts.to(device))
+
+        self._z1_ref = self._z1_ref.to(device)
+        self._z3_ref = self._z3_ref.to(device)
+        self._shifts_ref = self._shifts_ref.to(device)
+
+        self.device = device
 
 
 class TomographyINRDataset(TomographyDatasetBase, Dataset):

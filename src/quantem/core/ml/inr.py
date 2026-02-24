@@ -111,9 +111,12 @@ class Siren(nn.Module):
         self.net = nn.Sequential(*net_list)
 
         if self.winner_initialization:
-            if isinstance(self.winner_initialization, int):
+            if type(self.winner_initialization) is int:
                 rng = torch.Generator()
                 rng.manual_seed(self.winner_initialization)
+            else:
+                rng = torch.Generator()
+                rng.manual_seed(42)
             with torch.no_grad():
                 self.net[0].linear.weight += (  # pyright: ignore[reportAttributeAccessIssue]
                     torch.randn_like(self.net[0].linear.weight) * 5 / self.first_omega_0  # type:ignore

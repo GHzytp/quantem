@@ -57,9 +57,17 @@ class LoggerTomography(LoggerBase):
             shifts_vals = dataset_model.shifts_params.detach().cpu().numpy()
 
         print("Logging volume...")
-        self.log_image("volume/sum_z", pred_volume.sum(axis=0), iter, logger_cmap)
-        self.log_image("volume/sum_y", pred_volume.sum(axis=1), iter, logger_cmap)
-        self.log_image("volume/sum_x", pred_volume.sum(axis=2), iter, logger_cmap)
+
+        for channel in range(pred_volume.shape[0]):
+            self.log_image(
+                f"volume/sum_z_{channel}", pred_volume[channel].sum(axis=0), iter, logger_cmap
+            )
+            self.log_image(
+                f"volume/sum_y_{channel}", pred_volume[channel].sum(axis=1), iter, logger_cmap
+            )
+            self.log_image(
+                f"volume/sum_x_{channel}", pred_volume[channel].sum(axis=2), iter, logger_cmap
+            )
 
         # Plotting z1 and z3 vals
         print("Plotting z1 and z3 angles...")

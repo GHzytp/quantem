@@ -666,9 +666,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         return tv_loss
 
     def to(self, device: str):
-        # self._model = self._model.to(device)
         self.device = device
-        self._obj = self._obj.to(self.device)
+        # self._obj = self._obj.to(self.device)
         self.reconnect_optimizer_to_parameters()
 
 
