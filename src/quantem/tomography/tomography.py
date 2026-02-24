@@ -1,3 +1,4 @@
+import os
 from typing import Literal, Optional, Self
 
 import numpy as np
@@ -269,9 +270,15 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
     # --- Helper Functions ---
 
-    def save_volume(self, path: str = "recon_volume.npz"):
-        # TODO: Temporary, need to talk to Arthur what the correct way of saving results is.
+    def save_volume(self, path: str = "recon_volume.npz", overwrite: bool = False):
+        """
+        Saves volume to a numpy array file. Does not save the full Tomography object.
+        """
         if self.global_rank == 0:
+            if not overwrite and os.path.exists(path):
+                raise FileExistsError(
+                    f"File {path} already exists. Use overwrite=True to overwrite."
+                )
             print(f"Saving volume to {path}")
             np.savez(path, volume=self.obj_model.obj.detach().cpu().numpy())
 
