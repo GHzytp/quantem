@@ -146,30 +146,6 @@ def combined_l2(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.7) ->
 # TODO: Better loss function implementation? More torch-like.
 
 
-class L1Loss(nn.Module):
-    def __init__(
-        self,
-        reduction: str = "mean",
-    ):
-        super(L1Loss, self).__init__()
-        self.reduction = reduction
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.l1_loss(pred, target, reduction=self.reduction)
-
-
-class MSELoss(nn.Module):
-    def __init__(
-        self,
-        reduction: str = "mean",
-    ):
-        super(MSELoss, self).__init__()
-        self.reduction = reduction
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.mse_loss(pred, target, reduction=self.reduction)
-
-
 class MSELogMSELoss(nn.Module):
     def __init__(
         self,
