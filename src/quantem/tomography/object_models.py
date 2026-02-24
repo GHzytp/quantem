@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Generator
 
 import numpy as np
 import torch
@@ -107,9 +107,11 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
             raise NotImplementedError
 
         @property
-        def params(self) -> list[nn.Parameter]:
+        def params(self) -> Generator[torch.nn.Parameter, None, None]:
             """
             Get the parameters that should be optimized for this model.
+
+            Should be implemented in subclasses.
             """
             raise NotImplementedError
 
@@ -118,7 +120,7 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
             """
             Get the parameters that should be optimized for this model.
             """
-            return list[nn.Parameter](self.params())
+            return list(self.params)
 
         @abstractmethod  # Each subclass should implement this.
         def to(self, *args, **kwargs):
@@ -357,8 +359,11 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         return pred
 
     @property
-    def params(self):
-        return self.model.parameters()
+    def params(self) -> Generator[torch.nn.Parameter, None, None]:
+        return self.model.parameters()  # type: ignore[attr-defined]
+
+    def get_optimization_parameters(self):
+        return self.params
 
     # Pretraining
     @property
@@ -409,9 +414,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         self._model = self.distribute_model(
             self.model
         )  # Maybe add a check to see if distributed or not, but not very computationally expensive to do this.
-
-    def get_optimization_parameters(self):
-        return self.params
 
     # --- Forward Method ---
 
