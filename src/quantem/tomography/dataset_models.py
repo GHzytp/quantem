@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Generator
+from typing import Any
 
 import numpy as np
 import torch
@@ -109,20 +109,11 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     # --- Optimization Parameters ---
 
-    @property
-    def params(self) -> Generator[torch.nn.Parameter, None, None]:
-        """
-        Returns the parameters that should be optimized for this dataset.
-
-        Should be implemented in subclasses.
-        """
-        raise NotImplementedError("This method should be implemented in subclasses.")
-
     def get_optimization_parameters(self) -> list[nn.Parameter]:
         """
         Get the parameters that should be optimized for this model.
         """
-        return list(self.params)
+        return list(self.parameters())
 
     # --- Forward pass ---
     @abstractmethod
@@ -334,10 +325,6 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
             return shifts, z1, z3
         else:
             return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
-
-    @property
-    def params(self):
-        return self.parameters()
 
     def get_coords(
         self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int
