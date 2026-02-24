@@ -62,8 +62,7 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
         RNGMixin.__init__(self, rng=rng, device=device)
         OptimizerMixin.__init__(self)
 
-        # Initialize a torch.zeros volume with the given shape
-        self._obj = torch.zeros(self._shape, device=device, dtype=torch.float32)
+        # --- Instantiation ----
 
         # --- Properties ---
         @property
@@ -195,6 +194,35 @@ class ObjectPixelated(ObjectConstraints):
             rng=rng,
             _token=self._token,
         )
+
+    # --- Instantiation ----
+    @classmethod
+    def from_uniform(
+        cls,
+        shape: tuple[int, int, int],
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ):
+        # Initialize a torch.zeros volume with the given shape
+        obj = torch.zeros(shape, device=device, dtype=torch.float32)
+        obj_model = cls(shape=shape, device=device, rng=rng)
+        obj_model._obj = obj
+        return obj_model
+
+    @classmethod
+    def from_array(
+        cls,
+        initial_obj: torch.Tensor | np.ndarray,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ):
+        obj_model = cls(shape=initial_obj.shape, device=device, rng=rng)
+        if isinstance(initial_obj, np.ndarray):
+            initial_obj = torch.tensor(initial_obj, dtype=torch.float32)
+        else:
+            initial_obj = initial_obj.clone()
+        obj_model._obj = initial_obj.to(device)
+        return obj_model
 
     # --- Properties ----
     @property
