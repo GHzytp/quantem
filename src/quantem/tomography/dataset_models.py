@@ -50,8 +50,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         AutoSerialize.__init__(self)
         OptimizerMixin.__init__(self)
         nn.Module.__init__(self)
-        # if _token is not self._token: TODO: Idk why this isn't working.
-        #     raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
+        if _token is not self._token:
+            raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
         if not (
             tilt_stack.shape[0] < tilt_stack.shape[1] or tilt_stack.shape[0] < tilt_stack.shape[2]
@@ -104,6 +104,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            _token=cls._token,
         )
 
     # --- Optimization Parameters ---
