@@ -7,17 +7,16 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.ddp import DDPMixin
+from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
+from quantem.core.utils.tomography_utils import (
+    torch_phase_cross_correlation,
+)
 from quantem.tomography.dataset_models import DatasetModelType
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import ObjectModelType
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_opt import TomographyOpt
-from quantem.tomography.utils import (
-    gaussian_filter_2d_stack,
-    gaussian_kernel_1d,
-    torch_phase_cross_correlation,
-)
 
 
 class Tomography(TomographyOpt, TomographyBase, DDPMixin):
