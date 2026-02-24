@@ -18,7 +18,7 @@ class DDPMixin:
     ):
         self.setup_distributed()
 
-    def setup_distributed(self, device: str | None = None):
+    def setup_distributed(self, device: str | torch.device | None = None):
         """
         Initializes parameters depending if multiple-GPU training, single-GPU training, or CPU training.
         """
@@ -134,21 +134,16 @@ class DDPMixin:
 
         return train_dataloader, train_sampler, val_dataloader, val_sampler
 
-    def build_model(
+    def distribute_model(
         self,
         model: nn.Module,
-        pretrained_weights: dict[str, torch.Tensor] | None = None,
     ) -> nn.Module | nn.parallel.DistributedDataParallel:
         """
         Wraps the model with DistributedDataParallel if mulitple GPUs are available.
 
         Returns the model.
         """
-        print("Building Model on device: ", self.device)
         model = model.to(self.device)
-        if pretrained_weights is not None:
-            model.load_state_dict(pretrained_weights.copy())
-
         if self.world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,

@@ -271,7 +271,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
             self.setup_distributed(device=device)
-            self._model = self.build_model(model)
+            self._model = self.distribute_model(model)
 
     @classmethod
     def from_model(
@@ -400,14 +400,15 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
     # --- Helper Functions ---
     def rebuild_model(self):
-        self._model = self.build_model(self._model)
+        self._model = self.distribute_model(self._model)
 
     # Reset method that goes back to the pretrained weights.
     def reset(self):
         """reset the model to the pretrained weights"""
-        self._model = self.build_model(
-            self._model, self._pretrained_weights
-        )  # Since loading the pretrained weights needs to be done in build_model.
+        self.model.load_state_dict(self._pretrained_weights.copy())
+        self._model = self.distribute_model(
+            self.model
+        )  # Maybe add a check to see if distributed or not, but not very computationally expensive to do this.
 
     def get_optimization_parameters(self):
         return self.params
