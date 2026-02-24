@@ -23,7 +23,7 @@ class Siren(nn.Module):
         hsiren: bool = False,
         dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
-        winner_initialization: bool = False,
+        winner_initialization: bool | int = False,
     ) -> None:
         """Initialize Siren.
 
@@ -111,6 +111,9 @@ class Siren(nn.Module):
         self.net = nn.Sequential(*net_list)
 
         if self.winner_initialization:
+            if isinstance(self.winner_initialization, int):
+                rng = torch.Generator()
+                rng.manual_seed(self.winner_initialization)
             with torch.no_grad():
                 self.net[0].linear.weight += (
                     torch.randn_like(self.net[0].linear.weight) * 5 / self.first_omega_0
