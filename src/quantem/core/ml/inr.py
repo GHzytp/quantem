@@ -195,7 +195,7 @@ class HSiren(Siren):
         alpha: float = 1.0,
         dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
-        winner_initialization: bool = False,
+        winner_initialization: bool | int = False,
     ) -> None:
         """Initialize HSiren.
 

@@ -2,9 +2,15 @@ import os
 from typing import Literal, Self
 
 import numpy as np
+import torch
+from numpy.typing import NDArray
 
+from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.ml.inr import HSiren
-from quantem.tomography.dataset_models import DatasetModelType
+from quantem.tomography.dataset_models import (
+    TomographyINRDataset,
+    TomographyPixDataset,
+)
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import ObjectINR, ObjectPixelated
 from quantem.tomography.tomography import Tomography, TomographyConventional
@@ -18,13 +24,17 @@ class TomographyLiteINR(Tomography):
     @classmethod
     def from_dataset(
         cls,
-        dset: DatasetModelType,
+        tilt_series: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
         device: str = "cuda",
         log_dir: os.PathLike | str | None = None,
         log_images_every: int = 10,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
-        dset_model = dset
+        dset_model = TomographyINRDataset.from_data(
+            tilt_stack=tilt_series,
+            tilt_angles=tilt_angles,
+        )
 
         # Define the object model
         model = HSiren(alpha=1, winner_initialization=72)
@@ -125,17 +135,21 @@ class TomographyLiteConv(TomographyConventional):
     @classmethod
     def from_dataset(
         cls,
-        dset: DatasetModelType,
+        tilt_series: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
     ) -> Self:
-        dset_model = dset
+        dset_model = TomographyPixDataset.from_data(
+            tilt_stack=tilt_series,
+            tilt_angles=tilt_angles,
+        )
 
-        obj_model = ObjectPixelated(
+        obj_model = ObjectPixelated.from_uniform(
             shape=(
-                max(dset_model.tilt_stack.shape),
-                max(dset_model.tilt_stack.shape),
-                max(dset_model.tilt_stack.shape),
+                max(tilt_series.shape),
+                max(tilt_series.shape),
+                max(tilt_series.shape),
             ),
             device=device,
             rng=rng,
