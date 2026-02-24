@@ -500,9 +500,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             self.set_scheduler(scheduler_params, num_iters)
 
         if reset:
-            raise NotImplementedError(
-                "TODO: Resseting the model to the pretrained weights is not implemented yet. To make this work I would have to reinstantiate the model I think."
-            )
+            self.reset()
 
         loss_fn = get_loss_function(loss_fn, self.dtype)
 
