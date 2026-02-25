@@ -11,7 +11,7 @@ import torch.nn as nn
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
-from quantem.core.ml.loss_functions import get_loss_function
+from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
@@ -502,7 +502,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if reset:
             self.reset()
 
-        loss_fn = get_loss_function(loss_fn, self.dtype)
+        loss_fn = get_loss_module(loss_fn, self.dtype)
 
         self._pretrain(
             num_iters=num_iters,

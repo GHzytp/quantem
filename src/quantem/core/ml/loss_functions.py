@@ -11,139 +11,91 @@ else:
         import torch
 
 
-def get_loss_function(name: str | Callable, dtype: torch.dtype) -> Callable:
-    """Get a loss function by name or return callable if provided.
-
-    Parameters
-    ----------
-    name : str or Callable
-        Loss function name or callable function.
-    dtype : torch.dtype
-        Data type (used to determine complex vs real loss functions).
-
-    Returns
-    -------
-    Callable
-        Loss function.
-
-    Raises
-    ------
-    ValueError
-        If loss function name is unknown for the given dtype.
-    """
-    if isinstance(name, Callable):
+def get_loss_module(name: str | nn.Module | Callable, dtype: torch.dtype) -> nn.Module:
+    """Return a loss *module* by name, or wrap/return what was provided."""
+    if isinstance(name, nn.Module):
         return name
-    else:
-        name = name.lower()
+
+    if callable(name) and not isinstance(name, str):
+        # Wrap a bare callable into an nn.Module
+        class _CallableLoss(nn.Module):
+            def __init__(self, fn: Callable):
+                super().__init__()
+                self.fn = fn
+
+            def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                return self.fn(pred, target)
+
+        return _CallableLoss(name)
+
+    loss_name = str(name).lower()
+
     if dtype.is_complex:
-        if name in ["l2", "complex_l2"]:
-            return complex_l2
-        elif name in ["complex_cartesian_l2"]:
-            return complex_cartesian_l2
-        elif name in ["amp_phase_l2"]:
-            return amp_phase_l2
-        elif name in ["combined_l2"]:
-            return combined_l2
-        else:
-            raise ValueError(f"Unknown loss function for complex dtype: {name}")
-    else:
-        if name in ["l2"]:
-            return torch.nn.functional.mse_loss
-        elif name in ["l1"]:
-            return torch.nn.functional.l1_loss
-        else:
-            raise ValueError(f"Unknown loss function for real dtype: {name}")
+        if loss_name in {"l2", "complex_l2"}:
+            return ComplexL2Loss()
+        if loss_name in {"complex_cartesian_l2"}:
+            return ComplexCartesianL2Loss()
+        if loss_name in {"amp_phase_l2"}:
+            return AmpPhaseL2Loss()
+        if loss_name in {"combined_l2"}:
+            return CombinedL2Loss()
+        raise ValueError(f"Unknown loss module for complex dtype: {loss_name}")
+
+    # real dtype
+    if loss_name in {"l2"}:
+        return nn.MSELoss()
+    if loss_name in {"l1"}:
+        return nn.L1Loss()
+    raise ValueError(f"Unknown loss module for real dtype: {loss_name}")
 
 
-def complex_l2(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Compute L2 loss for complex tensors (separate real and imaginary parts).
+class ComplexL2Loss(nn.Module):
+    """L2 loss for complex tensors (separate real/imag, then average)."""
 
-    Parameters
-    ----------
-    pred : torch.Tensor
-        Predicted complex tensor.
-    target : torch.Tensor
-        Target complex tensor.
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        real_l2 = torch.mean((pred.real - target.real) ** 2)
+        imag_l2 = torch.mean((pred.imag - target.imag) ** 2)
+        return (real_l2 + imag_l2) / 2
 
-    Returns
-    -------
-    torch.Tensor
-        L2 loss value.
+
+class ComplexCartesianL2Loss(nn.Module):
+    """L2 loss for complex tensors in Cartesian form: E[(Δre^2 + Δim^2)]."""
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        real_dif = pred.real - target.real
+        imag_dif = pred.imag - target.imag
+        return torch.mean(real_dif**2 + imag_dif**2)
+
+
+class AmpPhaseL2Loss(nn.Module):
+    """L2 loss on amplitude + wrapped phase."""
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        amp_l2 = ((target.abs() - pred.abs()) ** 2).mean()
+
+        phase_dif = torch.abs(target.angle() - pred.angle())
+        phase_dif = torch.min(phase_dif, 2 * torch.pi - phase_dif)  # wrap to [0, pi]
+        phase_l2 = torch.mean(phase_dif**2)
+
+        return amp_l2 + phase_l2
+
+
+class CombinedL2Loss(nn.Module):
+    """Weighted sum of AmpPhaseL2 and ComplexL2.
+
+    loss = alpha * amp_phase + (1 - alpha) * complex_l2
     """
-    real_l2 = torch.mean((pred.real - target.real) ** 2)
-    imag_l2 = torch.mean((pred.imag - target.imag) ** 2)
-    return (real_l2 + imag_l2) / 2
 
+    def __init__(self, alpha: float = 0.7):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.complex_l2 = ComplexL2Loss()
+        self.amp_phase_l2 = AmpPhaseL2Loss()
 
-def complex_cartesian_l2(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Compute L2 loss for complex tensors in Cartesian coordinates.
-
-    Parameters
-    ----------
-    pred : torch.Tensor
-        Predicted complex tensor.
-    target : torch.Tensor
-        Target complex tensor.
-
-    Returns
-    -------
-    torch.Tensor
-        L2 loss value.
-    """
-    real_dif = pred.real - target.real
-    imag_dif = pred.imag - target.imag
-    loss = torch.mean(real_dif**2 + imag_dif**2)
-    return loss
-
-
-def amp_phase_l2(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Compute L2 loss for complex tensors in amplitude-phase representation.
-
-    Parameters
-    ----------
-    pred : torch.Tensor
-        Predicted complex tensor.
-    target : torch.Tensor
-        Target complex tensor.
-
-    Returns
-    -------
-    torch.Tensor
-        L2 loss value (amplitude + phase).
-    """
-    amp_l2 = ((target.abs() - pred.abs()) ** 2).mean()
-    phase_dif = torch.abs(target.angle() - pred.angle())
-    phase_dif = torch.min(phase_dif, 2 * torch.pi - phase_dif)  # phase wrapping
-    phase_l2 = torch.mean(phase_dif**2)
-    return amp_l2 + phase_l2
-
-
-def combined_l2(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.7) -> torch.Tensor:
-    """Combined L2 loss: weighted sum of amplitude-phase and complex L2 losses.
-
-    Parameters
-    ----------
-    pred : torch.Tensor
-        Predicted complex tensor.
-    target : torch.Tensor
-        Target complex tensor.
-    alpha : float, optional
-        Weight for amplitude-phase loss. Larger alpha gives more weight to
-        amp/phase, smaller alpha gives more weight to real/imag, by default 0.7
-
-    Returns
-    -------
-    torch.Tensor
-        Combined L2 loss value.
-
-    different alpha values can affect stability of training.
-    """
-    comp_l2 = complex_l2(pred, target)
-    amp_ph_l2 = amp_phase_l2(pred, target)
-    return alpha * amp_ph_l2 + (1 - alpha) * comp_l2
-
-
-# TODO: Better loss function implementation? More torch-like.
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        comp_l2 = self.complex_l2(pred, target)
+        amp_ph_l2 = self.amp_phase_l2(pred, target)
+        return self.alpha * amp_ph_l2 + (1 - self.alpha) * comp_l2
 
 
 class MSELogMSELoss(nn.Module):
