@@ -399,7 +399,13 @@ class Dataset3dspectroscopy(Dataset3d):
         """
         Store processed spectra in the 3D spectroscopy dataset structure, in a 1D array of 2D arrays. By default, calculate_mean_spectrum will
         """
-        two_d_spectrum = np.vstack((spectrum, energy_axis))
+        from quantem.core.datastructures.dataset1d import Dataset1d
+
+        two_d_spectrum = Dataset1d.from_array(
+            array=spectrum, origin=energy_axis[0], sampling=self.sampling[0], units=self.units[0]
+        )
+
+        # two_d_spectrum = np.vstack((spectrum, energy_axis))
 
         if self.attached_spectra is not None:
             self.attached_spectra.append(two_d_spectrum)
