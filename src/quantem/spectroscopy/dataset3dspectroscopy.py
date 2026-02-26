@@ -405,8 +405,6 @@ class Dataset3dspectroscopy(Dataset3d):
             array=spectrum, origin=energy_axis[0], sampling=self.sampling[0], units=self.units[0]
         )
 
-        # two_d_spectrum = np.vstack((spectrum, energy_axis))
-
         if self.attached_spectra is not None:
             self.attached_spectra.append(two_d_spectrum)
         else:
