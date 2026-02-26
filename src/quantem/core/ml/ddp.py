@@ -31,7 +31,6 @@ class DDPMixin:
             self.world_size = dist.get_world_size()
             self.global_rank = dist.get_rank()
             self.local_rank = int(os.environ["LOCAL_RANK"])
-
             torch.cuda.set_device(self.local_rank)
             device = torch.device("cuda", self.local_rank)
         else:
