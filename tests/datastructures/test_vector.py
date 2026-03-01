@@ -37,7 +37,9 @@ class TestVector:
         v1 = Vector.from_shape(shape=(2, 3), fields=["a", "b", "c"])
         assert v1.shape == (2, 3)
         assert len(v1) == 2
+        assert v1.num_cells == 6
         assert v1.num_fields == 3
+        assert v1.dtype == np.dtype(float)
         assert v1.fields == ["a", "b", "c"]
         assert v1.units == ["none", "none", "none"]
         assert v1.name == "2d ragged array"
@@ -79,6 +81,7 @@ class TestVector:
 
         result = v[[-1, 0], 1]
         assert result.shape == (2,)
+        assert result.num_cells == 2
         np.testing.assert_array_equal(result[0].array, np.array([[21.0, 121.0, 221.0]]))
         np.testing.assert_array_equal(result[1].array, np.array([[1.0, 101.0, 201.0]]))
 
@@ -106,6 +109,7 @@ class TestVector:
 
         multi = v.select_fields("intensity", "kx")
         assert multi.fields == ["intensity", "kx"]
+        assert multi.dtype == np.dtype(float)
         assert multi.total_rows == 6
         assert multi.row_counts() == [2, 1, 2, 1]
 

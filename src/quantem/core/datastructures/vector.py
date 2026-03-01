@@ -225,6 +225,11 @@ class Vector(AutoSerialize):
         return len(self.fields)
 
     @property
+    def dtype(self) -> np.dtype[Any]:
+        """Return the NumPy dtype of the backing row buffer."""
+        return self._state["data"].dtype
+
+    @property
     def name(self) -> str:
         """Human-readable Vector name."""
         return self._state["name"]
@@ -312,6 +317,11 @@ class Vector(AutoSerialize):
     def total_rows(self) -> int:
         """Return the total ragged-row count in the current selection."""
         return int(self._state["cell_lengths"][self._selected_cell_indices()].sum())
+
+    @property
+    def num_cells(self) -> int:
+        """Return the number of fixed-grid cells in the current selection."""
+        return int(self._selected_cell_indices().size)
 
     def row_counts(self) -> list[int]:
         """Return per-cell row counts in the current selection order."""
