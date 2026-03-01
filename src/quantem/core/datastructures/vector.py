@@ -1,1026 +1,694 @@
-from typing import (
-    Any,
-    List,
-    Optional,
-    Tuple,
-    Union,
-    cast,
-    overload,
-)
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+from typing import Any, Iterable, Sequence, overload
 
 import numpy as np
-from numpy.typing import ArrayLike, NDArray
+from numpy.typing import NDArray
 
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import (
     validate_fields,
     validate_num_fields,
     validate_shape,
-    validate_vector_data,
-    validate_vector_data_for_inference,
     validate_vector_units,
 )
 
 
+@dataclass
+class _VectorState:
+    shape: tuple[int, ...]
+    data: NDArray[np.object_]
+    fields: list[str]
+    units: list[str]
+    name: str
+    metadata: dict[str, Any]
+
+
 class Vector(AutoSerialize):
+    """Ragged cell data on a fixed grid.
+
+    A ``Vector`` has fixed grid dimensions (``shape``). Each fixed-grid cell stores a
+    NumPy array with shape ``(n_rows, num_fields)``. Selections always return new
+    ``Vector`` views over the same backing store, while raw NumPy extraction is explicit
+    via ``.array`` and ``.flatten()``.
     """
-    A class for holding vector data with ragged array lengths. This class supports any number of fixed dimensions
-    (indexed first) followed by a ragged numpy array that can have any number of entries (rows) and columns (fields).
-    Inherits from AutoSerialize for serialization support.
-
-    Basic Usage:
-    -----------
-    # Create a 2D vector with shape=(4, 3) and 3 named fields
-    v = Vector.from_shape(shape=(4, 3), fields=['field0', 'field1', 'field2'])
-
-    # Alternative creation with num_fields instead of fields
-    v = Vector.from_shape(shape=(4, 3), num_fields=3)  # Fields will be named field_0, field_1, field_2
-
-    # Create with custom name and units
-    v = Vector.from_shape(
-        shape=(4, 3),
-        fields=['field0', 'field1', 'field2'],
-        name='my_vector',
-        units=['unit0', 'unit1', 'unit2'],
-    )
-
-    # Access data at specific indices
-    data = v[0, 1]  # Returns numpy array at position (0,1)
-
-    # Set data at specific indices
-    v[0, 1] = np.array([[1.0, 2.0, 3.0]])  # Must match num_fields
-
-    # Create a deep copy
-    v_copy = v.copy()
-
-    Example usage of from_data:
-    -----------------------------------
-    data = [
-        np.array([[1, 2], [3, 4]]),
-        np.array([[5, 6], [7, 8], [9, 10]])
-    ]
-    v = Vector.from_data(
-        data,
-        fields=['x', 'y'],
-        name='my_ragged_vector',
-        units=['m', 'm']
-    )
-
-    # Or using lists instead of numpy arrays:
-    data = [
-        [[1, 2], [3, 4]],
-        [[5, 6], [7, 8], [9, 10]],
-    ]
-    v = Vector.from_data(
-        data,
-        fields=['x', 'y'],
-        name='my_ragged_vector',
-        units=['m', 'm']
-    )
-
-    Field Operations:
-    ----------------
-    # Access a specific field
-    field_data = v['field0']  # Returns a FieldView object
-
-    # Perform operations on a field
-    v['field0'] += 16  # Add 16 to all field0 values
-
-    # Apply a function to a field
-    v['field2'] = lambda x: x * 2  # Double all field2 values
-
-    # Get flattened field data
-    field_flat = v['field0'].flatten()  # Returns 1D numpy array
-
-    # Set field data from flattened array
-    v['field2'].set_flattened(new_values)  # Must match total length
-
-    Advanced Operations:
-    -------------------
-    # Complex field calculations
-    scale = v['field0'].flatten() / (v['field0'].flatten()**2 + v['field1'].flatten()**2)
-    v['field2'].set_flattened(v['field2'].flatten() * scale)
-
-    # Slicing and assignment
-    v[2:4, 1] = v[1:3, 1]  # Copy data from one region to another
-
-    # Boolean indexing
-    mask = v['field0'].flatten() > 0
-    v['field2'].set_flattened(v['field2'].flatten() * mask)
-
-    # Field management
-    v.add_fields(('field3', 'field4', 'field5'))  # Add new fields
-    v.remove_fields(('field3', 'field4', 'field5'))  # Remove fields
-
-    Direct Data Access:
-    ------------------
-    # Get data with integer indexing
-    data = v.get_data(0, 1)  # Returns numpy array at (0,1)
-
-    # Get data with slice indexing
-    data = v.get_data(slice(0, 2), 1)  # Returns list of arrays for rows 0-1 at column 1
-
-    # Set data with integer indexing
-    v.set_data(np.array([[1.0, 2.0, 3.0]]), 0, 1)  # Set data at (0,1)
-
-    # Set data with slice indexing
-    v.set_data([np.array([[1.0, 2.0, 3.0]]), np.array([[4.0, 5.0, 6.0]])],
-               slice(0, 2), 1)  # Set data for rows 0-1 at column 1
-
-    Notes:
-    -----
-    - All numpy arrays stored in the vector must have the same number of columns (fields)
-    - Field names must be unique
-    - Slicing operations return new Vector instances
-    - Field operations are performed in-place
-    - Units are stored for each field and can be accessed via the units attribute
-    - The name attribute can be used to identify the vector in a larger context
-    """
-
-    _token = object()
 
     def __init__(
         self,
-        shape: Tuple[int, ...],
-        fields: List[str],
-        units: List[str],
-        name: str,
-        metadata: dict = {},
-        _token: object | None = None,
+        shape: tuple[int, ...],
+        fields: Sequence[str],
+        units: Sequence[str] | None = None,
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
-        if _token is not self._token:
-            raise RuntimeError("Use Vector.from_shape() or Vector.from_data() to instantiate.")
+        validated_shape = validate_shape(shape)
+        validated_fields = validate_fields(list(fields))
+        validated_units = validate_vector_units(list(units) if units is not None else None, len(validated_fields))
+        self._state = _VectorState(
+            shape=validated_shape,
+            data=_empty_storage(validated_shape, len(validated_fields)),
+            fields=list(validated_fields),
+            units=list(validated_units),
+            name=name or f"{len(validated_shape)}d ragged array",
+            metadata=dict(metadata or {}),
+        )
+        self._coords = _root_coords(validated_shape)
+        self._field_names = tuple(validated_fields)
 
-        self.shape = shape
-        self.fields = fields
-        self.units = units
-        self.name = name
-        self._data = nested_list(self.shape, fill=None)
-        self._metadata = metadata
+    @classmethod
+    def _from_state(
+        cls,
+        state: _VectorState,
+        coords: NDArray[np.object_],
+        field_names: Sequence[str],
+    ) -> "Vector":
+        obj = cls.__new__(cls)
+        obj._state = state
+        obj._coords = coords
+        obj._field_names = tuple(field_names)
+        return obj
 
     @classmethod
     def from_shape(
         cls,
-        shape: Tuple[int, ...],
-        num_fields: Optional[int] = None,
-        fields: Optional[List[str]] = None,
-        units: Optional[List[str]] = None,
-        name: Optional[str] = None,
+        shape: tuple[int, ...],
+        num_fields: int | None = None,
+        fields: Sequence[str] | None = None,
+        units: Sequence[str] | None = None,
+        name: str | None = None,
     ) -> "Vector":
-        """
-        Factory method to create a Vector with the specified shape and fields.
-
-        Parameters
-        ----------
-        shape : Tuple[int, ...]
-            The shape of the vector (dimensions)
-        num_fields : Optional[int]
-            Number of fields in the vector
-        name : Optional[str]
-            Name of the vector
-        fields : Optional[List[str]]
-            List of field names
-        units : Optional[List[str]]
-            List of units for each field
-
-        Returns
-        -------
-        Vector
-            A new Vector instance
-        """
-        validated_shape = validate_shape(shape)
-        ndim = len(validated_shape)
-
         if fields is not None:
-            validated_fields = validate_fields(fields)
-            validated_num_fields = len(validated_fields)
-            if num_fields is not None and validated_num_fields != num_fields:
+            validated_fields = validate_fields(list(fields))
+            if num_fields is not None and len(validated_fields) != num_fields:
                 raise ValueError(
-                    f"num_fields ({num_fields}) does not match length of fields ({validated_num_fields})"
+                    f"num_fields ({num_fields}) does not match length of fields ({len(validated_fields)})"
                 )
         elif num_fields is not None:
-            validated_num_fields = validate_num_fields(num_fields)
-            validated_fields = [f"field_{i}" for i in range(validated_num_fields)]
+            validated_count = validate_num_fields(num_fields)
+            validated_fields = [f"field_{i}" for i in range(validated_count)]
         else:
             raise ValueError("Must specify either 'fields' or 'num_fields'.")
 
-        validated_units = validate_vector_units(units, validated_num_fields)
-        name = name or f"{ndim}d ragged array"
-
         return cls(
-            shape=validated_shape,
+            shape=shape,
             fields=validated_fields,
-            units=validated_units,
+            units=units,
             name=name,
-            _token=cls._token,
         )
 
     @classmethod
     def from_data(
         cls,
-        data: List[Any],
-        num_fields: Optional[int] = None,
-        fields: Optional[List[str]] = None,
-        units: Optional[List[str]] = None,
-        name: Optional[str] = None,
+        data: list[Any],
+        num_fields: int | None = None,
+        fields: Sequence[str] | None = None,
+        units: Sequence[str] | None = None,
+        name: str | None = None,
     ) -> "Vector":
-        """
-        Factory method to create a Vector from a list of
-        ragged lists or ragged numpy arrays.
+        inferred_shape, normalized_cells = _normalize_nested_data(data)
+        inferred_num_fields = normalized_cells[0].shape[1] if normalized_cells else 0
 
-        Parameters
-        ----------
-        data : List[Any]
-            A list of ragged lists containing the vector data.
-            Each element should be a numpy array with shape (n, num_fields).
-        num_fields : Optional[int]
-            Number of fields in the vector. If not provided, it will be inferred from the data.
-        fields : Optional[List[str]]
-            List of field names
-        units : Optional[List[str]]
-            List of units for each field
-        name : Optional[str]
-            Name of the vector
+        if fields is not None:
+            validated_fields = validate_fields(list(fields))
+            if len(validated_fields) != inferred_num_fields:
+                raise ValueError(
+                    f"num_fields ({inferred_num_fields}) does not match length of fields ({len(validated_fields)})"
+                )
+        elif num_fields is not None:
+            validated_num_fields = validate_num_fields(num_fields)
+            if validated_num_fields != inferred_num_fields:
+                raise ValueError(
+                    f"Provided num_fields ({validated_num_fields}) does not match inferred ({inferred_num_fields})."
+                )
+            validated_fields = [f"field_{i}" for i in range(validated_num_fields)]
+        else:
+            validated_fields = [f"field_{i}" for i in range(inferred_num_fields)]
 
-        Returns
-        -------
-        Vector
-            A new Vector instance with the provided data
-
-        Raises
-        ------
-        ValueError
-            If the data structure is invalid or inconsistent
-        TypeError
-            If the data contains invalid types
-        """
-        inferred_shape, inferred_num_fields = validate_vector_data_for_inference(data)
-
-        final_num_fields = num_fields or inferred_num_fields
-        if num_fields is not None and num_fields != inferred_num_fields:
-            raise ValueError(
-                f"Provided num_fields ({num_fields}) does not match inferred ({inferred_num_fields})."
-            )
-
-        vector = cls.from_shape(
+        vector = cls(
             shape=inferred_shape,
-            num_fields=final_num_fields,
-            fields=fields,
+            fields=validated_fields,
             units=units,
             name=name,
         )
-
-        # Now fully validate and set the data
-        vector.data = data
+        for coord, array in zip(np.ndindex(inferred_shape), normalized_cells):
+            vector._state.data[coord] = array.copy()
         return vector
 
-    def get_data(
-        self, *indices: Union[int, slice, List[int], np.ndarray[Any, np.dtype[Any]]]
-    ) -> Union[NDArray, List[NDArray]]:
-        """
-        Get data at specified indices.
-
-        Parameters:
-        -----------
-        *indices : Union[int, slice, List[int], np.ndarray]
-            Indices to access. Must match the number of dimensions in the vector.
-            Supports fancy indexing with lists or numpy arrays.
-
-        Returns:
-        --------
-        numpy.ndarray or list
-            The data at the specified indices.
-
-        Raises:
-        -------
-        IndexError
-            If indices are out of bounds.
-        ValueError
-            If the number of indices does not match the vector dimensions.
-        """
-        if len(indices) != len(self._shape):
-            raise ValueError(f"Expected {len(self._shape)} indices, got {len(indices)}")
-
-        # Handle fancy indexing and slicing
-        def get_indices(dim_idx: Any, dim_size: int) -> np.ndarray:
-            if isinstance(dim_idx, slice):
-                start, stop, step = dim_idx.indices(dim_size)
-                return np.arange(start, stop, step)
-            elif isinstance(dim_idx, (np.ndarray, list)):
-                idx = np.asarray(dim_idx)
-                if np.any((idx < 0) | (idx >= dim_size)):
-                    raise IndexError(f"Index out of bounds for axis with size {dim_size}")
-                return idx
-            elif isinstance(dim_idx, (int, np.integer)):
-                if dim_idx < 0 or dim_idx >= dim_size:
-                    raise IndexError(
-                        f"Index {dim_idx} out of bounds for axis with size {dim_size}"
-                    )
-                return np.array([dim_idx])
-            return np.arange(dim_size)
-
-        # Get indices for each dimension
-        indices_arrays = [get_indices(i, s) for i, s in zip(indices, self._shape)]
-
-        # If all indices are single integers, return a single array
-        if all(len(i) == 1 for i in indices_arrays):
-            ref = self._data
-            for idx in (i[0] for i in indices_arrays):
-                ref = ref[idx]
-            return ref
-
-        # Create result structure for fancy indexing
-        result = []
-        for idx in np.ndindex(*[len(i) for i in indices_arrays]):
-            src_idx = tuple(ind[i] for ind, i in zip(indices_arrays, idx))
-            result.append(self._data[src_idx[0]][src_idx[1]])
-
-        return result
-
-    def set_data(
-        self,
-        value: Union[NDArray, List[NDArray]],
-        *indices: Union[int, slice, List[int], np.ndarray[Any, np.dtype[Any]]],
-    ) -> None:
-        """
-        Set data at specified indices.
-
-        Parameters
-        ----------
-        value : Union[NDArray, List[NDArray]]
-            The numpy array(s) to set at the specified indices. Must have shape (_, num_fields).
-            For fancy indexing, can be a list of arrays.
-        *indices : Union[int, slice, List[int], np.ndarray]
-            Indices to set data at. Must match the number of dimensions in the vector.
-            Supports fancy indexing with lists or numpy arrays.
-
-        Raises
-        ------
-        IndexError
-            If indices are out of bounds.
-        ValueError
-            If the number of indices does not match the vector dimensions,
-            or if the value shape doesn't match the expected shape.
-        TypeError
-            If the value is not a numpy array or list of numpy arrays.
-        """
-        if len(indices) != len(self._shape):
-            raise ValueError(f"Expected {len(self._shape)} indices, got {len(indices)}")
-
-        # Handle fancy indexing and slicing
-        def get_indices(dim_idx: Any, dim_size: int) -> np.ndarray:
-            if isinstance(dim_idx, slice):
-                start, stop, step = dim_idx.indices(dim_size)
-                return np.arange(start, stop, step)
-            elif isinstance(dim_idx, (np.ndarray, list)):
-                idx = np.asarray(dim_idx)
-                if np.any((idx < 0) | (idx >= dim_size)):
-                    raise IndexError(f"Index out of bounds for axis with size {dim_size}")
-                return idx
-            elif isinstance(dim_idx, (int, np.integer)):
-                if dim_idx < 0 or dim_idx >= dim_size:
-                    raise IndexError(
-                        f"Index {dim_idx} out of bounds for axis with size {dim_size}"
-                    )
-                return np.array([dim_idx])
-            return np.arange(dim_size)
-
-        # Get indices for each dimension
-        indices_arrays = [get_indices(i, s) for i, s in zip(indices, self._shape)]
-
-        # If all indices are single integers, handle as single value
-        if all(len(i) == 1 for i in indices_arrays):
-            if not isinstance(value, np.ndarray):
-                raise TypeError(f"Value must be a numpy array, got {type(value).__name__}")
-            if value.ndim != 2 or value.shape[1] != self.num_fields:
-                raise ValueError(
-                    f"Expected a numpy array with shape (_, {self.num_fields}), got {value.shape}"
-                )
-            ref = self._data
-            for idx in (i[0] for i in indices_arrays[:-1]):
-                ref = ref[idx]
-            ref[indices_arrays[-1][0]] = value
-            return
-
-        # Handle fancy indexing
-        if not isinstance(value, list):
-            raise TypeError("For fancy indexing, value must be a list of numpy arrays")
-
-        # Validate and set values
-        for idx in np.ndindex(*[len(i) for i in indices_arrays]):
-            src_idx = tuple(ind[i] for ind, i in zip(indices_arrays, idx))
-            if not isinstance(value[idx[0]], np.ndarray):
-                raise TypeError(f"Expected numpy array, got {type(value[idx[0]]).__name__}")
-            if value[idx[0]].ndim != 2 or value[idx[0]].shape[1] != self.num_fields:
-                raise ValueError(
-                    f"Expected array with shape (_, {self.num_fields}), got {value[idx[0]].shape}"
-                )
-            ref = self._data
-            for i in src_idx[:-1]:
-                ref = ref[i]
-            ref[src_idx[-1]] = value[idx[0]]
-
-    @overload
-    def __getitem__(self, idx: str) -> "_FieldView": ...
-    @overload
-    def __getitem__(
-        self,
-        idx: Union[Tuple[Union[int, slice, List[int]], ...], int, slice, List[int]],
-    ) -> Union[NDArray, "Vector"]: ...
-
-    def __getitem__(
-        self,
-        idx: Union[str, Tuple[Union[int, slice, List[int]], ...], int, slice, List[int]],
-    ) -> Union["_FieldView", NDArray, "Vector"]:
-        """Get data or a view of the vector at specified indices."""
-        if isinstance(idx, str):
-            if idx not in self._fields:
-                raise KeyError(f"Field '{idx}' not found.")
-            return _FieldView(self, idx)
-
-        # Normalize idx to tuple
-        normalized: Tuple[Any, ...] = (idx,) if not isinstance(idx, tuple) else idx
-
-        # Convert lists/arrays to ndarray
-        idx_converted: Tuple[Union[int, slice, np.ndarray[Any, np.dtype[Any]]], ...] = tuple(
-            np.asarray(i) if isinstance(i, (list, np.ndarray)) else i for i in normalized
-        )
-
-        # Check if we should return a numpy array (all indices are integers)
-        return_np = all(isinstance(i, (int, np.integer)) for i in idx_converted[: len(self.shape)])
-        if len(idx_converted) < len(self.shape):
-            return_np = False
-
-        if return_np:
-            view = self._data
-            for i in idx_converted:
-                view = view[i]
-            return cast(NDArray[Any], view)
-
-        # Handle fancy indexing and slicing
-        def get_indices(dim_idx: Any, dim_size: int) -> np.ndarray:
-            if isinstance(dim_idx, slice):
-                start, stop, step = dim_idx.indices(dim_size)
-                return np.arange(start, stop, step)
-            elif isinstance(dim_idx, (np.ndarray, list)):
-                return np.asarray(dim_idx)
-            elif isinstance(dim_idx, (int, np.integer)):
-                return np.array([dim_idx])
-            return np.arange(dim_size)
-
-        # Get indices for each dimension
-        full_idx = list(idx_converted) + [slice(None)] * (len(self.shape) - len(idx_converted))
-        indices = [get_indices(i, s) for i, s in zip(full_idx, self.shape)]
-
-        # Create new shape and data
-        new_shape = [len(i) for i in indices]
-        new_data = [[None] * new_shape[-1] for _ in range(new_shape[0])]
-
-        # Fill the new data structure
-        for out_idx in np.ndindex(*new_shape):
-            src_idx = tuple(ind[i] for ind, i in zip(indices, out_idx))
-            new_data[out_idx[0]][out_idx[1]] = self._data[src_idx[0]][src_idx[1]]
-
-        # Create new Vector
-        vector_new = Vector.from_shape(
-            shape=tuple(new_shape),
-            num_fields=self.num_fields,
-            name=self.name + "[view]",
-            fields=self.fields,
-            units=self.units,
-        )
-        vector_new._data = new_data
-        return vector_new
-
-    def __setitem__(
-        self,
-        idx: Union[Tuple[Union[int, slice, List[int]], ...], int, slice, List[int], str],
-        value: Union[NDArray, List[NDArray]],
-    ) -> None:
-        """Set data at specified indices."""
-        if isinstance(idx, str):
-            if idx not in self._fields:
-                raise KeyError(f"Field '{idx}' not found.")
-            field_view = _FieldView(self, idx)
-            field_view.set_flattened(value)
-            return
-
-        # Normalize idx to tuple
-        normalized: Tuple[Any, ...] = (idx,) if not isinstance(idx, tuple) else idx
-
-        # Convert lists/arrays to ndarray
-        idx_converted: Tuple[Union[int, slice, np.ndarray[Any, np.dtype[Any]]], ...] = tuple(
-            np.asarray(i) if isinstance(i, (list, np.ndarray)) else i for i in normalized
-        )
-
-        # Check if we're doing slice‐ or array‐based (multi‐cell) indexing
-        has_fancy = any(
-            isinstance(i, slice) or (isinstance(i, np.ndarray) and i.size > 1)
-            for i in idx_converted[: len(self.shape)]
-        )
-
-        if has_fancy:
-            # If user passed a Vector, extract its cell arrays
-            if isinstance(value, Vector):
-
-                def _flatten_cells(data):
-                    if isinstance(data, np.ndarray):
-                        return [data]
-                    out = []
-                    for sub in data:
-                        out.extend(_flatten_cells(sub))
-                    return out
-
-                value = _flatten_cells(value._data)
-
-            # For fancy indexing, value should be a list of arrays
-            if not isinstance(value, list):
-                raise TypeError(
-                    "For fancy/slice indexing, value must be a list of numpy arrays or a Vector"
-                )
-
-            # Get indices for each dimension
-            def get_indices(dim_idx: Any, dim_size: int) -> np.ndarray:
-                if isinstance(dim_idx, slice):
-                    start, stop, step = dim_idx.indices(dim_size)
-                    return np.arange(start, stop, step)
-                elif isinstance(dim_idx, (np.ndarray, list)):
-                    idx = np.asarray(dim_idx)
-                    if np.any((idx < 0) | (idx >= dim_size)):
-                        raise IndexError(f"Index out of bounds for axis with size {dim_size}")
-                    return idx
-                elif isinstance(dim_idx, (int, np.integer)):
-                    if dim_idx < 0 or dim_idx >= dim_size:
-                        raise IndexError(f"Index out of bounds for axis with size {dim_size}")
-                    return np.array([dim_idx])
-                return np.arange(dim_size)
-
-            indices_arrays = [get_indices(i, s) for i, s in zip(idx_converted, self._shape)]
-            total_indices = np.prod([len(i) for i in indices_arrays])
-
-            if len(value) != total_indices:
-                raise ValueError(f"Expected {total_indices} arrays, got {len(value)}")
-
-            # Validate and set values
-            for array_idx, idx in enumerate(np.ndindex(*[len(i) for i in indices_arrays])):
-                src_idx = tuple(ind[i] for ind, i in zip(indices_arrays, idx))
-                if not isinstance(value[array_idx], np.ndarray):
-                    raise TypeError(f"Expected numpy array, got {type(value[array_idx]).__name__}")
-                if value[array_idx].ndim != 2 or value[array_idx].shape[1] != self.num_fields:
-                    raise ValueError(
-                        f"Expected array with shape (_, {self.num_fields}), got {value[array_idx].shape}"
-                    )
-                ref = self._data
-                for i in src_idx[:-1]:
-                    ref = ref[i]
-                ref[src_idx[-1]] = value[array_idx]
-        else:
-            # For single value assignment
-            if not isinstance(value, np.ndarray):
-                raise TypeError(f"Value must be a numpy array, got {type(value).__name__}")
-            if value.ndim != 2 or value.shape[1] != self.num_fields:
-                raise ValueError(
-                    f"Expected a numpy array with shape (_, {self.num_fields}), got {value.shape}"
-                )
-            ref = self._data
-            for i in idx_converted[:-1]:
-                ref = ref[i]
-            ref[idx_converted[-1]] = value
-
-    def add_fields(self, new_fields: Union[str, List[str]]) -> None:
-        """
-        Add new fields to the vector.
-
-        Parameters
-        ----------
-        new_fields : Union[str, List[str]]
-            Field name(s) to add. Must be unique and not already present.
-
-        Raises
-        ------
-        ValueError
-            If any field name already exists or if there are duplicates
-        """
-        if isinstance(new_fields, str):
-            new_fields = [new_fields]
-        else:
-            new_fields = list(new_fields)
-
-        if any(name in self._fields for name in new_fields):
-            raise ValueError("One or more new field names already exist.")
-
-        if len(set(new_fields)) != len(new_fields):
-            raise ValueError("Duplicate field names in input are not allowed.")
-
-        self._fields = list(self._fields) + list(new_fields)
-        self._units = list(self._units) + ["none"] * len(new_fields)
-
-        def expand_array(arr: Any) -> Any:
-            if isinstance(arr, np.ndarray):
-                if arr.shape[1] != self.num_fields - len(new_fields):
-                    raise ValueError(
-                        f"Expected arrays with {self.num_fields - len(new_fields)} fields, got {arr.shape[1]}"
-                    )
-                pad = np.zeros((arr.shape[0], len(new_fields)))
-                return np.hstack([arr, pad])
-            elif isinstance(arr, list):
-                return [expand_array(sub) for sub in arr]
-            else:
-                return arr
-
-        self._data = expand_array(self._data)
-
-    def remove_fields(self, fields_to_remove: Union[str, List[str]]) -> None:
-        """
-        Remove fields from the vector.
-
-        Parameters
-        ----------
-        fields_to_remove : Union[str, List[str]]
-            Field name(s) to remove. Must exist in the vector.
-
-        Raises
-        ------
-        ValueError
-            If any field doesn't exist
-        """
-        if isinstance(fields_to_remove, str):
-            fields_to_remove = [fields_to_remove]
-        else:
-            fields_to_remove = list(fields_to_remove)
-
-        field_to_index = {name: i for i, name in enumerate(self._fields)}
-        indices_to_remove = []
-        for field in fields_to_remove:
-            if field not in field_to_index:
-                print(f"Warning: field '{field}' not found.")
-            else:
-                indices_to_remove.append(field_to_index[field])
-
-        if not indices_to_remove:
-            return
-
-        indices_to_remove = sorted(set(indices_to_remove))
-        keep_indices = [i for i in range(self.num_fields) if i not in indices_to_remove]
-
-        # Update metadata
-        self._fields = [self._fields[i] for i in keep_indices]
-        self._units = [self._units[i] for i in keep_indices]
-
-        def prune_array(arr: Any) -> Any:
-            if isinstance(arr, np.ndarray):
-                if arr.shape[1] < max(indices_to_remove) + 1:
-                    raise ValueError(
-                        f"Cannot remove field index {max(indices_to_remove)} from array with shape {arr.shape}"
-                    )
-                return arr[:, keep_indices]
-            elif isinstance(arr, list):
-                return [prune_array(sub) for sub in arr]
-            else:
-                return arr
-
-        self._data = prune_array(self._data)
-
-    def copy(self) -> "Vector":
-        """
-        Create a deep copy of the vector.
-
-        Returns
-        -------
-        Vector
-            A new Vector instance with the same data, shape, fields, and units.
-        """
-        import copy
-
-        vector_copy = Vector.from_shape(
-            shape=self.shape,
-            name=self.name,
-            fields=self.fields,
-            units=self.units,
-        )
-        vector_copy._data = copy.deepcopy(self._data)
-        return vector_copy
-
-    def flatten(self) -> NDArray:
-        """
-        Flatten the vector into a 2D numpy array.
-
-        Returns
-        -------
-        NDArray
-            A 2D numpy array containing all data, with shape (total_rows, num_fields).
-        """
-
-        def collect_arrays(data: Any) -> List[NDArray]:
-            if isinstance(data, np.ndarray):
-                return [data]
-            elif isinstance(data, list):
-                arrays = []
-                for item in data:
-                    arrays.extend(collect_arrays(item))
-                return arrays
-            else:
-                return []
-
-        arrays = collect_arrays(self._data)
-        if not arrays:
-            return np.empty((0, self.num_fields))
-        return np.vstack(arrays)
-
-    def __repr__(self) -> str:
-        description = [
-            f"quantem.Vector, shape={self._shape}, name={self._name}",
-            f"  fields = {self._fields}",
-            f"  units: {self._units}",
-        ]
-        return "\n".join(description)
-
-    def __str__(self) -> str:
-        description = [
-            f"quantem.Vector, shape={self._shape}, name={self._name}",
-            f"  fields = {self._fields}",
-            f"  units: {self._units}",
-        ]
-        return "\n".join(description)
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._coords.shape
 
     @property
-    def metadata(self) -> dict:
-        return self._metadata
+    def fields(self) -> list[str]:
+        return list(self._field_names)
 
     @property
-    def shape(self) -> Tuple[int, ...]:
-        """
-        Get the shape of the vector.
-
-        Returns
-        -------
-        Tuple[int, ...]
-            The dimensions of the vector.
-        """
-        return self._shape
-
-    @shape.setter
-    def shape(self, value: Tuple[int, ...]) -> None:
-        """
-        Set the shape of the vector.
-
-        Parameters
-        ----------
-        value : Tuple[int, ...]
-            The new shape. All dimensions must be positive.
-
-        Raises
-        ------
-        ValueError
-            If any dimension is not positive.
-        TypeError
-            If value is not a tuple or contains non-integer values.
-        """
-        self._shape = validate_shape(value)
+    def units(self) -> list[str]:
+        lookup = {name: unit for name, unit in zip(self._state.fields, self._state.units)}
+        return [lookup[name] for name in self._field_names]
 
     @property
     def num_fields(self) -> int:
-        """
-        Get the number of fields in the vector.
-
-        Returns
-        -------
-        int
-            The number of fields.
-        """
-        return len(self._fields)
+        return len(self._field_names)
 
     @property
     def name(self) -> str:
-        """
-        Get the name of the vector.
-
-        Returns
-        -------
-        str
-            The name of the vector
-        """
-        return self._name
+        return self._state.name
 
     @name.setter
     def name(self, value: str) -> None:
-        """
-        Set the name of the vector.
-
-        Parameters
-        ----------
-        value : str
-            The new name of the vector
-        """
-        self._name = str(value)
+        self._state.name = str(value)
 
     @property
-    def fields(self) -> List[str]:
-        """
-        Get the field names of the vector.
-
-        Returns
-        -------
-        List[str]
-            The list of field names.
-        """
-        return self._fields
-
-    @fields.setter
-    def fields(self, value: List[str]) -> None:
-        """
-        Set the field names of the vector.
-
-        Parameters
-        ----------
-        value : List[str]
-            The new field names. Must match num_fields and be unique.
-
-        Raises
-        ------
-        ValueError
-            If length doesn't match num_fields or if there are duplicates.
-        TypeError
-            If value is not a list or contains non-string values.
-        """
-        self._fields = validate_fields(value)
+    def metadata(self) -> dict[str, Any]:
+        return self._state.metadata
 
     @property
-    def units(self) -> List[str]:
-        """
-        Get the units of the vector's fields.
+    def array(self) -> NDArray[np.generic]:
+        if self.shape != ():
+            raise ValueError(".array is only valid when the selection contains exactly one cell.")
+        coord = self._coords[()]
+        cell = self._state.data[coord]
+        indices = self._field_indices()
+        if len(indices) == len(self._state.fields) and indices == list(range(len(self._state.fields))):
+            return cell
+        if len(indices) == 1:
+            idx = indices[0]
+            return cell[:, idx : idx + 1]
+        if _is_contiguous(indices):
+            return cell[:, indices[0] : indices[-1] + 1]
+        return cell[:, indices].copy()
 
-        Returns
-        -------
-        List[str]
-            The list of units, one per field.
-        """
-        return self._units
+    def __len__(self) -> int:
+        if self.shape == ():
+            raise TypeError("len() of unsized 0D Vector")
+        return self.shape[0]
 
-    @units.setter
-    def units(self, value: List[str]) -> None:
-        """
-        Set the units of the vector's fields.
+    def __repr__(self) -> str:
+        return f"quantem.Vector(shape={self.shape}, fields={self.fields}, name={self.name!r})"
 
-        Parameters
-        ----------
-        value : List[str]
-            The new units. Must match num_fields.
+    __str__ = __repr__
 
-        Raises
-        ------
-        ValueError
-            If length doesn't match num_fields.
-        TypeError
-            If value is not a list or contains non-string values.
-        """
-        self._units = validate_vector_units(value, self.num_fields)
+    def copy(self) -> "Vector":
+        copied = self.__class__._from_state(
+            _VectorState(
+                shape=self.shape,
+                data=_empty_storage(self.shape, self.num_fields),
+                fields=self.fields,
+                units=self.units,
+                name=self.name,
+                metadata=copy.deepcopy(self.metadata),
+            ),
+            _root_coords_allow_empty(self.shape),
+            self.fields,
+        )
+        for coord, array in zip(np.ndindex(self.shape) if self.shape != () else [()], self._iter_selected_arrays()):
+            copied._state.data[coord] = array.copy()
+        return copied
 
-    @property
-    def data(self) -> List[Any]:
-        """
-        Get the raw data of the vector.
+    def flatten(self) -> NDArray[np.generic]:
+        arrays = [array for array in self._iter_selected_arrays() if array.shape[0] > 0]
+        if arrays:
+            return np.vstack(arrays)
+        dtype = float
+        for array in self._iter_selected_arrays():
+            dtype = array.dtype
+            break
+        return np.empty((0, self.num_fields), dtype=dtype)
 
-        Returns
-        -------
-        List[Any]
-            The nested list structure containing the vector's data.
-        """
-        return self._data
+    def select_fields(self, field_names: str | Sequence[str]) -> "Vector":
+        normalized = _normalize_field_names(field_names)
+        available = set(self._field_names)
+        missing = [name for name in normalized if name not in available]
+        if missing:
+            raise KeyError(f"Unknown field(s): {missing}")
+        return self._from_state(self._state, self._coords, normalized)
 
-    @data.setter
-    def data(self, value: List[Any]) -> None:
-        """
-        Set the raw data of the vector.
+    def add_fields(
+        self,
+        names: str | Sequence[str],
+        values: Any | None = None,
+        units: str | Sequence[str] | None = None,
+    ) -> None:
+        new_names = _normalize_field_names(names)
+        if any(name in self._state.fields for name in new_names):
+            raise ValueError("One or more new field names already exist.")
 
-        Parameters
-        ----------
-        value : List[Any]
-            The new data structure. Must match the vector's shape and num_fields.
+        new_units = _normalize_units(units, len(new_names))
+        old_fields = list(self._state.fields)
+        self._state.fields.extend(new_names)
+        self._state.units.extend(new_units)
 
-        Raises
-        ------
-        ValueError
-            If the data structure doesn't match shape or num_fields.
-        TypeError
-            If value is not a list or contains invalid data types.
-        """
-        self._data = validate_vector_data(value, self.shape, self.num_fields)
+        old_width = len(old_fields)
+        new_width = len(self._state.fields)
+        for coord in np.ndindex(self._state.shape) if self._state.shape != () else [()]:
+            current = self._state.data[coord]
+            promoted = np.result_type(current.dtype, float)
+            expanded = np.full((current.shape[0], new_width), np.nan, dtype=promoted)
+            expanded[:, :old_width] = current
+            self._state.data[coord] = expanded
 
+        if list(self._field_names) == old_fields:
+            self._field_names = tuple(self._state.fields)
 
-# Helper function for nesting lists
-def nested_list(shape: Tuple[int, ...], fill: Any = None) -> Any:
-    if len(shape) == 0:
-        return fill
-    return [nested_list(shape[1:], fill) for _ in range(shape[0])]
+        target = self._from_state(self._state, self._coords, new_names)
+        if values is None:
+            return
 
+        if len(new_names) > 1 and isinstance(values, (list, tuple)) and len(values) == len(new_names):
+            for name, value in zip(new_names, values):
+                target.select_fields(name)._assign(value)
+        else:
+            target._assign(values)
 
-# Helper class for numerical field operations
-class _FieldView:
-    def __init__(self, vector: Vector, field_name: str) -> None:
-        self.vector = vector
-        self.field_name = field_name
-        self.field_index = vector._fields.index(field_name)
+    def remove_fields(self, names: str | Sequence[str]) -> None:
+        to_remove = _normalize_field_names(names)
+        missing = [name for name in to_remove if name not in self._state.fields]
+        if missing:
+            raise KeyError(f"Unknown field(s): {missing}")
+        if len(to_remove) == len(self._state.fields):
+            raise ValueError("Cannot remove all fields from a Vector.")
 
-    def _apply_op(self, op: Any) -> None:
-        def apply(arr: Any) -> None:
-            if isinstance(arr, np.ndarray):
-                arr[:, self.field_index] = op(arr[:, self.field_index])
-            elif isinstance(arr, list):
-                for sub in arr:
-                    apply(sub)
+        remove_set = set(to_remove)
+        keep_names = [name for name in self._state.fields if name not in remove_set]
+        keep_indices = [self._state.fields.index(name) for name in keep_names]
+        keep_units = [self._state.units[index] for index in keep_indices]
 
-        apply(self.vector._data)
+        for coord in np.ndindex(self._state.shape) if self._state.shape != () else [()]:
+            self._state.data[coord] = self._state.data[coord][:, keep_indices]
 
-    def __iadd__(self, other: Union[float, int, np.ndarray]) -> "_FieldView":
-        """Handle in-place addition (+=)."""
-        self._apply_op(lambda x: x + other)
+        self._state.fields = keep_names
+        self._state.units = keep_units
+        self._field_names = tuple(name for name in self._field_names if name in keep_names)
+
+    def get_data(self, *indices: Any) -> NDArray[np.generic] | list[NDArray[np.generic]]:
+        if len(indices) != len(self.shape):
+            raise ValueError(f"Expected {len(self.shape)} indices, got {len(indices)}")
+        selection = self[indices if len(indices) != 1 else indices[0]]
+        if selection.shape == ():
+            return selection.array
+        return [array.copy() for array in selection._iter_selected_arrays()]
+
+    def set_data(self, value: Any, *indices: Any) -> None:
+        if len(indices) != len(self.shape):
+            raise ValueError(f"Expected {len(self.shape)} indices, got {len(indices)}")
+        self[indices if len(indices) != 1 else indices[0]] = value
+
+    @overload
+    def __getitem__(self, idx: Any) -> "Vector": ...
+
+    def __getitem__(self, idx: Any) -> "Vector":
+        if _is_field_selector(idx):
+            raise TypeError("Use select_fields(...) for field selection.")
+        coords = _select_coords(self._coords, idx)
+        return self._from_state(self._state, coords, self._field_names)
+
+    def __setitem__(self, idx: Any, value: Any) -> None:
+        if _is_field_selector(idx):
+            raise TypeError("Use select_fields(...) for field selection.")
+        self[idx]._assign(value)
+
+    def __add__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.add)
+
+    def __sub__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.subtract)
+
+    def __mul__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.multiply)
+
+    def __truediv__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.divide)
+
+    def __pow__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.power)
+
+    def __iadd__(self, other: Any) -> "Vector":
+        return self._binary_op_inplace(other, np.add)
+
+    def __isub__(self, other: Any) -> "Vector":
+        return self._binary_op_inplace(other, np.subtract)
+
+    def __imul__(self, other: Any) -> "Vector":
+        return self._binary_op_inplace(other, np.multiply)
+
+    def __itruediv__(self, other: Any) -> "Vector":
+        return self._binary_op_inplace(other, np.divide)
+
+    def __ipow__(self, other: Any) -> "Vector":
+        return self._binary_op_inplace(other, np.power)
+
+    def _binary_op(self, other: Any, op: Any) -> "Vector":
+        result = self.copy()
+        result._binary_op_inplace(other, op)
+        return result
+
+    def _binary_op_inplace(self, other: Any, op: Any) -> "Vector":
+        row_counts = self._row_counts()
+        targets = list(self._iter_coords())
+
+        if isinstance(other, Vector):
+            self._validate_vector_rhs(other, require_matching_rows=True)
+            source_arrays = list(other._iter_selected_arrays())
+            for coord, current, rhs in zip(targets, self._iter_selected_arrays(), source_arrays):
+                updated = current.copy()
+                op(updated, rhs, out=updated, casting="same_kind")
+                self._write_selected_array(coord, updated)
+            return self
+
+        rhs_matrix = _broadcast_rhs(np.asarray(other), sum(row_counts), self.num_fields)
+        cursor = 0
+        for coord, current, row_count in zip(targets, self._iter_selected_arrays(), row_counts):
+            chunk = rhs_matrix[cursor : cursor + row_count]
+            cursor += row_count
+            updated = current.copy()
+            op(updated, chunk, out=updated, casting="same_kind")
+            self._write_selected_array(coord, updated)
         return self
 
-    def __isub__(self, other: Union[float, int, np.ndarray]) -> "_FieldView":
-        """Handle in-place subtraction (-=)."""
-        self._apply_op(lambda x: x - other)
-        return self
+    def _assign(self, value: Any) -> None:
+        if self._is_full_field_selection():
+            self._assign_full_cells(value)
+        else:
+            self._assign_selected_fields(value)
 
-    def __imul__(self, other: Union[float, int, np.ndarray]) -> "_FieldView":
-        """Handle in-place multiplication (*=)."""
-        self._apply_op(lambda x: x * other)
-        return self
+    def _assign_full_cells(self, value: Any) -> None:
+        targets = list(self._iter_coords())
+        if isinstance(value, Vector):
+            self._validate_vector_rhs(value, require_matching_rows=False)
+            for target, source in zip(targets, value._iter_selected_arrays()):
+                self._state.data[target] = source.copy()
+            return
 
-    def __itruediv__(self, other: Union[float, int, np.ndarray]) -> "_FieldView":
-        """Handle in-place division (/=)."""
-        self._apply_op(lambda x: x / other)
-        return self
+        array = _coerce_cell_array(value, self.num_fields)
+        for target in targets:
+            self._state.data[target] = array.copy()
 
-    def __ifloordiv__(self, other: Union[float, int, np.ndarray]) -> "_FieldView":
-        """Handle in-place floor division (//=)."""
-        self._apply_op(lambda x: x // other)
-        return self
+    def _assign_selected_fields(self, value: Any) -> None:
+        targets = list(self._iter_coords())
+        row_counts = self._row_counts()
+        if isinstance(value, Vector):
+            self._validate_vector_rhs(value, require_matching_rows=True)
+            for coord, source in zip(targets, value._iter_selected_arrays()):
+                self._write_selected_array(coord, source)
+            return
 
-    def __imod__(self, other: Union[float, int, np.ndarray]) -> "_FieldView":
-        """Handle in-place modulo (%=)."""
-        self._apply_op(lambda x: x % other)
-        return self
+        if np.isscalar(value):
+            for coord in targets:
+                current = self._selected_array_for_coord(coord)
+                fill = np.full(current.shape, value)
+                self._write_selected_array(coord, fill)
+            return
 
-    def __ipow__(self, other: Union[float, int, np.ndarray]) -> "_FieldView":
-        """Handle in-place power (**=)."""
-        self._apply_op(lambda x: x**other)
-        return self
+        rhs_matrix = _broadcast_rhs(np.asarray(value), sum(row_counts), self.num_fields)
+        cursor = 0
+        for coord, row_count in zip(targets, row_counts):
+            chunk = rhs_matrix[cursor : cursor + row_count]
+            cursor += row_count
+            self._write_selected_array(coord, chunk)
 
-    def flatten(self) -> NDArray:
-        def collect(arr: Any) -> List[NDArray]:
-            if isinstance(arr, np.ndarray):
-                return [arr[:, self.field_index]]
-            elif isinstance(arr, list):
-                result = []
-                for sub in arr:
-                    result.extend(collect(sub))
-                return result
+    def _validate_vector_rhs(self, other: "Vector", require_matching_rows: bool) -> None:
+        if self.num_fields != other.num_fields:
+            raise ValueError(f"Expected {self.num_fields} fields, got {other.num_fields}")
+        if self._coords.size != other._coords.size:
+            raise ValueError(f"Expected {self._coords.size} cells, got {other._coords.size}")
+        if require_matching_rows:
+            left = self._row_counts()
+            right = other._row_counts()
+            if left != right:
+                raise ValueError(f"Per-cell row counts must match: {left} != {right}")
+
+    def _row_counts(self) -> list[int]:
+        return [self._state.data[coord].shape[0] for coord in self._iter_coords()]
+
+    def _iter_coords(self) -> Iterable[tuple[int, ...]]:
+        return iter(self._coords.flat)
+
+    def _iter_selected_arrays(self) -> Iterable[NDArray[np.generic]]:
+        for coord in self._iter_coords():
+            yield self._selected_array_for_coord(coord)
+
+    def _selected_array_for_coord(self, coord: tuple[int, ...]) -> NDArray[np.generic]:
+        cell = self._state.data[coord]
+        indices = self._field_indices()
+        if self._is_full_field_selection():
+            return cell
+        if len(indices) == 1:
+            idx = indices[0]
+            return cell[:, idx : idx + 1]
+        if _is_contiguous(indices):
+            return cell[:, indices[0] : indices[-1] + 1]
+        return cell[:, indices].copy()
+
+    def _write_selected_array(self, coord: tuple[int, ...], values: NDArray[np.generic]) -> None:
+        cell = self._state.data[coord]
+        if self._is_full_field_selection():
+            replacement = _coerce_cell_array(values, self.num_fields)
+            self._state.data[coord] = replacement.copy()
+            return
+
+        if values.ndim != 2 or values.shape[1] != self.num_fields:
+            raise ValueError(
+                f"Expected array with shape (_, {self.num_fields}), got {values.shape}"
+            )
+        if values.shape[0] != cell.shape[0]:
+            raise ValueError(
+                f"Expected {cell.shape[0]} rows for in-place field update, got {values.shape[0]}"
+            )
+        cell[:, self._field_indices()] = values
+
+    def _field_indices(self) -> list[int]:
+        lookup = {name: idx for idx, name in enumerate(self._state.fields)}
+        try:
+            return [lookup[name] for name in self._field_names]
+        except KeyError as exc:
+            raise KeyError(f"Unknown field '{exc.args[0]}'") from exc
+
+    def _is_full_field_selection(self) -> bool:
+        return list(self._field_names) == self._state.fields
+
+
+def _empty_storage(shape: tuple[int, ...], num_fields: int) -> NDArray[np.object_]:
+    storage = np.empty(shape if shape != () else (), dtype=object)
+    for coord in np.ndindex(shape) if shape != () else [()]:
+        storage[coord] = np.empty((0, num_fields), dtype=float)
+    return storage
+
+
+def _root_coords(shape: tuple[int, ...]) -> NDArray[np.object_]:
+    return _root_coords_allow_empty(shape)
+
+
+def _root_coords_allow_empty(shape: tuple[int, ...]) -> NDArray[np.object_]:
+    coords = np.empty(shape if shape != () else (), dtype=object)
+    for coord in np.ndindex(shape) if shape != () else [()]:
+        coords[coord] = coord
+    return coords
+
+
+def _normalize_field_names(field_names: str | Sequence[str]) -> list[str]:
+    if isinstance(field_names, str):
+        names = [field_names]
+    elif isinstance(field_names, Sequence):
+        names = [str(name) for name in field_names]
+    else:
+        raise TypeError("Field names must be a string or a sequence of strings.")
+    if not names:
+        raise ValueError("Must select at least one field.")
+    if len(set(names)) != len(names):
+        raise ValueError("Duplicate field names are not allowed.")
+    return names
+
+
+def _normalize_units(units: str | Sequence[str] | None, count: int) -> list[str]:
+    if units is None:
+        return ["none"] * count
+    if isinstance(units, str):
+        if count != 1:
+            raise ValueError("A single unit string is only valid for a single new field.")
+        return [units]
+    normalized = [str(unit) for unit in units]
+    if len(normalized) != count:
+        raise ValueError(f"Expected {count} units, got {len(normalized)}")
+    return normalized
+
+
+def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[np.generic]:
+    array = np.asarray(value)
+    if array.ndim != 2 or array.shape[1] != num_fields:
+        raise ValueError(f"Expected a numpy array with shape (_, {num_fields}), got {array.shape}")
+    if not np.issubdtype(array.dtype, np.number):
+        raise TypeError("Cell arrays must contain numeric values.")
+    return array
+
+
+def _broadcast_rhs(value: NDArray[np.generic], total_rows: int, num_fields: int) -> NDArray[np.generic]:
+    if num_fields == 1 and value.ndim == 1:
+        value = value.reshape(-1, 1)
+    try:
+        return np.broadcast_to(value, (total_rows, num_fields))
+    except ValueError as exc:
+        raise ValueError(
+            f"RHS is not broadcast-compatible with flattened target shape ({total_rows}, {num_fields})."
+        ) from exc
+
+
+def _is_field_selector(idx: Any) -> bool:
+    if isinstance(idx, str):
+        return True
+    if isinstance(idx, list | tuple) and idx:
+        if all(isinstance(item, str) for item in idx):
+            return True
+        return any(isinstance(item, str) for item in idx)
+    return False
+
+
+def _is_contiguous(indices: Sequence[int]) -> bool:
+    if not indices:
+        return False
+    return list(indices) == list(range(indices[0], indices[0] + len(indices)))
+
+
+def _select_coords(coords: NDArray[np.object_], idx: Any) -> NDArray[np.object_]:
+    shape = coords.shape
+    selectors, scalar_axes = _normalize_indices(shape, idx)
+    out_shape = tuple(len(selector) for selector, scalar in zip(selectors, scalar_axes) if not scalar)
+    result = np.empty(out_shape if out_shape != () else (), dtype=object)
+
+    if out_shape == ():
+        source = tuple(selector[0] for selector in selectors)
+        result[()] = coords[source]
+        return result
+
+    for out_index in np.ndindex(out_shape):
+        out_cursor = 0
+        source = []
+        for axis, selector in enumerate(selectors):
+            if scalar_axes[axis]:
+                source.append(selector[0])
             else:
-                return []
+                source.append(selector[out_index[out_cursor]])
+                out_cursor += 1
+        result[out_index] = coords[tuple(source)]
+    return result
 
-        arrays = collect(self.vector._data)
-        if not arrays:
-            return np.empty((0,), dtype=float)
-        return np.concatenate(arrays, axis=0)
 
-    def set_flattened(self, values: ArrayLike) -> None:
-        """
-        Set the field values across the entire Vector from a 1D flattened array.
-        """
+def _normalize_indices(shape: tuple[int, ...], idx: Any) -> tuple[list[np.ndarray], list[bool]]:
+    if shape == ():
+        if idx in ((), Ellipsis, slice(None), None):
+            return [], []
+        raise IndexError("Too many indices for a 0D Vector.")
 
-        def fill(arr: Any, values: NDArray, cursor: int) -> int:
-            if isinstance(arr, np.ndarray):
-                n = arr.shape[0]
-                arr[:, self.field_index] = values[cursor : cursor + n]
-                return cursor + n
-            elif isinstance(arr, list):
-                for sub in arr:
-                    cursor = fill(sub, values, cursor)
-                return cursor
-            return cursor
+    normalized = idx if isinstance(idx, tuple) else (idx,)
+    normalized = _expand_ellipsis(normalized, len(shape))
+    if len(normalized) > len(shape):
+        raise IndexError(f"Expected at most {len(shape)} indices, got {len(normalized)}")
+    normalized = normalized + (slice(None),) * (len(shape) - len(normalized))
 
-        values = np.asarray(values)
-        if values.ndim != 1:
-            raise ValueError("Input to set_flattened must be a 1D array.")
+    selectors: list[np.ndarray] = []
+    scalar_axes: list[bool] = []
+    for axis_value, axis_size in zip(normalized, shape):
+        selector, scalar = _normalize_axis_index(axis_value, axis_size)
+        selectors.append(selector)
+        scalar_axes.append(scalar)
+    return selectors, scalar_axes
 
-        expected = self.flatten().shape[0]
-        if values.shape[0] != expected:
-            raise ValueError(f"Expected {expected} values, got {values.shape[0]}")
 
-        fill(self.vector._data, values, cursor=0)
+def _expand_ellipsis(idx: tuple[Any, ...], ndim: int) -> tuple[Any, ...]:
+    if not any(item is Ellipsis for item in idx):
+        return idx
+    if sum(item is Ellipsis for item in idx) > 1:
+        raise IndexError("Only one ellipsis is allowed.")
+    ellipsis_pos = next(i for i, item in enumerate(idx) if item is Ellipsis)
+    fill = ndim - (len(idx) - 1)
+    return idx[:ellipsis_pos] + (slice(None),) * fill + idx[ellipsis_pos + 1 :]
 
-    def __getitem__(
-        self, idx: Union[Tuple[Union[int, slice], ...], int, slice]
-    ) -> Union[NDArray, "_FieldView"]:
-        # Optionally allow v['field0'][0, 1] to get subregion, or v['field0'][...] slice
-        sub = self.vector[idx]
-        if isinstance(sub, Vector):
-            return sub[self.field_name]
-        elif isinstance(sub, np.ndarray):
-            return sub[:, self.field_index]
-        return cast(NDArray, None)
 
-    def __array__(self) -> np.ndarray:
-        """Convert to numpy array when needed."""
-        return self.flatten()
+def _normalize_axis_index(value: Any, axis_size: int) -> tuple[np.ndarray, bool]:
+    if isinstance(value, (int, np.integer)):
+        index = int(value)
+        if index < 0:
+            index += axis_size
+        if index < 0 or index >= axis_size:
+            raise IndexError(f"Index {value} out of bounds for axis with size {axis_size}")
+        return np.array([index], dtype=int), True
+
+    if isinstance(value, slice):
+        return np.arange(axis_size)[value], False
+
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        return _normalize_axis_index(value.item(), axis_size)
+
+    array = np.asarray(value)
+    if array.ndim != 1:
+        raise IndexError("Only 1D per-axis fancy or boolean indexing is supported.")
+    if array.size == 0:
+        return np.array([], dtype=int), False
+
+    if array.dtype == bool or np.issubdtype(array.dtype, np.bool_):
+        if array.shape[0] != axis_size:
+            raise IndexError(
+                f"Boolean mask length {array.shape[0]} does not match axis size {axis_size}"
+            )
+        return np.flatnonzero(array), False
+
+    if not np.issubdtype(array.dtype, np.integer):
+        raise TypeError(f"Unsupported index type {type(value).__name__}")
+
+    normalized = array.astype(int, copy=True)
+    normalized[normalized < 0] += axis_size
+    if np.any((normalized < 0) | (normalized >= axis_size)):
+        raise IndexError(f"Index out of bounds for axis with size {axis_size}")
+    return normalized, False
+
+
+def _normalize_nested_data(data: list[Any]) -> tuple[tuple[int, ...], list[NDArray[np.generic]]]:
+    if not isinstance(data, list):
+        raise TypeError("Data must be a list.")
+    if not data:
+        raise ValueError("Data list cannot be empty.")
+
+    leaves: list[NDArray[np.generic]] = []
+    num_fields: int | None = None
+
+    def walk(node: Any) -> tuple[int, ...]:
+        nonlocal num_fields
+        if _is_leaf_cell(node):
+            array = np.asarray(node)
+            if array.ndim != 2:
+                raise ValueError(f"Cell arrays must be 2D, got shape {array.shape}")
+            if not np.issubdtype(array.dtype, np.number):
+                raise TypeError("Cell arrays must contain numeric values.")
+            if num_fields is None:
+                num_fields = array.shape[1]
+            elif array.shape[1] != num_fields:
+                raise ValueError("All data arrays must have same number of fields.")
+            leaves.append(array)
+            return ()
+
+        if not isinstance(node, list):
+            raise TypeError("Data elements must be numpy arrays, numeric 2D lists, or nested lists thereof.")
+        if not node:
+            raise ValueError("Nested data lists cannot be empty.")
+        child_shapes = [walk(child) for child in node]
+        first = child_shapes[0]
+        if any(shape != first for shape in child_shapes[1:]):
+            raise ValueError("Nested data structure must have a consistent fixed-grid shape.")
+        return (len(node), *first)
+
+    inferred_shape = walk(data)
+    return inferred_shape, leaves
+
+
+def _is_leaf_cell(node: Any) -> bool:
+    if isinstance(node, np.ndarray):
+        return True
+    if not isinstance(node, list):
+        return False
+    try:
+        array = np.asarray(node)
+    except Exception:
+        return False
+    return array.ndim == 2 and np.issubdtype(array.dtype, np.number)
