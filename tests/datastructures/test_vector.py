@@ -203,6 +203,9 @@ class TestVector:
             np.array([[5.0], [6.0], [7.0], [8.0], [9.0], [10.0]]),
         )
 
+        with pytest.raises(ValueError, match="all fields are selected"):
+            v2.select_fields("kx").add_fields("bad")
+
     def test_remove_fields_preserves_remaining_data(self):
         v = make_line_vector()
         v.add_fields("extra", 1.0)

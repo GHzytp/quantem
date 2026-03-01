@@ -240,6 +240,7 @@ class Vector(AutoSerialize):
         values: Any | None = None,
         units: str | Sequence[str] | None = None,
     ) -> None:
+        self._require_full_field_view("add_fields")
         new_fields = _normalize_field_names(names)
         if any(field in self._state["fields"] for field in new_fields):
             raise ValueError("One or more new field names already exist.")
@@ -264,6 +265,7 @@ class Vector(AutoSerialize):
             self._selected_fields = None
 
     def remove_fields(self, names: str | Sequence[str]) -> None:
+        self._require_full_field_view("remove_fields")
         to_remove = set(_normalize_field_names(names))
         old_fields = self._state["fields"]
         old_units = self._state["units"]
@@ -378,6 +380,10 @@ class Vector(AutoSerialize):
             return np.array([lookup[field] for field in self._selected_fields], dtype=np.int64)
         except KeyError as exc:
             raise KeyError(f"Unknown field(s): {[str(exc.args[0])]}") from exc
+
+    def _require_full_field_view(self, operation: str) -> None:
+        if self._selected_fields is not None:
+            raise ValueError(f"{operation} is only allowed when all fields are selected.")
 
     def _selected_cell_indices(self) -> NDArray[np.int64]:
         if self._selection_indices is None:
