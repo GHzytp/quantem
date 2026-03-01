@@ -104,11 +104,30 @@ class TestVector:
         with pytest.raises(TypeError):
             _ = v[1, "kx"]
 
+        multi = v.select_fields("intensity", "kx")
+        assert multi.fields == ["intensity", "kx"]
+        assert multi.total_rows == 6
+        assert multi.row_counts() == [2, 1, 2, 1]
+
     def test_array_mutation_writes_through_for_single_field(self):
         v = make_line_vector()
         cell = v.select_fields("kx")[1].array
         cell[0, 0] = 99.0
         assert v[1].array[0, 1] == 99.0
+
+    def test_set_flattened_updates_rowwise(self):
+        v = make_line_vector()
+        kx = v.select_fields("kx")
+
+        flat_kx = kx.flatten()
+        mask = flat_kx >= 30.0
+        flat_kx[mask[:, 0], 0] = -1.0
+        kx.set_flattened(flat_kx)
+
+        np.testing.assert_array_equal(
+            kx.flatten(),
+            np.array([[10.0], [20.0], [-1.0], [-1.0], [-1.0], [-1.0]]),
+        )
 
     def test_field_arithmetic_with_scalar_and_ndarray(self):
         v = make_line_vector()
@@ -156,6 +175,24 @@ class TestVector:
         v[[0, 3]] = broadcast_cell
         np.testing.assert_array_equal(v[0].array, broadcast_cell)
         np.testing.assert_array_equal(v[3].array, broadcast_cell)
+
+    def test_append_rows_and_compact(self):
+        v = make_line_vector()
+
+        v.append_rows(1, np.array([[7.0, 70.0, 700.0]]))
+        np.testing.assert_array_equal(
+            v[1].array,
+            np.array([[3.0, 30.0, 300.0], [7.0, 70.0, 700.0]]),
+        )
+
+        v[1] = np.array([[8.0, 80.0, 800.0]])
+        assert v._state["data"].shape[0] > v.total_rows
+
+        v.compact()
+        assert v._state["data"].shape[0] == v.total_rows
+
+        with pytest.raises(ValueError, match="exactly one cell"):
+            v.append_rows(slice(None), np.array([[1.0, 2.0, 3.0]]))
 
     def test_boolean_indexing_is_axis_wise(self):
         v = make_grid_vector()

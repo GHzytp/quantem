@@ -18,10 +18,75 @@ from quantem.core.utils.validators import (
 class Vector(AutoSerialize):
     """Ragged cell data on a fixed grid.
 
-    Storage is compact and AutoSerialize-friendly:
-    - one 2D numeric row buffer for all ragged rows
-    - one start array and one length array for cell boundaries
-    - optional selection state for views
+    A ``Vector`` has two independent axes of structure:
+    - fixed-grid dimensions given by ``shape``
+    - ragged rows stored inside each fixed-grid cell
+
+    Each ragged row has one value per named field, so each cell behaves like a
+    small 2D array with shape ``(n_rows, num_fields)``, where ``n_rows`` may
+    vary from cell to cell.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Fixed-grid shape.
+    fields : sequence of str
+        Field names in column order.
+    units : sequence of str, optional
+        Units corresponding to ``fields``. If omitted, units default to
+        ``"none"`` for all fields.
+    name : str, optional
+        Descriptive name for the Vector.
+    metadata : dict, optional
+        Additional user metadata.
+
+    Notes
+    -----
+    The public API keeps fixed-grid indexing and field selection separate:
+    - use ``[]`` for fixed-grid indexing
+    - use ``select_fields(...)`` for field selection
+
+    Fixed-grid indexing always returns a ``Vector``. A 0D selection exposes its
+    underlying cell array through ``.array``. Multi-cell selections can be
+    concatenated with ``flatten()``.
+
+    The internal representation is compact:
+    - ``_state["data"]`` stores all ragged rows in one numeric 2D array
+    - ``_state["cell_starts"]`` stores the start offset for each cell
+    - ``_state["cell_lengths"]`` stores the row count for each cell
+
+    A ``Vector`` selection is a write-through view over shared storage. Views
+    track only the selected fixed-grid shape, selected cell indices, and selected
+    field names.
+
+    Examples
+    --------
+    Create a Vector and assign one cell:
+
+    >>> import numpy as np
+    >>> v = Vector.from_shape((2, 2), fields=("kx", "ky", "intensity"))
+    >>> v[0, 0] = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    >>> v[0, 0].array.shape
+    (2, 3)
+
+    Select fields and apply in-place arithmetic:
+
+    >>> kx = v.select_fields("kx")
+    >>> kx += 16
+    >>> kx.flatten().shape
+    (2, 1)
+
+    Apply a rowwise transform with ``flatten()`` and ``set_flattened()``:
+
+    >>> kx = v.select_fields("kx")
+    >>> ky = v.select_fields("ky")
+    >>> kx.set_flattened(
+    ...     np.where(
+    ...         ((kx.flatten() - 16) ** 2 + (ky.flatten() - 16) ** 2) < 12,
+    ...         10,
+    ...         kx.flatten(),
+    ...     )
+    ... )
     """
 
     def __init__(
@@ -61,6 +126,7 @@ class Vector(AutoSerialize):
         selection_indices: NDArray[np.int64] | None,
         selected_fields: tuple[str, ...] | None,
     ) -> "Vector":
+        """Build a view that shares backing storage with another Vector."""
         obj = cls.__new__(cls)
         obj._state = state
         obj._selection_shape = selection_shape
@@ -77,6 +143,7 @@ class Vector(AutoSerialize):
         units: Sequence[str] | None = None,
         name: str | None = None,
     ) -> "Vector":
+        """Create an empty Vector with the given fixed-grid shape and fields."""
         if fields is not None:
             root_fields = validate_fields(list(fields))
             if num_fields is not None and len(root_fields) != num_fields:
@@ -100,6 +167,11 @@ class Vector(AutoSerialize):
         units: Sequence[str] | None = None,
         name: str | None = None,
     ) -> "Vector":
+        """Create a Vector from nested fixed-grid data.
+
+        The outer nesting defines the fixed-grid shape. Each leaf must coerce to a
+        2D cell array with consistent field count across all cells.
+        """
         root_shape, cell_arrays = _normalize_nested_data(data)
         inferred_counts = {array.shape[1] for array in cell_arrays}
         if len(inferred_counts) > 1:
@@ -128,16 +200,19 @@ class Vector(AutoSerialize):
 
     @property
     def shape(self) -> tuple[int, ...]:
+        """Return the fixed-grid shape of this selection."""
         return self._selection_shape
 
     @property
     def fields(self) -> list[str]:
+        """Return selected field names in column order."""
         if self._selected_fields is None:
             return list(self._state["fields"])
         return list(self._selected_fields)
 
     @property
     def units(self) -> list[str]:
+        """Return units for the selected fields."""
         lookup = {
             field: unit
             for field, unit in zip(self._state["fields"], self._state["units"])
@@ -146,10 +221,12 @@ class Vector(AutoSerialize):
 
     @property
     def num_fields(self) -> int:
+        """Return the number of selected fields."""
         return len(self.fields)
 
     @property
     def name(self) -> str:
+        """Human-readable Vector name."""
         return self._state["name"]
 
     @name.setter
@@ -158,10 +235,18 @@ class Vector(AutoSerialize):
 
     @property
     def metadata(self) -> dict[str, Any]:
+        """Mutable metadata dictionary shared by all views."""
         return self._state["metadata"]
 
     @property
     def array(self) -> NDArray[np.generic]:
+        """Return the selected cell as a NumPy array.
+
+        This is only valid for 0D selections. Single-field and contiguous
+        multi-field selections return writable views into the backing storage.
+        Non-contiguous multi-field selections return a copy because NumPy cannot
+        expose a writable column-subset view for that layout.
+        """
         if self.shape != ():
             raise ValueError(".array is only valid when the selection contains exactly one cell.")
         cell = self._cell_matrix(self._selected_cell_indices()[0])
@@ -176,6 +261,7 @@ class Vector(AutoSerialize):
         return cell[:, cols].copy()
 
     def __len__(self) -> int:
+        """Return ``shape[0]`` for non-scalar selections."""
         if self.shape == ():
             raise TypeError("len() of unsized 0D Vector")
         return self.shape[0]
@@ -192,6 +278,7 @@ class Vector(AutoSerialize):
     __str__ = __repr__
 
     def copy(self) -> "Vector":
+        """Return a deep copy of the current selection."""
         copied = self.__class__(
             shape=self.shape,
             fields=self.fields,
@@ -205,6 +292,11 @@ class Vector(AutoSerialize):
         return copied
 
     def flatten(self) -> NDArray[np.generic]:
+        """Concatenate selected cells in row-major order.
+
+        Returns a 2D array with shape ``(total_rows, num_fields)`` even for
+        single-field selections.
+        """
         arrays = [
             self._selected_cell_matrix(index)
             for index in self._selected_cell_indices()
@@ -216,8 +308,24 @@ class Vector(AutoSerialize):
         dtype = self._state["data"].dtype if self._state["data"].ndim == 2 else float
         return np.empty((0, self.num_fields), dtype=dtype)
 
-    def select_fields(self, field_names: str | Sequence[str]) -> "Vector":
-        selected = _normalize_field_names(field_names)
+    @property
+    def total_rows(self) -> int:
+        """Return the total ragged-row count in the current selection."""
+        return int(self._state["cell_lengths"][self._selected_cell_indices()].sum())
+
+    def row_counts(self) -> list[int]:
+        """Return per-cell row counts in the current selection order."""
+        return [self._cell_row_count(int(index)) for index in self._selected_cell_indices()]
+
+    def select_fields(self, *field_names: str | Sequence[str]) -> "Vector":
+        """Return a view containing only the requested fields.
+
+        Accepted forms:
+        - ``select_fields("kx")``
+        - ``select_fields("kx", "ky")``
+        - ``select_fields(["kx", "ky"])``
+        """
+        selected = _normalize_select_field_args(*field_names)
         available = set(self.fields)
         missing = [field for field in selected if field not in available]
         if missing:
@@ -234,12 +342,71 @@ class Vector(AutoSerialize):
             selected_fields,
         )
 
+    def set_flattened(self, values: Any) -> None:
+        """Write values back in flattened row-major order.
+
+        This updates existing rows without changing per-cell row counts. It is
+        the rowwise companion to ``flatten()`` and is especially useful for
+        NumPy-based transforms that operate on all selected rows at once.
+        """
+        field_indices = self._field_indices()
+        targets = self._selected_cell_indices()
+        row_counts = self.row_counts()
+        total_rows = sum(row_counts)
+
+        if isinstance(values, Vector):
+            if values.num_fields != self.num_fields:
+                raise ValueError(f"Expected {self.num_fields} fields, got {values.num_fields}")
+            flat_values = values.flatten()
+            if flat_values.shape[0] != total_rows:
+                raise ValueError(f"Expected {total_rows} rows, got {flat_values.shape[0]}")
+        else:
+            flat_values = _broadcast_field_values(values, total_rows, self.num_fields)
+
+        cursor = 0
+        for target, rows in zip(targets, row_counts):
+            cell = self._cell_matrix(int(target))
+            if rows > 0:
+                cell[:, field_indices] = flat_values[cursor : cursor + rows]
+            cursor += rows
+
+    def compact(self) -> None:
+        """Repack the backing row buffer to remove dead rows.
+
+        Whole-cell replacement appends new rows and leaves previous rows unused
+        until compaction. Calling ``compact()`` makes memory usage and save size
+        predictable at the cost of reallocating the backing buffer.
+        """
+        self._compact_storage()
+
+    def append_rows(self, idx: Any, rows: Any) -> None:
+        """Append one or more rows to a single selected cell.
+
+        ``idx`` is interpreted with the same fixed-grid indexing rules as
+        ``__getitem__`` and must resolve to exactly one cell. Appending rows is a
+        full-cell operation, so all fields must be selected.
+        """
+        target = self[idx]
+        if target.shape != ():
+            raise ValueError("append_rows requires an index that selects exactly one cell.")
+        target._require_full_field_view("append_rows")
+
+        new_rows = _coerce_cell_array(rows, target.num_fields)
+        if new_rows.shape[0] == 0:
+            return
+
+        cell_index = int(target._selected_cell_indices()[0])
+        existing = target._cell_matrix(cell_index)
+        combined = np.vstack((existing, new_rows)) if existing.shape[0] > 0 else new_rows.copy()
+        target._replace_cells(np.array([cell_index], dtype=np.int64), [combined])
+
     def add_fields(
         self,
         names: str | Sequence[str],
         values: Any | None = None,
         units: str | Sequence[str] | None = None,
     ) -> None:
+        """Add one or more new fields to the full Vector schema."""
         self._require_full_field_view("add_fields")
         new_fields = _normalize_field_names(names)
         if any(field in self._state["fields"] for field in new_fields):
@@ -254,7 +421,7 @@ class Vector(AutoSerialize):
         if values is None:
             return
 
-        target = self.select_fields(list(new_fields))
+        target = self.select_fields(*new_fields)
         if len(new_fields) > 1 and isinstance(values, (list, tuple)) and len(values) == len(new_fields):
             for field, value in zip(new_fields, values):
                 target.select_fields(field)[...] = value
@@ -265,6 +432,7 @@ class Vector(AutoSerialize):
             self._selected_fields = None
 
     def remove_fields(self, names: str | Sequence[str]) -> None:
+        """Remove one or more fields from the full Vector schema."""
         self._require_full_field_view("remove_fields")
         to_remove = set(_normalize_field_names(names))
         old_fields = self._state["fields"]
@@ -286,23 +454,11 @@ class Vector(AutoSerialize):
             if len(self._selected_fields) == len(self._state["fields"]):
                 self._selected_fields = None
 
-    def get_data(self, *indices: Any) -> NDArray[np.generic] | list[NDArray[np.generic]]:
-        if len(indices) != len(self.shape):
-            raise ValueError(f"Expected {len(self.shape)} indices, got {len(indices)}")
-        selection = self[indices if len(indices) != 1 else indices[0]]
-        if selection.shape == ():
-            return selection.array
-        return [selection._selected_cell_matrix(index).copy() for index in selection._selected_cell_indices()]
-
-    def set_data(self, value: Any, *indices: Any) -> None:
-        if len(indices) != len(self.shape):
-            raise ValueError(f"Expected {len(self.shape)} indices, got {len(indices)}")
-        self[indices if len(indices) != 1 else indices[0]] = value
-
     @overload
     def __getitem__(self, idx: Any) -> "Vector": ...
 
     def __getitem__(self, idx: Any) -> "Vector":
+        """Return a fixed-grid selection as another Vector view."""
         if _looks_like_field_selector(idx):
             raise TypeError("Use select_fields(...) for field selection.")
         if idx is Ellipsis:
@@ -321,6 +477,7 @@ class Vector(AutoSerialize):
         )
 
     def __setitem__(self, idx: Any, value: Any) -> None:
+        """Assign to a fixed-grid selection."""
         if idx is Ellipsis:
             target = self
         else:
@@ -372,6 +529,7 @@ class Vector(AutoSerialize):
         return len(self._state["fields"])
 
     def _field_indices(self) -> NDArray[np.int64]:
+        """Map selected field names to column indices in the backing buffer."""
         if self._selected_fields is None:
             return np.arange(self._full_num_fields, dtype=np.int64)
 
@@ -382,10 +540,12 @@ class Vector(AutoSerialize):
             raise KeyError(f"Unknown field(s): {[str(exc.args[0])]}") from exc
 
     def _require_full_field_view(self, operation: str) -> None:
+        """Raise if a schema-changing/full-row operation is attempted on a field view."""
         if self._selected_fields is not None:
             raise ValueError(f"{operation} is only allowed when all fields are selected.")
 
     def _selected_cell_indices(self) -> NDArray[np.int64]:
+        """Return linear cell indices for the current fixed-grid selection."""
         if self._selection_indices is None:
             return np.arange(_cell_count(self._state["shape"]), dtype=np.int64)
         return self._selection_indices
@@ -394,9 +554,11 @@ class Vector(AutoSerialize):
         return self._selected_fields is None
 
     def _cell_row_count(self, linear_index: int) -> int:
+        """Return the row count for one cell in the backing buffer."""
         return int(self._state["cell_lengths"][linear_index])
 
     def _cell_matrix(self, linear_index: int) -> NDArray[np.generic]:
+        """Return the full backing matrix for one cell."""
         start = int(self._state["cell_starts"][linear_index])
         length = int(self._state["cell_lengths"][linear_index])
         if length == 0:
@@ -404,6 +566,7 @@ class Vector(AutoSerialize):
         return self._state["data"][start : start + length]
 
     def _selected_cell_matrix(self, linear_index: int) -> NDArray[np.generic]:
+        """Return one cell with the current field selection applied."""
         cell = self._cell_matrix(linear_index)
         cols = self._field_indices()
         if cols.size == self._full_num_fields:
@@ -416,6 +579,14 @@ class Vector(AutoSerialize):
         return cell[:, cols].copy()
 
     def _replace_cells(self, targets: NDArray[np.int64], arrays: Sequence[NDArray[np.generic]]) -> None:
+        """Replace complete cells in the compact row buffer.
+
+        Whole-cell replacement is implemented by appending the new payload rows to
+        the end of the backing buffer and then updating ``cell_starts`` /
+        ``cell_lengths`` for the targeted cells. This keeps the operation simple
+        and makes overlapping assignment semantics easy to reason about, but it
+        leaves the previous rows unreachable until compaction removes them.
+        """
         if len(targets) != len(arrays):
             raise ValueError("Target cell count does not match source cell count.")
         if len(targets) == 0:
@@ -440,6 +611,7 @@ class Vector(AutoSerialize):
         self._maybe_compact_storage()
 
     def _expand_storage(self, num_new_fields: int) -> None:
+        """Append new ``np.nan``-initialized columns for added fields."""
         data = self._state["data"]
         if data.shape[0] == 0:
             dtype = np.result_type(data.dtype, float)
@@ -451,15 +623,22 @@ class Vector(AutoSerialize):
         self._state["data"] = np.concatenate((data.astype(dtype, copy=False), filler), axis=1)
 
     def _maybe_compact_storage(self) -> None:
+        """Compact automatically once dead rows become materially larger than live rows."""
         data = self._state["data"]
         used_rows = int(self._state["cell_lengths"].sum())
         if data.shape[0] <= used_rows + 1024:
             return
+        if data.shape[0] <= 2 * used_rows:
+            return
+        self._compact_storage()
+
+    def _compact_storage(self) -> None:
+        """Rebuild the row buffer so only live rows remain."""
+        data = self._state["data"]
+        used_rows = int(self._state["cell_lengths"].sum())
         if used_rows == 0:
             self._state["data"] = np.empty((0, self._full_num_fields), dtype=data.dtype)
             self._state["cell_starts"].fill(0)
-            return
-        if data.shape[0] <= 2 * used_rows:
             return
 
         compacted = np.empty((used_rows, self._full_num_fields), dtype=data.dtype)
@@ -476,12 +655,18 @@ class Vector(AutoSerialize):
         self._state["cell_starts"] = starts
 
     def _assign(self, value: Any) -> None:
+        """Dispatch assignment based on whether all fields or a subset are selected."""
         if self._is_full_field_selection():
             self._assign_full_cells(value)
         else:
             self._assign_selected_fields(value)
 
     def _assign_full_cells(self, value: Any) -> None:
+        """Replace full cell payloads.
+
+        Full-cell assignment may change the ragged row count of each targeted
+        cell, because the existing cell matrix is replaced as a whole.
+        """
         targets = self._selected_cell_indices()
         if isinstance(value, Vector):
             source_cells = value._selected_cell_indices()
@@ -499,6 +684,13 @@ class Vector(AutoSerialize):
         self._replace_cells(targets, [array] * len(targets))
 
     def _assign_selected_fields(self, value: Any) -> None:
+        """Update only the selected columns while preserving row counts.
+
+        This is the in-place path for assignments such as
+        ``vector.select_fields("kx")[...] = rhs``. The target cell structure is
+        preserved, so each target cell keeps its existing row count and only the
+        selected columns are overwritten.
+        """
         targets = self._selected_cell_indices()
         field_indices = self._field_indices()
         row_counts = [self._cell_row_count(index) for index in targets]
@@ -539,11 +731,13 @@ class Vector(AutoSerialize):
             cursor += rows
 
     def _binary_op(self, other: Any, op: Any, reverse: bool = False) -> "Vector":
+        """Return a new Vector produced by elementwise arithmetic."""
         result = self.copy()
         result._inplace_op(other, op, reverse=reverse)
         return result
 
     def _inplace_op(self, other: Any, op: Any, reverse: bool = False) -> None:
+        """Apply elementwise arithmetic in-place to the selected fields."""
         targets = self._selected_cell_indices()
         field_indices = self._field_indices()
         row_counts = [self._cell_row_count(index) for index in targets]
@@ -585,10 +779,12 @@ class Vector(AutoSerialize):
 
 
 def _cell_count(shape: tuple[int, ...]) -> int:
+    """Return the number of fixed-grid cells in a shape."""
     return int(np.prod(shape, dtype=np.int64)) if shape else 1
 
 
 def _normalize_field_names(field_names: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize one-or-many field names into a validated tuple."""
     if isinstance(field_names, str):
         normalized = (field_names,)
     else:
@@ -599,8 +795,25 @@ def _normalize_field_names(field_names: str | Sequence[str]) -> tuple[str, ...]:
     return normalized
 
 
+def _normalize_select_field_args(*field_names: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize ``select_fields`` arguments.
+
+    This accepts either ``select_fields("a", "b")`` or
+    ``select_fields(["a", "b"])`` while keeping ``add_fields`` /
+    ``remove_fields`` on the simpler single-argument path.
+    """
+    if not field_names:
+        raise ValueError("At least one field name is required.")
+    if len(field_names) == 1 and not isinstance(field_names[0], str):
+        return _normalize_field_names(field_names[0])
+    if not all(isinstance(name, str) for name in field_names):
+        raise TypeError("select_fields(...) expects field names as strings or one sequence of strings.")
+    return _normalize_field_names(field_names)
+
+
 
 def _normalize_units(units: str | Sequence[str] | None, count: int) -> list[str]:
+    """Normalize field units to a list matching ``count``."""
     if units is None:
         return ["none"] * count
     if isinstance(units, str):
@@ -615,6 +828,7 @@ def _normalize_units(units: str | Sequence[str] | None, count: int) -> list[str]
 
 
 def _looks_like_field_selector(idx: Any) -> bool:
+    """Return True for indices that look like field selection by mistake."""
     if isinstance(idx, str):
         return True
     if isinstance(idx, tuple) and any(_looks_like_field_selector(item) for item in idx):
@@ -626,6 +840,7 @@ def _looks_like_field_selector(idx: Any) -> bool:
 
 
 def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[np.generic]:
+    """Normalize a single-cell payload to shape ``(n_rows, num_fields)``."""
     if isinstance(value, Vector):
         if value.shape != ():
             raise ValueError("Expected a 0D Vector for single-cell assignment.")
@@ -651,6 +866,7 @@ def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[np.generic]:
 
 
 def _normalize_nested_data(data: list[Any]) -> tuple[tuple[int, ...], list[NDArray[np.generic]]]:
+    """Normalize nested input data into ``(shape, flat_cell_arrays)``."""
     if not isinstance(data, list):
         raise TypeError("Data must be a list")
     if not data:
@@ -660,6 +876,7 @@ def _normalize_nested_data(data: list[Any]) -> tuple[tuple[int, ...], list[NDArr
 
 
 def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[np.generic]]]:
+    """Recursively flatten nested fixed-grid input into row-major cell order."""
     if isinstance(node, np.ndarray):
         return (), [_coerce_inferred_cell_array(node)]
     if not isinstance(node, (list, tuple)):
@@ -685,6 +902,7 @@ def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[np.gen
 
 
 def _looks_like_cell_rows(node: Sequence[Any]) -> bool:
+    """Return True when a sequence should be interpreted as cell rows, not grid nesting."""
     if len(node) == 0:
         return True
     return all(_is_row_like(item) for item in node)
@@ -692,6 +910,7 @@ def _looks_like_cell_rows(node: Sequence[Any]) -> bool:
 
 
 def _is_row_like(item: Any) -> bool:
+    """Return True for a single row of scalar values."""
     if isinstance(item, np.ndarray):
         return item.ndim == 1
     if not isinstance(item, (list, tuple)):
@@ -701,6 +920,7 @@ def _is_row_like(item: Any) -> bool:
 
 
 def _coerce_inferred_cell_array(value: Any) -> NDArray[np.generic]:
+    """Infer a 2D cell array from row-like input during ``from_data``."""
     array = np.asarray(value)
     if array.ndim == 0:
         raise ValueError("Cell data must be 1D or 2D.")
@@ -719,6 +939,14 @@ def _select_linear_indices(
     current_indices: NDArray[np.int64],
     idx: Any,
 ) -> tuple[tuple[int, ...], NDArray[np.int64]]:
+    """Apply fixed-grid indexing to a flattened cell-index view.
+
+    ``current_indices`` stores the linear cell indices represented by the current
+    selection. This helper reshapes those indices to the current selection shape,
+    applies NumPy-like indexing on the fixed-grid axes, and then returns:
+    - the output fixed-grid shape
+    - the flattened linear indices of the selected cells, in row-major order
+    """
     if shape == ():
         if idx in ((), Ellipsis):
             return (), np.array([int(current_indices[0])], dtype=np.int64)
@@ -750,6 +978,7 @@ def _select_linear_indices(
 
 
 def _normalize_index_tuple(idx: Any, ndim: int) -> tuple[Any, ...]:
+    """Normalize fixed-grid indexing to a full ``ndim``-length tuple."""
     if idx is Ellipsis:
         return (slice(None),) * ndim
     if not isinstance(idx, tuple):
@@ -771,6 +1000,7 @@ def _normalize_index_tuple(idx: Any, ndim: int) -> tuple[Any, ...]:
 
 
 def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], bool]:
+    """Resolve one axis index into concrete positions and scalar-vs-vector shape behavior."""
     if isinstance(axis_index, (bool, np.bool_)):
         raise TypeError("Boolean scalars are not valid Vector indices.")
 
@@ -814,6 +1044,7 @@ def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], 
 
 
 def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDArray[np.generic]:
+    """Broadcast array-like input to flattened rowwise assignment shape."""
     array = np.asarray(value)
     if array.ndim == 0:
         return np.broadcast_to(array.reshape(1, 1), (total_rows, num_fields))
@@ -833,6 +1064,7 @@ def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDA
 
 
 def _is_contiguous(indices: NDArray[np.int64]) -> bool:
+    """Return True when integer column indices form one contiguous slice."""
     if indices.size <= 1:
         return True
     return bool(np.all(indices[1:] - indices[:-1] == 1))
