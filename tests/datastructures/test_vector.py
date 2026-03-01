@@ -1,6 +1,9 @@
+import zipfile
+
 import numpy as np
 import pytest
 
+from quantem.core.io.serialize import load
 from quantem.core.datastructures.vector import Vector
 
 
@@ -55,6 +58,12 @@ class TestVector:
 
         with pytest.raises(ValueError, match="Duplicate field names"):
             Vector.from_shape(shape=(2, 3), fields=["a", "a"])
+
+        assert str(v1) == (
+            "quantem.Vector, shape=(2, 3), name=2d ragged array\n"
+            "  fields = ['a', 'b', 'c']\n"
+            "  units: ['none', 'none', 'none']"
+        )
 
     def test_indexing_and_array_contract(self):
         v = make_grid_vector()
@@ -227,8 +236,40 @@ class TestVector:
         assert v.name == "nested"
         np.testing.assert_array_equal(v[0, 1].array, np.array([[3.0, 4.0], [5.0, 6.0]]))
 
+        tuple_cells = [
+            ([1.0, 2.0], [3.0, 4.0]),
+            ([5.0, 6.0], [7.0, 8.0], [9.0, 10.0]),
+        ]
+        tuple_vector = Vector.from_data(data=tuple_cells, fields=["a", "b"])
+        assert tuple_vector.shape == (2,)
+        np.testing.assert_array_equal(tuple_vector[0].array, np.array([[1.0, 2.0], [3.0, 4.0]]))
+        np.testing.assert_array_equal(
+            tuple_vector[1].array,
+            np.array([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]),
+        )
+
         with pytest.raises(TypeError, match="Data must be a list"):
             Vector.from_data(data=np.array([1, 2, 3]))  # type: ignore[arg-type]
 
         with pytest.raises(ValueError, match="same number of fields"):
             Vector.from_data(data=[np.array([[1.0, 2.0]]), np.array([[1.0, 2.0, 3.0]])])
+
+    def test_save_and_load_round_trip(self, tmp_path):
+        v = make_grid_vector()
+        v.add_fields("extra", v.select_fields("intensity") + 1.0)
+
+        path = tmp_path / "vector_test.zip"
+        v.save(path, mode="o", compression_level=4)
+
+        with zipfile.ZipFile(path) as zf:
+            names = [info.filename for info in zf.infolist()]
+        assert len(names) < 30
+        assert "_state/data/zarr.json" in names
+        assert all(not name.startswith("_selection_coords/") for name in names)
+
+        loaded = load(path)
+        assert isinstance(loaded, Vector)
+        assert loaded.shape == v.shape
+        assert loaded.fields == v.fields
+        assert loaded.units == v.units
+        np.testing.assert_array_equal(loaded[2, 1].array, v[2, 1].array)
