@@ -348,14 +348,18 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def apply_soft_constraints(
         self,
         coords: torch.Tensor,
+        pred: torch.Tensor,
     ) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=coords.device)
+        soft_loss = torch.tensor(0.0, device=pred.device)
         if self.constraints.tv_vol > 0:
             num_tv_samples = min(10_000, coords.shape[0])
             tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
 
             tv_coords = coords[tv_indices].detach().requires_grad_(True)
             tv_densities_recomputed = self.model(tv_coords)
+            if isinstance(tv_densities_recomputed, tuple):
+                tv_densities_recomputed = tv_densities_recomputed[0]
+
             # Ensure shape is [num_samples, num_channels]
             if tv_densities_recomputed.dim() == 1:
                 tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
@@ -371,6 +375,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             # Compute TV loss - gradient magnitude per sample
             grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
             soft_loss += self.constraints.tv_vol * grad_norm.mean()
+
+        if self.constraints.sparsity > 0:
+            sparsity_loss = self.constraints.sparsity * torch.norm(pred, p=1)
+            soft_loss += sparsity_loss
 
         return soft_loss
 
@@ -449,6 +457,11 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         """forward pass for the INR model"""
         all_densities = self.model(coords)
+        if isinstance(all_densities, tuple):
+            all_densities = all_densities[0]
+            ot_reg = all_densities[1]
+        else:
+            ot_reg = None
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
@@ -462,7 +475,11 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         all_densities = all_densities * valid_mask
 
         all_densities = self.apply_hard_constraints(all_densities)
-        return all_densities
+
+        if ot_reg is not None:
+            return all_densities, ot_reg
+        else:
+            return all_densities
 
     # Pretrain Loop
 
@@ -585,6 +602,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 )
 
                 batch_outputs = model(batch_coords)  # (B, C) or (B,) etc.
+
+                if isinstance(batch_outputs, tuple):
+                    batch_outputs = batch_outputs[0]
                 batch_outputs = self.apply_hard_constraints(batch_outputs)
 
                 # Ensure shape is (B, C)

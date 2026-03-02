@@ -162,7 +162,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
                 batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
 
-                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords)
+                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred)
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 
