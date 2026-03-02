@@ -11,7 +11,7 @@ else:
         import torch
 
 
-def get_loss_module(name: str | nn.Module | Callable, dtype: torch.dtype) -> nn.Module:
+def get_loss_module(name: str | nn.Module | Callable, dtype: torch.dtype, **kwargs) -> nn.Module:
     """Return a loss *module* by name, or wrap/return what was provided."""
     if isinstance(name, nn.Module):
         return name
@@ -32,20 +32,29 @@ def get_loss_module(name: str | nn.Module | Callable, dtype: torch.dtype) -> nn.
 
     if dtype.is_complex:
         if loss_name in {"l2", "complex_l2"}:
-            return ComplexL2Loss()
+            return ComplexL2Loss(**kwargs)
         if loss_name in {"complex_cartesian_l2"}:
-            return ComplexCartesianL2Loss()
+            return ComplexCartesianL2Loss(**kwargs)
         if loss_name in {"amp_phase_l2"}:
-            return AmpPhaseL2Loss()
+            return AmpPhaseL2Loss(**kwargs)
         if loss_name in {"combined_l2"}:
-            return CombinedL2Loss()
+            return CombinedL2Loss(**kwargs)
         raise ValueError(f"Unknown loss module for complex dtype: {loss_name}")
 
     # real dtype
     if loss_name in {"l2"}:
-        return nn.MSELoss()
+        return nn.MSELoss(**kwargs)
     if loss_name in {"l1"}:
-        return nn.L1Loss()
+        return nn.L1Loss(**kwargs)
+    if loss_name in {"smooth_l1"}:
+        return nn.SmoothL1Loss(**kwargs)
+    if loss_name in {"charbonnier"}:
+        return CharbonnierLoss(**kwargs)
+    if loss_name in {"llmse"}:
+        return LLMSELoss(**kwargs)
+    if loss_name in {"mse_log_mse"}:
+        return MSELogMSELoss(**kwargs)
+
     raise ValueError(f"Unknown loss module for real dtype: {loss_name}")
 
 

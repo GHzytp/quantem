@@ -1,5 +1,5 @@
 import os
-from typing import Literal, Optional, Self
+from typing import Literal, Self
 
 import numpy as np
 import torch
@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.ddp import DDPMixin
+from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import (
     torch_phase_cross_correlation,
@@ -51,11 +52,18 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = {},
         constraints: dict = {},  # TODO: What to pass into the constraints?
-        loss_func: tuple[str, Optional[float]] = ("smooth_l1", 0.07),
-        num_samples_per_ray: int | list[tuple[int, int]] = None,
+        num_samples_per_ray: int | list[tuple[int, int]] = 1,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
-        # reset_dset: bool = False,
+        loss_type: Literal[
+            "l2",
+            "l1",
+            "smooth_l1",
+            "charbonnier",
+            "llmse",
+            "mse_log_mse",
+        ] = "l2",
+        loss_func_kwargs: dict = {},
         reset_dset: DatasetModelType | None = None,
     ):
         """
@@ -120,6 +128,8 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
             else:
                 print("num_samples_per_ray schedule provided.")
 
+        loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
+
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
         for a0 in range(num_iter):
             consistency_loss = 0.0
@@ -160,7 +170,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 
-                batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
+                batch_consistency_loss = loss_func(pred, target)
 
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred)
 

@@ -31,8 +31,9 @@ class DefaultConstraintsTomography(Constraints):
 
     # Soft Constraints
     tv_vol: float = 0.0
+    sparsity: float = 0.0
 
-    soft_constraint_keys = ["tv_vol"]
+    soft_constraint_keys = ["tv_vol", "sparsity"]
     hard_constraint_keys = ["positivity", "shrinkage", "circular_mask", "fourier_filter"]
 
 
