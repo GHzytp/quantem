@@ -44,6 +44,8 @@ class Tomography(TomographyOpt, TomographyBase):
             obj_model=obj_model,
             logger=logger,
             device=device,
+            rng=rng,
+            _token=cls._token,
         )
 
     def reconstruct(

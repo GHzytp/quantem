@@ -61,7 +61,7 @@ class DDPMixin:
         persist = num_workers > 0
 
         if val_fraction > 0.0:
-            train_dataset, val_dataset = random_split(dataset, [1 - val_fraction, val_fraction])
+            train_dataset, val_dataset = random_split(dataset, [1 - val_fraction, val_fraction])  # type: ignore[reportArgumentType] --> dataset inherits from torch Dataset so this is fine.
         else:
             train_dataset = dataset
             val_dataset = None
@@ -69,7 +69,7 @@ class DDPMixin:
         if self.world_size > 1:
             shuffle = True
             train_sampler = DistributedSampler(
-                train_dataset,
+                train_dataset,  # type: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
                 num_replicas=self.world_size,
                 rank=self.global_rank,
                 shuffle=shuffle,
@@ -92,7 +92,7 @@ class DDPMixin:
             shuffle = True
 
         train_dataloader = DataLoader(
-            train_dataset,
+            train_dataset,  # type: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
             batch_size=batch_size,
             num_workers=num_workers,
             sampler=train_sampler,
