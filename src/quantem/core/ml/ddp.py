@@ -5,6 +5,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_split
 
+from quantem.tomography.dataset_models import DatasetModelType
+
 
 class DDPMixin:
     """
@@ -50,7 +52,7 @@ class DDPMixin:
 
     def setup_dataloader(
         self,
-        dataset: Dataset,
+        dataset: Dataset | DatasetModelType,
         batch_size: int,
         num_workers: int = 0,
         val_fraction: float = 0.0,

@@ -1,5 +1,5 @@
 import os
-from typing import Literal, Self
+from typing import Literal, Self, cast
 
 import numpy as np
 import torch
@@ -14,7 +14,11 @@ from quantem.core.utils.tomography_utils import (
 )
 from quantem.tomography.dataset_models import DatasetModelType
 from quantem.tomography.logger_tomography import LoggerTomography
-from quantem.tomography.object_models import ObjectModelType
+from quantem.tomography.object_models import (
+    DefaultConstraintsTomography,
+    ObjectINR,
+    ObjectPixelated,
+)
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_opt import TomographyOpt
@@ -30,7 +34,7 @@ class Tomography(TomographyOpt, TomographyBase):
     def from_models(
         cls,
         dset: DatasetModelType,
-        obj_model: ObjectModelType,
+        obj_model: ObjectINR,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
@@ -49,7 +53,7 @@ class Tomography(TomographyOpt, TomographyBase):
         num_workers: int = 32,
         reset: bool = False,
         optimizer_params: dict | None = None,
-        scheduler_params: dict | None = {},
+        scheduler_params: dict | None = None,
         constraints: dict = {},  # TODO: What to pass into the constraints?
         num_samples_per_ray: int | list[tuple[int, int]] = 1,
         profiling_mode: bool = False,
@@ -83,7 +87,6 @@ class Tomography(TomographyOpt, TomographyBase):
             raise NotImplementedError("Reset is not implemented yet.")
 
         new_scheduler = reset
-
         if optimizer_params is not None:
             self.optimizer_params = optimizer_params
             self.set_optimizers()
@@ -93,11 +96,11 @@ class Tomography(TomographyOpt, TomographyBase):
             self.scheduler_params = scheduler_params
             new_scheduler = True
 
-        if constraints is not None:
-            self.obj_model.constraints = constraints
-
         if new_scheduler:
-            self.set_schedulers(scheduler_params, num_iter=num_iter)
+            self.set_schedulers(self.scheduler_params, num_iter=num_iter)
+
+        if constraints is not None:
+            self.obj_model.constraints = cast(DefaultConstraintsTomography, constraints)
 
         # Setting up DDP
         if not hasattr(self, "dataloader") or reset_dset is not None:
@@ -107,8 +110,13 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 self.dset = reset_dset
                 self.dset.to(self.device)
-                self.optimizer_params = optimizer_params
-                self.set_optimizers()
+                if optimizer_params is not None:
+                    self.optimizer_params = optimizer_params
+                    self.set_optimizers()
+                if scheduler_params is not None:
+                    self.scheduler_params = scheduler_params
+                    self.set_schedulers(self.scheduler_params, num_iter=num_iter)
+
             self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
                 self.setup_dataloader(
                     self.dset,
@@ -320,7 +328,7 @@ class TomographyConventional(TomographyBase):
     def from_models(
         cls,
         dset: DatasetModelType,
-        obj_model: ObjectModelType,
+        obj_model: ObjectPixelated,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
@@ -425,7 +433,6 @@ class TomographyConventional(TomographyBase):
                 torch.ones_like(error),
                 theta=self.dset.tilt_angles,
                 device=self.device,
-                filter_name=None,
                 circle=True,
             )
 

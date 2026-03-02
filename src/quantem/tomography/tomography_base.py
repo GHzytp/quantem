@@ -8,8 +8,8 @@ from quantem.tomography.dataset_models import DatasetModelType, TomographyDatase
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
     DefaultConstraintsTomography,
-    ObjectConstraints,
     ObjectINR,
+    ObjectModelType,
 )
 
 
@@ -25,7 +25,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
     def __init__(
         self,
         dset: DatasetModelType,
-        obj_model: ObjectConstraints,
+        obj_model: ObjectModelType,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
@@ -68,11 +68,11 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._dset = new_dset
 
     @property
-    def obj_model(self) -> ObjectConstraints:
+    def obj_model(self) -> ObjectModelType:
         return self._obj_model
 
     @obj_model.setter
-    def obj_model(self, obj_model: ObjectConstraints):
+    def obj_model(self, obj_model: ObjectModelType):
         self._obj_model = obj_model
 
     @property

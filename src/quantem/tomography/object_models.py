@@ -256,6 +256,10 @@ class ObjectPixelated(ObjectConstraints):
     def obj_type(self) -> str:
         return "pixelated"
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._obj.dtype
+
     def apply_soft_constraints(self, obj: torch.Tensor) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
         if self.constraints.tv_vol > 0:
@@ -279,8 +283,13 @@ class ObjectPixelated(ObjectConstraints):
         return tv_loss * tv_weight / (torch.prod(torch.tensor(obj.shape)))
 
     # --- Helper Functions ---
-    def to(self, device: str):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
+    def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
+        if isinstance(device, str):
+            device = torch.device(device)
+        self._device = device
         self._obj = self._obj.to(device)
+        self.reconnect_optimizer_to_parameters()
+        return self
 
 
 class ObjectINR(ObjectConstraints, DDPMixin):
@@ -327,7 +336,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     # --- Properties ---
 
     @property
-    def model(self) -> nn.Module:
+    def model(self) -> nn.Module | nn.parallel.DistributedDataParallel:
         """
         Returns the INR model.
         """
@@ -683,8 +692,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         tv_loss += self.constraints.tv_vol * grad_norm.mean()
         return tv_loss
 
-    def to(self, device: str):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
-        self.device = device
+    def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
+        if isinstance(device, str):
+            device = torch.device(device)
+        self._device = device
         # self._obj = self._obj.to(self.device)
         self.reconnect_optimizer_to_parameters()
 

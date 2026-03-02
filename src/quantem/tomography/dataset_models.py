@@ -208,16 +208,18 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._shifts_params = nn.Parameter(shifts.to(device))
 
     @property
-    def device(self) -> str:
+    def device(self) -> torch.device:
         return self._device
 
     @device.setter
-    def device(self, device: str):
+    def device(self, device: torch.device | str):
+        if isinstance(device, str):
+            device = torch.device(device)
         self._device = device
 
     # --- Helper Functions ---
     @abstractmethod
-    def to(self, device: str):
+    def to(self, device: torch.device | str):
         """
         Moves the dataset to the device, and also insantiates the aux params to the device.
         """
@@ -263,7 +265,7 @@ class TomographyPixDataset(TomographyDatasetBase):
             pixel_loc=None,
         )
 
-    def to(self, device: str):
+    def to(self, device: str | torch.device):
         """
         Moves the tilt stack and tilt_angles to the device, along with other nn.Parameters to the device.
         """
@@ -474,7 +476,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         N = max(self.tilt_stack.shape)
         return self.tilt_stack.shape[0] * N * N
 
-    def to(self, device: str):
+    def to(self, device: torch.device | str):
         self._z1_params = nn.Parameter(self._z1_angles.to(device))
         self._z3_params = nn.Parameter(self._z3_angles.to(device))
         self._shifts_params = nn.Parameter(self._shifts.to(device))
