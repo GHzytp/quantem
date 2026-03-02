@@ -122,14 +122,14 @@ class DDPMixin:
 
         if self.global_rank == 0:
             print("Dataloader setup complete:")
-            print(f"  Total train samples: {len(train_dataset)}")
+            print(f"  Total train samples: {len(train_dataset)}")  # pyright: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
             print(f"  Local batch size: {batch_size}")
             print(f"  Global batch size: {batch_size * self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(train_dataloader)}")
 
             if val_dataset:
                 print(f"  Total val samples: {len(val_dataset)}")
-                print(f"  Val batches per GPU per epoch: {len(val_dataloader)}")
+                print(f"  Val batches per GPU per epoch: {len(val_dataloader)}")  # pyright: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
 
         return train_dataloader, train_sampler, val_dataloader, val_sampler
 
