@@ -94,9 +94,9 @@ def abundance_smoothness_l2(abundance_maps: torch.Tensor) -> torch.Tensor:
 
 
 class EDSModel(nn.Module):
-    """Complete EDS forward model with optional fit range"""
+    """EDS spectrum model = peaks + optional background."""
 
-    def __init__(self, peak_model, background_model=None, fit_range=None, energy_axis=None):
+    def __init__(self, peak_model, background_model=None):
         super().__init__()
         self.peak_model = peak_model
         self.background_model = background_model
@@ -109,7 +109,7 @@ class EDSModel(nn.Module):
 
 
 class GaussianPeaks(nn.Module):
-    """Generate Gaussian peaks from peak library"""
+    """Generate Gaussian peak spectra from X-ray line data."""
 
     def __init__(
         self,
@@ -130,11 +130,8 @@ class GaussianPeaks(nn.Module):
         self.register_buffer("energy_axis", energy_axis_tensor)
         self.energy_min = self.energy_axis.min().item()
         self.energy_max = self.energy_axis.max().item()
-
-        # Calculate energy step for later use
         self.energy_step = (self.energy_axis[1] - self.energy_axis[0]).item()
 
-        # Parse and filter elements
         all_element_data = {}
         for elem, lines in data.items():
             if len(lines) > 0:
@@ -156,7 +153,6 @@ class GaussianPeaks(nn.Module):
                         "line_names": line_names,
                     }
 
-        # Filter to specific elements
         if elements_to_fit is not None:
             self.element_data = {}
             for elem in elements_to_fit:
@@ -168,7 +164,6 @@ class GaussianPeaks(nn.Module):
         self.element_names = list(self.element_data.keys())
         n_elements = len(self.element_names)
 
-        # Pre-compute all peak positions and weights as tensors
         all_peak_energies = []
         all_peak_weights = []
         all_peak_element_indices = []
@@ -210,7 +205,6 @@ class GaussianPeaks(nn.Module):
                     shell_group_shell_labels.append(shell_label)
                 all_peak_shell_group_indices.append(shell_group_lookup[key])
 
-        # Store as tensors for fast computation
         self.register_buffer(
             "peak_energies",
             torch.tensor(
@@ -275,7 +269,6 @@ class GaussianPeaks(nn.Module):
             f"across {n_shell_groups} edge groups"
         )
 
-        # Learnable parameters
         concentration_size = len(shell_group_names)
         if concentration_size > 0:
             init_concentration = torch.ones(
@@ -302,11 +295,10 @@ class GaussianPeaks(nn.Module):
         return "Other"
 
     def forward(self):
-        """Vectorized forward pass"""
         centers = self.peak_energies.unsqueeze(1)
         energies = self.energy_axis.unsqueeze(0)
 
-        fwhm = nn.functional.softplus(self.peak_width_by_peak)  # (n_peaks,)
+        fwhm = nn.functional.softplus(self.peak_width_by_peak)
         sigma = (fwhm / 2.355).unsqueeze(1)
 
         all_peaks = torch.exp(-0.5 * ((energies - centers) / sigma) ** 2)
@@ -332,7 +324,7 @@ class GaussianPeaks(nn.Module):
 class PolynomialBackground(nn.Module):
     """Polynomial background model"""
 
-    def __init__(self, energy_axis, degree=3, positive_output=False):
+    def __init__(self, energy_axis, degree=3):
         super().__init__()
         energy_axis_tensor = (
             energy_axis.float()
@@ -341,9 +333,7 @@ class PolynomialBackground(nn.Module):
         )
         self.register_buffer("energy_axis", energy_axis_tensor)
         self.degree = degree
-        self.positive_output = bool(positive_output)
 
-        # Normalize energy axis to [0, 1] for numerical stability
         energy_norm = (self.energy_axis - self.energy_axis.min()) / (
             self.energy_axis.max() - self.energy_axis.min()
         )
@@ -362,8 +352,6 @@ class PolynomialBackground(nn.Module):
         background = torch.zeros_like(self.energy_axis)
         for i, coeff in enumerate(self.coeffs):
             background += coeff * (self.energy_norm**i)
-        if self.positive_output:
-            background = nn.functional.softplus(background)
         return background
 
 

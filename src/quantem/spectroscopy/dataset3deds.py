@@ -1124,7 +1124,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             peak_width=peak_width,
             elements_to_fit=elements_to_fit,
         )
-        model = EDSModel(peaks, background, energy_axis=energy_axis)
+        model = EDSModel(peaks, background)
         model = model.to(device=energy_axis.device, dtype=energy_axis.dtype)
         if len(model.peak_model.element_names) == 0:
             raise ValueError("No elements found in the selected energy range/elements_to_fit.")
@@ -1140,7 +1140,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             optimizer_obj = torch.optim.LBFGS(
                 model.parameters(),
                 lr=lr,
-                max_iter=1,
                 line_search_fn="strong_wolfe",
             )
         else:
@@ -1334,14 +1333,11 @@ class Dataset3deds(Dataset3dspectroscopy):
         peak_width=0.1,
         num_iters=300,
         num_iters_global=200,
-        lr=None,
         polynomial_background_degree=3,
-        optimizer=None,
-        loss=None,
-        optimizer_global=None,
-        optimizer_local=None,
+        optimizer_global="lbfgs",
+        optimizer_local="lbfgs",
         loss_global=None,
-        loss_local=None,
+        loss_local="poisson",
         freeze_peak_width=True,
         spatial_lambda=0.0,
         min_total_counts=0.0,
@@ -1350,130 +1346,33 @@ class Dataset3deds(Dataset3dspectroscopy):
         show_plot=True,
         lr_global=None,
         lr_local=None,
-        lr_background_local=None,
         device=None,
         constrain_background=True,
     ):
-        """Fit EDS spectra with one entrypoint for mean-only or full-cube fitting.
-
-        Parameters
-        ----------
-        energy_range : list[float] | tuple[float, float] | None
-            Energy range [emin, emax] to include in the fit.
-        elements_to_fit : list[str] | None
-            Element symbols to fit. If None, all available elements in range are used.
-        peak_width : float, optional
-            Initial peak FWHM in keV.
-        num_iters : int, optional
-            Number of optimization iterations for per-pixel fitting.
-        num_iters_global : int, optional
-            Number of mean-spectrum iterations used to initialize local fitting (3D mode).
-        lr : float, optional
-            Backward-compatible shared learning rate fallback. Used for global/local
-            fitting only when lr_global/lr_local are not provided.
-        lr_global : float, optional
-            Learning rate for the global mean-spectrum stage. In mean-only mode, this
-            is the learning rate used for that fit.
-        lr_local : float, optional
-            Learning rate for the position-by-position stage (3D mode).
-        lr_background_local : float, optional
-            Deprecated. Local background now uses the same learning rate as
-            other local parameters.
-        polynomial_background_degree : int, optional
-            Degree of per-pixel polynomial background.
-        optimizer : str | None, optional
-            Backward-compatible optimizer selector. In mean-only mode it controls
-            the global stage. In 3D mode it controls the local stage.
-        optimizer_global : str | None, optional
-            Global/mean-stage optimizer, "adam" or "lbfgs". In 3D mode, defaults
-            to "lbfgs" unless explicitly set.
-        optimizer_local : str | None, optional
-            Local position-by-position optimizer, "adam" or "lbfgs". In 3D mode,
-            defaults to optimizer if provided, otherwise "lbfgs".
-        loss : str | None, optional
-            Backward-compatible shared data term, "poisson" or "mse". If provided,
-            it applies to both stages unless stage-specific losses are set.
-        loss_global : str | None, optional
-            Global/mean-stage data term, "poisson" or "mse".
-        loss_local : str | None, optional
-            Local position-by-position data term, "poisson" or "mse".
-        freeze_peak_width : bool, optional
-            If True, lock peak widths after global fit (3D mode).
-        spatial_lambda : float, optional
-            Weight for spatial smoothness on abundance maps (3D mode).
-        min_total_counts : float, optional
-            Ignore pixels with summed counts below this threshold in data loss (3D mode).
-        verbose : bool, optional
-            Print progress updates.
-        fit_mean_only : bool, optional
-            If True, fit only the summed spectrum over (x, y).
-        show_plot : bool, optional
-            Plot fit diagnostics in mean-only mode.
-        device : str | torch.device | None, optional
-            Compute device to run fitting on. If None, uses CUDA when available,
-            otherwise CPU.
-        constrain_background : bool, optional
-            If True (3D mode), regularize local backgrounds using the global fit as
-            a prior and soft physical constraints with built-in weights.
-        Returns
-        -------
-        dict
-            Mean-only mode keys include concentrations, fit, and diagnostics.
-            3D mode keys include abundance maps and fit diagnostics.
-        """
+        """Fit EDS spectra on either the mean spectrum or the full cube."""
 
         def _normalize_choice(name, param_name, allowed_values):
-            if name is None:
-                return None
-            name_norm = name.lower()
+            name_norm = str(name).lower()
             if name_norm not in allowed_values:
                 allowed_display = "', '".join(sorted(allowed_values))
                 raise ValueError(f"{param_name} must be '{allowed_display}'")
             return name_norm
 
-        def _resolve_stage_settings(
-            fit_mean_only_mode,
-            optimizer_default_global,
-            loss_default_global,
-            loss_default_local,
-        ):
-            if fit_mean_only_mode:
-                return (
-                    optimizer_global_name or optimizer_name or optimizer_default_global,
-                    None,
-                    loss_global_name or loss_name or loss_default_global,
-                    None,
-                )
-            # Preserve historical behavior: global stage defaults to LBFGS.
-            return (
-                optimizer_global_name or optimizer_default_global,
-                optimizer_local_name or optimizer_name or "lbfgs",
-                loss_global_name or loss_name or loss_default_global,
-                loss_local_name or loss_name or loss_default_local,
-            )
-
-        optimizer_name = _normalize_choice(optimizer, "optimizer", {"adam", "lbfgs"})
-        optimizer_global_name = _normalize_choice(
+        effective_optimizer_global = _normalize_choice(
             optimizer_global, "optimizer_global", {"adam", "lbfgs"}
         )
-        optimizer_local_name = _normalize_choice(
+        effective_optimizer_local = _normalize_choice(
             optimizer_local, "optimizer_local", {"adam", "lbfgs"}
         )
-
-        loss_name = _normalize_choice(loss, "loss", {"poisson", "mse"})
-        loss_global_name = _normalize_choice(loss_global, "loss_global", {"poisson", "mse"})
-        loss_local_name = _normalize_choice(loss_local, "loss_local", {"poisson", "mse"})
-
-        (
-            effective_optimizer_global,
-            effective_optimizer_local,
-            effective_loss_global,
-            effective_loss_local,
-        ) = _resolve_stage_settings(
-            fit_mean_only_mode=fit_mean_only,
-            optimizer_default_global="lbfgs",
-            loss_default_global="mse" if fit_mean_only else "poisson",
-            loss_default_local="poisson",
+        effective_loss_global = (
+            _normalize_choice(loss_global, "loss_global", {"poisson", "mse"})
+            if loss_global is not None
+            else ("mse" if fit_mean_only else "poisson")
+        )
+        effective_loss_local = (
+            _normalize_choice(loss_local, "loss_local", {"poisson", "mse"})
+            if not fit_mean_only
+            else None
         )
 
         if spatial_lambda < 0:
@@ -1486,12 +1385,12 @@ class Dataset3deds(Dataset3dspectroscopy):
         if device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
 
-        effective_lr_global = lr if lr_global is None else lr_global
-        effective_lr_local = lr if lr_local is None else lr_local
+        effective_lr_global = lr_global
+        effective_lr_local = lr_local
 
         energy_axis_np = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
         energy_axis = torch.tensor(energy_axis_np, dtype=torch.float32, device=device)
-        spectra = torch.tensor(self.array, dtype=torch.float32, device=device)  # (E, Y, X)
+        spectra = torch.tensor(self.array, dtype=torch.float32, device=device)
 
         if energy_range is not None:
             ind = (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
@@ -1612,7 +1511,6 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         mean_spectrum = spectra_flat[valid_pixel_mask].mean(dim=0)
 
-        # Stage 1: global mean-spectrum fit to initialize per-pixel parameters.
         if verbose:
             print("fitting spectrum globally")
         global_fit = self._fit_mean_model_pytorch(
@@ -1638,8 +1536,6 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         n_elements = len(global_model.peak_model.element_names)
         with torch.no_grad():
-            # If the global stage fit a normalized target, convert amplitude-like
-            # parameters back to raw-count scale for local initialization.
             global_conc_shell = (
                 nn.functional.softplus(global_model.peak_model.concentrations).detach()
                 * global_scale
@@ -1657,7 +1553,6 @@ class Dataset3deds(Dataset3dspectroscopy):
                 global_bg_coeffs[0] = global_bg_coeffs[0] + global_offset
             global_peak_width_params = global_model.peak_model.peak_width_by_peak.detach().clone()
 
-        # Stage 2: vectorized per-pixel fit with shared peak shapes.
         peak_energies = global_model.peak_model.peak_energies
         peak_weights = global_model.peak_model.peak_weights
         peak_element_indices = global_model.peak_model.peak_element_indices
@@ -1669,13 +1564,10 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         mean_total = torch.clamp(mean_spectrum.sum(), min=1e-8)
         pixel_scales = (total_counts / mean_total).unsqueeze(1)
-        # Avoid near-zero concentration initialization that can cause vanishing
-        # softplus gradients in local optimization (especially on normalized data).
         conc_init = torch.clamp(
             global_conc.unsqueeze(0) * pixel_scales,
             min=1e-3,
         )
-        # Small random perturbation helps break symmetry across pixels.
         conc_init = torch.clamp(
             conc_init * (1.0 + 0.02 * torch.randn_like(conc_init)),
             min=1e-3,
@@ -1711,12 +1603,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             else (0.05 if effective_optimizer_local == "adam" else 1.0)
         )
 
-        if lr_background_local is not None and verbose:
-            print(
-                "lr_background_local is deprecated and ignored; using lr_local for "
-                "background coefficients."
-            )
-
         if effective_optimizer_local == "adam":
             adam_param_groups = [{"params": [conc_logits], "lr": local_lr}]
             adam_param_groups.append({"params": [bg_coeffs], "lr": local_lr})
@@ -1727,7 +1613,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             local_opt = torch.optim.LBFGS(
                 trainable_params,
                 lr=local_lr,
-                max_iter=1,
                 line_search_fn="strong_wolfe",
                 history_size=10,
             )
@@ -1749,20 +1634,10 @@ class Dataset3deds(Dataset3dspectroscopy):
                 )
             )
             conc = nn.functional.softplus(conc_logits)  # (P, n_elements)
-            peaks_pred = conc @ basis.t()  # (P, E)
-            bg_raw = bg_coeffs @ background_basis  # (P, E)
-            # Keep local background parameterization consistent with global initialization.
-            bg_pred = bg_raw
+            peaks_pred = conc @ basis.t()
+            bg_pred = bg_coeffs @ background_basis
             predicted = torch.clamp(peaks_pred + bg_pred, min=1e-8, max=1e8)
             return predicted, conc, bg_pred
-
-        def _prepare_local_loss_inputs(pred_local):
-            pred_eval = pred_local[valid_pixel_mask]
-            target_eval = spectra_flat[valid_pixel_mask]
-            local_scale = torch.clamp(global_scale, min=1e-8)
-            pred_eval = pred_eval / local_scale
-            target_eval = target_eval / local_scale
-            return pred_eval, target_eval
 
         def _background_regularization(bg_local):
             if not constrain_background:
@@ -1802,7 +1677,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             return reg_loss
 
         def _local_loss(pred_local, conc_local, bg_local):
-            pred_eval, target_eval = _prepare_local_loss_inputs(pred_local)
+            local_scale = torch.clamp(global_scale, min=1e-8)
+            pred_eval = pred_local[valid_pixel_mask] / local_scale
+            target_eval = spectra_flat[valid_pixel_mask] / local_scale
 
             loss_data = eds_data_loss(
                 pred_eval,
@@ -1849,14 +1726,9 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         with torch.no_grad():
             pred_final, conc_final, bg_final = _forward_model()
-
-            # Keep global/local/data comparison on equal footing by averaging
-            # over the same valid-pixel mask used in the global stage.
             mean_input_spectrum = spectra_flat[valid_pixel_mask].mean(dim=0).cpu().numpy()
             mean_fitted_spectrum = pred_final[valid_pixel_mask].mean(dim=0).cpu().numpy()
             mean_background_spectrum = bg_final[valid_pixel_mask].mean(dim=0).cpu().numpy()
-
-            # Also provide all-pixel aggregates for diagnostics.
             mean_input_spectrum_all = spectra_flat.mean(dim=0).cpu().numpy()
             mean_fitted_spectrum_all = pred_final.mean(dim=0).cpu().numpy()
             mean_background_spectrum_all = bg_final.mean(dim=0).cpu().numpy()
