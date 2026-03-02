@@ -171,7 +171,7 @@ class DDPMixin:
         return self._device
 
     @device.setter
-    def device(self, device: torch.device):
+    def device(self, device: torch.device | str):
         if isinstance(device, str):
             device = torch.device(device)
         self._device = device

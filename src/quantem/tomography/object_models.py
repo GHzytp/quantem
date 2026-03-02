@@ -171,7 +171,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
     #     return NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
-    def get_tv_loss(self, obj: torch.Tensor, tv_weight: float = 0.0) -> torch.Tensor:
+    def get_tv_loss(self, **kwargs) -> torch.Tensor:
         """
         Get the TV loss for the object model. Must be implemented in each subclass.
         """
@@ -260,7 +260,7 @@ class ObjectPixelated(ObjectConstraints):
         soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
         if self.constraints.tv_vol > 0:
             tv_loss = self.get_tv_loss(
-                obj.unsqueeze(0).unsqueeze(0), factor=self.constraints.tv_vol
+                obj.unsqueeze(0).unsqueeze(0), tv_weight=self.constraints.tv_vol
             )
             soft_loss += tv_loss
         return soft_loss
@@ -270,7 +270,7 @@ class ObjectPixelated(ObjectConstraints):
         return self.obj
 
     # --- Defining the TV loss ---
-    def get_tv_loss(self, obj: torch.Tensor, tv_weight: float = 1e-3) -> torch.Tensor:
+    def get_tv_loss(self, obj: torch.Tensor, tv_weight: float = 1e-3) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride] -> get_tv_loss has different arguments depending on the object.
         tv_d = torch.pow(obj[:, :, 1:, :, :] - obj[:, :, :-1, :, :], 2).sum()
         tv_h = torch.pow(obj[:, :, :, 1:, :] - obj[:, :, :, :-1, :], 2).sum()
         tv_w = torch.pow(obj[:, :, :, :, 1:] - obj[:, :, :, :, :-1], 2).sum()
@@ -279,7 +279,7 @@ class ObjectPixelated(ObjectConstraints):
         return tv_loss * tv_weight / (torch.prod(torch.tensor(obj.shape)))
 
     # --- Helper Functions ---
-    def to(self, device: str):
+    def to(self, device: str):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
         self._obj = self._obj.to(device)
 
 
@@ -327,7 +327,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     # --- Properties ---
 
     @property
-    def model(self) -> "nn.Module":
+    def model(self) -> nn.Module:
         """
         Returns the INR model.
         """
@@ -527,6 +527,11 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         loss_fn: Callable,
         apply_constraints: bool,
     ):
+        if self.optimizer is None:
+            raise RuntimeError("Optimizer not set. Call set_optimizer() first.")
+        if self.scheduler is None:
+            raise RuntimeError("Scheduler not set. Call set_scheduler() first.")
+
         self.model.train()
         optimizer = self.optimizer
         scheduler = self.scheduler
@@ -570,8 +575,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             coords_1d = torch.linspace(-1, 1, N)
             x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
             inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-
-            model = self.model.module if hasattr(self.model, "module") else self.model
+            model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
             inference_batch_size = 5 * N * N
             total_samples = N**3
@@ -624,7 +628,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 outputs_dev = outputs.to(self.device)  # (local_B, C)
                 if local_B < max_size:
                     pad = torch.zeros(
-                        (max_size - local_B, C),
+                        (max_size - local_B, C),  # type: ignore
                         device=self.device,
                         dtype=outputs_dev.dtype,
                     )
@@ -633,7 +637,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                     outputs_padded = outputs_dev
 
                 gathered_outputs = [
-                    torch.empty((max_size, C), device=self.device, dtype=outputs_dev.dtype)
+                    torch.empty((max_size, C), device=self.device, dtype=outputs_dev.dtype)  # type: ignore
                     for _ in range(self.world_size)
                 ]
                 dist.all_gather(gathered_outputs, outputs_padded.contiguous())
@@ -651,10 +655,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
             self._obj = pred_full.detach().cpu()
 
-    def get_tv_loss(
+    def get_tv_loss(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         coords: torch.Tensor,
-    ):
+    ) -> torch.Tensor:
         tv_loss = torch.tensor(0.0, device=coords.device)
 
         num_tv_samples = min(10000, coords.shape[0])
@@ -679,7 +683,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         tv_loss += self.constraints.tv_vol * grad_norm.mean()
         return tv_loss
 
-    def to(self, device: str):
+    def to(self, device: str):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
         self.device = device
         # self._obj = self._obj.to(self.device)
         self.reconnect_optimizer_to_parameters()
