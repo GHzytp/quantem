@@ -13,11 +13,6 @@ class DDPMixin:
     -
     """
 
-    def __init__(
-        self,
-    ):
-        self.setup_distributed()
-
     def setup_distributed(self, device: str | torch.device | None = None):
         """
         Initializes parameters depending if multiple-GPU training, single-GPU training, or CPU training.

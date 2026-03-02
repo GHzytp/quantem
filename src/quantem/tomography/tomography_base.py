@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 from numpy.typing import NDArray
 
 from quantem.core.io.serialize import AutoSerialize
@@ -9,8 +8,8 @@ from quantem.tomography.dataset_models import DatasetModelType, TomographyDatase
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
     DefaultConstraintsTomography,
-    ObjectBase,
-    ObjectPixelated,
+    ObjectConstraints,
+    ObjectINR,
 )
 
 
@@ -26,14 +25,14 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
     def __init__(
         self,
         dset: DatasetModelType,
-        obj_model: ObjectBase,
+        obj_model: ObjectConstraints,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
         _token: object | None = None,
     ):
-        # if _token is not self._token: # TODO: Idk why this isn't working.
-        #     raise RuntimeError("Use Dataset.from_* to instantiate this class.")
+        if _token is not self._token:
+            raise RuntimeError("Use .from_* to instantiate this class.")
 
         super().__init__()
         self.obj_model = obj_model
@@ -48,12 +47,9 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._consistency_losses: list[float] = []
         self._val_losses: list[float] = []
         # DDP Initialization
-        # print("Checking if obj_model is a ObjectPixelated: ", not isinstance(obj_model, ObjectPixelated))
-        if not isinstance(obj_model, ObjectPixelated):
+        if isinstance(obj_model, ObjectINR):
             print("Setting up DDP for obj_model")
             self.setup_distributed(device=device)
-            # self._obj_model._model = self.build_model(obj_model) # Assuming when object is initialized it's already wrapped in DDP?
-            # print("After DDP Setup", self._obj_model)
 
         self.dset = dset
         self.dset.to(device)
@@ -72,17 +68,11 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._dset = new_dset
 
     @property
-    def obj_type(self) -> str:
-        return self.obj_model.obj_type
-
-    @property
-    def obj_model(self) -> ObjectBase:
+    def obj_model(self) -> ObjectConstraints:
         return self._obj_model
 
     @obj_model.setter
-    def obj_model(self, obj_model: ObjectBase):
-        # if not isinstance(obj_model, ObjectBase):
-        #     raise TypeError(f"obj_model should be a ObjectBase, got {type(obj_model)}")
+    def obj_model(self, obj_model: ObjectConstraints):
         self._obj_model = obj_model
 
     @property
@@ -91,10 +81,6 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
 
     @constraints.setter
     def constraints(self, constraints: DefaultConstraintsTomography):
-        if not isinstance(constraints, DefaultConstraintsTomography):
-            raise TypeError(
-                f"constraints should be a DefaultConstraintsTomography, got {type(constraints)}"
-            )
         self.obj_model.constraints = constraints
 
     @property
@@ -106,18 +92,6 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         if not isinstance(logger, LoggerTomography) and logger is not None:
             raise TypeError(f"logger should be a LoggerTomography, got {type(logger)}")
         self._logger = logger
-
-    @property
-    def device(self) -> str:
-        return torch.device(self._device)
-
-    @device.setter
-    def device(self, device: str):
-        print("Device trying to set: ", device)
-        # if not isinstance(device, str):
-        #     raise TypeError(f"device should be a str, got {type(device)}")
-        self._device = device
-        # self.to(device)
 
     @property
     def epoch_losses(self) -> NDArray:
