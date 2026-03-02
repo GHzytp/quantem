@@ -116,13 +116,11 @@ class GaussianPeaks(nn.Module):
         energy_axis,
         peak_width,
         elements_to_fit=None,
-        independent_shell_concentrations=False,
     ):
         super().__init__()
 
         current_dir = Path(__file__).parent
         data = load_xray_lines_database(current_dir / "x_ray_lines.csv")
-        self.independent_shell_concentrations = bool(independent_shell_concentrations)
 
         energy_axis_tensor = (
             energy_axis.float()
@@ -185,39 +183,32 @@ class GaussianPeaks(nn.Module):
             weights = np.asarray(self.element_data[elem]["weights"], dtype=np.float32)
             line_names = self.element_data[elem]["line_names"]
 
-            if self.independent_shell_concentrations:
-                shell_labels = [self._line_shell_label(line_name) for line_name in line_names]
-                normalized_weights = np.zeros_like(weights)
-                for shell_label in set(shell_labels):
-                    shell_indices = [
-                        i for i, label in enumerate(shell_labels) if label == shell_label
-                    ]
-                    shell_weights = np.clip(weights[shell_indices], a_min=0.0, a_max=None)
-                    shell_sum = float(np.sum(shell_weights))
-                    if shell_sum <= 0.0:
-                        shell_weights = np.ones(len(shell_indices), dtype=np.float32) / float(
-                            len(shell_indices)
-                        )
-                    else:
-                        shell_weights = shell_weights / shell_sum
-                    normalized_weights[shell_indices] = shell_weights
-                weights_to_use = normalized_weights
-            else:
-                shell_labels = [None] * len(line_names)
-                weights_to_use = weights
+            shell_labels = [self._line_shell_label(line_name) for line_name in line_names]
+            normalized_weights = np.zeros_like(weights)
+            for shell_label in set(shell_labels):
+                shell_indices = [i for i, label in enumerate(shell_labels) if label == shell_label]
+                shell_weights = np.clip(weights[shell_indices], a_min=0.0, a_max=None)
+                shell_sum = float(np.sum(shell_weights))
+                if shell_sum <= 0.0:
+                    shell_weights = np.ones(len(shell_indices), dtype=np.float32) / float(
+                        len(shell_indices)
+                    )
+                else:
+                    shell_weights = shell_weights / shell_sum
+                normalized_weights[shell_indices] = shell_weights
+            weights_to_use = normalized_weights
 
             all_peak_energies.extend(energies)
             all_peak_weights.extend(float(weight) for weight in weights_to_use)
             all_peak_element_indices.extend([elem_idx] * len(energies))
-            if self.independent_shell_concentrations:
-                for shell_label in shell_labels:
-                    key = (elem_idx, shell_label)
-                    if key not in shell_group_lookup:
-                        shell_group_lookup[key] = len(shell_group_names)
-                        shell_group_names.append(f"{elem} {shell_label}")
-                        shell_group_element_indices.append(elem_idx)
-                        shell_group_shell_labels.append(shell_label)
-                    all_peak_shell_group_indices.append(shell_group_lookup[key])
+            for shell_label in shell_labels:
+                key = (elem_idx, shell_label)
+                if key not in shell_group_lookup:
+                    shell_group_lookup[key] = len(shell_group_names)
+                    shell_group_names.append(f"{elem} {shell_label}")
+                    shell_group_element_indices.append(elem_idx)
+                    shell_group_shell_labels.append(shell_label)
+                all_peak_shell_group_indices.append(shell_group_lookup[key])
 
         # Store as tensors for fast computation
         self.register_buffer(
@@ -244,28 +235,24 @@ class GaussianPeaks(nn.Module):
                 device=self.energy_axis.device,
             ),
         )
-        if self.independent_shell_concentrations:
-            self.register_buffer(
-                "peak_shell_group_indices",
-                torch.tensor(
-                    all_peak_shell_group_indices,
-                    dtype=torch.long,
-                    device=self.energy_axis.device,
-                ),
-            )
-            self.register_buffer(
-                "shell_group_element_indices",
-                torch.tensor(
-                    shell_group_element_indices,
-                    dtype=torch.long,
-                    device=self.energy_axis.device,
-                ),
-            )
-            self.shell_group_names = shell_group_names
-            self.shell_group_shell_labels = shell_group_shell_labels
-        else:
-            self.shell_group_names = []
-            self.shell_group_shell_labels = []
+        self.register_buffer(
+            "peak_shell_group_indices",
+            torch.tensor(
+                all_peak_shell_group_indices,
+                dtype=torch.long,
+                device=self.energy_axis.device,
+            ),
+        )
+        self.register_buffer(
+            "shell_group_element_indices",
+            torch.tensor(
+                shell_group_element_indices,
+                dtype=torch.long,
+                device=self.energy_axis.device,
+            ),
+        )
+        self.shell_group_names = shell_group_names
+        self.shell_group_shell_labels = shell_group_shell_labels
 
         self.n_peaks = len(all_peak_energies)
         init_fwhm = torch.tensor(
@@ -282,26 +269,29 @@ class GaussianPeaks(nn.Module):
             )
         )
 
-        if self.independent_shell_concentrations:
-            n_shell_groups = len(shell_group_names)
-            print(
-                f"Fitting {n_elements} elements with {self.n_peaks} total peaks "
-                f"across {n_shell_groups} edge groups"
-            )
-        else:
-            print(f"Fitting {n_elements} elements with {self.n_peaks} total peaks")
+        n_shell_groups = len(shell_group_names)
+        print(
+            f"Fitting {n_elements} elements with {self.n_peaks} total peaks "
+            f"across {n_shell_groups} edge groups"
+        )
 
         # Learnable parameters
-        concentration_size = (
-            len(shell_group_names) if self.independent_shell_concentrations else n_elements
-        )
-        self.concentrations = nn.Parameter(
-            torch.ones(
+        concentration_size = len(shell_group_names)
+        if concentration_size > 0:
+            init_concentration = torch.ones(
                 concentration_size,
                 dtype=self.energy_axis.dtype,
                 device=self.energy_axis.device,
             )
-        )
+            concentration_init_logits = inverse_softplus(init_concentration)
+        else:
+            concentration_init_logits = torch.ones(
+                concentration_size,
+                dtype=self.energy_axis.dtype,
+                device=self.energy_axis.device,
+            )
+
+        self.concentrations = nn.Parameter(concentration_init_logits)
 
     @staticmethod
     def _line_shell_label(line_name: str) -> str:
@@ -330,11 +320,7 @@ class GaussianPeaks(nn.Module):
         )
         all_peaks = all_peaks * self.energy_step / (sqrt_2pi * sigma)
 
-        concentration_lookup = (
-            self.peak_shell_group_indices
-            if self.independent_shell_concentrations
-            else self.peak_element_indices
-        )
+        concentration_lookup = self.peak_shell_group_indices
         peak_concentrations = nn.functional.softplus(self.concentrations[concentration_lookup])
         weighted_peaks = all_peaks * (peak_concentrations * self.peak_weights).unsqueeze(1)
 
@@ -346,7 +332,7 @@ class GaussianPeaks(nn.Module):
 class PolynomialBackground(nn.Module):
     """Polynomial background model"""
 
-    def __init__(self, energy_axis, degree=3):
+    def __init__(self, energy_axis, degree=3, positive_output=False):
         super().__init__()
         energy_axis_tensor = (
             energy_axis.float()
@@ -355,6 +341,7 @@ class PolynomialBackground(nn.Module):
         )
         self.register_buffer("energy_axis", energy_axis_tensor)
         self.degree = degree
+        self.positive_output = bool(positive_output)
 
         # Normalize energy axis to [0, 1] for numerical stability
         energy_norm = (self.energy_axis - self.energy_axis.min()) / (
@@ -375,6 +362,8 @@ class PolynomialBackground(nn.Module):
         background = torch.zeros_like(self.energy_axis)
         for i, coeff in enumerate(self.coeffs):
             background += coeff * (self.energy_norm**i)
+        if self.positive_output:
+            background = nn.functional.softplus(background)
         return background
 
 

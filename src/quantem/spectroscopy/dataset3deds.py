@@ -1106,7 +1106,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         default_lr_adam,
         default_lr_lbfgs,
         verbose=False,
-        independent_shell_concentrations=False,
     ):
         target = spectrum_raw
         spectrum_offset = torch.tensor(0.0, dtype=spectrum_raw.dtype, device=spectrum_raw.device)
@@ -1116,20 +1115,19 @@ class Dataset3deds(Dataset3dspectroscopy):
             spectrum_scale = torch.clamp(spectrum_raw.max() - spectrum_offset, min=1e-8)
             target = (spectrum_raw - spectrum_offset) / spectrum_scale
 
-        background = PolynomialBackground(energy_axis, degree=polynomial_background_degree)
+        background = PolynomialBackground(
+            energy_axis,
+            degree=polynomial_background_degree,
+        )
         peaks = GaussianPeaks(
             energy_axis,
             peak_width=peak_width,
             elements_to_fit=elements_to_fit,
-            independent_shell_concentrations=independent_shell_concentrations,
         )
         model = EDSModel(peaks, background, energy_axis=energy_axis)
         model = model.to(device=energy_axis.device, dtype=energy_axis.dtype)
         if len(model.peak_model.element_names) == 0:
             raise ValueError("No elements found in the selected energy range/elements_to_fit.")
-
-        with torch.no_grad():
-            model.peak_model.concentrations.fill_(1.0)
 
         optimizer_name = optimizer.lower()
         if optimizer_name == "adam":
@@ -1199,23 +1197,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         polynomial_background_degree=3,
         optimizer="lbfgs",
         device=None,
-        independent_shell_concentrations=True,
     ):
-        if not independent_shell_concentrations:
-            return self.fit_spectrum_pytorch(
-                energy_range=energy_range,
-                elements_to_fit=elements_to_fit,
-                peak_width=peak_width,
-                num_iters=num_iters,
-                lr=lr,
-                polynomial_background_degree=polynomial_background_degree,
-                optimizer=optimizer,
-                loss="mse",
-                fit_mean_only=True,
-                show_plot=True,
-                device=device,
-            )
-
         optimizer_name = str(optimizer).lower()
         if optimizer_name not in {"adam", "lbfgs"}:
             raise ValueError("optimizer must be 'lbfgs' or 'adam'")
@@ -1254,7 +1236,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             default_lr_adam=1e-3,
             default_lr_lbfgs=1.0,
             verbose=True,
-            independent_shell_concentrations=True,
         )
 
         model = mean_fit["model"]
@@ -1369,6 +1350,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         show_plot=True,
         lr_global=None,
         lr_local=None,
+        lr_background_local=None,
         device=None,
         constrain_background=True,
     ):
@@ -1394,6 +1376,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             is the learning rate used for that fit.
         lr_local : float, optional
             Learning rate for the position-by-position stage (3D mode).
+        lr_background_local : float, optional
+            Deprecated. Local background now uses the same learning rate as
+            other local parameters.
         polynomial_background_degree : int, optional
             Degree of per-pixel polynomial background.
         optimizer : str | None, optional
@@ -1430,7 +1415,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         constrain_background : bool, optional
             If True (3D mode), regularize local backgrounds using the global fit as
             a prior and soft physical constraints with built-in weights.
-
         Returns
         -------
         dict
@@ -1542,9 +1526,14 @@ class Dataset3deds(Dataset3dspectroscopy):
             spectrum_scale = mean_fit["spectrum_scale"]
             with torch.no_grad():
                 final_pred = mean_fit["final_pred_raw"].cpu().numpy()
-                concs = (
+                shell_concs = (
                     nn.functional.softplus(model.peak_model.concentrations).detach().cpu().numpy()
                 )
+                shell_element_indices = (
+                    model.peak_model.shell_group_element_indices.detach().cpu().numpy()
+                )
+                concs = np.zeros(len(model.peak_model.element_names), dtype=np.float32)
+                np.add.at(concs, shell_element_indices, shell_concs)
                 final_fwhm = (
                     torch.nn.functional.softplus(model.peak_model.peak_width_by_peak)
                     .detach()
@@ -1604,6 +1593,9 @@ class Dataset3deds(Dataset3dspectroscopy):
                 "background_spectrum": background_fit,
                 "concentrations": concs,
                 "element_names": model.peak_model.element_names,
+                "edge_concentrations": shell_concs,
+                "edge_names": list(model.peak_model.shell_group_names),
+                "edge_element_indices": shell_element_indices,
                 "peak_widths": final_fwhm,
                 "energy_axis": energy_axis.detach().cpu().numpy(),
                 "fit_range": energy_range,
@@ -1644,13 +1636,21 @@ class Dataset3deds(Dataset3dspectroscopy):
         global_offset = global_fit["spectrum_offset"].detach()
         global_fitted_spectrum = global_fit["final_pred_raw"].detach().cpu().numpy()
 
+        n_elements = len(global_model.peak_model.element_names)
         with torch.no_grad():
             # If the global stage fit a normalized target, convert amplitude-like
             # parameters back to raw-count scale for local initialization.
-            global_conc = (
+            global_conc_shell = (
                 nn.functional.softplus(global_model.peak_model.concentrations).detach()
                 * global_scale
             )
+            shell_element_indices = global_model.peak_model.shell_group_element_indices
+            global_conc = torch.zeros(
+                n_elements,
+                dtype=global_conc_shell.dtype,
+                device=global_conc_shell.device,
+            )
+            global_conc.index_add_(0, shell_element_indices, global_conc_shell)
             global_bg_coeffs = global_model.background_model.coeffs.detach() * global_scale
             if global_bg_coeffs.numel() > 0:
                 global_bg_coeffs = global_bg_coeffs.clone()
@@ -1658,7 +1658,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             global_peak_width_params = global_model.peak_model.peak_width_by_peak.detach().clone()
 
         # Stage 2: vectorized per-pixel fit with shared peak shapes.
-        n_elements = len(global_model.peak_model.element_names)
         peak_energies = global_model.peak_model.peak_energies
         peak_weights = global_model.peak_model.peak_weights
         peak_element_indices = global_model.peak_model.peak_element_indices
@@ -1712,8 +1711,18 @@ class Dataset3deds(Dataset3dspectroscopy):
             else (0.05 if effective_optimizer_local == "adam" else 1.0)
         )
 
+        if lr_background_local is not None and verbose:
+            print(
+                "lr_background_local is deprecated and ignored; using lr_local for "
+                "background coefficients."
+            )
+
         if effective_optimizer_local == "adam":
-            local_opt = torch.optim.Adam(trainable_params, lr=local_lr)
+            adam_param_groups = [{"params": [conc_logits], "lr": local_lr}]
+            adam_param_groups.append({"params": [bg_coeffs], "lr": local_lr})
+            if not freeze_peak_width:
+                adam_param_groups.append({"params": [peak_width_params], "lr": local_lr})
+            local_opt = torch.optim.Adam(adam_param_groups)
         else:
             local_opt = torch.optim.LBFGS(
                 trainable_params,
