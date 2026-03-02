@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, Literal
 
 import numpy as np
 import torch
@@ -15,6 +15,8 @@ from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
+
+object_type = Literal["potential"]
 
 
 @dataclass(slots=True)
@@ -48,7 +50,7 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
 
     def __init__(
         self,
-        shape: tuple[int, int, int],
+        shape: tuple[int, int, int],  # pyright: ignore[reportRedeclaration]
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         _token: object | None = None,
@@ -74,8 +76,8 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
             return self._shape
 
         @shape.setter
-        def shape(self, shape: tuple[int, int, int]):
-            self._shape = shape
+        def shape(self, new_shape: tuple[int, int, int]):
+            self._shape = new_shape
 
         @property
         def obj(self) -> torch.Tensor:
@@ -136,18 +138,18 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.constraints = self.DEFAULT_CONSTRAINTS.copy()
+        self.constraints: DefaultConstraintsTomography = self.DEFAULT_CONSTRAINTS.copy()
 
     def apply_hard_constraints(
         self,
-        obj: torch.Tensor,
+        pred: torch.Tensor,
     ) -> torch.Tensor:
         """
         Apply hard constraints to the object model.
 
         Only hard constraint here is the positivity and shrinkage. TODO: Add the other hard constraints.
         """
-        obj2 = obj.clone()
+        obj2 = pred.clone()
         if self.constraints.positivity:
             obj2 = torch.clamp(obj2, min=0.0, max=None)
         if self.constraints.shrinkage:
@@ -297,7 +299,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
-        self.device = device
 
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
@@ -458,11 +459,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         """forward pass for the INR model"""
         all_densities = self.model(coords)
-        if isinstance(all_densities, tuple):
-            all_densities = all_densities[0]
-            ot_reg = all_densities[1]
-        else:
-            ot_reg = None
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
@@ -477,10 +473,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         all_densities = self.apply_hard_constraints(all_densities)
 
-        if ot_reg is not None:
-            return all_densities, ot_reg
-        else:
-            return all_densities
+        return all_densities
 
     # Pretrain Loop
 

@@ -7,7 +7,6 @@ import torch.distributed as dist
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
-from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import (
@@ -21,7 +20,7 @@ from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_opt import TomographyOpt
 
 
-class Tomography(TomographyOpt, TomographyBase, DDPMixin):
+class Tomography(TomographyOpt, TomographyBase):
     """
     Class for handling all ML tomography reconstruction methods.
     Automatic handling between AD and INR-based tomography.
