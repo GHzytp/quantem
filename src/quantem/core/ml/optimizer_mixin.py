@@ -154,7 +154,7 @@ class OptimizerMixin:
                 mode=params.get("mode", "triangular2"),
                 cycle_momentum=params.get("momentum", False),
             )
-        elif sched_type.startswith(("plat", "reducelronplat")):
+        elif sched_type.startswith(("plateau", "plat", "reducelronplat")):
             self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
                 mode="min",

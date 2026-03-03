@@ -345,6 +345,16 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def obj(self) -> torch.Tensor:
         return self._obj
 
+    @property
+    def obj_view(self) -> np.ndarray:
+        """
+        Returns the object as a view of the x, y, z axes.
+
+        Matches the axes of conventionally reconstructed objects, this is the object that will be saved.
+        """
+        self.create_volume()
+        return self._obj.cpu().numpy()[0].transpose(0, 2, 1)
+
     def apply_soft_constraints(
         self,
         coords: torch.Tensor,

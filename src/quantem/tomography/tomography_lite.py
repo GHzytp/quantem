@@ -111,7 +111,6 @@ class TomographyLiteINR(Tomography):
                 }
                 scheduler_params["pose"] = {
                     "type": scheduler_type,
-                    "factor": scheduler_factor,
                 }
 
         else:
