@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Sequence, overload
+from typing import Any, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -132,7 +132,9 @@ class Vector(AutoSerialize):
         obj = cls.__new__(cls)
         obj._state = state
         obj._selection_shape = selection_shape
-        obj._selection_indices = None if selection_indices is None else selection_indices.astype(np.int64, copy=False)
+        obj._selection_indices = (
+            None if selection_indices is None else selection_indices.astype(np.int64, copy=False)
+        )
         obj._selected_fields = selected_fields
         return obj
 
@@ -215,10 +217,7 @@ class Vector(AutoSerialize):
     @property
     def units(self) -> list[str]:
         """Return units for the selected fields."""
-        lookup = {
-            field: unit
-            for field, unit in zip(self._state["fields"], self._state["units"])
-        }
+        lookup = {field: unit for field, unit in zip(self._state["fields"], self._state["units"])}
         return [lookup[field] for field in self.fields]
 
     @property
@@ -294,7 +293,9 @@ class Vector(AutoSerialize):
             metadata=copy.deepcopy(self.metadata),
         )
         target_cells = copied._selected_cell_indices()
-        source_arrays = [self._selected_cell_matrix(index).copy() for index in self._selected_cell_indices()]
+        source_arrays = [
+            self._selected_cell_matrix(index).copy() for index in self._selected_cell_indices()
+        ]
         copied._replace_cells(target_cells, source_arrays)
         return copied
 
@@ -434,7 +435,11 @@ class Vector(AutoSerialize):
             return
 
         target = self.select_fields(*new_fields)
-        if len(new_fields) > 1 and isinstance(values, (list, tuple)) and len(values) == len(new_fields):
+        if (
+            len(new_fields) > 1
+            and isinstance(values, (list, tuple))
+            and len(values) == len(new_fields)
+        ):
             for field, value in zip(new_fields, values):
                 target.select_fields(field)[...] = value
         else:
@@ -462,12 +467,11 @@ class Vector(AutoSerialize):
         self._state["data"] = self._state["data"][:, keep]
 
         if self._selected_fields is not None:
-            self._selected_fields = tuple(field for field in self._selected_fields if field in self._state["fields"])
+            self._selected_fields = tuple(
+                field for field in self._selected_fields if field in self._state["fields"]
+            )
             if len(self._selected_fields) == len(self._state["fields"]):
                 self._selected_fields = None
-
-    @overload
-    def __getitem__(self, idx: Any) -> "Vector": ...
 
     def __getitem__(self, idx: Any) -> "Vector":
         """Return a fixed-grid selection as another Vector view."""
@@ -525,7 +529,9 @@ class Vector(AutoSerialize):
             if other.row_counts() != row_counts:
                 raise ValueError("Vector ufunc inputs must have matching per-cell row counts.")
 
-        flat_inputs = [_normalize_ufunc_input(value, total_rows, template.num_fields) for value in inputs]
+        flat_inputs = [
+            _normalize_ufunc_input(value, total_rows, template.num_fields) for value in inputs
+        ]
         result = ufunc(*flat_inputs, **kwargs)
         return _wrap_ufunc_result(template, result, row_counts)
 
@@ -664,7 +670,9 @@ class Vector(AutoSerialize):
             return cell[:, int(cols[0]) : int(cols[-1]) + 1]
         return cell[:, cols].copy()
 
-    def _replace_cells(self, targets: NDArray[np.int64], arrays: Sequence[NDArray[np.generic]]) -> None:
+    def _replace_cells(
+        self, targets: NDArray[np.int64], arrays: Sequence[NDArray[np.generic]]
+    ) -> None:
         """Replace complete cells in the compact row buffer.
 
         Whole-cell replacement is implemented by appending the new payload rows to
@@ -759,9 +767,7 @@ class Vector(AutoSerialize):
             if len(targets) != len(source_cells):
                 raise ValueError(f"Expected {len(targets)} cells, got {len(source_cells)}")
             if value.num_fields != self.num_fields:
-                raise ValueError(
-                    f"Expected {self.num_fields} fields, got {value.num_fields}"
-                )
+                raise ValueError(f"Expected {self.num_fields} fields, got {value.num_fields}")
             arrays = [value._selected_cell_matrix(index).copy() for index in source_cells]
             self._replace_cells(targets, arrays)
             return
@@ -787,9 +793,7 @@ class Vector(AutoSerialize):
             if len(targets) != len(source_cells):
                 raise ValueError(f"Expected {len(targets)} cells, got {len(source_cells)}")
             if value.num_fields != self.num_fields:
-                raise ValueError(
-                    f"Expected {self.num_fields} fields, got {value.num_fields}"
-                )
+                raise ValueError(f"Expected {self.num_fields} fields, got {value.num_fields}")
             source_counts = [value._cell_row_count(index) for index in source_cells]
             if row_counts != source_counts:
                 raise ValueError("Per-cell row counts must match for field-selected assignment.")
@@ -903,9 +907,10 @@ def _normalize_select_field_args(*field_names: str | Sequence[str]) -> tuple[str
     if len(field_names) == 1 and not isinstance(field_names[0], str):
         return _normalize_field_names(field_names[0])
     if not all(isinstance(name, str) for name in field_names):
-        raise TypeError("select_fields(...) expects field names as strings or one sequence of strings.")
-    return _normalize_field_names(field_names)
-
+        raise TypeError(
+            "select_fields(...) expects field names as strings or one sequence of strings."
+        )
+    return _normalize_field_names(cast(Sequence[str], field_names))
 
 
 def _normalize_units(units: str | Sequence[str] | None, count: int) -> list[str]:
@@ -922,7 +927,6 @@ def _normalize_units(units: str | Sequence[str] | None, count: int) -> list[str]
     return normalized
 
 
-
 def _looks_like_field_selector(idx: Any) -> bool:
     """Return True for indices that look like field selection by mistake."""
     if isinstance(idx, str):
@@ -932,7 +936,6 @@ def _looks_like_field_selector(idx: Any) -> bool:
     if isinstance(idx, (list, tuple)) and idx and all(isinstance(item, str) for item in idx):
         return True
     return False
-
 
 
 def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[np.generic]:
@@ -960,7 +963,6 @@ def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[np.generic]:
     return array
 
 
-
 def _normalize_nested_data(data: list[Any]) -> tuple[tuple[int, ...], list[NDArray[np.generic]]]:
     """Normalize nested input data into ``(shape, flat_cell_arrays)``."""
     if not isinstance(data, list):
@@ -968,7 +970,6 @@ def _normalize_nested_data(data: list[Any]) -> tuple[tuple[int, ...], list[NDArr
     if not data:
         return (0,), []
     return _flatten_fixed_grid(data)
-
 
 
 def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[np.generic]]]:
@@ -996,13 +997,11 @@ def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[np.gen
     return (len(node),) + child_shape, cells
 
 
-
 def _looks_like_cell_rows(node: Sequence[Any]) -> bool:
     """Return True when a sequence should be interpreted as cell rows, not grid nesting."""
     if len(node) == 0:
         return True
     return all(_is_row_like(item) for item in node)
-
 
 
 def _is_row_like(item: Any) -> bool:
@@ -1012,7 +1011,6 @@ def _is_row_like(item: Any) -> bool:
     if not isinstance(item, (list, tuple)):
         return False
     return all(np.isscalar(value) for value in item)
-
 
 
 def _coerce_inferred_cell_array(value: Any) -> NDArray[np.generic]:
@@ -1027,7 +1025,6 @@ def _coerce_inferred_cell_array(value: Any) -> NDArray[np.generic]:
     if array.ndim != 2:
         raise ValueError("Cell data must be 1D or 2D.")
     return array
-
 
 
 def _select_linear_indices(
@@ -1066,11 +1063,13 @@ def _select_linear_indices(
         value = int(current_grid[scalar_key])
         return (), np.array([value], dtype=np.int64)
 
-    mesh_inputs = [positions if not is_scalar else positions[:1] for positions, is_scalar in zip(axis_positions, scalar_axes)]
+    mesh_inputs = [
+        positions if not is_scalar else positions[:1]
+        for positions, is_scalar in zip(axis_positions, scalar_axes)
+    ]
     grids = np.meshgrid(*mesh_inputs, indexing="ij")
     selected = np.asarray(current_grid[tuple(grids)], dtype=np.int64).reshape(-1)
     return tuple(out_shape), selected
-
 
 
 def _normalize_index_tuple(idx: Any, ndim: int) -> tuple[Any, ...]:
@@ -1092,7 +1091,6 @@ def _normalize_index_tuple(idx: Any, ndim: int) -> tuple[Any, ...]:
     if len(idx) < ndim:
         idx = idx + (slice(None),) * (ndim - len(idx))
     return idx
-
 
 
 def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], bool]:
@@ -1121,7 +1119,9 @@ def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], 
         if array.ndim != 1:
             raise IndexError("Full-grid boolean masks are not supported.")
         if array.shape[0] != size:
-            raise IndexError(f"Boolean mask length {array.shape[0]} does not match axis length {size}")
+            raise IndexError(
+                f"Boolean mask length {array.shape[0]} does not match axis length {size}"
+            )
         return np.flatnonzero(array).astype(np.int64, copy=False), False
 
     if array.ndim != 1:
@@ -1136,7 +1136,6 @@ def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], 
     if np.any((positions < 0) | (positions >= size)):
         raise IndexError("Vector index out of range")
     return positions, False
-
 
 
 def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDArray[np.generic]:
@@ -1207,7 +1206,6 @@ def _vector_from_flat_result(
 
     result._replace_cells(result._selected_cell_indices(), cells)
     return result
-
 
 
 def _is_contiguous(indices: NDArray[np.int64]) -> bool:
