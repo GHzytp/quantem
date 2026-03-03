@@ -10,7 +10,24 @@ from torch.utils.data import Dataset
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.tomography.utils import tv_loss_1d
+
+
+# --- Constraints ---
+@dataclass(slots=False)
+class DefaultTomographyDatasetConstraints(Constraints):
+    """
+    Data class for constraints that can be applied to the parameters of a tomography dataset.
+    """
+
+    # Soft Constraints
+    tv_zs: float = 0.0
+    tv_shifts: float = 0.0
+
+    soft_constraint_keys = ["tv_zs", "tv_shifts"]
+    hard_constraint_keys = []
 
 
 @dataclass
@@ -169,7 +186,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     @property
     def reference_tilt_idx(self) -> int:
-        return self._reference_tilt_angle_idx
+        return int(self._reference_tilt_angle_idx)
 
     @reference_tilt_idx.setter
     def reference_tilt_idx(self, reference_tilt_idx: int):
@@ -227,7 +244,35 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         raise NotImplementedError("This method should be implemented in subclasses.")
 
 
-class TomographyPixDataset(TomographyDatasetBase):
+class TomographyDatasetConstraints(BaseConstraints, TomographyDatasetBase):
+    DEFAULT_CONSTRAINTS = DefaultTomographyDatasetConstraints()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.constraints: DefaultTomographyDatasetConstraints = self.DEFAULT_CONSTRAINTS.copy()
+
+    def apply_soft_constraints(self) -> torch.Tensor:
+        soft_loss = torch.tensor(0.0, device=self.z1_params.device)
+        if self.constraints.tv_zs > 0:
+            tv_loss_zs = tv_loss_1d(self.z1_params)
+            tv_loss_zs += tv_loss_1d(self.z3_params)
+            tv_loss_zs = self.constraints.tv_zs * tv_loss_zs
+            soft_loss += tv_loss_zs
+
+        if self.constraints.tv_shifts > 0:
+            # Shift params is of shape (N, 2)
+            tv_loss_shifts = tv_loss_1d(self.shifts_params[:, 0])
+            tv_loss_shifts += tv_loss_1d(self.shifts_params[:, 1])
+            tv_loss_shifts = self.constraints.tv_shifts * tv_loss_shifts
+            soft_loss += tv_loss_shifts
+
+        return soft_loss
+
+    def apply_hard_constraints(self):
+        pass
+
+
+class TomographyPixDataset(TomographyDatasetConstraints):
     """
     Dataset class for pixel-based tomography, i.e AD, SIRT, WBP, etc...
 
@@ -283,7 +328,7 @@ class TomographyPixDataset(TomographyDatasetBase):
         self.device = device
 
 
-class TomographyINRDataset(TomographyDatasetBase, Dataset):
+class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
     """
     Dataset class for INR-based tomography.
 
@@ -446,7 +491,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
     def __getitem__(
         self,
         idx: int,
-    ) -> DatasetValue:
+    ) -> dict:
         """
         Gets the item for INR i.e, the project index, pixel value at (i, j), and the tilt angle.
         """

@@ -19,7 +19,7 @@ from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 object_type = Literal["potential"]
 
 
-@dataclass(slots=True)
+@dataclass(slots=False)
 class DefaultConstraintsTomography(Constraints):
     """
     Data class for all constraints that can be applied to the object model.
@@ -157,18 +157,6 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
         # TODO: Need to implement the other hard constraints: Fourier Filter and Circular Mask.
         return obj2
-
-    # def apply_soft_constraints(
-    #     self,
-    #     obj: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     """
-    # TODO: Already in BaseConstraints class.
-    #     Apply soft constraints to the object model.
-
-    #     Only soft constraint here is the TV loss.
-    #     """
-    #     return NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
     def get_tv_loss(self, **kwargs) -> torch.Tensor:

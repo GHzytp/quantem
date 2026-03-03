@@ -12,7 +12,7 @@ from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_
 from quantem.core.utils.tomography_utils import (
     torch_phase_cross_correlation,
 )
-from quantem.tomography.dataset_models import DatasetModelType
+from quantem.tomography.dataset_models import DatasetModelType, DefaultTomographyDatasetConstraints
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
     DefaultConstraintsTomography,
@@ -57,6 +57,7 @@ class Tomography(TomographyOpt, TomographyBase):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         constraints: dict = {},  # TODO: What to pass into the constraints?
+        dataset_constraints: dict = {},
         num_samples_per_ray: int | list[tuple[int, int]] = 1,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
@@ -104,6 +105,8 @@ class Tomography(TomographyOpt, TomographyBase):
         if constraints is not None:
             self.obj_model.constraints = cast(DefaultConstraintsTomography, constraints)
 
+        if dataset_constraints is not None:
+            self.dset.constraints = cast(DefaultTomographyDatasetConstraints, dataset_constraints)
         # Setting up DDP
         if not hasattr(self, "dataloader") or reset_dset is not None:
             if reset_dset is not None:
@@ -112,6 +115,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 self.dset = reset_dset
                 self.dset.to(self.device)
+
                 if optimizer_params is not None:
                     self.optimizer_params = optimizer_params
                     self.set_optimizers()
@@ -182,6 +186,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 batch_consistency_loss = loss_func(pred, target)
 
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred)
+                soft_constraints_loss += self.dset.apply_soft_constraints()
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 

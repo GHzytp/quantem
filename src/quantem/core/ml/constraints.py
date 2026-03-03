@@ -8,7 +8,7 @@ import torch
 from numpy.typing import NDArray
 
 
-@dataclass(slots=True)
+@dataclass(slots=False)
 class Constraints(ABC):
     """
     Any model that inherits from BaseConstraints will contain a Constraints instance that contains soft and hard constraints.

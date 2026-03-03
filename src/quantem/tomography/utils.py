@@ -67,3 +67,31 @@ def differentiable_rotx_vectorized(mags, theta, mode="bilinear"):
 
     rotated_mags = torch.vmap(transform_slice)(mags)
     return rotated_mags.permute(1, 2, 3, 0)
+
+
+def tv_loss_1d(x: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    """
+    1D Total Variation Loss.
+
+    Encourages piecewise smoothness by penalizing differences between
+    adjacent elements.
+
+    Args:
+        x:         Input tensor of shape (N, C, L) or (N, L) or (L,)
+        reduction: 'mean' | 'sum' | 'none'
+
+    Returns:
+        Scalar loss (or per-sample tensor if reduction='none')
+    """
+    # Difference between adjacent elements along the last dimension
+    diff = x[..., 1:] - x[..., :-1]  # shape: (..., L-1)
+    tv = diff.abs()  # L1 variant  ← most common
+
+    if reduction == "mean":
+        return tv.mean()
+    elif reduction == "sum":
+        return tv.sum()
+    elif reduction == "none":
+        return tv
+    else:
+        raise ValueError(f"Unknown reduction: {reduction!r}")
