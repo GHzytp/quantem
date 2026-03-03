@@ -89,6 +89,8 @@ class Vector(AutoSerialize):
     ... )
     """
 
+    __array_priority__ = 1000
+
     def __init__(
         self,
         shape: tuple[int, ...],
@@ -494,6 +496,39 @@ class Vector(AutoSerialize):
             target = self[idx]
         target._assign(value)
 
+    def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any) -> Any:
+        """Apply supported NumPy ufuncs elementwise.
+
+        Supported operations are limited to elementwise ``__call__`` ufuncs. The
+        result preserves the current selection shape and fields.
+        """
+        if method != "__call__":
+            return NotImplemented
+
+        out = kwargs.get("out")
+        if out is not None:
+            return NotImplemented
+
+        vector_inputs = [value for value in inputs if isinstance(value, Vector)]
+        if not vector_inputs:
+            return NotImplemented
+
+        template = vector_inputs[0]
+        row_counts = template.row_counts()
+        total_rows = sum(row_counts)
+
+        for other in vector_inputs[1:]:
+            if other.shape != template.shape:
+                raise ValueError("Vector ufunc inputs must have matching fixed-grid shapes.")
+            if other.num_fields != template.num_fields:
+                raise ValueError("Vector ufunc inputs must have matching field counts.")
+            if other.row_counts() != row_counts:
+                raise ValueError("Vector ufunc inputs must have matching per-cell row counts.")
+
+        flat_inputs = [_normalize_ufunc_input(value, total_rows, template.num_fields) for value in inputs]
+        result = ufunc(*flat_inputs, **kwargs)
+        return _wrap_ufunc_result(template, result, row_counts)
+
     def __add__(self, other: Any) -> "Vector":
         return self._binary_op(other, np.add)
 
@@ -506,6 +541,15 @@ class Vector(AutoSerialize):
     def __truediv__(self, other: Any) -> "Vector":
         return self._binary_op(other, np.divide)
 
+    def __floordiv__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.floor_divide)
+
+    def __mod__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.mod)
+
+    def __pow__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.power)
+
     def __radd__(self, other: Any) -> "Vector":
         return self._binary_op(other, np.add, reverse=True)
 
@@ -517,6 +561,15 @@ class Vector(AutoSerialize):
 
     def __rtruediv__(self, other: Any) -> "Vector":
         return self._binary_op(other, np.divide, reverse=True)
+
+    def __rfloordiv__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.floor_divide, reverse=True)
+
+    def __rmod__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.mod, reverse=True)
+
+    def __rpow__(self, other: Any) -> "Vector":
+        return self._binary_op(other, np.power, reverse=True)
 
     def __iadd__(self, other: Any) -> "Vector":
         self._inplace_op(other, np.add)
@@ -533,6 +586,29 @@ class Vector(AutoSerialize):
     def __itruediv__(self, other: Any) -> "Vector":
         self._inplace_op(other, np.divide)
         return self
+
+    def __ifloordiv__(self, other: Any) -> "Vector":
+        self._inplace_op(other, np.floor_divide)
+        return self
+
+    def __imod__(self, other: Any) -> "Vector":
+        self._inplace_op(other, np.mod)
+        return self
+
+    def __ipow__(self, other: Any) -> "Vector":
+        self._inplace_op(other, np.power)
+        return self
+
+    def __neg__(self) -> "Vector":
+        return self._binary_op(-1, np.multiply)
+
+    def __pos__(self) -> "Vector":
+        return self.copy()
+
+    def __abs__(self) -> "Vector":
+        result = self.copy()
+        result._inplace_unary(np.abs)
+        return result
 
     @property
     def _full_num_fields(self) -> int:
@@ -745,6 +821,16 @@ class Vector(AutoSerialize):
         result = self.copy()
         result._inplace_op(other, op, reverse=reverse)
         return result
+
+    def _inplace_unary(self, op: Any) -> None:
+        """Apply a unary elementwise operation in-place to the selected fields."""
+        targets = self._selected_cell_indices()
+        field_indices = self._field_indices()
+        for target in targets:
+            cell = self._cell_matrix(int(target))
+            lhs = cell[:, field_indices]
+            if lhs.shape[0] > 0:
+                cell[:, field_indices] = op(lhs)
 
     def _inplace_op(self, other: Any, op: Any, reverse: bool = False) -> None:
         """Apply elementwise arithmetic in-place to the selected fields."""
@@ -1070,6 +1156,57 @@ def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDA
         raise ValueError(
             f"Cannot broadcast value with shape {array.shape} to ({total_rows}, {num_fields})"
         ) from exc
+
+
+def _normalize_ufunc_input(value: Any, total_rows: int, num_fields: int) -> Any:
+    """Normalize one ufunc input to flattened Vector-compatible form."""
+    if isinstance(value, Vector):
+        return value.flatten()
+    if np.isscalar(value):
+        return value
+    return _broadcast_field_values(value, total_rows, num_fields)
+
+
+def _wrap_ufunc_result(
+    template: Vector,
+    result: Any,
+    row_counts: list[int],
+) -> Any:
+    """Convert elementwise ufunc output back into Vector selections."""
+    if isinstance(result, tuple):
+        return tuple(_vector_from_flat_result(template, item, row_counts) for item in result)
+    return _vector_from_flat_result(template, result, row_counts)
+
+
+def _vector_from_flat_result(
+    template: Vector,
+    values: Any,
+    row_counts: list[int],
+) -> Vector:
+    """Build a Vector from flattened rowwise result data."""
+    total_rows = sum(row_counts)
+    flat_values = _broadcast_field_values(values, total_rows, template.num_fields)
+
+    result = Vector.from_shape(
+        shape=template.shape,
+        fields=template.fields,
+        units=template.units,
+        name=template.name,
+    )
+    result._state["metadata"] = copy.deepcopy(template.metadata)
+
+    if total_rows == 0:
+        result._state["data"] = np.empty((0, template.num_fields), dtype=flat_values.dtype)
+        return result
+
+    cursor = 0
+    cells: list[NDArray[np.generic]] = []
+    for rows in row_counts:
+        cells.append(flat_values[cursor : cursor + rows].copy())
+        cursor += rows
+
+    result._replace_cells(result._selected_cell_indices(), cells)
+    return result
 
 
 

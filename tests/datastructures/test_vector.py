@@ -149,6 +149,94 @@ class TestVector:
             np.array([[101.0], [202.0], [303.0], [404.0], [505.0], [606.0]]),
         )
 
+    def test_power_operations(self):
+        v = make_line_vector()
+
+        squared = v.select_fields("intensity") ** 2
+        np.testing.assert_array_equal(
+            squared.flatten(),
+            np.array([[1.0], [4.0], [9.0], [16.0], [25.0], [36.0]]),
+        )
+
+        intensity = v.select_fields("intensity")
+        intensity **= 2
+        np.testing.assert_array_equal(
+            intensity.flatten(),
+            np.array([[1.0], [4.0], [9.0], [16.0], [25.0], [36.0]]),
+        )
+
+        reverse = 2 ** v.select_fields("intensity")
+        np.testing.assert_array_equal(
+            reverse.flatten(),
+            np.array([[2.0], [16.0], [512.0], [65536.0], [33554432.0], [68719476736.0]]),
+        )
+
+    def test_unary_mod_and_floor_division_operations(self):
+        v = make_line_vector()
+
+        negative = -v.select_fields("intensity")
+        np.testing.assert_array_equal(
+            negative.flatten(),
+            np.array([[-1.0], [-2.0], [-3.0], [-4.0], [-5.0], [-6.0]]),
+        )
+
+        absolute = abs(negative)
+        np.testing.assert_array_equal(
+            absolute.flatten(),
+            np.array([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]),
+        )
+
+        floored = v.select_fields("ky") // 150
+        np.testing.assert_array_equal(
+            floored.flatten(),
+            np.array([[0.0], [1.0], [2.0], [2.0], [3.0], [4.0]]),
+        )
+
+        modded = v.select_fields("ky") % 150
+        np.testing.assert_array_equal(
+            modded.flatten(),
+            np.array([[100.0], [50.0], [0.0], [100.0], [50.0], [0.0]]),
+        )
+
+        ky = v.select_fields("ky")
+        ky //= 150
+        np.testing.assert_array_equal(
+            ky.flatten(),
+            np.array([[0.0], [1.0], [2.0], [2.0], [3.0], [4.0]]),
+        )
+
+        intensity = v.select_fields("intensity")
+        intensity %= 2
+        np.testing.assert_array_equal(
+            intensity.flatten(),
+            np.array([[1.0], [0.0], [1.0], [0.0], [1.0], [0.0]]),
+        )
+
+    def test_numpy_ufunc_support(self):
+        v = make_line_vector()
+
+        sine = np.sin(v.select_fields("kx"))
+        np.testing.assert_allclose(
+            sine.flatten(),
+            np.sin(v.select_fields("kx").flatten()),
+        )
+
+        maximum = np.maximum(v.select_fields("intensity"), 3.0)
+        np.testing.assert_array_equal(
+            maximum.flatten(),
+            np.array([[3.0], [3.0], [3.0], [4.0], [5.0], [6.0]]),
+        )
+
+        frac, whole = np.modf(v.select_fields("intensity") / 2.0)
+        np.testing.assert_allclose(
+            frac.flatten(),
+            np.array([[0.5], [0.0], [0.5], [0.0], [0.5], [0.0]]),
+        )
+        np.testing.assert_allclose(
+            whole.flatten(),
+            np.array([[0.0], [1.0], [1.0], [2.0], [2.0], [3.0]]),
+        )
+
     def test_field_assignment_from_vector_expression(self):
         v = make_line_vector()
         scale = 2.5
