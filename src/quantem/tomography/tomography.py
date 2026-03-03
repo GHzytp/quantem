@@ -79,10 +79,13 @@ class Tomography(TomographyOpt, TomographyBase):
         I.e, auto-detection through the obj model type, while both share the same pose optimization.
         """
 
-        # TODO: Prior to reconstruction, it is assumed that object + dataset are both in the correct devices. Need to implement a way to check this.
-
         # Check device consistency
         self.obj_model.to(self.device)
+
+        # Saving batch size, num workers, and val fraction for reloading
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.val_fraction = val_fraction
 
         if profiling_mode:
             if self.global_rank == 0:
@@ -307,7 +310,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     f"File {path} already exists. Use overwrite=True to overwrite."
                 )
             print(f"Saving volume to {path}")
-            np.savez(path, volume=self.obj_model.obj.detach().cpu().numpy())
+            np.savez(path, volume=self.obj_model.obj_view)
 
         if torch.distributed.is_initialized():
             print("Barrier")
@@ -326,7 +329,25 @@ class Tomography(TomographyOpt, TomographyBase):
     ) -> Self:
         tomography = cls._recursive_load_from_path(path)
         tomography.to(device)
+        tomography._rebuild_dataloader(
+            batch_size=tomography.batch_size,
+            num_workers=tomography.num_workers,
+            val_fraction=tomography.val_fraction,
+        )
         return tomography
+
+    def _rebuild_dataloader(self, batch_size: int, num_workers: int, val_fraction: float):
+        """
+        Rebuilds the dataloader due to persistent workers error when reloading the object.
+        """
+        self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
+            self.setup_dataloader(
+                self.dset,
+                batch_size,
+                num_workers=num_workers,
+                val_fraction=val_fraction,
+            )
+        )
 
 
 class TomographyConventional(TomographyBase):

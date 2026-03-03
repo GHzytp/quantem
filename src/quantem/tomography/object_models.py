@@ -353,7 +353,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         Matches the axes of conventionally reconstructed objects, this is the object that will be saved.
         """
         self.create_volume()
-        return self._obj.cpu().numpy()[0].transpose(0, 2, 1)
+        return self._obj.cpu().numpy().transpose(0, 1, 3, 2)
 
     def apply_soft_constraints(
         self,
@@ -695,7 +695,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if isinstance(device, str):
             device = torch.device(device)
         self._device = device
-        # self._obj = self._obj.to(self.device)
+        self._model = self._model.to(device)
         self.reconnect_optimizer_to_parameters()
 
 
