@@ -38,10 +38,8 @@ class DDPMixin:
             if torch.cuda.is_available():
                 device = torch.device("cuda:0" if device is None else device)
                 torch.cuda.set_device(device.index)
-                print("Single GPU training")
             else:
                 device = torch.device("cpu")
-                print("CPU training")
 
         if device.type == "cuda":
             torch.backends.cudnn.benchmark = True

@@ -56,8 +56,8 @@ class Tomography(TomographyOpt, TomographyBase):
         reset: bool = False,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
-        constraints: dict = {},  # TODO: What to pass into the constraints?
-        dataset_constraints: dict = {},
+        obj_constraints: dict = {},  # TODO: What to pass into the constraints?
+        dset_constraints: dict = {},
         num_samples_per_ray: int | list[tuple[int, int]] = 1,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
@@ -102,11 +102,11 @@ class Tomography(TomographyOpt, TomographyBase):
         if new_scheduler:
             self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
-        if constraints is not None:
-            self.obj_model.constraints = cast(DefaultConstraintsTomography, constraints)
+        if obj_constraints is not None:
+            self.obj_model.constraints = cast(DefaultConstraintsTomography, obj_constraints)
 
-        if dataset_constraints is not None:
-            self.dset.constraints = cast(DefaultTomographyDatasetConstraints, dataset_constraints)
+        if dset_constraints is not None:
+            self.dset.constraints = cast(DefaultTomographyDatasetConstraints, dset_constraints)
         # Setting up DDP
         if not hasattr(self, "dataloader") or reset_dset is not None:
             if reset_dset is not None:
@@ -346,6 +346,7 @@ class TomographyConventional(TomographyBase):
             logger=logger,
             device=device,
             rng=rng,
+            _token=cls._token,
         )
 
     def reconstruct(
@@ -441,6 +442,7 @@ class TomographyConventional(TomographyBase):
                 theta=self.dset.tilt_angles,
                 device=self.device,
                 circle=True,
+                filter_name=None,
             )
 
             normalization[normalization == 0] = 1e-6

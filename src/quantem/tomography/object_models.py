@@ -287,6 +287,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
+        _token: object | None = None,
     ):
         super().__init__(
             shape=shape,
