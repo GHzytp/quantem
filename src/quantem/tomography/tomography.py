@@ -269,11 +269,9 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.logger.log_images_every > 0
                     and self.num_epochs % self.logger.log_images_every == 0
                 ):
-                    print("Creating volume...")
                     pred_full = self.obj_model.create_volume(return_vol=True)
 
                     if self.global_rank == 0:
-                        print("Logging images...")
                         self.logger.log_iter_images(
                             pred_volume=pred_full,
                             dataset_model=self.dset,
@@ -292,6 +290,10 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 self.logger.flush()
+
+                pbar.set_description(
+                    f"Reconstruction | Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}, Soft Constraint Loss: {epoch_soft_constraint_loss:.4f} | Logger Updated"
+                )
 
     # --- Helper Functions ---
 
