@@ -37,6 +37,7 @@ class Tomography(TomographyOpt, TomographyBase):
         obj_model: ObjectINR,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
+        verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
         return cls(
@@ -45,6 +46,7 @@ class Tomography(TomographyOpt, TomographyBase):
             logger=logger,
             device=device,
             rng=rng,
+            verbose=verbose,
             _token=cls._token,
         )
 
@@ -143,8 +145,8 @@ class Tomography(TomographyOpt, TomographyBase):
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
 
-        print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
-        for a0 in range(num_iter):
+        pbar = tqdm(range(num_iter), desc="Reconstruction", disable=not self.verbose)
+        for a0 in pbar:
             consistency_loss = 0.0
             total_loss = 0.0
             epoch_soft_constraint_loss = 0.0
@@ -160,8 +162,6 @@ class Tomography(TomographyOpt, TomographyBase):
             else:
                 curr_num_samples_per_ray = num_samples_per_ray
 
-            if self.global_rank == 0:
-                print(f"curr_num_samples_per_ray: {curr_num_samples_per_ray}")
             for batch_idx, batch in enumerate(self.dataloader):
                 self.zero_grad_all()
                 with torch.autocast(
@@ -205,6 +205,10 @@ class Tomography(TomographyOpt, TomographyBase):
             total_loss = total_loss.item() / len(self.dataloader)
             consistency_loss = consistency_loss.item() / len(self.dataloader)
             epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
+
+            pbar.set_description(
+                f"Reconstruction | Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}, Soft Constraint Loss: {epoch_soft_constraint_loss:.4f}"
+            )
 
             if self.val_dataloader is not None:
                 print("Validating...")
@@ -250,11 +254,9 @@ class Tomography(TomographyOpt, TomographyBase):
 
             total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
 
-            if self.global_rank == 0:
-                print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}")
-
-                if self.val_dataloader:
-                    print(f"Validation loss: {avg_val_loss:4f}")
+            pbar.set_description(
+                f"Reconstruction | Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}, Soft Constraint Loss: {epoch_soft_constraint_loss:.4f}"
+            )
 
             self._epoch_losses.append(total_loss)
             self._consistency_losses.append(consistency_loss)
@@ -338,6 +340,7 @@ class TomographyConventional(TomographyBase):
         obj_model: ObjectPixelated,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
+        verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
         return cls(
@@ -346,6 +349,7 @@ class TomographyConventional(TomographyBase):
             logger=logger,
             device=device,
             rng=rng,
+            verbose=verbose,
             _token=cls._token,
         )
 
@@ -357,7 +361,7 @@ class TomographyConventional(TomographyBase):
         inline_alignment: bool = False,
         smoothing_sigma: float | None = None,
     ):
-        pbar = tqdm(range(num_iter), desc=f"{mode} Reconstruction")
+        pbar = tqdm(range(num_iter), desc=f"{mode} Reconstruction", disable=not self.verbose)
         if mode == "sirt" or mode == "fbp":
             proj_forward = torch.zeros_like(self.dset.tilt_stack).permute(2, 0, 1)
         else:

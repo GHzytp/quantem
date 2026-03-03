@@ -29,6 +29,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
+        verbose: int | bool = True,
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -38,6 +39,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self.obj_model = obj_model
 
         self.dset = dset
+        self.verbose = verbose
         self.rng = rng
         self.device = device
         self.logger = logger
@@ -66,6 +68,14 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         ):
             raise TypeError(f"dset should be a TomographyDataset, got {type(new_dset)}")
         self._dset = new_dset
+
+    @property
+    def verbose(self) -> int | bool:
+        return self._verbose
+
+    @verbose.setter
+    def verbose(self, verbose: int | bool):
+        self._verbose = verbose
 
     @property
     def obj_model(self) -> ObjectModelType:
