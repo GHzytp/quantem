@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
@@ -218,11 +219,17 @@ class ObjectPixelated(ObjectConstraints):
     # --- Properties ----
     @property
     def obj(self) -> torch.Tensor:
-        return self.apply_hard_constraints(self._obj)
+        return self.apply_hard_constraints(
+            self._obj
+        )  # TODO: Normalization factor to ensure object agrees with INR.
 
     @obj.setter
     def obj(self, obj: torch.Tensor):
         self._obj = obj
+
+    @property
+    def obj_view(self) -> np.ndarray:
+        return self.obj.cpu().unsqueeze(0).numpy()
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -495,8 +502,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l1",
-        apply_constraints: bool = False,
-        show: bool = True,
+        verbose: bool = True,
     ):
         """
         Pretrain the INR model to fit target volume.
@@ -526,14 +532,14 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         self._pretrain(
             num_iters=num_iters,
             loss_fn=loss_fn,
-            apply_constraints=apply_constraints,
+            verbose=verbose,
         )
 
     def _pretrain(
         self,
         num_iters: int,
         loss_fn: Callable,
-        apply_constraints: bool,
+        verbose: bool,
     ):
         if self.optimizer is None:
             raise RuntimeError("Optimizer not set. Call set_optimizer() first.")
@@ -544,7 +550,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         optimizer = self.optimizer
         scheduler = self.scheduler
 
-        for a0 in range(num_iters):
+        pbar = tqdm(range(num_iters), desc="Pretraining", disable=not verbose)
+        for a0 in pbar:
             epoch_loss = 0
             for batch_idx, batch in enumerate[Any](self.pretraining_dataloader):
                 coords = batch["coords"].to(self.device, non_blocking=True)

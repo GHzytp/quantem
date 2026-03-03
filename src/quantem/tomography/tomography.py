@@ -1,5 +1,6 @@
 import os
-from typing import Literal, Self, cast
+from pathlib import Path
+from typing import Literal, Self, Sequence, cast
 
 import numpy as np
 import torch
@@ -347,6 +348,22 @@ class Tomography(TomographyOpt, TomographyBase):
                 num_workers=num_workers,
                 val_fraction=val_fraction,
             )
+        )
+
+    def save(
+        self,
+        path: str | Path,
+        mode: Literal["w", "o"] = "w",
+        store: Literal["auto", "zip", "dir"] = "auto",
+        skip: str | type | Sequence[str | type] = ["dataloader"],
+        compression_level: int | None = 4,
+    ) -> None:
+        super(Tomography, self).save(
+            path=path,
+            mode=mode,
+            store=store,
+            skip=skip,
+            compression_level=compression_level,
         )
 
 
