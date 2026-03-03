@@ -60,7 +60,7 @@ class Tomography(TomographyOpt, TomographyBase):
         scheduler_params: dict | None = None,
         obj_constraints: dict = {},  # TODO: What to pass into the constraints?
         dset_constraints: dict = {},
-        num_samples_per_ray: int | list[tuple[int, int]] = 1,
+        num_samples_per_ray: int | list[tuple[int, int]] = None,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
         loss_type: Literal[
@@ -145,7 +145,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
 
-        pbar = tqdm(range(num_iter), desc="Reconstruction", disable=not self.verbose)
+        pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
             consistency_loss = 0.0
             total_loss = 0.0
@@ -255,7 +255,7 @@ class Tomography(TomographyOpt, TomographyBase):
             total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
 
             pbar.set_description(
-                f"Reconstruction | Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}, Soft Constraint Loss: {epoch_soft_constraint_loss:.4f}"
+                f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
             )
 
             self._epoch_losses.append(total_loss)

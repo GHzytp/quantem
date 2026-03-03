@@ -82,11 +82,12 @@ class TomographyLiteINR(Tomography):
         learn_pose: bool = True,
         warmup_routine: bool = True,
         scheduler_type: Literal[
-            "exp", "cyclic", "plateau", "cosine_annealing", "linear", "full_warmup"
+            "exp", "cyclic", "plateau", "cosine_annealing", "linear", "full_warmup", "none"
         ] = "none",
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,
-        constraints: dict = {},
+        obj_constraints: dict = {},
+        dset_constraints: dict = {},
     ):
         if self.num_epochs == 0:
             opt_params = {
@@ -117,7 +118,6 @@ class TomographyLiteINR(Tomography):
             opt_params = None
             scheduler_params = None
 
-        constraints = constraints
         num_samples_per_ray = int(max(self.dset.tilt_stack.shape))
         return super().reconstruct(
             num_iter=num_iter,
@@ -127,7 +127,8 @@ class TomographyLiteINR(Tomography):
             num_samples_per_ray=num_samples_per_ray,
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
-            constraints=constraints,
+            obj_constraints=obj_constraints,
+            dset_constraints=dset_constraints,
         )
 
 
