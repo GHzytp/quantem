@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Sequence, cast
+from typing import Any, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -90,6 +90,7 @@ class Vector(AutoSerialize):
     """
 
     __array_priority__ = 1000
+    _token = object()
 
     def __init__(
         self,
@@ -98,7 +99,12 @@ class Vector(AutoSerialize):
         units: Sequence[str] | None = None,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        _token: object | None = None,
     ) -> None:
+        if _token is not self._token:
+            raise RuntimeError(
+                "Use Vector.from_shape() or Vector.from_data() to instantiate this class."
+            )
         root_shape = validate_shape(shape)
         root_fields = validate_fields(list(fields))
         root_units = validate_vector_units(
@@ -146,59 +152,50 @@ class Vector(AutoSerialize):
         fields: Sequence[str] | None = None,
         units: Sequence[str] | None = None,
         name: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "Vector":
         """Create an empty Vector with the given fixed-grid shape and fields."""
-        if fields is not None:
-            root_fields = validate_fields(list(fields))
-            if num_fields is not None and len(root_fields) != num_fields:
-                raise ValueError(
-                    f"num_fields ({num_fields}) does not match length of fields ({len(root_fields)})"
-                )
-        elif num_fields is not None:
-            count = validate_num_fields(num_fields)
-            root_fields = [f"field_{i}" for i in range(count)]
-        else:
-            raise ValueError("Must specify either 'fields' or 'num_fields'.")
-
-        return cls(shape=shape, fields=root_fields, units=units, name=name)
+        fields = _resolve_fields(fields, num_fields, None)
+        return cls(
+            shape=shape,
+            fields=fields,
+            units=units,
+            name=name,
+            metadata=metadata,
+            _token=cls._token,
+        )
 
     @classmethod
     def from_data(
         cls,
-        data: list[Any],
+        data: Sequence[Any],
         num_fields: int | None = None,
         fields: Sequence[str] | None = None,
         units: Sequence[str] | None = None,
         name: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "Vector":
         """Create a Vector from nested fixed-grid data.
 
         The outer nesting defines the fixed-grid shape. Each leaf must coerce to a
         2D cell array with consistent field count across all cells.
         """
-        root_shape, cell_arrays = _normalize_nested_data(data)
+        if not isinstance(data, (list, tuple)):
+            raise TypeError(f"Data must be a list or tuple, got {type(data)}")
+        root_shape, cell_arrays = _flatten_fixed_grid(data) if len(data) > 0 else ((0,), [])
         inferred_counts = {array.shape[1] for array in cell_arrays}
         if len(inferred_counts) > 1:
             raise ValueError("All cell arrays must have the same number of fields.")
         inferred_fields = cell_arrays[0].shape[1] if cell_arrays else 0
 
-        if fields is not None:
-            root_fields = validate_fields(list(fields))
-            if len(root_fields) != inferred_fields:
-                raise ValueError(
-                    f"num_fields ({inferred_fields}) does not match length of fields ({len(root_fields)})"
-                )
-        elif num_fields is not None:
-            count = validate_num_fields(num_fields)
-            if count != inferred_fields:
-                raise ValueError(
-                    f"Provided num_fields ({count}) does not match inferred ({inferred_fields})."
-                )
-            root_fields = [f"field_{i}" for i in range(count)]
-        else:
-            root_fields = [f"field_{i}" for i in range(inferred_fields)]
-
-        vector = cls(shape=root_shape, fields=root_fields, units=units, name=name)
+        vector = cls(
+            shape=root_shape,
+            fields=_resolve_fields(fields, num_fields, inferred_fields),
+            units=units,
+            name=name,
+            metadata=metadata,
+            _token=cls._token,
+        )
         vector._replace_cells(np.arange(len(cell_arrays), dtype=np.int64), cell_arrays)
         return vector
 
@@ -245,7 +242,7 @@ class Vector(AutoSerialize):
         return self._state["metadata"]
 
     @property
-    def array(self) -> NDArray[np.generic]:
+    def array(self) -> NDArray[Any]:
         """Return the selected cell as a NumPy array.
 
         This is only valid for 0D selections. Single-field and contiguous
@@ -291,6 +288,7 @@ class Vector(AutoSerialize):
             units=self.units,
             name=self.name,
             metadata=copy.deepcopy(self.metadata),
+            _token=self.__class__._token,
         )
         target_cells = copied._selected_cell_indices()
         source_arrays = [
@@ -299,7 +297,7 @@ class Vector(AutoSerialize):
         copied._replace_cells(target_cells, source_arrays)
         return copied
 
-    def flatten(self) -> NDArray[np.generic]:
+    def flatten(self) -> NDArray[Any]:
         """Concatenate selected cells in row-major order.
 
         Returns a 2D array with shape ``(total_rows, num_fields)`` even for
@@ -338,7 +336,16 @@ class Vector(AutoSerialize):
         - ``select_fields("kx", "ky")``
         - ``select_fields(["kx", "ky"])``
         """
-        selected = _normalize_select_field_args(*field_names)
+        if not field_names:
+            raise ValueError("At least one field name is required.")
+        if len(field_names) == 1 and not isinstance(field_names[0], str):
+            selected = _normalize_field_names(field_names[0])
+        elif not all(isinstance(n, str) for n in field_names):
+            raise TypeError(
+                "select_fields(...) expects field names as strings or one sequence of strings."
+            )
+        else:
+            selected = _normalize_field_names(field_names)  # type: ignore[arg-type]
         available = set(self.fields)
         missing = [field for field in selected if field not in available]
         if missing:
@@ -390,7 +397,25 @@ class Vector(AutoSerialize):
         until compaction. Calling ``compact()`` makes memory usage and save size
         predictable at the cost of reallocating the backing buffer.
         """
-        self._compact_storage()
+        data = self._state["data"]
+        used_rows = int(self._state["cell_lengths"].sum())
+        if used_rows == 0:
+            self._state["data"] = np.empty((0, self._full_num_fields), dtype=data.dtype)
+            self._state["cell_starts"].fill(0)
+            return
+
+        compacted = np.empty((used_rows, self._full_num_fields), dtype=data.dtype)
+        starts = np.zeros_like(self._state["cell_starts"])
+        cursor = 0
+        for linear_index in range(_cell_count(self._state["shape"])):
+            length = self._cell_row_count(linear_index)
+            starts[linear_index] = cursor
+            if length > 0:
+                cell = self._cell_matrix(linear_index)
+                compacted[cursor : cursor + length] = cell
+                cursor += length
+        self._state["data"] = compacted
+        self._state["cell_starts"] = starts
 
     def append_rows(self, idx: Any, rows: Any) -> None:
         """Append one or more rows to a single selected cell.
@@ -533,7 +558,9 @@ class Vector(AutoSerialize):
             _normalize_ufunc_input(value, total_rows, template.num_fields) for value in inputs
         ]
         result = ufunc(*flat_inputs, **kwargs)
-        return _wrap_ufunc_result(template, result, row_counts)
+        if isinstance(result, tuple):
+            return tuple(_vector_from_flat_result(template, item, row_counts) for item in result)
+        return _vector_from_flat_result(template, result, row_counts)
 
     def __add__(self, other: Any) -> "Vector":
         return self._binary_op(other, np.add)
@@ -642,14 +669,11 @@ class Vector(AutoSerialize):
             return np.arange(_cell_count(self._state["shape"]), dtype=np.int64)
         return self._selection_indices
 
-    def _is_full_field_selection(self) -> bool:
-        return self._selected_fields is None
-
     def _cell_row_count(self, linear_index: int) -> int:
         """Return the row count for one cell in the backing buffer."""
         return int(self._state["cell_lengths"][linear_index])
 
-    def _cell_matrix(self, linear_index: int) -> NDArray[np.generic]:
+    def _cell_matrix(self, linear_index: int) -> NDArray[Any]:
         """Return the full backing matrix for one cell."""
         start = int(self._state["cell_starts"][linear_index])
         length = int(self._state["cell_lengths"][linear_index])
@@ -657,7 +681,7 @@ class Vector(AutoSerialize):
             return self._state["data"][0:0]
         return self._state["data"][start : start + length]
 
-    def _selected_cell_matrix(self, linear_index: int) -> NDArray[np.generic]:
+    def _selected_cell_matrix(self, linear_index: int) -> NDArray[Any]:
         """Return one cell with the current field selection applied."""
         cell = self._cell_matrix(linear_index)
         cols = self._field_indices()
@@ -670,9 +694,7 @@ class Vector(AutoSerialize):
             return cell[:, int(cols[0]) : int(cols[-1]) + 1]
         return cell[:, cols].copy()
 
-    def _replace_cells(
-        self, targets: NDArray[np.int64], arrays: Sequence[NDArray[np.generic]]
-    ) -> None:
+    def _replace_cells(self, targets: NDArray[np.int64], arrays: Sequence[NDArray[Any]]) -> None:
         """Replace complete cells in the compact row buffer.
 
         Whole-cell replacement is implemented by appending the new payload rows to
@@ -707,12 +729,11 @@ class Vector(AutoSerialize):
     def _expand_storage(self, num_new_fields: int) -> None:
         """Append new ``np.nan``-initialized columns for added fields."""
         data = self._state["data"]
+        dtype = np.result_type(data.dtype, float)
         if data.shape[0] == 0:
-            dtype = np.result_type(data.dtype, float)
             self._state["data"] = np.empty((0, data.shape[1] + num_new_fields), dtype=dtype)
             return
 
-        dtype = np.result_type(data.dtype, float)
         filler = np.full((data.shape[0], num_new_fields), np.nan, dtype=dtype)
         self._state["data"] = np.concatenate((data.astype(dtype, copy=False), filler), axis=1)
 
@@ -724,33 +745,11 @@ class Vector(AutoSerialize):
             return
         if data.shape[0] <= 2 * used_rows:
             return
-        self._compact_storage()
-
-    def _compact_storage(self) -> None:
-        """Rebuild the row buffer so only live rows remain."""
-        data = self._state["data"]
-        used_rows = int(self._state["cell_lengths"].sum())
-        if used_rows == 0:
-            self._state["data"] = np.empty((0, self._full_num_fields), dtype=data.dtype)
-            self._state["cell_starts"].fill(0)
-            return
-
-        compacted = np.empty((used_rows, self._full_num_fields), dtype=data.dtype)
-        starts = np.zeros_like(self._state["cell_starts"])
-        cursor = 0
-        for linear_index in range(_cell_count(self._state["shape"])):
-            length = self._cell_row_count(linear_index)
-            starts[linear_index] = cursor
-            if length > 0:
-                cell = self._cell_matrix(linear_index)
-                compacted[cursor : cursor + length] = cell
-                cursor += length
-        self._state["data"] = compacted
-        self._state["cell_starts"] = starts
+        self.compact()
 
     def _assign(self, value: Any) -> None:
         """Dispatch assignment based on whether all fields or a subset are selected."""
-        if self._is_full_field_selection():
+        if self._selected_fields is None:
             self._assign_full_cells(value)
         else:
             self._assign_selected_fields(value)
@@ -878,6 +877,38 @@ class Vector(AutoSerialize):
             cursor += rows
 
 
+def _resolve_fields(
+    fields: Sequence[str] | None,
+    num_fields: int | None,
+    inferred: int | None,
+) -> list[str]:
+    """Resolve field names from constructor arguments.
+
+    ``inferred`` is the field count inferred from data; pass ``None`` when there
+    is no data source and explicit fields/num_fields are required.
+    """
+    if fields is not None:
+        root_fields = validate_fields(list(fields))
+        count = len(root_fields)
+        if num_fields is not None and count != num_fields:
+            raise ValueError(
+                f"num_fields ({num_fields}) does not match length of fields ({count})"
+            )
+        if inferred is not None and count != inferred:
+            raise ValueError(f"num_fields ({inferred}) does not match length of fields ({count})")
+        return root_fields
+    if num_fields is not None:
+        count = validate_num_fields(num_fields)
+        if inferred is not None and count != inferred:
+            raise ValueError(
+                f"Provided num_fields ({count}) does not match inferred ({inferred})."
+            )
+        return [f"field_{i}" for i in range(count)]
+    if inferred is not None:
+        return [f"field_{i}" for i in range(inferred)]
+    raise ValueError("Must specify either 'fields' or 'num_fields'.")
+
+
 def _cell_count(shape: tuple[int, ...]) -> int:
     """Return the number of fixed-grid cells in a shape."""
     return int(np.prod(shape, dtype=np.int64)) if shape else 1
@@ -893,24 +924,6 @@ def _normalize_field_names(field_names: str | Sequence[str]) -> tuple[str, ...]:
         raise ValueError("At least one field name is required.")
     validate_fields(list(normalized))
     return normalized
-
-
-def _normalize_select_field_args(*field_names: str | Sequence[str]) -> tuple[str, ...]:
-    """Normalize ``select_fields`` arguments.
-
-    This accepts either ``select_fields("a", "b")`` or
-    ``select_fields(["a", "b"])`` while keeping ``add_fields`` /
-    ``remove_fields`` on the simpler single-argument path.
-    """
-    if not field_names:
-        raise ValueError("At least one field name is required.")
-    if len(field_names) == 1 and not isinstance(field_names[0], str):
-        return _normalize_field_names(field_names[0])
-    if not all(isinstance(name, str) for name in field_names):
-        raise TypeError(
-            "select_fields(...) expects field names as strings or one sequence of strings."
-        )
-    return _normalize_field_names(cast(Sequence[str], field_names))
 
 
 def _normalize_units(units: str | Sequence[str] | None, count: int) -> list[str]:
@@ -933,12 +946,12 @@ def _looks_like_field_selector(idx: Any) -> bool:
         return True
     if isinstance(idx, tuple) and any(_looks_like_field_selector(item) for item in idx):
         return True
-    if isinstance(idx, (list, tuple)) and idx and all(isinstance(item, str) for item in idx):
+    if isinstance(idx, list) and idx and all(isinstance(item, str) for item in idx):
         return True
     return False
 
 
-def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[np.generic]:
+def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[Any]:
     """Normalize a single-cell payload to shape ``(n_rows, num_fields)``."""
     if isinstance(value, Vector):
         if value.shape != ():
@@ -963,16 +976,7 @@ def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[np.generic]:
     return array
 
 
-def _normalize_nested_data(data: list[Any]) -> tuple[tuple[int, ...], list[NDArray[np.generic]]]:
-    """Normalize nested input data into ``(shape, flat_cell_arrays)``."""
-    if not isinstance(data, list):
-        raise TypeError("Data must be a list")
-    if not data:
-        return (0,), []
-    return _flatten_fixed_grid(data)
-
-
-def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[np.generic]]]:
+def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[Any]]]:
     """Recursively flatten nested fixed-grid input into row-major cell order."""
     if isinstance(node, np.ndarray):
         return (), [_coerce_inferred_cell_array(node)]
@@ -984,7 +988,7 @@ def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[np.gen
         return (0,), []
 
     child_shape: tuple[int, ...] | None = None
-    cells: list[NDArray[np.generic]] = []
+    cells: list[NDArray[Any]] = []
     for child in node:
         shape, child_cells = _flatten_fixed_grid(child)
         if child_shape is None:
@@ -1013,7 +1017,7 @@ def _is_row_like(item: Any) -> bool:
     return all(np.isscalar(value) for value in item)
 
 
-def _coerce_inferred_cell_array(value: Any) -> NDArray[np.generic]:
+def _coerce_inferred_cell_array(value: Any) -> NDArray[Any]:
     """Infer a 2D cell array from row-like input during ``from_data``."""
     array = np.asarray(value)
     if array.ndim == 0:
@@ -1138,7 +1142,7 @@ def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], 
     return positions, False
 
 
-def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDArray[np.generic]:
+def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDArray[Any]:
     """Broadcast array-like input to flattened rowwise assignment shape."""
     array = np.asarray(value)
     if array.ndim == 0:
@@ -1166,17 +1170,6 @@ def _normalize_ufunc_input(value: Any, total_rows: int, num_fields: int) -> Any:
     return _broadcast_field_values(value, total_rows, num_fields)
 
 
-def _wrap_ufunc_result(
-    template: Vector,
-    result: Any,
-    row_counts: list[int],
-) -> Any:
-    """Convert elementwise ufunc output back into Vector selections."""
-    if isinstance(result, tuple):
-        return tuple(_vector_from_flat_result(template, item, row_counts) for item in result)
-    return _vector_from_flat_result(template, result, row_counts)
-
-
 def _vector_from_flat_result(
     template: Vector,
     values: Any,
@@ -1199,7 +1192,7 @@ def _vector_from_flat_result(
         return result
 
     cursor = 0
-    cells: list[NDArray[np.generic]] = []
+    cells: list[NDArray[Any]] = []
     for rows in row_counts:
         cells.append(flat_values[cursor : cursor + rows].copy())
         cursor += rows

@@ -3,9 +3,8 @@ import zipfile
 import numpy as np
 import pytest
 
-from quantem.core.io.serialize import load
 from quantem.core.datastructures.vector import Vector
-
+from quantem.core.io.serialize import load
 
 
 def make_line_vector() -> Vector:
@@ -20,7 +19,6 @@ def make_line_vector() -> Vector:
     v[2] = np.array([[4.0, 40.0, 400.0], [5.0, 50.0, 500.0]])
     v[3] = np.array([[6.0, 60.0, 600.0]])
     return v
-
 
 
 def make_grid_vector() -> Vector:
@@ -138,10 +136,16 @@ class TestVector:
 
         kx = v.select_fields("kx")
         kx += 10
-        np.testing.assert_array_equal(v.select_fields("kx").flatten(), np.array([[20.0], [30.0], [40.0], [50.0], [60.0], [70.0]]))
+        np.testing.assert_array_equal(
+            v.select_fields("kx").flatten(),
+            np.array([[20.0], [30.0], [40.0], [50.0], [60.0], [70.0]]),
+        )
 
         v.select_fields("kx")[...] += np.arange(6)
-        np.testing.assert_array_equal(v.select_fields("kx").flatten(), np.array([[20.0], [31.0], [42.0], [53.0], [64.0], [75.0]]))
+        np.testing.assert_array_equal(
+            v.select_fields("kx").flatten(),
+            np.array([[20.0], [31.0], [42.0], [53.0], [64.0], [75.0]]),
+        )
 
         summed = v.select_fields("intensity") + v.select_fields("ky")
         np.testing.assert_array_equal(
@@ -221,7 +225,7 @@ class TestVector:
             np.sin(v.select_fields("kx").flatten()),
         )
 
-        maximum = np.maximum(v.select_fields("intensity"), 3.0)
+        maximum = np.maximum(v.select_fields("intensity"), 3.0)  # type: ignore[arg-type]
         np.testing.assert_array_equal(
             maximum.flatten(),
             np.array([[3.0], [3.0], [3.0], [4.0], [5.0], [6.0]]),
@@ -380,7 +384,11 @@ class TestVector:
             np.array([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]),
         )
 
-        with pytest.raises(TypeError, match="Data must be a list"):
+        tuple_data = (np.array([[1.0, 2.0]]), np.array([[3.0, 4.0]]))
+        tuple_outer = Vector.from_data(data=tuple_data, fields=["a", "b"])
+        assert tuple_outer.shape == (2,)
+
+        with pytest.raises(TypeError, match="Data must be a list or tuple"):
             Vector.from_data(data=np.array([1, 2, 3]))  # type: ignore[arg-type]
 
         with pytest.raises(ValueError, match="same number of fields"):
