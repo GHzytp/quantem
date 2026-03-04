@@ -158,7 +158,6 @@ class OptimizerParams:
         Parse dictionary to a optimizer params object.
         Accepts either ``"name"`` or ``"type"`` as the optimizer key.
         """
-        print("d: ", d)
         d = dict(d)  # avoid mutating caller's dict
         name = d.pop("name", None) or d.pop("type", None)
         if isinstance(name, type):
