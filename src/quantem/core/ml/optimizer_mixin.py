@@ -1,5 +1,6 @@
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Generator, Iterator, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Generator, Iterator, Literal, Sequence
 
 from quantem.core import config
 
@@ -144,6 +145,8 @@ class OptimizerMixin:
 
         if sched_type == "none":
             self._scheduler = None
+        # elif sched_type._name == "cyclic":
+        #     blah = torch.optim.lr_scheduler.CyclicLR(opt, sched_type.parse_params())
         elif sched_type == "cyclic":
             self._scheduler = torch.optim.lr_scheduler.CyclicLR(
                 optimizer,
@@ -292,3 +295,38 @@ class OptimizerMixin:
         if self._scheduler is not None and self._optimizer is not None:
             self._scheduler.optimizer = self._optimizer
         return
+
+
+@dataclass
+class OptimizerParams:
+    type: (
+        str
+        | Literal[
+            "adam",
+            "adamw",
+        ]
+    )
+
+
+@dataclass
+class SchedulerParams:
+    @dataclass
+    class Plateau:
+        _name: str = "plateau"
+        factor: float = 0.5
+        patience: int = 10
+        threshold: float = 1e-3
+        min_lr: float = 1e-7
+        cooldown: int = 50
+
+        def parse_params() -> dict:
+            pass
+
+    @dataclass
+    class Exponential:
+        _name: str = "exponential"
+        gamma: float = 0.9
+        factor: float | None = 0.5
+
+        def parse_params() -> dict:
+            pass
