@@ -156,18 +156,25 @@ class OptimizerParams:
     def parse_dict(cls, d: dict):
         """
         Parse dictionary to a optimizer params object.
+        Accepts either ``"name"`` or ``"type"`` as the optimizer key.
         """
-        if d["name"] == "adam":
-            d.pop("name")
+        print("d: ", d)
+        d = dict(d)  # avoid mutating caller's dict
+        name = d.pop("name", None) or d.pop("type", None)
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown optimizer type: {name}")
+        if name == "adam":
             return OptimizerParams.Adam(**d)
-        elif d["name"] == "adamw":
-            d.pop("name")
+        elif name == "adamw":
             return OptimizerParams.AdamW(**d)
-        elif d["name"] == "sgd":
-            d.pop("name")
+        elif name == "sgd":
             return OptimizerParams.SGD(**d)
         else:
-            raise ValueError(f"Unknown optimizer type: {d['name']}")
+            raise ValueError(f"Unknown optimizer type: {name.lower()}")
 
 
 OptimizerType = (
@@ -415,27 +422,30 @@ class SchedulerParams:
     def parse_dict(cls, d: dict):
         """
         Parse dictionary to a scheduler params object.
+        Accepts either ``"name"`` or ``"type"`` as the scheduler key.
         """
-        if d["name"] == "plateau":
-            d.pop("name")
+        d = dict(d)  # avoid mutating caller's dict
+        name = d.pop("name", None) or d.pop("type", None)
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown scheduler type: {name}")
+        if name == "plateau":
             return SchedulerParams.Plateau(**d)
-        elif d["name"] == "exponential":
-            d.pop("name")
+        elif name == "exponential":
             return SchedulerParams.Exponential(**d)
-        elif d["name"] == "cyclic":
-            d.pop("name")
+        elif name == "cyclic":
             return SchedulerParams.Cyclic(**d)
-        elif d["name"] == "linear":
-            d.pop("name")
+        elif name == "linear":
             return SchedulerParams.Linear(**d)
-        elif d["name"] == "cosine_annealing":
-            d.pop("name")
+        elif name == "cosine_annealing":
             return SchedulerParams.CosineAnnealing(**d)
-        elif d["name"] == "none":
-            d.pop("name")
+        elif name == "none":
             return SchedulerParams.NoneScheduler()
         else:
-            raise ValueError(f"Unknown scheduler type: {d['name']}")
+            raise ValueError(f"Unknown scheduler type: {name}")
 
 
 SchedulerType = (
