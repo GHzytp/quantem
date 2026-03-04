@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Generator, Iterator, Literal, Protocol, Sequence
 
 from quantem.core import config
 
@@ -9,6 +9,154 @@ if TYPE_CHECKING:
 else:
     if config.get("has_torch"):
         import torch
+
+
+@dataclass
+class OptimizerParams:
+    type: (
+        str
+        | Literal[
+            "adam",
+            "adamw",
+        ]
+    )
+
+
+class SchedulerParams(Protocol):
+    """
+    Nested dataclass for scheduler parameters.
+    """
+
+    @dataclass
+    class Plateau:
+        mode: Literal["min", "max"] = "min"
+        min_lr_factor: float = 1 / 20
+        min_lr: float | None = None
+        factor: float = 0.5
+        patience: int = 10
+        threshold: float = 1e-5
+        cooldown: int = 50
+        _name: str = "plateau"
+
+        def params(self, base_LR: float) -> dict:
+            if self.min_lr is None:
+                self.min_lr = self.min_lr_factor * base_LR
+            return {
+                "mode": self.mode,
+                "factor": self.factor,
+                "patience": self.patience,
+                "threshold": self.threshold,
+                "min_lr": self.min_lr,
+                "cooldown": self.cooldown,
+            }
+
+    @dataclass
+    class Exponential:
+        gamma: float = 0.9
+        factor: float | None = 0.5
+        num_iter: int | None = None
+        _name: str = "exponential"
+
+        def params(self, base_LR: float) -> dict:
+            return {
+                "gamma": self.gamma,
+                "factor": self.factor,
+            }
+
+    @dataclass
+    class Cyclic:
+        base_lr_factor: float = 1 / 4
+        max_lr_factor: float = 4
+        base_lr: float | None = None
+        max_lr: float | None = None
+        step_size_up: int = 100
+        step_size_down: int = 100
+        mode: Literal["triangular2", "triangular", "exp_range"] = "triangular2"
+        cycle_momentum: bool = False
+        _name: str = "cyclic"
+
+        def params(self, base_LR: float) -> dict:
+            if self.base_lr is None:
+                self.base_lr = self.base_lr_factor * base_LR
+            if self.max_lr is None:
+                self.max_lr = self.max_lr_factor * base_LR
+            return {
+                "base_lr": self.base_lr,
+                "max_lr": self.max_lr,
+                "step_size_up": self.step_size_up,
+                "step_size_down": self.step_size_down,
+                "mode": self.mode,
+                "cycle_momentum": self.cycle_momentum,
+            }
+
+    @dataclass
+    class Linear:
+        total_iters: int
+        start_factor: float = 0.1
+        end_factor: float = 1.0
+        _name: str = "linear"
+
+        def params(self, base_LR: float) -> dict:
+            return {
+                "start_factor": self.start_factor,
+                "end_factor": self.end_factor,
+                "total_iters": self.total_iters,
+            }
+
+    @dataclass
+    class CosineAnnealing:
+        T_max: int
+        eta_min: float = 1e-7
+        _name: str = "cosine_annealing"
+
+        def params(self, base_LR: float) -> dict:
+            return {
+                "T_max": self.T_max,
+                "eta_min": self.eta_min,
+            }
+
+    @dataclass
+    class NoneScheduler:
+        _name: str = "none"
+
+        def params(self, base_LR: float) -> dict:
+            return {}
+
+    @classmethod
+    def parse_dict(cls, d: dict):
+        """
+        Parse dictionary to a scheduler params object.
+        """
+        if d["name"] == "plateau":
+            d.pop("name")
+            return SchedulerParams.Plateau(**d)
+        elif d["name"] == "exponential":
+            d.pop("name")
+            return SchedulerParams.Exponential(**d)
+        elif d["name"] == "cyclic":
+            d.pop("name")
+            return SchedulerParams.Cyclic(**d)
+        elif d["name"] == "linear":
+            d.pop("name")
+            return SchedulerParams.Linear(**d)
+        elif d["name"] == "cosine_annealing":
+            d.pop("name")
+            return SchedulerParams.CosineAnnealing(**d)
+        elif d["name"] == "none":
+            d.pop("name")
+            return SchedulerParams.NoneScheduler()
+        else:
+            raise ValueError(f"Unknown scheduler type: {d['name']}")
+
+
+SchedulerType = (
+    SchedulerParams.Plateau
+    | SchedulerParams.Exponential
+    | SchedulerParams.Cyclic
+    | SchedulerParams.Linear
+    | SchedulerParams.CosineAnnealing
+    | SchedulerParams.NoneScheduler
+)
 
 
 class OptimizerMixin:
@@ -24,7 +172,7 @@ class OptimizerMixin:
         self._optimizer = None
         self._scheduler = None
         self._optimizer_params = {}
-        self._scheduler_params = {}
+        self._scheduler_params: SchedulerType = SchedulerParams.NoneScheduler()
         # Don't call super().__init__() in mixin classes to avoid MRO issues
 
     @property
@@ -48,29 +196,18 @@ class OptimizerMixin:
         self._optimizer_params = params.copy() if params else {}
 
     @property
-    def scheduler_params(self) -> dict:
+    def scheduler_params(self) -> SchedulerType:
         """Get the scheduler parameters."""
         return self._scheduler_params
 
     @scheduler_params.setter
-    def scheduler_params(self, params: dict):
+    def scheduler_params(self, params: SchedulerType | dict):
         """Set the scheduler parameters."""
-        if params:
-            if params["type"].lower() not in [
-                "cyclic",
-                "plateau",
-                "exp",
-                "gamma",
-                "linear",
-                "cosine_annealing",
-                "none",
-            ]:
-                raise ValueError(
-                    f"Unknown scheduler type: {params['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'linear', 'cosine_annealing', 'none']"
-                )
-            self._scheduler_params = params.copy()
-        else:
-            self._scheduler_params = {}
+        if isinstance(params, dict):
+            params = SchedulerParams.parse_dict(d=params)
+        if not isinstance(params, SchedulerType):
+            raise TypeError(f"scheduler parameters must be a SchedulerType, got {type(params)}")
+        self._scheduler_params = params
 
     @abstractmethod
     def get_optimization_parameters(
@@ -128,7 +265,8 @@ class OptimizerMixin:
             raise TypeError(f"optimizer type must be string or type, got {type(opt_type)}")
 
     def set_scheduler(
-        self, scheduler_params: dict | None = None, num_iter: int | None = None
+        self,
+        scheduler_params: SchedulerType | None = None,
     ) -> None:
         """Set the scheduler for this model."""
         if scheduler_params is not None:
@@ -138,59 +276,40 @@ class OptimizerMixin:
             self._scheduler = None
             return
 
-        params = self._scheduler_params
-        sched_type = params.get("type", "none").lower()
         optimizer = self._optimizer
         base_LR = optimizer.param_groups[0]["lr"]
 
-        if sched_type == "none":
-            self._scheduler = None
-        # elif sched_type._name == "cyclic":
-        #     blah = torch.optim.lr_scheduler.CyclicLR(opt, sched_type.parse_params())
-        elif sched_type == "cyclic":
-            self._scheduler = torch.optim.lr_scheduler.CyclicLR(
-                optimizer,
-                base_lr=params.get("base_lr", base_LR / 4),
-                max_lr=params.get("max_lr", base_LR * 4),
-                step_size_up=params.get("step_size_up", 100),
-                step_size_down=params.get("step_size_down", params.get("step_size_up", 100)),
-                mode=params.get("mode", "triangular2"),
-                cycle_momentum=params.get("momentum", False),
-            )
-        elif sched_type.startswith(("plateau", "plat", "reducelronplat")):
-            self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=params.get("factor", 0.5),
-                patience=params.get("patience", 10),
-                threshold=params.get("threshold", 1e-3),
-                min_lr=params.get("min_lr", base_LR / 20),
-                cooldown=params.get("cooldown", 50),
-            )
-        elif sched_type in ["exp", "gamma", "exponential"]:
-            if "gamma" in params:
-                gamma = params["gamma"]
-            elif num_iter is not None:
-                fac = params.get("factor", 0.01)
-                gamma = fac ** (1.0 / num_iter)
-            else:
-                gamma = 0.9
-            self._scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
-        elif sched_type == "linear":
-            self._scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=params.get("start_factor", 0.1),
-                end_factor=params.get("end_factor", 1.0),
-                total_iters=params.get("total_iters", num_iter),
-            )
-        elif sched_type == "cosine_annealing":
-            self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=params.get("T_max", num_iter),
-                eta_min=params.get("eta_min", 1e-7),
-            )
-        else:
-            raise ValueError(f"Unknown scheduler type: {sched_type}")
+        params = self._scheduler_params.params(base_LR)
+        match self.scheduler_params:
+            case SchedulerParams.NoneScheduler():
+                self._scheduler = None
+            case SchedulerParams.Cyclic():
+                self._scheduler = torch.optim.lr_scheduler.CyclicLR(
+                    optimizer,
+                    **params,
+                )
+            case SchedulerParams.Plateau():
+                self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    **params,
+                )
+            case SchedulerParams.Exponential():
+                self._scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                    optimizer,
+                    **params,
+                )
+            case SchedulerParams.Linear():
+                self._scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    **params,
+                )
+            case SchedulerParams.CosineAnnealing():
+                self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    **params,
+                )
+            case _:
+                raise ValueError(f"Unknown scheduler type: {self.scheduler_params}")
 
     def step_optimizer(self) -> None:
         """Step the optimizer if it exists."""
@@ -295,38 +414,3 @@ class OptimizerMixin:
         if self._scheduler is not None and self._optimizer is not None:
             self._scheduler.optimizer = self._optimizer
         return
-
-
-@dataclass
-class OptimizerParams:
-    type: (
-        str
-        | Literal[
-            "adam",
-            "adamw",
-        ]
-    )
-
-
-@dataclass
-class SchedulerParams:
-    @dataclass
-    class Plateau:
-        _name: str = "plateau"
-        factor: float = 0.5
-        patience: int = 10
-        threshold: float = 1e-3
-        min_lr: float = 1e-7
-        cooldown: int = 50
-
-        def parse_params() -> dict:
-            pass
-
-    @dataclass
-    class Exponential:
-        _name: str = "exponential"
-        gamma: float = 0.9
-        factor: float | None = 0.5
-
-        def parse_params() -> dict:
-            pass

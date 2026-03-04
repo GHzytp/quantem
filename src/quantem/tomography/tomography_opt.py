@@ -126,12 +126,12 @@ class TomographyOpt(TomographyBase):
 
         return schedulers
 
-    def set_schedulers(self, params: dict[str, dict], num_iter: int | None = None):
+    def set_schedulers(self, params: dict[str, dict]):
         for key, scheduler_params in params.items():
             if key == "object":
-                self.obj_model.set_scheduler(scheduler_params, num_iter)
+                self.obj_model.set_scheduler(scheduler_params)
             elif key == "pose":
-                self.dset.set_scheduler(scheduler_params, num_iter)
+                self.dset.set_scheduler(scheduler_params)
             else:
                 raise ValueError(f"Unknown optimization key: {key}")
 

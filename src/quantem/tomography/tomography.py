@@ -61,7 +61,7 @@ class Tomography(TomographyOpt, TomographyBase):
         scheduler_params: dict | None = None,
         obj_constraints: dict = {},  # TODO: What to pass into the constraints?
         dset_constraints: dict = {},
-        num_samples_per_ray: int | list[tuple[int, int]] = None,
+        num_samples_per_ray: int | list[tuple[int, int]] | None = None,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
         loss_type: Literal[
@@ -106,7 +106,7 @@ class Tomography(TomographyOpt, TomographyBase):
             new_scheduler = True
 
         if new_scheduler:
-            self.set_schedulers(self.scheduler_params, num_iter=num_iter)
+            self.set_schedulers(self.scheduler_params)
 
         if obj_constraints is not None:
             self.obj_model.constraints = cast(DefaultConstraintsTomography, obj_constraints)
@@ -127,7 +127,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.set_optimizers()
                 if scheduler_params is not None:
                     self.scheduler_params = scheduler_params
-                    self.set_schedulers(self.scheduler_params, num_iter=num_iter)
+                    self.set_schedulers(self.scheduler_params)
 
             self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
                 self.setup_dataloader(
