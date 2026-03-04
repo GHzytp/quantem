@@ -210,10 +210,6 @@ class Tomography(TomographyOpt, TomographyBase):
             consistency_loss = consistency_loss.item() / len(self.dataloader)
             epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
 
-            pbar.set_description(
-                f"Reconstruction | Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}, Soft Constraint Loss: {epoch_soft_constraint_loss:.4f}"
-            )
-
             if self.val_dataloader is not None:
                 print("Validating...")
                 self.obj_model.model.eval()
@@ -296,7 +292,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 self.logger.flush()
 
                 pbar.set_description(
-                    f"Reconstruction | Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}, Soft Constraint Loss: {epoch_soft_constraint_loss:.4f} | Logger Updated"
+                    f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Logger Updated"
                 )
 
     # --- Helper Functions ---

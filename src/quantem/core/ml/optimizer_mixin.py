@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Iterator, Literal, Protocol, Sequence
+from typing import TYPE_CHECKING, Generator, Iterator, Literal, Sequence
 
 from quantem.core import config
 
@@ -11,20 +11,97 @@ else:
         import torch
 
 
-@dataclass
 class OptimizerParams:
-    type: (
-        str
-        | Literal[
-            "adam",
-            "adamw",
-        ]
-    )
-
-
-class SchedulerParams(Protocol):
     """
-    Nested dataclass for scheduler parameters.
+    Nested class for optimizer parameters.
+    """
+
+    @dataclass
+    class Adam:
+        lr: float = 1e-3
+        betas: tuple[float, float] = (0.9, 0.999)
+        eps: float = 1e-8
+        weight_decay: float = 0
+        _name: str = "adam"
+
+        def params(self) -> dict:
+            return {
+                "lr": self.lr,
+                "betas": self.betas,
+                "eps": self.eps,
+                "weight_decay": self.weight_decay,
+            }
+
+    @dataclass
+    class AdamW:
+        lr: float = 1e-3
+        betas: tuple[float, float] = (0.9, 0.999)
+        eps: float = 1e-8
+        weight_decay: float = 0
+        _name: str = "adamw"
+
+        def params(self) -> dict:
+            return {
+                "lr": self.lr,
+                "betas": self.betas,
+                "eps": self.eps,
+                "weight_decay": self.weight_decay,
+            }
+
+    @dataclass
+    class SGD:
+        lr: float = 1e-3
+        momentum: float = 0
+        dampening: float = 0
+        weight_decay: float = 0
+        nesterov: bool = False
+        _name: str = "sgd"
+
+        def params(self) -> dict:
+            return {
+                "lr": self.lr,
+                "momentum": self.momentum,
+                "dampening": self.dampening,
+                "weight_decay": self.weight_decay,
+                "nesterov": self.nesterov,
+            }
+
+    @dataclass
+    class NoneOptimizer:
+        _name: str = "none"
+
+        def params(self) -> dict:
+            return {}
+
+    @classmethod
+    def parse_dict(cls, d: dict):
+        """
+        Parse dictionary to a optimizer params object.
+        """
+        if d["name"] == "adam":
+            d.pop("name")
+            return OptimizerParams.Adam(**d)
+        elif d["name"] == "adamw":
+            d.pop("name")
+            return OptimizerParams.AdamW(**d)
+        elif d["name"] == "sgd":
+            d.pop("name")
+            return OptimizerParams.SGD(**d)
+        else:
+            raise ValueError(f"Unknown optimizer type: {d['name']}")
+
+
+OptimizerType = (
+    OptimizerParams.Adam
+    | OptimizerParams.AdamW
+    | OptimizerParams.SGD
+    | OptimizerParams.NoneOptimizer
+)
+
+
+class SchedulerParams:
+    """
+    Nested class for scheduler parameters.
     """
 
     @dataclass
@@ -171,7 +248,7 @@ class OptimizerMixin:
         """Initialize the optimizer mixin."""
         self._optimizer = None
         self._scheduler = None
-        self._optimizer_params = {}
+        self._optimizer_params: OptimizerType = OptimizerParams.NoneOptimizer()
         self._scheduler_params: SchedulerType = SchedulerParams.NoneScheduler()
         # Don't call super().__init__() in mixin classes to avoid MRO issues
 
@@ -186,14 +263,18 @@ class OptimizerMixin:
         return self._scheduler
 
     @property
-    def optimizer_params(self) -> dict:
+    def optimizer_params(self) -> OptimizerType:
         """Get the optimizer parameters."""
         return self._optimizer_params
 
     @optimizer_params.setter
-    def optimizer_params(self, params: dict):
+    def optimizer_params(self, params: OptimizerType | dict):
         """Set the optimizer parameters."""
-        self._optimizer_params = params.copy() if params else {}
+        if isinstance(params, dict):
+            params = OptimizerParams.parse_dict(d=params)
+        if not isinstance(params, OptimizerType):
+            raise TypeError(f"optimizer parameters must be a OptimizerType, got {type(params)}")
+        self._optimizer_params = params
 
     @property
     def scheduler_params(self) -> SchedulerType:
@@ -220,7 +301,7 @@ class OptimizerMixin:
         """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
-    def set_optimizer(self, opt_params: dict | None = None) -> None:
+    def set_optimizer(self, opt_params: OptimizerType | None = None) -> None:
         """
         Set the optimizer for this model.
         Currently supports single LR for all parameters, TODO allow for per parameter LRs by
@@ -233,10 +314,7 @@ class OptimizerMixin:
             self._optimizer = None
             return
 
-        opt_params = self._optimizer_params.copy()
-        opt_type = opt_params.pop("type", self.DEFAULT_OPTIMIZER_TYPE)
-
-        if opt_type == "none":
+        if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
             self.remove_optimizer()
             return
 
@@ -250,19 +328,15 @@ class OptimizerMixin:
         for p in params:
             p.requires_grad_(True)
 
-        if isinstance(opt_type, type):
-            self._optimizer = opt_type(params, **opt_params)
-        elif isinstance(opt_type, str):
-            if opt_type.lower() == "adam":
-                self._optimizer = torch.optim.Adam(params, **opt_params)
-            elif opt_type.lower() == "adamw":
-                self._optimizer = torch.optim.AdamW(params, **opt_params)
-            elif opt_type.lower() == "sgd":
-                self._optimizer = torch.optim.SGD(params, **opt_params)
-            else:
-                raise NotImplementedError(f"Unknown optimizer type: {opt_type}")
-        else:
-            raise TypeError(f"optimizer type must be string or type, got {type(opt_type)}")
+        match self._optimizer_params:
+            case OptimizerParams.Adam():
+                self._optimizer = torch.optim.Adam(params, **self._optimizer_params.params())
+            case OptimizerParams.AdamW():
+                self._optimizer = torch.optim.AdamW(params, **self._optimizer_params.params())
+            case OptimizerParams.SGD():
+                self._optimizer = torch.optim.SGD(params, **self._optimizer_params.params())
+            case _:
+                raise NotImplementedError(f"Unknown optimizer type: {self._optimizer_params}")
 
     def set_scheduler(
         self,
@@ -343,9 +417,9 @@ class OptimizerMixin:
     def remove_optimizer(self) -> None:
         """Remove the optimizer and scheduler."""
         self._optimizer = None
-        self._optimizer_params = {}
+        self._optimizer_params = OptimizerParams.NoneOptimizer()
         self._scheduler = None
-        self._scheduler_params = {}
+        self._scheduler_params = SchedulerParams.NoneScheduler()
 
     def reset_optimizer(self) -> None:
         """Reset the optimizer and scheduler."""
