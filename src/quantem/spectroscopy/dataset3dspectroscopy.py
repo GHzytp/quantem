@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 from typing import Any, Optional
@@ -17,7 +18,7 @@ class Dataset3dspectroscopy(Dataset3d):
     element_info = None
     element_info_path = "x_ray_lines.csv"
     atomic_weights = None
-    atomic_weights_path = "atomic_weights.json"
+    atomic_weights_path = "atomic_weights.csv"
     dataset_type = "EDS"
 
     def __init__(
@@ -72,20 +73,36 @@ class Dataset3dspectroscopy(Dataset3d):
 
     @classmethod
     def load_atomic_weights(cls):
-        """Load atomic weights table from JSON once per class."""
+        """Load atomic weights table from CSV once per class."""
         if cls.atomic_weights is not None:
             return
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         full_path = os.path.join(base_dir, cls.atomic_weights_path)
-        with open(full_path, "r") as f:
-            data = json.load(f)
+        data = {}
+        with open(full_path, "r", newline="") as f:
+            reader = csv.reader(f)
+            for row_index, row in enumerate(reader, start=1):
+                if not row:
+                    continue
+                if len(row) < 2:
+                    raise ValueError(
+                        f"{cls.atomic_weights_path} row {row_index} must contain element symbol and weight"
+                    )
+                symbol = str(row[0]).strip()
+                weight_raw = str(row[1]).strip()
+                if not symbol:
+                    continue
+                try:
+                    weight = float(weight_raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{cls.atomic_weights_path} row {row_index} has invalid weight: {weight_raw!r}"
+                    ) from exc
+                data[symbol] = weight
 
-        if isinstance(data, dict) and "atomic_weights" in data:
-            data = data["atomic_weights"]
-
-        if not isinstance(data, dict):
-            raise ValueError("atomic_weights.json must contain a JSON object")
+        if not data:
+            raise ValueError(f"{cls.atomic_weights_path} did not contain any atomic weights")
 
         cls.atomic_weights = data
 
