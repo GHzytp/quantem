@@ -301,7 +301,7 @@ class OptimizerMixin:
         """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
-    def set_optimizer(self, opt_params: OptimizerType | None = None) -> None:
+    def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
         """
         Set the optimizer for this model.
         Currently supports single LR for all parameters, TODO allow for per parameter LRs by
@@ -340,7 +340,7 @@ class OptimizerMixin:
 
     def set_scheduler(
         self,
-        scheduler_params: SchedulerType | None = None,
+        scheduler_params: SchedulerType | dict | None = None,
     ) -> None:
         """Set the scheduler for this model."""
         if scheduler_params is not None:
