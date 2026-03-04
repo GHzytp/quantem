@@ -1347,9 +1347,100 @@ class Dataset3deds(Dataset3dspectroscopy):
         lr_global=None,
         lr_local=None,
         device=None,
-        constrain_background=True,
+        constrain_background=0.1,
     ):
-        """Fit EDS spectra on either the mean spectrum or the full cube."""
+        """Fit EDS spectra using a PyTorch model.
+
+        Supports two workflows:
+        - Mean-only fitting (`fit_mean_only=True`): fit a single spectrum formed by
+          summing over all spatial pixels.
+        - Global + local fitting (`fit_mean_only=False`): fit a global mean model,
+          then refine concentrations/background per pixel across the full cube.
+
+        Parameters
+        ----------
+        energy_range : sequence[float] | None, optional
+            Two-element energy interval ``[emin, emax]`` in keV used for fitting.
+            If ``None``, the full energy axis is used.
+        elements_to_fit : sequence[str] | None, optional
+            Element symbols (or model-supported element labels) to include in the
+            fit. If ``None``, all supported elements from the model are considered.
+        peak_width : float, optional
+            Initial peak width (FWHM-like parameter in keV) for model peaks.
+        num_iters : int, optional
+            Number of optimization iterations for mean-only mode, or local
+            per-pixel refinement iterations in full-cube mode.
+        num_iters_global : int, optional
+            Number of iterations for the global/mean stage in full-cube mode.
+        polynomial_background_degree : int, optional
+            Degree of polynomial background basis.
+        optimizer_global : {"adam", "lbfgs"}, optional
+            Optimizer for the global/mean stage.
+        optimizer_local : {"adam", "lbfgs"}, optional
+            Optimizer for per-pixel local fitting.
+        loss_global : {"poisson", "mse"} | None, optional
+            Global-stage data term. If ``None``, defaults to ``"mse"`` for
+            mean-only mode and ``"poisson"`` otherwise.
+        loss_local : {"poisson", "mse"}, optional
+            Local-stage data term (ignored when ``fit_mean_only=True``).
+        freeze_peak_width : bool, optional
+            If ``True``, keep peak widths fixed during local fitting.
+        spatial_lambda : float, optional
+            L2 spatial smoothness weight applied to abundance maps during local
+            fitting. Must be non-negative.
+        min_total_counts : float, optional
+            Minimum per-pixel integrated counts required for a pixel to
+            participate in local fitting.
+        verbose : bool, optional
+            If ``True``, print optimization progress.
+        fit_mean_only : bool, optional
+            If ``True``, run only the mean-spectrum fit and skip per-pixel
+            refinement.
+        show_plot : bool, optional
+            If ``True``, display diagnostic plots.
+        lr_global : float | None, optional
+            Learning rate for the global optimizer. If ``None``, an optimizer-
+            specific default is used.
+        lr_local : float | None, optional
+            Learning rate for the local optimizer. If ``None``, an optimizer-
+            specific default is used.
+        device : str | torch.device | None, optional
+            Torch device for fitting (for example ``"cpu"`` or ``"cuda"``).
+            If ``None``, uses CUDA when available, otherwise CPU.
+        constrain_background : float, optional
+            Background prior weight used in local fitting to keep per-pixel
+            background coefficients close to the globally optimized background.
+            Set to ``0`` to disable. This is only used when
+            ``fit_mean_only=False``.
+
+        Returns
+        -------
+        dict
+            Fit results. Contents depend on the selected mode.
+
+            Mean-only mode (``fit_mean_only=True``) returns keys:
+            ``loss_history``, ``fitted_spectrum``, ``input_spectrum``,
+            ``background_spectrum``, ``concentrations``, ``element_names``,
+            ``edge_concentrations``, ``edge_names``, ``edge_element_indices``,
+            ``peak_widths``, ``energy_axis``, ``fit_range``.
+
+            Full-cube mode (``fit_mean_only=False``) returns keys:
+            ``abundance_maps``, ``element_names``, ``peak_widths``,
+            ``loss_history``, ``global_loss_history``, ``valid_pixel_mask``,
+            ``energy_axis``, ``input_spectrum``, ``fitted_spectrum``,
+            ``background_spectrum``, ``input_spectrum_all_pixels``,
+            ``fitted_spectrum_all_pixels``, ``background_spectrum_all_pixels``,
+            ``fit_range``.
+
+        Raises
+        ------
+        TypeError
+            If ``constrain_background`` is not numeric (for example ``bool``).
+        ValueError
+            If optimizer/loss names are invalid, ``spatial_lambda < 0``, CUDA is
+            requested but unavailable, ``constrain_background < 0``, or no pixels
+            satisfy ``min_total_counts``.
+        """
 
         def _normalize_choice(name, param_name, allowed_values):
             name_norm = str(name).lower()
@@ -1377,6 +1468,15 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         if spatial_lambda < 0:
             raise ValueError("spatial_lambda must be >= 0")
+
+        if isinstance(constrain_background, bool):
+            raise TypeError("constrain_background must be a non-negative float.")
+        try:
+            background_prior_lambda = float(constrain_background)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("constrain_background must be a non-negative float.") from exc
+        if background_prior_lambda < 0:
+            raise ValueError("constrain_background must be >= 0")
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1639,44 +1739,17 @@ class Dataset3deds(Dataset3dspectroscopy):
             predicted = torch.clamp(peaks_pred + bg_pred, min=1e-8, max=1e8)
             return predicted, conc, bg_pred
 
-        def _background_regularization(bg_local):
-            if not constrain_background:
-                return bg_local.new_tensor(0.0)
+        def _background_regularization():
+            if background_prior_lambda <= 0:
+                return bg_coeffs.new_tensor(0.0)
 
-            prior_lambda = 0.1
-            nonneg_lambda = 0.5
-            monotonic_lambda = 0.05
-            smoothness_lambda = 0.01
+            coeff_init_eval = bg_coeffs_init[valid_pixel_mask]
+            coeff_eval = bg_coeffs[valid_pixel_mask]
+            coeff_scale = torch.clamp(coeff_init_eval.abs().mean(), min=1e-8)
+            reg_prior = ((coeff_eval - coeff_init_eval) / coeff_scale).pow(2).mean()
+            return background_prior_lambda * reg_prior
 
-            reg_loss = bg_local.new_tensor(0.0)
-            local_scale = torch.clamp(global_scale, min=1e-8)
-
-            if prior_lambda > 0:
-                coeff_init_eval = bg_coeffs_init[valid_pixel_mask]
-                coeff_eval = bg_coeffs[valid_pixel_mask]
-                coeff_scale = torch.clamp(coeff_init_eval.abs().mean(), min=1e-8)
-                reg_prior = ((coeff_eval - coeff_init_eval) / coeff_scale).pow(2).mean()
-                reg_loss = reg_loss + prior_lambda * reg_prior
-
-            bg_eval = bg_local[valid_pixel_mask] / local_scale
-
-            if nonneg_lambda > 0:
-                reg_nonneg = torch.relu(-bg_eval).pow(2).mean()
-                reg_loss = reg_loss + nonneg_lambda * reg_nonneg
-
-            if monotonic_lambda > 0 and bg_eval.shape[1] > 1:
-                slope = bg_eval[:, 1:] - bg_eval[:, :-1]
-                reg_monotonic = torch.relu(slope).pow(2).mean()
-                reg_loss = reg_loss + monotonic_lambda * reg_monotonic
-
-            if smoothness_lambda > 0 and bg_eval.shape[1] > 2:
-                curvature = bg_eval[:, 2:] - 2.0 * bg_eval[:, 1:-1] + bg_eval[:, :-2]
-                reg_smooth = curvature.pow(2).mean()
-                reg_loss = reg_loss + smoothness_lambda * reg_smooth
-
-            return reg_loss
-
-        def _local_loss(pred_local, conc_local, bg_local):
+        def _local_loss(pred_local, conc_local):
             local_scale = torch.clamp(global_scale, min=1e-8)
             pred_eval = pred_local[valid_pixel_mask] / local_scale
             target_eval = spectra_flat[valid_pixel_mask] / local_scale
@@ -1686,7 +1759,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 target_eval,
                 loss=effective_loss_local,
             )
-            loss_total = loss_data + _background_regularization(bg_local)
+            loss_total = loss_data + _background_regularization()
 
             if spatial_lambda <= 0:
                 return loss_total
@@ -1703,20 +1776,20 @@ class Dataset3deds(Dataset3dspectroscopy):
 
                 def _local_closure():
                     local_opt.zero_grad()
-                    pred_local, conc_local, bg_local = _forward_model()
-                    loss_total = _local_loss(pred_local, conc_local, bg_local)
+                    pred_local, conc_local, _bg_local = _forward_model()
+                    loss_total = _local_loss(pred_local, conc_local)
                     loss_total.backward()
                     return loss_total
 
                 loss_value = local_opt.step(_local_closure)
                 if not torch.is_tensor(loss_value):
                     with torch.no_grad():
-                        pred_local, conc_local, bg_local = _forward_model()
-                        loss_value = _local_loss(pred_local, conc_local, bg_local)
+                        pred_local, conc_local, _bg_local = _forward_model()
+                        loss_value = _local_loss(pred_local, conc_local)
             else:
                 local_opt.zero_grad()
-                pred_local, conc_local, bg_local = _forward_model()
-                loss_value = _local_loss(pred_local, conc_local, bg_local)
+                pred_local, conc_local, _bg_local = _forward_model()
+                loss_value = _local_loss(pred_local, conc_local)
                 loss_value.backward()
                 local_opt.step()
 
