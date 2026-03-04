@@ -339,6 +339,27 @@ class TestVector:
         with pytest.raises(ValueError, match="all fields are selected"):
             v2.select_fields("kx").add_fields("bad")
 
+    def test_rename_fields(self):
+        v = make_line_vector()
+        kx_data = v.select_fields("kx").flatten().copy()
+
+        v.rename_fields({"kx": "qx", "ky": "qy"})
+        assert v.fields == ["intensity", "qx", "qy"]
+        np.testing.assert_array_equal(v.select_fields("qx").flatten(), kx_data)
+
+        # Renaming through a field-selected view updates that view's selected names
+        view = v.select_fields("qx")
+        assert view.fields == ["qx"]
+        view.rename_fields({"qx": "px"})
+        assert view.fields == ["px"]
+        assert v.fields == ["intensity", "px", "qy"]
+
+        with pytest.raises(KeyError, match="Unknown field"):
+            v.rename_fields({"nonexistent": "x"})
+
+        with pytest.raises(ValueError, match="already exist"):
+            v.rename_fields({"px": "intensity"})
+
     def test_remove_fields_preserves_remaining_data(self):
         v = make_line_vector()
         v.add_fields("extra", 1.0)

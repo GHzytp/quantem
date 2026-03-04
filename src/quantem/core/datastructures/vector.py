@@ -473,6 +473,30 @@ class Vector(AutoSerialize):
         if self._selected_fields is not None and tuple(old_fields) == self._selected_fields:
             self._selected_fields = None
 
+    def rename_fields(self, mapping: dict[str, str]) -> None:
+        """Rename one or more fields in-place.
+
+        Parameters
+        ----------
+        mapping : dict
+            Maps each old field name to its new name, e.g.
+            ``{"kx": "qx", "ky": "qy"}``.
+        """
+        old_field_set = set(self._state["fields"])
+        missing = [old for old in mapping if old not in old_field_set]
+        if missing:
+            raise KeyError(f"Unknown field(s): {missing}")
+        new_names = list(mapping.values())
+        conflicts = [n for n in new_names if n in old_field_set and n not in mapping]
+        if conflicts:
+            raise ValueError(f"New field name(s) already exist: {conflicts}")
+        validate_fields(new_names)
+
+        rename = {old: new for old, new in mapping.items()}
+        self._state["fields"] = [rename.get(f, f) for f in self._state["fields"]]
+        if self._selected_fields is not None:
+            self._selected_fields = tuple(rename.get(f, f) for f in self._selected_fields)
+
     def remove_fields(self, names: str | Sequence[str]) -> None:
         """Remove one or more fields from the full Vector schema."""
         self._require_full_field_view("remove_fields")
