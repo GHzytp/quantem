@@ -13,11 +13,47 @@ else:
 
 class OptimizerParams:
     """
-    Nested class for optimizer parameters.
+    Container for optimizer parameter dataclasses.
+
+    Each nested class configures a specific PyTorch optimizer and can be passed
+    directly to ``OptimizerMixin.set_optimizer``, or constructed from a dict via
+    ``OptimizerParams.parse_dict``.
+
+    Supported optimizers
+    --------------------
+    Adam
+        ``torch.optim.Adam`` — adaptive moment estimation.
+    AdamW
+        ``torch.optim.AdamW`` — Adam with decoupled weight decay.
+    SGD
+        ``torch.optim.SGD`` — stochastic gradient descent with optional momentum and Nesterov.
+    NoneOptimizer
+        Sentinel that disables / removes the optimizer.
+
+    Examples
+    --------
+    >>> obj.set_optimizer(OptimizerParams.Adam(lr=1e-4))
+    >>> obj.set_optimizer({"name": "adam", "lr": 1e-4})  # equivalent dict form
     """
 
     @dataclass
     class Adam:
+        """
+        Adam optimizer (``torch.optim.Adam``).
+
+        Parameters
+        ----------
+        lr : float
+            Learning rate. Default: 1e-3.
+        betas : tuple[float, float]
+            Coefficients for computing running averages of the gradient and its square.
+            Default: (0.9, 0.999).
+        eps : float
+            Term added to the denominator for numerical stability. Default: 1e-8.
+        weight_decay : float
+            L2 regularisation penalty. Default: 0.
+        """
+
         lr: float = 1e-3
         betas: tuple[float, float] = (0.9, 0.999)
         eps: float = 1e-8
@@ -34,6 +70,25 @@ class OptimizerParams:
 
     @dataclass
     class AdamW:
+        """
+        AdamW optimizer (``torch.optim.AdamW``).
+
+        Identical to Adam but applies weight decay directly to the parameters
+        rather than folding it into the gradient update (decoupled weight decay).
+
+        Parameters
+        ----------
+        lr : float
+            Learning rate. Default: 1e-3.
+        betas : tuple[float, float]
+            Coefficients for computing running averages of the gradient and its square.
+            Default: (0.9, 0.999).
+        eps : float
+            Term added to the denominator for numerical stability. Default: 1e-8.
+        weight_decay : float
+            Decoupled L2 regularisation penalty. Default: 0.
+        """
+
         lr: float = 1e-3
         betas: tuple[float, float] = (0.9, 0.999)
         eps: float = 1e-8
@@ -50,6 +105,23 @@ class OptimizerParams:
 
     @dataclass
     class SGD:
+        """
+        SGD optimizer (``torch.optim.SGD``).
+
+        Parameters
+        ----------
+        lr : float
+            Learning rate. Default: 1e-3.
+        momentum : float
+            Momentum factor. Default: 0.
+        dampening : float
+            Dampening for momentum. Default: 0.
+        weight_decay : float
+            L2 regularisation penalty. Default: 0.
+        nesterov : bool
+            Enables Nesterov momentum. Default: False.
+        """
+
         lr: float = 1e-3
         momentum: float = 0
         dampening: float = 0
@@ -68,6 +140,13 @@ class OptimizerParams:
 
     @dataclass
     class NoneOptimizer:
+        """
+        Sentinel optimizer that disables optimization.
+
+        Passing this to ``set_optimizer`` will call ``remove_optimizer``,
+        clearing both the optimizer and scheduler.
+        """
+
         _name: str = "none"
 
         def params(self) -> dict:
@@ -77,18 +156,24 @@ class OptimizerParams:
     def parse_dict(cls, d: dict):
         """
         Parse dictionary to a optimizer params object.
+        Accepts either ``"name"`` or ``"type"`` as the optimizer key.
         """
-        if d["name"] == "adam":
-            d.pop("name")
+        d = dict(d)  # avoid mutating caller's dict
+        name = d.pop("name", None) or d.pop("type", None)
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown optimizer type: {name}")
+        if name == "adam":
             return OptimizerParams.Adam(**d)
-        elif d["name"] == "adamw":
-            d.pop("name")
+        elif name == "adamw":
             return OptimizerParams.AdamW(**d)
-        elif d["name"] == "sgd":
-            d.pop("name")
+        elif name == "sgd":
             return OptimizerParams.SGD(**d)
         else:
-            raise ValueError(f"Unknown optimizer type: {d['name']}")
+            raise ValueError(f"Unknown optimizer type: {name.lower()}")
 
 
 OptimizerType = (
@@ -101,11 +186,61 @@ OptimizerType = (
 
 class SchedulerParams:
     """
-    Nested class for scheduler parameters.
+    Container for learning-rate scheduler parameter dataclasses.
+
+    Each nested class configures a specific PyTorch LR scheduler and can be passed
+    directly to ``OptimizerMixin.set_scheduler``, or constructed from a dict via
+    ``SchedulerParams.parse_dict``.
+
+    Supported schedulers
+    --------------------
+    Plateau
+        ``torch.optim.lr_scheduler.ReduceLROnPlateau`` — reduce LR when a metric stops improving.
+    Exponential
+        ``torch.optim.lr_scheduler.ExponentialLR`` — multiply LR by ``gamma`` each step.
+    Cyclic
+        ``torch.optim.lr_scheduler.CyclicLR`` — cycle LR between ``base_lr`` and ``max_lr``.
+    Linear
+        ``torch.optim.lr_scheduler.LinearLR`` — linearly interpolate LR over ``total_iters`` steps.
+    CosineAnnealing
+        ``torch.optim.lr_scheduler.CosineAnnealingLR`` — cosine-annealing LR schedule.
+    NoneScheduler
+        Sentinel that disables / removes the scheduler.
+
+    Examples
+    --------
+    >>> obj.set_scheduler(SchedulerParams.Plateau(factor=0.5, patience=10, cooldown=20))
+    >>> obj.set_scheduler({"name": "plateau", "factor": 0.5})  # equivalent dict form
     """
 
     @dataclass
     class Plateau:
+        """
+        ReduceLROnPlateau scheduler (``torch.optim.lr_scheduler.ReduceLROnPlateau``).
+
+        Reduces the learning rate when a monitored metric stops improving.
+
+        Parameters
+        ----------
+        mode : {'min', 'max'}
+            Whether the monitored metric should be minimised or maximised. Default: 'min'.
+        min_lr_factor : float
+            Sets ``min_lr = min_lr_factor * base_lr`` when ``min_lr`` is not provided.
+            Default: 1/20.
+        min_lr : float or None
+            Absolute lower bound on the learning rate. Overrides ``min_lr_factor`` when set.
+            Default: None.
+        factor : float
+            Factor by which the LR is reduced: ``new_lr = lr * factor``. Default: 0.5.
+        patience : int
+            Number of epochs with no improvement before reducing LR. Default: 10.
+        threshold : float
+            Minimum change in the monitored metric to qualify as an improvement. Default: 1e-5.
+        cooldown : int
+            Number of epochs to wait after a LR reduction before resuming normal operation.
+            Default: 50.
+        """
+
         mode: Literal["min", "max"] = "min"
         min_lr_factor: float = 1 / 20
         min_lr: float | None = None
@@ -115,7 +250,7 @@ class SchedulerParams:
         cooldown: int = 50
         _name: str = "plateau"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
             if self.min_lr is None:
                 self.min_lr = self.min_lr_factor * base_LR
             return {
@@ -129,12 +264,36 @@ class SchedulerParams:
 
     @dataclass
     class Exponential:
+        """
+        ExponentialLR scheduler (``torch.optim.lr_scheduler.ExponentialLR``).
+
+        Multiplies the learning rate by ``gamma`` after each step.
+
+        Parameters
+        ----------
+        gamma : float
+            Multiplicative decay factor applied each step. Default: 0.9.
+        factor : float or None
+            Reserved for future use. Default: 0.5.
+        num_iter : int or None
+            Reserved for future use. Default: None.
+        """
+
         gamma: float = 0.9
-        factor: float | None = 0.5
+        factor: float | None = None
         num_iter: int | None = None
         _name: str = "exponential"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
+            effective_num_iter = self.num_iter if self.num_iter is not None else num_iter
+            if effective_num_iter is None:
+                raise ValueError("num_iter must be set if num_iter is not provided")
+
+            self.num_iter = effective_num_iter
+
+            if self.factor is not None:
+                self.gamma = self.factor ** (1.0 / effective_num_iter)
+
             return {
                 "gamma": self.gamma,
                 "factor": self.factor,
@@ -142,6 +301,37 @@ class SchedulerParams:
 
     @dataclass
     class Cyclic:
+        """
+        CyclicLR scheduler (``torch.optim.lr_scheduler.CyclicLR``).
+
+        Cycles the learning rate between a lower bound (``base_lr``) and an upper
+        bound (``max_lr``). Bounds can be set directly or derived from the optimizer's
+        base LR via the factor parameters.
+
+        Parameters
+        ----------
+        base_lr_factor : float
+            Sets ``base_lr = base_lr_factor * optimizer_lr`` when ``base_lr`` is not provided.
+            Default: 1/4.
+        max_lr_factor : float
+            Sets ``max_lr = max_lr_factor * optimizer_lr`` when ``max_lr`` is not provided.
+            Default: 4.
+        base_lr : float or None
+            Absolute lower bound of the LR cycle. Overrides ``base_lr_factor`` when set.
+            Default: None.
+        max_lr : float or None
+            Absolute upper bound of the LR cycle. Overrides ``max_lr_factor`` when set.
+            Default: None.
+        step_size_up : int
+            Number of steps in the increasing half of each cycle. Default: 100.
+        step_size_down : int
+            Number of steps in the decreasing half of each cycle. Default: 100.
+        mode : {'triangular2', 'triangular', 'exp_range'}
+            Cycling policy. Default: 'triangular2'.
+        cycle_momentum : bool
+            If True, cycles momentum inversely to the learning rate. Default: False.
+        """
+
         base_lr_factor: float = 1 / 4
         max_lr_factor: float = 4
         base_lr: float | None = None
@@ -152,7 +342,7 @@ class SchedulerParams:
         cycle_momentum: bool = False
         _name: str = "cyclic"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
             if self.base_lr is None:
                 self.base_lr = self.base_lr_factor * base_LR
             if self.max_lr is None:
@@ -168,12 +358,34 @@ class SchedulerParams:
 
     @dataclass
     class Linear:
-        total_iters: int
+        """
+        LinearLR scheduler (``torch.optim.lr_scheduler.LinearLR``).
+
+        Linearly interpolates the learning rate from ``start_factor * base_lr`` to
+        ``end_factor * base_lr`` over ``total_iters`` steps.
+
+        Parameters
+        ----------
+        total_iters : int
+            Number of steps over which to interpolate the LR. Required.
+        start_factor : float
+            Multiplicative factor applied to the LR at the first step. Default: 0.1.
+        end_factor : float
+            Multiplicative factor applied to the LR at the final step. Default: 1.0.
+        """
+
+        total_iters: int | None = None
         start_factor: float = 0.1
         end_factor: float = 1.0
         _name: str = "linear"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
+            if num_iter is None and self.total_iters is None:
+                raise ValueError(
+                    "total_iters must be set if num_iter is not provided"
+                )  # Should never be reached
+            if self.total_iters is None:
+                self.total_iters = num_iter
             return {
                 "start_factor": self.start_factor,
                 "end_factor": self.end_factor,
@@ -182,11 +394,31 @@ class SchedulerParams:
 
     @dataclass
     class CosineAnnealing:
-        T_max: int
+        """
+        CosineAnnealingLR scheduler (``torch.optim.lr_scheduler.CosineAnnealingLR``).
+
+        Anneals the learning rate following a cosine curve from the base LR down to
+        ``eta_min`` over ``T_max`` steps, then restarts.
+
+        Parameters
+        ----------
+        T_max : int
+            Maximum number of iterations (half-period of the cosine cycle). Required.
+        eta_min : float
+            Minimum learning rate at the trough of the cosine curve. Default: 1e-7.
+        """
+
         eta_min: float = 1e-7
+        T_max: int | None = None
         _name: str = "cosine_annealing"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
+            if num_iter is None and self.T_max is None:
+                raise ValueError(
+                    "T_max must be set if num_iter is not provided"
+                )  # Should never be reached
+            if self.T_max is None:
+                self.T_max = num_iter
             return {
                 "T_max": self.T_max,
                 "eta_min": self.eta_min,
@@ -194,36 +426,46 @@ class SchedulerParams:
 
     @dataclass
     class NoneScheduler:
+        """
+        Sentinel scheduler that disables LR scheduling.
+
+        Passing this to ``set_scheduler`` clears the active scheduler without
+        affecting the optimizer.
+        """
+
         _name: str = "none"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
             return {}
 
     @classmethod
     def parse_dict(cls, d: dict):
         """
         Parse dictionary to a scheduler params object.
+        Accepts either ``"name"`` or ``"type"`` as the scheduler key.
         """
-        if d["name"] == "plateau":
-            d.pop("name")
+        d = dict(d)  # avoid mutating caller's dict
+        name = d.pop("name", None) or d.pop("type", None)
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown scheduler type: {name}")
+        if name == "plateau":
             return SchedulerParams.Plateau(**d)
-        elif d["name"] == "exponential":
-            d.pop("name")
+        elif name == "exponential":
             return SchedulerParams.Exponential(**d)
-        elif d["name"] == "cyclic":
-            d.pop("name")
+        elif name == "cyclic":
             return SchedulerParams.Cyclic(**d)
-        elif d["name"] == "linear":
-            d.pop("name")
+        elif name == "linear":
             return SchedulerParams.Linear(**d)
-        elif d["name"] == "cosine_annealing":
-            d.pop("name")
+        elif name == "cosine_annealing":
             return SchedulerParams.CosineAnnealing(**d)
-        elif d["name"] == "none":
-            d.pop("name")
+        elif name == "none":
             return SchedulerParams.NoneScheduler()
         else:
-            raise ValueError(f"Unknown scheduler type: {d['name']}")
+            raise ValueError(f"Unknown scheduler type: {name}")
 
 
 SchedulerType = (
@@ -339,8 +581,7 @@ class OptimizerMixin:
                 raise NotImplementedError(f"Unknown optimizer type: {self._optimizer_params}")
 
     def set_scheduler(
-        self,
-        scheduler_params: SchedulerType | dict | None = None,
+        self, scheduler_params: SchedulerType | dict | None = None, num_iter: int | None = None
     ) -> None:
         """Set the scheduler for this model."""
         if scheduler_params is not None:
@@ -352,8 +593,7 @@ class OptimizerMixin:
 
         optimizer = self._optimizer
         base_LR = optimizer.param_groups[0]["lr"]
-
-        params = self._scheduler_params.params(base_LR)
+        params = self._scheduler_params.params(base_LR, num_iter=num_iter)
         match self.scheduler_params:
             case SchedulerParams.NoneScheduler():
                 self._scheduler = None
