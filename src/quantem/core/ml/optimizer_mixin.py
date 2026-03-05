@@ -296,7 +296,6 @@ class SchedulerParams:
 
             return {
                 "gamma": self.gamma,
-                "factor": self.factor,
             }
 
     @dataclass
