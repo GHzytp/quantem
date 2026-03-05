@@ -107,7 +107,7 @@ class DatasetConstraintParams:
             raise ValueError(f"Unknown dataset constraint type: {name.lower()}")
 
 
-DatasetConstraintType = (
+DatasetConstraintsType = (
     DatasetConstraintParams.BaseTomographyDatasetConstraints
     | DatasetConstraintParams.ThroughFocalDatasetConstraints
 )
