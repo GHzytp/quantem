@@ -1,6 +1,6 @@
 import torch
 
-from quantem.core.ml.optimizer_mixin import OptimizerType
+from quantem.core.ml.optimizer_mixin import OptimizerParams, OptimizerType
 from quantem.tomography.tomography_base import TomographyBase
 
 
@@ -36,7 +36,7 @@ class TomographyOpt(TomographyBase):
         }
 
     @optimizer_params.setter
-    def optimizer_params(self, d: dict[str, OptimizerType]):
+    def optimizer_params(self, d: dict[str, OptimizerType] | dict[str, dict]):
         """Set the optimizer parameters."""
         if isinstance(d, (tuple, list)):
             d = {k: {} for k in d}
@@ -51,8 +51,7 @@ class TomographyOpt(TomographyBase):
                 raise ValueError(f"Unknown optimization key: {k}")
 
             if not isinstance(v, OptimizerType):
-                if "lr" not in v:
-                    v["lr"] = self._get_default_lr(k)
+                v = OptimizerParams.parse_dict(v)
 
             targets[k].optimizer_params = v
 

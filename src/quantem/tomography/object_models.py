@@ -48,7 +48,7 @@ class ObjConstraintParams:
         Parse dictionary to an object constraint params object.
         """
         d = dict(d)
-        name = d.pop("name", "none") or d.pop("type", "none")
+        name = d.pop("name", None) or d.pop("type", "none")
         if isinstance(name, type):
             name = name.__name__.lower()
         elif isinstance(name, str):
