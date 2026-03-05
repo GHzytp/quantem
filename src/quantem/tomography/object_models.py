@@ -22,22 +22,43 @@ class ObjConstraintParams:
     """
     Namespace class for object reconstruction constraint dataclasses and parsing utilities.
 
-    Contains constraint definitions for pixelated and implicit neural representation (INR)
-    object types, along with a factory method for instantiating the appropriate class
-    from a configuration dictionary.
+    Contains constraint definitions for pixelated and implicit neural representation
+    (INR) object types, along with a factory method for instantiating the appropriate
+    class from a configuration dictionary.
+
+    Supported constraint types
+    --------------------------
+    ObjPixelatedConstraints
+        Constraints for a voxel-grid (pixelated) object representation.
+    ObjINRConstraints
+        Constraints for a network-parameterized (INR) object representation;
+        adds a sparsity term not present in the pixelated variant.
+
+    Examples
+    --------
+    >>> ObjConstraintParams.parse_dict({"name": "obj_pixelated", "tv_vol": 0.01})
+    ObjPixelatedConstraints(positivity=True, shrinkage=0.0, tv_vol=0.01)
+    >>> ObjConstraintParams.parse_dict({"type": "obj_inr", "sparsity": 0.05})
+    ObjINRConstraints(positivity=True, shrinkage=0.0, tv_vol=0.0, sparsity=0.05)
     """
 
     @dataclass
     class ObjPixelatedConstraints(Constraints):
         """
-        Constraints for a pixelated object representation.
+        Constraints for a pixelated (voxel-grid) object representation.
 
-        Attributes:
-            positivity: If True, enforces non-negative values in the reconstruction.
-            shrinkage: Shrinkage regularization strength; pushes values toward zero.
-            tv_vol: Total variation regularization weight for the 3-D volume.
-            soft_constraint_keys: Constraint fields penalized softly during optimization.
-            hard_constraint_keys: Constraint fields enforced strictly during optimization.
+        Attributes
+        ----------
+        positivity : bool
+            If ``True``, enforces non-negative values in the reconstruction.
+        shrinkage : float
+            Shrinkage regularization strength; pushes values toward zero.
+        tv_vol : float
+            Total variation regularization weight for the 3-D volume.
+        soft_constraint_keys : list[str]
+            Constraint fields penalized softly during optimization.
+        hard_constraint_keys : list[str]
+            Constraint fields enforced strictly during optimization.
         """
 
         positivity: bool = True
@@ -53,13 +74,23 @@ class ObjConstraintParams:
         """
         Constraints for an implicit neural representation (INR) object.
 
-        Attributes:
-            positivity: If True, enforces non-negative values in the reconstruction.
-            shrinkage: Shrinkage regularization strength; pushes values toward zero.
-            tv_vol: Total variation regularization weight for the 3-D volume.
-            sparsity: Sparsity regularization weight; encourages near-zero activations.
-            soft_constraint_keys: Constraint fields penalized softly during optimization.
-            hard_constraint_keys: Constraint fields enforced strictly during optimization.
+        Extends pixelated constraints with an additional sparsity term suited
+        to the continuous, network-parameterized object representation.
+
+        Attributes
+        ----------
+        positivity : bool
+            If ``True``, enforces non-negative values in the reconstruction.
+        shrinkage : float
+            Shrinkage regularization strength; pushes values toward zero.
+        tv_vol : float
+            Total variation regularization weight for the 3-D volume.
+        sparsity : float
+            Sparsity regularization weight; encourages near-zero activations.
+        soft_constraint_keys : list[str]
+            Constraint fields penalized softly during optimization.
+        hard_constraint_keys : list[str]
+            Constraint fields enforced strictly during optimization.
         """
 
         positivity: bool = True
@@ -82,23 +113,29 @@ class ObjConstraintParams:
         which constraint class to construct. All remaining keys are forwarded as
         keyword arguments to the selected dataclass.
 
-        Args:
-            d: Configuration dictionary. Must include ``'name'`` or ``'type'``
-               with one of the following values (case-insensitive):
+        Parameters
+        ----------
+        d : dict
+            Configuration dictionary. Must include ``'name'`` or ``'type'``
+            with one of the following values (case-insensitive):
 
-               - ``'obj_pixelated'`` → :class:`ObjPixelatedConstraints`
-               - ``'obj_inr'`` → :class:`ObjINRConstraints`
+            - ``'obj_pixelated'`` → :class:`ObjPixelatedConstraints`
+            - ``'obj_inr'`` → :class:`ObjINRConstraints`
 
-               The key may also be a class ``type`` object, in which case its
-               ``__name__`` is used after lower-casing.
+            The value may also be a class ``type`` object, in which case its
+            ``__name__`` is used after lower-casing.
 
-        Returns:
+        Returns
+        -------
+        ObjPixelatedConstraints or ObjINRConstraints
             An instance of the appropriate object constraint dataclass.
 
-        Raises:
-            ValueError: If neither ``'name'`` nor ``'type'`` is present, if the
-                value is not a string or type, or if the name does not match any
-                known object constraint type.
+        Raises
+        ------
+        ValueError
+            If neither ``'name'`` nor ``'type'`` is present, if the value is not
+            a string or type, or if the name does not match any known object
+            constraint type.
         """
         d = dict(d)
         name = d.pop("name", None)

@@ -23,6 +23,20 @@ class DatasetConstraintParams:
 
     Contains constraint definitions for different tomography dataset types and a
     factory method for instantiating the appropriate constraint class from a dict.
+
+    Supported constraint types
+    --------------------------
+    BaseTomographyDatasetConstraints
+        Base soft constraints for z-position and lateral shift regularization.
+    ThroughFocalDatasetConstraints
+        Inherits base constraints; not yet implemented.
+
+    Examples
+    --------
+    >>> DatasetConstraintParams.parse_dict({"name": "base_tomography_dataset", "tv_zs": 0.1})
+    BaseTomographyDatasetConstraints(tv_zs=0.1, tv_shifts=0.0)
+    >>> DatasetConstraintParams.parse_dict({"type": "base_tomography_dataset"})
+    BaseTomographyDatasetConstraints(tv_zs=0.0, tv_shifts=0.0)
     """
 
     @dataclass
@@ -30,11 +44,16 @@ class DatasetConstraintParams:
         """
         Soft constraints for a base tomography dataset.
 
-        Attributes:
-            tv_zs: Total variation regularization weight for z-positions.
-            tv_shifts: Total variation regularization weight for lateral shifts.
-            soft_constraint_keys: Constraint fields penalized softly during optimization.
-            hard_constraint_keys: Constraint fields enforced strictly (none for this class).
+        Attributes
+        ----------
+        tv_zs : float
+            Total variation regularization weight for z-positions.
+        tv_shifts : float
+            Total variation regularization weight for lateral shifts.
+        soft_constraint_keys : list[str]
+            Constraint fields penalized softly during optimization.
+        hard_constraint_keys : list[str]
+            Constraint fields enforced strictly (none for this class).
         """
 
         tv_zs: float = 0.0
@@ -48,8 +67,8 @@ class DatasetConstraintParams:
         """
         Constraints for a through-focal tomography dataset.
 
-        Inherits all constraints from BaseTomographyDatasetConstraints.
-        Currently not implemented — instantiation will raise NotImplementedError.
+        Inherits all constraints from ``BaseTomographyDatasetConstraints``.
+        Currently not implemented — instantiation will raise ``NotImplementedError``.
         """
 
         pass
@@ -65,27 +84,32 @@ class DatasetConstraintParams:
         which constraint class to construct. All remaining keys are forwarded as
         keyword arguments to the selected dataclass.
 
-        Args:
-            d: Configuration dictionary. Must include ``'name'`` or ``'type'``
-               with one of the following values (case-insensitive):
+        Parameters
+        ----------
+        d : dict
+            Configuration dictionary. Must include ``'name'`` or ``'type'``
+            with one of the following values (case-insensitive):
 
-               - ``'base_tomography_dataset'`` →
-                 :class:`BaseTomographyDatasetConstraints`
-               - ``'through_focal_dataset'`` →
-                 :class:`ThroughFocalDatasetConstraints` *(not yet implemented)*
+            - ``'base_tomography_dataset'`` → :class:`BaseTomographyDatasetConstraints`
+            - ``'through_focal_dataset'`` → :class:`ThroughFocalDatasetConstraints`
+              *(not yet implemented)*
 
-               The key may also be a class ``type`` object, in which case its
-               ``__name__`` is used after lower-casing.
+            The value may also be a class ``type`` object, in which case its
+            ``__name__`` is used after lower-casing.
 
-        Returns:
+        Returns
+        -------
+        BaseTomographyDatasetConstraints or ThroughFocalDatasetConstraints
             An instance of the appropriate constraint dataclass.
 
-        Raises:
-            ValueError: If neither ``'name'`` nor ``'type'`` is present, if the
-                value is not a string or type, or if the name does not match any
-                known dataset constraint type.
-            NotImplementedError: If ``'through_focal_dataset'`` is requested, as
-                it is not yet implemented.
+        Raises
+        ------
+        ValueError
+            If neither ``'name'`` nor ``'type'`` is present, if the value is not
+            a string or type, or if the name does not match any known dataset
+            constraint type.
+        NotImplementedError
+            If ``'through_focal_dataset'`` is requested, as it is not yet implemented.
         """
         d = dict(d)
         name = d.pop("name", None)
