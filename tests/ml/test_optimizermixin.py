@@ -114,6 +114,61 @@ class TestOptimizerParseDict:
             OptimizerParams.parse_dict({"name": 42})
 
 
+# ─── parse_dict "name" vs "type" key handling ───────────────────────────────
+
+
+class TestOptimizerParseDictKeyHandling:
+    def test_parse_with_type_key(self):
+        result = OptimizerParams.parse_dict({"type": "adam", "lr": 0.01})
+        assert isinstance(result, OptimizerParams.Adam)
+        assert result.lr == 0.01
+
+    def test_name_takes_precedence_over_type(self):
+        result = OptimizerParams.parse_dict({"name": "adam", "type": "sgd"})
+        assert isinstance(result, OptimizerParams.Adam)
+
+    def test_neither_name_nor_type_raises(self):
+        with pytest.raises(ValueError, match="Must provide either"):
+            OptimizerParams.parse_dict({"lr": 0.01})
+
+    def test_type_key_not_leaked_into_constructor(self):
+        """'type' should be popped from d so it doesn't become an unexpected kwarg."""
+        result = OptimizerParams.parse_dict({"type": "sgd", "momentum": 0.9})
+        assert isinstance(result, OptimizerParams.SGD)
+        assert result.momentum == 0.9
+
+    def test_both_keys_popped_when_name_used(self):
+        """Even when 'name' is used, 'type' should be popped so it doesn't leak."""
+        result = OptimizerParams.parse_dict({"name": "adam", "type": "ignored", "lr": 0.05})
+        assert isinstance(result, OptimizerParams.Adam)
+        assert result.lr == 0.05
+
+
+class TestSchedulerParseDictKeyHandling:
+    def test_parse_with_type_key(self):
+        result = SchedulerParams.parse_dict({"type": "plateau", "patience": 20})
+        assert isinstance(result, SchedulerParams.Plateau)
+        assert result.patience == 20
+
+    def test_name_takes_precedence_over_type(self):
+        result = SchedulerParams.parse_dict({"name": "plateau", "type": "linear"})
+        assert isinstance(result, SchedulerParams.Plateau)
+
+    def test_neither_name_nor_type_raises(self):
+        with pytest.raises(ValueError, match="Must provide either"):
+            SchedulerParams.parse_dict({"patience": 20})
+
+    def test_type_key_not_leaked_into_constructor(self):
+        result = SchedulerParams.parse_dict({"type": "cyclic", "step_size_up": 50})
+        assert isinstance(result, SchedulerParams.Cyclic)
+        assert result.step_size_up == 50
+
+    def test_both_keys_popped_when_name_used(self):
+        result = SchedulerParams.parse_dict({"name": "plateau", "type": "ignored", "patience": 5})
+        assert isinstance(result, SchedulerParams.Plateau)
+        assert result.patience == 5
+
+
 # ─── SchedulerParams defaults ───────────────────────────────────────────────
 
 
@@ -291,5 +346,5 @@ class TestSchedulerParseDict:
             SchedulerParams.parse_dict({"name": 3.14})
 
     def test_parse_default_name_is_none(self):
-        result = SchedulerParams.parse_dict({})
-        assert isinstance(result, SchedulerParams.NoneScheduler)
+        with pytest.raises(ValueError, match="Must provide either"):
+            SchedulerParams.parse_dict({})
