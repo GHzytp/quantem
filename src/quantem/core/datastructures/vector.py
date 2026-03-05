@@ -93,6 +93,10 @@ class Vector(AutoSerialize):
     __array_priority__ = 1000
     _token = object()
 
+    # ------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------ #
+
     def __init__(
         self,
         shape: tuple[int, ...],
@@ -200,6 +204,28 @@ class Vector(AutoSerialize):
         vector._replace_cells(np.arange(len(cell_arrays), dtype=np.int64), cell_arrays)
         return vector
 
+    # ------------------------------------------------------------------ #
+    # Identity properties
+    # ------------------------------------------------------------------ #
+
+    @property
+    def name(self) -> str:
+        """Human-readable Vector name."""
+        return self._state["name"]
+
+    @name.setter
+    def name(self, value: str) -> None:
+        self._state["name"] = str(value)
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Mutable metadata dictionary shared by all views."""
+        return self._state["metadata"]
+
+    # ------------------------------------------------------------------ #
+    # Shape & structure properties
+    # ------------------------------------------------------------------ #
+
     @property
     def shape(self) -> tuple[int, ...]:
         """Return the fixed-grid shape of this selection."""
@@ -224,23 +250,23 @@ class Vector(AutoSerialize):
         return len(self.fields)
 
     @property
+    def num_cells(self) -> int:
+        """Return the number of fixed-grid cells in the current selection."""
+        return int(self._selected_cell_indices().size)
+
+    @property
+    def total_rows(self) -> int:
+        """Return the total ragged-row count in the current selection."""
+        return int(self._state["cell_lengths"][self._selected_cell_indices()].sum())
+
+    @property
     def dtype(self) -> np.dtype[Any]:
         """Return the NumPy dtype of the backing row buffer."""
         return self._state["data"].dtype
 
-    @property
-    def name(self) -> str:
-        """Human-readable Vector name."""
-        return self._state["name"]
-
-    @name.setter
-    def name(self, value: str) -> None:
-        self._state["name"] = str(value)
-
-    @property
-    def metadata(self) -> dict[str, Any]:
-        """Mutable metadata dictionary shared by all views."""
-        return self._state["metadata"]
+    # ------------------------------------------------------------------ #
+    # Data access
+    # ------------------------------------------------------------------ #
 
     @property
     def array(self) -> NDArray[Any]:
@@ -264,40 +290,6 @@ class Vector(AutoSerialize):
             return cell[:, int(cols[0]) : int(cols[-1]) + 1]
         return cell[:, cols].copy()
 
-    def __len__(self) -> int:
-        """Return ``shape[0]`` for non-scalar selections."""
-        if self.shape == ():
-            raise TypeError("len() of unsized 0D Vector")
-        return self.shape[0]
-
-    def __repr__(self) -> str:
-        return "\n".join(
-            [
-                f"quantem.Vector, shape={self.shape}, name={self.name}",
-                f"  fields = {self.fields}",
-                f"  units: {self.units}",
-            ]
-        )
-
-    __str__ = __repr__
-
-    def copy(self) -> "Vector":
-        """Return a deep copy of the current selection."""
-        copied = self.__class__(
-            shape=self.shape,
-            fields=self.fields,
-            units=self.units,
-            name=self.name,
-            metadata=copy.deepcopy(self.metadata),
-            _token=self.__class__._token,
-        )
-        target_cells = copied._selected_cell_indices()
-        source_arrays = [
-            self._selected_cell_matrix(index).copy() for index in self._selected_cell_indices()
-        ]
-        copied._replace_cells(target_cells, source_arrays)
-        return copied
-
     def flatten(self) -> NDArray[Any]:
         """Concatenate selected cells in row-major order.
 
@@ -315,19 +307,13 @@ class Vector(AutoSerialize):
         dtype = self._state["data"].dtype if self._state["data"].ndim == 2 else float
         return np.empty((0, self.num_fields), dtype=dtype)
 
-    @property
-    def total_rows(self) -> int:
-        """Return the total ragged-row count in the current selection."""
-        return int(self._state["cell_lengths"][self._selected_cell_indices()].sum())
-
-    @property
-    def num_cells(self) -> int:
-        """Return the number of fixed-grid cells in the current selection."""
-        return int(self._selected_cell_indices().size)
-
     def row_counts(self) -> list[int]:
         """Return per-cell row counts in the current selection order."""
         return [self._cell_row_count(int(index)) for index in self._selected_cell_indices()]
+
+    # ------------------------------------------------------------------ #
+    # Field management
+    # ------------------------------------------------------------------ #
 
     def select_fields(self, *field_names: str | Sequence[str]) -> "Vector":
         """Return a view containing only the requested fields.
@@ -362,82 +348,6 @@ class Vector(AutoSerialize):
             self._selection_indices,
             selected_fields,
         )
-
-    def set_flattened(self, values: Any) -> None:
-        """Write values back in flattened row-major order.
-
-        This updates existing rows without changing per-cell row counts. It is
-        the rowwise companion to ``flatten()`` and is especially useful for
-        NumPy-based transforms that operate on all selected rows at once.
-        """
-        field_indices = self._field_indices()
-        targets = self._selected_cell_indices()
-        row_counts = self.row_counts()
-        total_rows = sum(row_counts)
-
-        if isinstance(values, Vector):
-            if values.num_fields != self.num_fields:
-                raise ValueError(f"Expected {self.num_fields} fields, got {values.num_fields}")
-            flat_values = values.flatten()
-            if flat_values.shape[0] != total_rows:
-                raise ValueError(f"Expected {total_rows} rows, got {flat_values.shape[0]}")
-        else:
-            flat_values = _broadcast_field_values(values, total_rows, self.num_fields)
-
-        cursor = 0
-        for target, rows in zip(targets, row_counts):
-            cell = self._cell_matrix(int(target))
-            if rows > 0:
-                cell[:, field_indices] = flat_values[cursor : cursor + rows]
-            cursor += rows
-
-    def compact(self) -> None:
-        """Repack the backing row buffer to remove dead rows.
-
-        Whole-cell replacement appends new rows and leaves previous rows unused
-        until compaction. Calling ``compact()`` makes memory usage and save size
-        predictable at the cost of reallocating the backing buffer.
-        """
-        data = self._state["data"]
-        used_rows = int(self._state["cell_lengths"].sum())
-        if used_rows == 0:
-            self._state["data"] = np.empty((0, self._full_num_fields), dtype=data.dtype)
-            self._state["cell_starts"].fill(0)
-            return
-
-        compacted = np.empty((used_rows, self._full_num_fields), dtype=data.dtype)
-        starts = np.zeros_like(self._state["cell_starts"])
-        cursor = 0
-        for linear_index in range(_cell_count(self._state["shape"])):
-            length = self._cell_row_count(linear_index)
-            starts[linear_index] = cursor
-            if length > 0:
-                cell = self._cell_matrix(linear_index)
-                compacted[cursor : cursor + length] = cell
-                cursor += length
-        self._state["data"] = compacted
-        self._state["cell_starts"] = starts
-
-    def append_rows(self, idx: Any, rows: Any) -> None:
-        """Append one or more rows to a single selected cell.
-
-        ``idx`` is interpreted with the same fixed-grid indexing rules as
-        ``__getitem__`` and must resolve to exactly one cell. Appending rows is a
-        full-cell operation, so all fields must be selected.
-        """
-        target = self[idx]
-        if target.shape != ():
-            raise ValueError("append_rows requires an index that selects exactly one cell.")
-        target._require_full_field_view("append_rows")
-
-        new_rows = _coerce_cell_array(rows, target.num_fields)
-        if new_rows.shape[0] == 0:
-            return
-
-        cell_index = int(target._selected_cell_indices()[0])
-        existing = target._cell_matrix(cell_index)
-        combined = np.vstack((existing, new_rows)) if existing.shape[0] > 0 else new_rows.copy()
-        target._replace_cells(np.array([cell_index], dtype=np.int64), [combined])
 
     def add_fields(
         self,
@@ -523,6 +433,124 @@ class Vector(AutoSerialize):
             if len(self._selected_fields) == len(self._state["fields"]):
                 self._selected_fields = None
 
+    # ------------------------------------------------------------------ #
+    # Cell / row mutation
+    # ------------------------------------------------------------------ #
+
+    def append_rows(self, idx: Any, rows: Any) -> None:
+        """Append one or more rows to a single selected cell.
+
+        ``idx`` is interpreted with the same fixed-grid indexing rules as
+        ``__getitem__`` and must resolve to exactly one cell. Appending rows is a
+        full-cell operation, so all fields must be selected.
+        """
+        target = self[idx]
+        if target.shape != ():
+            raise ValueError("append_rows requires an index that selects exactly one cell.")
+        target._require_full_field_view("append_rows")
+
+        new_rows = _coerce_cell_array(rows, target.num_fields)
+        if new_rows.shape[0] == 0:
+            return
+
+        cell_index = int(target._selected_cell_indices()[0])
+        existing = target._cell_matrix(cell_index)
+        combined = np.vstack((existing, new_rows)) if existing.shape[0] > 0 else new_rows.copy()
+        target._replace_cells(np.array([cell_index], dtype=np.int64), [combined])
+
+    def set_flattened(self, values: Any) -> None:
+        """Write values back in flattened row-major order.
+
+        This updates existing rows without changing per-cell row counts. It is
+        the rowwise companion to ``flatten()`` and is especially useful for
+        NumPy-based transforms that operate on all selected rows at once.
+        """
+        field_indices = self._field_indices()
+        targets = self._selected_cell_indices()
+        row_counts = self.row_counts()
+        total_rows = sum(row_counts)
+
+        if isinstance(values, Vector):
+            if values.num_fields != self.num_fields:
+                raise ValueError(f"Expected {self.num_fields} fields, got {values.num_fields}")
+            flat_values = values.flatten()
+            if flat_values.shape[0] != total_rows:
+                raise ValueError(f"Expected {total_rows} rows, got {flat_values.shape[0]}")
+        else:
+            flat_values = _broadcast_field_values(values, total_rows, self.num_fields)
+
+        cursor = 0
+        for target, rows in zip(targets, row_counts):
+            cell = self._cell_matrix(int(target))
+            if rows > 0:
+                cell[:, field_indices] = flat_values[cursor : cursor + rows]
+            cursor += rows
+
+    def compact(self) -> None:
+        """Repack the backing row buffer to remove dead rows.
+
+        Whole-cell replacement appends new rows and leaves previous rows unused
+        until compaction. Calling ``compact()`` makes memory usage and save size
+        predictable at the cost of reallocating the backing buffer.
+        """
+        data = self._state["data"]
+        used_rows = int(self._state["cell_lengths"].sum())
+        if used_rows == 0:
+            self._state["data"] = np.empty((0, self._full_num_fields), dtype=data.dtype)
+            self._state["cell_starts"].fill(0)
+            return
+
+        compacted = np.empty((used_rows, self._full_num_fields), dtype=data.dtype)
+        starts = np.zeros_like(self._state["cell_starts"])
+        cursor = 0
+        for linear_index in range(_cell_count(self._state["shape"])):
+            length = self._cell_row_count(linear_index)
+            starts[linear_index] = cursor
+            if length > 0:
+                cell = self._cell_matrix(linear_index)
+                compacted[cursor : cursor + length] = cell
+                cursor += length
+        self._state["data"] = compacted
+        self._state["cell_starts"] = starts
+
+    # ------------------------------------------------------------------ #
+    # Python data model
+    # ------------------------------------------------------------------ #
+
+    def __len__(self) -> int:
+        """Return ``shape[0]`` for non-scalar selections."""
+        if self.shape == ():
+            raise TypeError("len() of unsized 0D Vector")
+        return self.shape[0]
+
+    def __repr__(self) -> str:
+        return "\n".join(
+            [
+                f"quantem.Vector, shape={self.shape}, name={self.name}",
+                f"  fields = {self.fields}",
+                f"  units: {self.units}",
+            ]
+        )
+
+    __str__ = __repr__
+
+    def copy(self) -> "Vector":
+        """Return a deep copy of the current selection."""
+        copied = self.__class__(
+            shape=self.shape,
+            fields=self.fields,
+            units=self.units,
+            name=self.name,
+            metadata=copy.deepcopy(self.metadata),
+            _token=self.__class__._token,
+        )
+        target_cells = copied._selected_cell_indices()
+        source_arrays = [
+            self._selected_cell_matrix(index).copy() for index in self._selected_cell_indices()
+        ]
+        copied._replace_cells(target_cells, source_arrays)
+        return copied
+
     def __getitem__(self, idx: Any) -> "Vector":
         """Return a fixed-grid selection as another Vector view."""
         if _looks_like_field_selector(idx):
@@ -549,6 +577,10 @@ class Vector(AutoSerialize):
         else:
             target = self[idx]
         target._assign(value)
+
+    # ------------------------------------------------------------------ #
+    # Arithmetic operators
+    # ------------------------------------------------------------------ #
 
     def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any) -> Any:
         """Apply supported NumPy ufuncs elementwise.
@@ -668,6 +700,54 @@ class Vector(AutoSerialize):
         result._inplace_unary(np.abs)
         return result
 
+    # ------------------------------------------------------------------ #
+    # I/O
+    # ------------------------------------------------------------------ #
+
+    def save(
+        self,
+        path: str | Path,
+        mode: Literal["w", "o"] = "w",
+        store: Literal["auto", "zip", "dir"] = "auto",
+        skip: str | type | Sequence[str | type] = (),
+        compression_level: int | None = 4,
+    ) -> None:
+        """
+        Save the Vector object to disk using Zarr serialization. self.compact() is called before
+        saving to reduce file size if possible.
+
+        Parameters
+        ----------
+        path : str or Path
+            Target file path. Use '.zip' extension for zip format, otherwise a directory.
+        mode : {'w', 'o'}
+            'w' = write only if file doesn't exist, 'o' = overwrite if it does.
+        store : {'auto', 'zip', 'dir'}
+            Storage format. 'auto' infers from file extension.
+        skip : str, type, or list of (str or type)
+            Attribute names/types to skip (by name or type) during serialization.
+        compression_level : int or None
+            If set (0–9), applies Zstandard compression with Blosc backend at that level.
+            Level 0 disables compression. Raises ValueError if > 9.
+
+        Notes
+        -----
+        Skipped attribute names and types are also stored in the file metadata for correct
+        round-trip skipping during load().
+        """
+        self.compact()
+        super().save(
+            path,
+            mode=mode,
+            store=store,
+            skip=skip,
+            compression_level=compression_level,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Private helpers — backing-store access
+    # ------------------------------------------------------------------ #
+
     @property
     def _full_num_fields(self) -> int:
         return len(self._state["fields"])
@@ -772,6 +852,10 @@ class Vector(AutoSerialize):
             return
         self.compact()
 
+    # ------------------------------------------------------------------ #
+    # Private helpers — assignment
+    # ------------------------------------------------------------------ #
+
     def _assign(self, value: Any) -> None:
         """Dispatch assignment based on whether all fields or a subset are selected."""
         if self._selected_fields is None:
@@ -844,6 +928,10 @@ class Vector(AutoSerialize):
                 cell[:, field_indices] = chunk
             cursor += rows
 
+    # ------------------------------------------------------------------ #
+    # Private helpers — arithmetic
+    # ------------------------------------------------------------------ #
+
     def _binary_op(self, other: Any, op: Any, reverse: bool = False) -> "Vector":
         """Return a new Vector produced by elementwise arithmetic."""
         result = self.copy()
@@ -900,46 +988,6 @@ class Vector(AutoSerialize):
             if rows > 0:
                 cell[:, field_indices] = op(chunk, lhs) if reverse else op(lhs, chunk)
             cursor += rows
-
-    def save(
-        self,
-        path: str | Path,
-        mode: Literal["w", "o"] = "w",
-        store: Literal["auto", "zip", "dir"] = "auto",
-        skip: str | type | Sequence[str | type] = (),
-        compression_level: int | None = 4,
-    ) -> None:
-        """
-        Save the Vector object to disk using Zarr serialization. self.compact() is called before
-        saving to reduce file size if possible.
-
-        Parameters
-        ----------
-        path : str or Path
-            Target file path. Use '.zip' extension for zip format, otherwise a directory.
-        mode : {'w', 'o'}
-            'w' = write only if file doesn't exist, 'o' = overwrite if it does.
-        store : {'auto', 'zip', 'dir'}
-            Storage format. 'auto' infers from file extension.
-        skip : str, type, or list of (str or type)
-            Attribute names/types to skip (by name or type) during serialization.
-        compression_level : int or None
-            If set (0–9), applies Zstandard compression with Blosc backend at that level.
-            Level 0 disables compression. Raises ValueError if > 9.
-
-        Notes
-        -----
-        Skipped attribute names and types are also stored in the file metadata for correct
-        round-trip skipping during load().
-        """
-        self.compact()
-        super().save(
-            path,
-            mode=mode,
-            store=store,
-            skip=skip,
-            compression_level=compression_level,
-        )
 
 
 def _resolve_fields(
