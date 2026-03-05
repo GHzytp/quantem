@@ -156,18 +156,24 @@ class OptimizerParams:
     def parse_dict(cls, d: dict):
         """
         Parse dictionary to a optimizer params object.
+        Accepts either ``"name"`` or ``"type"`` as the optimizer key.
         """
-        if d["name"] == "adam":
-            d.pop("name")
+        d = dict(d)  # avoid mutating caller's dict
+        name = d.pop("name", None) or d.pop("type", None)
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown optimizer type: {name}")
+        if name == "adam":
             return OptimizerParams.Adam(**d)
-        elif d["name"] == "adamw":
-            d.pop("name")
+        elif name == "adamw":
             return OptimizerParams.AdamW(**d)
-        elif d["name"] == "sgd":
-            d.pop("name")
+        elif name == "sgd":
             return OptimizerParams.SGD(**d)
         else:
-            raise ValueError(f"Unknown optimizer type: {d['name']}")
+            raise ValueError(f"Unknown optimizer type: {name.lower()}")
 
 
 OptimizerType = (
@@ -244,7 +250,7 @@ class SchedulerParams:
         cooldown: int = 50
         _name: str = "plateau"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
             if self.min_lr is None:
                 self.min_lr = self.min_lr_factor * base_LR
             return {
@@ -274,14 +280,22 @@ class SchedulerParams:
         """
 
         gamma: float = 0.9
-        factor: float | None = 0.5
+        factor: float | None = None
         num_iter: int | None = None
         _name: str = "exponential"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
+            effective_num_iter = self.num_iter if self.num_iter is not None else num_iter
+            if effective_num_iter is None:
+                raise ValueError("num_iter must be set if num_iter is not provided")
+
+            self.num_iter = effective_num_iter
+
+            if self.factor is not None:
+                self.gamma = self.factor ** (1.0 / effective_num_iter)
+
             return {
                 "gamma": self.gamma,
-                "factor": self.factor,
             }
 
     @dataclass
@@ -327,7 +341,7 @@ class SchedulerParams:
         cycle_momentum: bool = False
         _name: str = "cyclic"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
             if self.base_lr is None:
                 self.base_lr = self.base_lr_factor * base_LR
             if self.max_lr is None:
@@ -359,12 +373,18 @@ class SchedulerParams:
             Multiplicative factor applied to the LR at the final step. Default: 1.0.
         """
 
-        total_iters: int
+        total_iters: int | None = None
         start_factor: float = 0.1
         end_factor: float = 1.0
         _name: str = "linear"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
+            if num_iter is None and self.total_iters is None:
+                raise ValueError(
+                    "total_iters must be set if num_iter is not provided"
+                )  # Should never be reached
+            if self.total_iters is None:
+                self.total_iters = num_iter
             return {
                 "start_factor": self.start_factor,
                 "end_factor": self.end_factor,
@@ -387,11 +407,17 @@ class SchedulerParams:
             Minimum learning rate at the trough of the cosine curve. Default: 1e-7.
         """
 
-        T_max: int
         eta_min: float = 1e-7
+        T_max: int | None = None
         _name: str = "cosine_annealing"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
+            if num_iter is None and self.T_max is None:
+                raise ValueError(
+                    "T_max must be set if num_iter is not provided"
+                )  # Should never be reached
+            if self.T_max is None:
+                self.T_max = num_iter
             return {
                 "T_max": self.T_max,
                 "eta_min": self.eta_min,
@@ -408,34 +434,37 @@ class SchedulerParams:
 
         _name: str = "none"
 
-        def params(self, base_LR: float) -> dict:
+        def params(self, base_LR: float, num_iter: int | None = None) -> dict:
             return {}
 
     @classmethod
     def parse_dict(cls, d: dict):
         """
         Parse dictionary to a scheduler params object.
+        Accepts either ``"name"`` or ``"type"`` as the scheduler key.
         """
-        if d["name"] == "plateau":
-            d.pop("name")
+        d = dict(d)  # avoid mutating caller's dict
+        name = d.pop("name", None) or d.pop("type", None)
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown scheduler type: {name}")
+        if name == "plateau":
             return SchedulerParams.Plateau(**d)
-        elif d["name"] == "exponential":
-            d.pop("name")
+        elif name == "exponential":
             return SchedulerParams.Exponential(**d)
-        elif d["name"] == "cyclic":
-            d.pop("name")
+        elif name == "cyclic":
             return SchedulerParams.Cyclic(**d)
-        elif d["name"] == "linear":
-            d.pop("name")
+        elif name == "linear":
             return SchedulerParams.Linear(**d)
-        elif d["name"] == "cosine_annealing":
-            d.pop("name")
+        elif name == "cosine_annealing":
             return SchedulerParams.CosineAnnealing(**d)
-        elif d["name"] == "none":
-            d.pop("name")
+        elif name == "none":
             return SchedulerParams.NoneScheduler()
         else:
-            raise ValueError(f"Unknown scheduler type: {d['name']}")
+            raise ValueError(f"Unknown scheduler type: {name}")
 
 
 SchedulerType = (
@@ -551,8 +580,7 @@ class OptimizerMixin:
                 raise NotImplementedError(f"Unknown optimizer type: {self._optimizer_params}")
 
     def set_scheduler(
-        self,
-        scheduler_params: SchedulerType | dict | None = None,
+        self, scheduler_params: SchedulerType | dict | None = None, num_iter: int | None = None
     ) -> None:
         """Set the scheduler for this model."""
         if scheduler_params is not None:
@@ -564,8 +592,7 @@ class OptimizerMixin:
 
         optimizer = self._optimizer
         base_LR = optimizer.param_groups[0]["lr"]
-
-        params = self._scheduler_params.params(base_LR)
+        params = self._scheduler_params.params(base_LR, num_iter=num_iter)
         match self.scheduler_params:
             case SchedulerParams.NoneScheduler():
                 self._scheduler = None
