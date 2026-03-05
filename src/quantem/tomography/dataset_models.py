@@ -47,9 +47,9 @@ class DatasetConstraintParams:
         Attributes
         ----------
         tv_zs : float
-            Total variation regularization weight for z-positions.
+            Total variation regularization weight for Z1 and Z3 Euler angles.
         tv_shifts : float
-            Total variation regularization weight for lateral shifts.
+            Total variation regularization weight for X and Y shifts.
         soft_constraint_keys : list[str]
             Constraint fields penalized softly during optimization.
         hard_constraint_keys : list[str]
@@ -58,6 +58,7 @@ class DatasetConstraintParams:
 
         tv_zs: float = 0.0
         tv_shifts: float = 0.0
+        _name: str = "base_tomography_dataset"
 
         soft_constraint_keys = ["tv_zs", "tv_shifts"]
         hard_constraint_keys = []
