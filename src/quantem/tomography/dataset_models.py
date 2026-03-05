@@ -18,8 +18,25 @@ from quantem.tomography.utils import tv_loss_1d
 
 
 class DatasetConstraintParams:
+    """
+    Namespace class for dataset constraint parameter dataclasses and parsing utilities.
+
+    Contains constraint definitions for different tomography dataset types and a
+    factory method for instantiating the appropriate constraint class from a dict.
+    """
+
     @dataclass
     class BaseTomographyDatasetConstraints(Constraints):
+        """
+        Soft constraints for a base tomography dataset.
+
+        Attributes:
+            tv_zs: Total variation regularization weight for z-positions.
+            tv_shifts: Total variation regularization weight for lateral shifts.
+            soft_constraint_keys: Constraint fields penalized softly during optimization.
+            hard_constraint_keys: Constraint fields enforced strictly (none for this class).
+        """
+
         tv_zs: float = 0.0
         tv_shifts: float = 0.0
 
@@ -28,12 +45,48 @@ class DatasetConstraintParams:
 
     @dataclass
     class ThroughFocalDatasetConstraints(BaseTomographyDatasetConstraints):
+        """
+        Constraints for a through-focal tomography dataset.
+
+        Inherits all constraints from BaseTomographyDatasetConstraints.
+        Currently not implemented — instantiation will raise NotImplementedError.
+        """
+
         pass
 
     @classmethod
     def parse_dict(
         cls, d: dict
-    ) -> BaseTomographyDatasetConstraints | ThroughFocalDatasetConstraints:
+    ) -> "DatasetConstraintParams.BaseTomographyDatasetConstraints | DatasetConstraintParams.ThroughFocalDatasetConstraints":
+        """
+        Instantiate a dataset constraint dataclass from a configuration dictionary.
+
+        The dictionary must contain a ``'name'`` or ``'type'`` key identifying
+        which constraint class to construct. All remaining keys are forwarded as
+        keyword arguments to the selected dataclass.
+
+        Args:
+            d: Configuration dictionary. Must include ``'name'`` or ``'type'``
+               with one of the following values (case-insensitive):
+
+               - ``'base_tomography_dataset'`` →
+                 :class:`BaseTomographyDatasetConstraints`
+               - ``'through_focal_dataset'`` →
+                 :class:`ThroughFocalDatasetConstraints` *(not yet implemented)*
+
+               The key may also be a class ``type`` object, in which case its
+               ``__name__`` is used after lower-casing.
+
+        Returns:
+            An instance of the appropriate constraint dataclass.
+
+        Raises:
+            ValueError: If neither ``'name'`` nor ``'type'`` is present, if the
+                value is not a string or type, or if the name does not match any
+                known dataset constraint type.
+            NotImplementedError: If ``'through_focal_dataset'`` is requested, as
+                it is not yet implemented.
+        """
         d = dict(d)
         name = d.pop("name", None)
         type_ = d.pop("type", None)
@@ -49,16 +102,9 @@ class DatasetConstraintParams:
         if name == "base_tomography_dataset":
             return DatasetConstraintParams.BaseTomographyDatasetConstraints(**d)
         elif name == "through_focal_dataset":
-            # return DatasetConstraintParams.ThroughFocalDatasetConstraints(**d)
             raise NotImplementedError("Through focal dataset constraints are not implemented yet.")
         else:
             raise ValueError(f"Unknown dataset constraint type: {name.lower()}")
-
-
-DatasetConstraintsType = (
-    DatasetConstraintParams.BaseTomographyDatasetConstraints
-    | DatasetConstraintParams.ThroughFocalDatasetConstraints
-)
 
 
 @dataclass

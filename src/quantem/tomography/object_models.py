@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, Literal
+from typing import Any, Callable, Generator
 
 import numpy as np
 import torch
@@ -17,12 +17,29 @@ from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 
-object_type = Literal["potential"]
-
 
 class ObjConstraintParams:
+    """
+    Namespace class for object reconstruction constraint dataclasses and parsing utilities.
+
+    Contains constraint definitions for pixelated and implicit neural representation (INR)
+    object types, along with a factory method for instantiating the appropriate class
+    from a configuration dictionary.
+    """
+
     @dataclass
     class ObjPixelatedConstraints(Constraints):
+        """
+        Constraints for a pixelated object representation.
+
+        Attributes:
+            positivity: If True, enforces non-negative values in the reconstruction.
+            shrinkage: Shrinkage regularization strength; pushes values toward zero.
+            tv_vol: Total variation regularization weight for the 3-D volume.
+            soft_constraint_keys: Constraint fields penalized softly during optimization.
+            hard_constraint_keys: Constraint fields enforced strictly during optimization.
+        """
+
         positivity: bool = True
         shrinkage: float = 0.0
         tv_vol: float = 0.0
@@ -33,6 +50,18 @@ class ObjConstraintParams:
 
     @dataclass
     class ObjINRConstraints(Constraints):
+        """
+        Constraints for an implicit neural representation (INR) object.
+
+        Attributes:
+            positivity: If True, enforces non-negative values in the reconstruction.
+            shrinkage: Shrinkage regularization strength; pushes values toward zero.
+            tv_vol: Total variation regularization weight for the 3-D volume.
+            sparsity: Sparsity regularization weight; encourages near-zero activations.
+            soft_constraint_keys: Constraint fields penalized softly during optimization.
+            hard_constraint_keys: Constraint fields enforced strictly during optimization.
+        """
+
         positivity: bool = True
         shrinkage: float = 0.0
         tv_vol: float = 0.0
@@ -43,9 +72,33 @@ class ObjConstraintParams:
         hard_constraint_keys = ["positivity", "shrinkage"]
 
     @classmethod
-    def parse_dict(cls, d: dict) -> ObjPixelatedConstraints | ObjINRConstraints:
+    def parse_dict(
+        cls, d: dict
+    ) -> "ObjConstraintParams.ObjPixelatedConstraints | ObjConstraintParams.ObjINRConstraints":
         """
-        Parse dictionary to an object constraint params object.
+        Instantiate an object constraint dataclass from a configuration dictionary.
+
+        The dictionary must contain a ``'name'`` or ``'type'`` key identifying
+        which constraint class to construct. All remaining keys are forwarded as
+        keyword arguments to the selected dataclass.
+
+        Args:
+            d: Configuration dictionary. Must include ``'name'`` or ``'type'``
+               with one of the following values (case-insensitive):
+
+               - ``'obj_pixelated'`` → :class:`ObjPixelatedConstraints`
+               - ``'obj_inr'`` → :class:`ObjINRConstraints`
+
+               The key may also be a class ``type`` object, in which case its
+               ``__name__`` is used after lower-casing.
+
+        Returns:
+            An instance of the appropriate object constraint dataclass.
+
+        Raises:
+            ValueError: If neither ``'name'`` nor ``'type'`` is present, if the
+                value is not a string or type, or if the name does not match any
+                known object constraint type.
         """
         d = dict(d)
         name = d.pop("name", None)
