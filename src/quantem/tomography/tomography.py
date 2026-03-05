@@ -16,7 +16,8 @@ from quantem.core.utils.tomography_utils import (
 from quantem.tomography.dataset_models import DatasetModelType, DefaultTomographyDatasetConstraints
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
-    DefaultConstraintsTomography,
+    ObjConstraintParams,
+    ObjConstraintsType,
     ObjectINR,
     ObjectPixelated,
 )
@@ -59,7 +60,7 @@ class Tomography(TomographyOpt, TomographyBase):
         reset: bool = False,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
-        obj_constraints: dict = {},  # TODO: What to pass into the constraints?
+        obj_constraints: dict | ObjConstraintsType | None = None,
         dset_constraints: dict = {},
         num_samples_per_ray: int | list[tuple[int, int]] | None = None,
         profiling_mode: bool = False,
@@ -109,7 +110,10 @@ class Tomography(TomographyOpt, TomographyBase):
             self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
         if obj_constraints is not None:
-            self.obj_model.constraints = cast(DefaultConstraintsTomography, obj_constraints)
+            if isinstance(obj_constraints, dict):
+                obj_constraints = ObjConstraintParams.parse_dict(obj_constraints)
+
+            self.obj_model.constraints = obj_constraints
 
         if dset_constraints is not None:
             self.dset.constraints = cast(DefaultTomographyDatasetConstraints, dset_constraints)
@@ -277,6 +281,9 @@ class Tomography(TomographyOpt, TomographyBase):
                             dataset_model=self.dset,
                             iter=self.num_epochs,
                         )
+                    pbar.set_description(
+                        f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Images Logged"
+                    )
 
                 if self.global_rank == 0:
                     self.logger.log_iter(
@@ -290,10 +297,6 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 self.logger.flush()
-
-                pbar.set_description(
-                    f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Logger Updated"
-                )
 
     # --- Helper Functions ---
 
@@ -392,18 +395,27 @@ class TomographyConventional(TomographyBase):
     def reconstruct(
         self,
         num_iter: int = 10,
+        obj_constraints: dict | ObjConstraintsType | None = None,
         mode: Literal["sirt", "fbp"] = "sirt",
         reset: bool = False,
         inline_alignment: bool = False,
         smoothing_sigma: float | None = None,
     ):
-        pbar = tqdm(range(num_iter), desc=f"{mode} Reconstruction", disable=not self.verbose)
+        if obj_constraints is not None:
+            if isinstance(obj_constraints, dict):
+                obj_constraints = ObjConstraintParams.parse_dict(obj_constraints)
+
+            self.obj_model.constraints = obj_constraints
+
+        pbar = tqdm(
+            range(num_iter),
+            desc=f"{mode} Reconstruction | Loss: {0:.4f}",
+            disable=not self.verbose,
+        )
         if mode == "sirt" or mode == "fbp":
             proj_forward = torch.zeros_like(self.dset.tilt_stack).permute(2, 0, 1)
         else:
             proj_forward = torch.zeros_like(self.dset.tilt_stack)
-        print("proj_forward.shape", proj_forward.shape)
-        print("self.dset.tilt_stack.shape", self.dset.tilt_stack.shape)
 
         if smoothing_sigma is not None:
             gaussian_kernel = gaussian_kernel_1d(smoothing_sigma).to(self.device)

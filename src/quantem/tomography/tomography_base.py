@@ -7,7 +7,8 @@ from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import DatasetModelType, TomographyDatasetBase
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
-    DefaultConstraintsTomography,
+    ObjConstraintParams,
+    ObjConstraintsType,
     ObjectINR,
     ObjectModelType,
 )
@@ -86,12 +87,19 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._obj_model = obj_model
 
     @property
-    def constraints(self) -> DefaultConstraintsTomography:
+    def constraints(self) -> ObjConstraintsType:  # TODO: Also looks at Dataset constraints
         return self.obj_model.constraints
 
     @constraints.setter
-    def constraints(self, constraints: DefaultConstraintsTomography):
-        self.obj_model.constraints = constraints
+    def constraints(self, constraints: ObjConstraintsType | dict | None):
+        if constraints is None:
+            return
+        elif isinstance(constraints, dict):
+            self.obj_model.constraints = ObjConstraintParams.parse_dict(constraints)
+        elif isinstance(constraints, ObjConstraintsType):
+            self.obj_model.constraints = constraints
+        else:
+            raise ValueError(f"Invalid constraints type: {type(constraints)}")
 
     @property
     def logger(self) -> LoggerTomography | None:

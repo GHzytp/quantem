@@ -20,24 +20,52 @@ from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 object_type = Literal["potential"]
 
 
-@dataclass(slots=False)
-class DefaultConstraintsTomography(Constraints):
-    """
-    Data class for all constraints that can be applied to the object model.
-    """
+class ObjConstraintParams:
+    @dataclass
+    class ObjPixelatedConstraints(Constraints):
+        positivity: bool = True
+        shrinkage: float = 0.0
+        tv_vol: float = 0.0
+        _name: str = "obj_pixelated"
 
-    # Hard Constraints
-    positivity: bool = True
-    shrinkage: float = 0.0
-    circular_mask: bool = False
-    fourier_filter: str | None = None  # Hamming, etc...
+        soft_constraint_keys = ["tv_vol"]
+        hard_constraint_keys = ["positivity", "shrinkage"]
 
-    # Soft Constraints
-    tv_vol: float = 0.0
-    sparsity: float = 0.0
+    @dataclass
+    class ObjINRConstraints(Constraints):
+        positivity: bool = True
+        shrinkage: float = 0.0
+        tv_vol: float = 0.0
+        sparsity: float = 0.0
+        _name: str = "obj_inr"
 
-    soft_constraint_keys = ["tv_vol", "sparsity"]
-    hard_constraint_keys = ["positivity", "shrinkage", "circular_mask", "fourier_filter"]
+        soft_constraint_keys = ["tv_vol", "sparsity"]
+        hard_constraint_keys = ["positivity", "shrinkage"]
+
+    @classmethod
+    def parse_dict(cls, d: dict) -> ObjPixelatedConstraints | ObjINRConstraints:
+        """
+        Parse dictionary to an object constraint params object.
+        """
+        d = dict(d)
+        name = d.pop("name", "none") or d.pop("type", "none")
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown object constraint type: {name}")
+        if name == "obj_pixelated":
+            return ObjConstraintParams.ObjPixelatedConstraints(**d)
+        elif name == "obj_inr":
+            return ObjConstraintParams.ObjINRConstraints(**d)
+        else:
+            raise ValueError(f"Unknown object constraint type: {name.lower()}")
+
+
+ObjConstraintsType = (
+    ObjConstraintParams.ObjPixelatedConstraints | ObjConstraintParams.ObjINRConstraints
+)
 
 
 class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
@@ -134,30 +162,9 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
             raise NotImplementedError
 
 
-class ObjectConstraints(BaseConstraints, ObjectBase):
-    DEFAULT_CONSTRAINTS = DefaultConstraintsTomography()
-
+class ObjectConstraints(BaseConstraints, ObjectBase):  # TODO: Ask Arthur why we still need this
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.constraints: DefaultConstraintsTomography = self.DEFAULT_CONSTRAINTS.copy()
-
-    def apply_hard_constraints(
-        self,
-        pred: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Apply hard constraints to the object model.
-
-        Only hard constraint here is the positivity and shrinkage. TODO: Add the other hard constraints.
-        """
-        obj2 = pred.clone()
-        if self.constraints.positivity:
-            obj2 = torch.clamp(obj2, min=0.0, max=None)
-        if self.constraints.shrinkage:
-            obj2 = torch.max(obj2 - self.constraints.shrinkage, torch.zeros_like(obj2))
-
-        # TODO: Need to implement the other hard constraints: Fourier Filter and Circular Mask.
-        return obj2
 
     @abstractmethod
     def get_tv_loss(self, **kwargs) -> torch.Tensor:
@@ -174,6 +181,8 @@ class ObjectPixelated(ObjectConstraints):
     Supports: Conventional algorithms (SIRT, FBP), and AD-based reconstructions.
     """
 
+    DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjPixelatedConstraints()
+
     def __init__(
         self,
         shape: tuple[int, int, int],
@@ -186,6 +195,7 @@ class ObjectPixelated(ObjectConstraints):
             rng=rng,
             _token=self._token,
         )
+        self.constraints: ObjConstraintsType = self.DEFAULT_CONSTRAINTS.copy()
 
     # --- Instantiation ----
     @classmethod
@@ -245,7 +255,7 @@ class ObjectPixelated(ObjectConstraints):
 
     @property
     def name(self) -> str:
-        return "ObjectPixelated"
+        return "obj_pixelated"
 
     @property
     def obj_type(self) -> str:
@@ -254,6 +264,24 @@ class ObjectPixelated(ObjectConstraints):
     @property
     def dtype(self) -> torch.dtype:
         return self._obj.dtype
+
+    def apply_hard_constraints(
+        self,
+        pred: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply hard constraints to the object model.
+
+        Only hard constraint here is the positivity and shrinkage. TODO: Add the other hard constraints.
+        """
+        obj2 = pred.clone()
+        if self.constraints.positivity:
+            obj2 = torch.clamp(obj2, min=0.0, max=None)
+        if self.constraints.shrinkage:
+            obj2 = torch.max(obj2 - self.constraints.shrinkage, torch.zeros_like(obj2))
+
+        # TODO: Need to implement the other hard constraints: Fourier Filter and Circular Mask.
+        return obj2
 
     def apply_soft_constraints(self, obj: torch.Tensor) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
@@ -288,6 +316,8 @@ class ObjectPixelated(ObjectConstraints):
 
 
 class ObjectINR(ObjectConstraints, DDPMixin):
+    DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjINRConstraints()
+
     def __init__(
         self,
         shape: tuple[int, int, int],
@@ -304,7 +334,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
-
+        self.constraints: ObjConstraintsType = self.DEFAULT_CONSTRAINTS.copy()
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
             self.setup_distributed(device=device)
@@ -393,7 +423,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
             soft_loss += self.constraints.tv_vol * grad_norm.mean()
 
-        if self.constraints.sparsity > 0:
+        if (
+            isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
+            and self.constraints.sparsity > 0
+        ):  # NOTE: For the linter, I must make this :)
             sparsity_loss = self.constraints.sparsity * torch.norm(pred, p=1)
             soft_loss += sparsity_loss
 
