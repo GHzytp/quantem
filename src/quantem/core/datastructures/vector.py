@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Sequence
+from pathlib import Path
+from typing import Any, Literal, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -899,6 +900,46 @@ class Vector(AutoSerialize):
             if rows > 0:
                 cell[:, field_indices] = op(chunk, lhs) if reverse else op(lhs, chunk)
             cursor += rows
+
+    def save(
+        self,
+        path: str | Path,
+        mode: Literal["w", "o"] = "w",
+        store: Literal["auto", "zip", "dir"] = "auto",
+        skip: str | type | Sequence[str | type] = (),
+        compression_level: int | None = 4,
+    ) -> None:
+        """
+        Save the Vector object to disk using Zarr serialization. self.compact() is called before
+        saving to reduce file size if possible.
+
+        Parameters
+        ----------
+        path : str or Path
+            Target file path. Use '.zip' extension for zip format, otherwise a directory.
+        mode : {'w', 'o'}
+            'w' = write only if file doesn't exist, 'o' = overwrite if it does.
+        store : {'auto', 'zip', 'dir'}
+            Storage format. 'auto' infers from file extension.
+        skip : str, type, or list of (str or type)
+            Attribute names/types to skip (by name or type) during serialization.
+        compression_level : int or None
+            If set (0–9), applies Zstandard compression with Blosc backend at that level.
+            Level 0 disables compression. Raises ValueError if > 9.
+
+        Notes
+        -----
+        Skipped attribute names and types are also stored in the file metadata for correct
+        round-trip skipping during load().
+        """
+        self.compact()
+        super().save(
+            path,
+            mode=mode,
+            store=store,
+            skip=skip,
+            compression_level=compression_level,
+        )
 
 
 def _resolve_fields(
