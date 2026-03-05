@@ -106,6 +106,71 @@ class Dataset3dspectroscopy(Dataset3d):
 
         cls.atomic_weights = data
 
+    @staticmethod
+    def _resolve_spectral_source(source: str, dataset_type: str) -> str:
+        source_norm = source.strip().lower()
+        if source_norm not in {"auto", "xray", "eels"}:
+            raise ValueError("source must be one of: 'auto', 'xray', 'eels'")
+        if source_norm == "auto":
+            return "eels" if dataset_type.strip().lower() == "eels" else "xray"
+        return source_norm
+
+    @staticmethod
+    def _build_spectral_table(
+        element: str, source: str, rows: list[tuple[str, float, float]], precision: int
+    ) -> str:
+        unit = "eV" if source == "eels" else "keV"
+        title = f"{element} {'EELS edges' if source == 'eels' else 'X-ray lines'}"
+
+        display_rows = [
+            (
+                feature,
+                f"{energy:.{precision}f}",
+                "" if not np.isfinite(weight) else f"{weight:.{precision}f}",
+            )
+            for feature, energy, weight in rows
+        ]
+        show_weight = any(weight for _, _, weight in display_rows)
+
+        feature_w = max(len("Feature"), *(len(feature) for feature, _, _ in display_rows))
+        energy_header = f"Energy ({unit})"
+        energy_w = max(len(energy_header), *(len(energy) for _, energy, _ in display_rows))
+
+        columns = [("Feature", feature_w, "<"), (energy_header, energy_w, ">")]
+        if show_weight:
+            weight_w = max(len("Weight"), *(len(weight) for _, _, weight in display_rows))
+            columns.append(("Weight", weight_w, ">"))
+
+        header = "  ".join(f"{name:{align}{width}}" for name, width, align in columns)
+        lines = [title, header, "-" * len(header)]
+        for feature, energy, weight in display_rows:
+            values = [feature, energy]
+            if show_weight:
+                values.append(weight)
+            line = "  ".join(
+                f"{value:{align}{width}}" for value, (_, width, align) in zip(values, columns)
+            )
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _print_spectral_table(
+        self,
+        element: str,
+        source: str,
+        sort_by: str = "energy",
+        ascending: bool = True,
+        precision: int = 4,
+    ) -> str:
+        table = self.format_spectral_features_table(
+            element=element,
+            source=source,
+            sort_by=sort_by,
+            ascending=ascending,
+            precision=precision,
+        )
+        print(table)
+        return table
+
     def format_spectral_features_table(
         self,
         element: str,
@@ -126,13 +191,9 @@ class Dataset3dspectroscopy(Dataset3d):
                 msg += f" Available examples: {', '.join(available[:10])}"
             raise ValueError(msg)
 
-        source_norm = source.strip().lower()
-        if source_norm not in {"auto", "xray", "eels"}:
-            raise ValueError("source must be one of: 'auto', 'xray', 'eels'")
-
-        if source_norm == "auto":
-            class_type = str(getattr(type(self), "dataset_type", "")).strip().lower()
-            source_norm = "eels" if class_type == "eels" else "xray"
+        source_norm = type(self)._resolve_spectral_source(
+            source=source, dataset_type=str(getattr(type(self), "dataset_type", ""))
+        )
 
         energy_keys = (
             ("energy (eV)", "onset (eV)", "edge (eV)", "energy")
@@ -176,35 +237,9 @@ class Dataset3dspectroscopy(Dataset3d):
         if sort_index is None:
             raise ValueError("sort_by must be one of: feature/line/edge, energy, weight/strength")
         rows.sort(key=lambda r: r[sort_index], reverse=not ascending)
-
-        unit = "eV" if source_norm == "eels" else "keV"
-        show_weight = any(np.isfinite(r[2]) for r in rows)
-        feature_w = max(len("Feature"), *(len(r[0]) for r in rows))
-        energy_vals = [f"{r[1]:.{precision}f}" for r in rows]
-        energy_w = max(len(f"Energy ({unit})"), *(len(v) for v in energy_vals))
-
-        if show_weight:
-            weight_vals = [f"{r[2]:.{precision}f}" if np.isfinite(r[2]) else "" for r in rows]
-            weight_w = max(len("Weight"), *(len(v) for v in weight_vals))
-            header = f"{'Feature':<{feature_w}}  {'Energy (' + unit + ')':>{energy_w}}  {'Weight':>{weight_w}}"
-            lines = [
-                f"{element} {'EELS edges' if source_norm == 'eels' else 'X-ray lines'}",
-                header,
-                "-" * len(header),
-            ]
-            for (feature, _, _), e, w in zip(rows, energy_vals, weight_vals):
-                lines.append(f"{feature:<{feature_w}}  {e:>{energy_w}}  {w:>{weight_w}}")
-        else:
-            header = f"{'Feature':<{feature_w}}  {'Energy (' + unit + ')':>{energy_w}}"
-            lines = [
-                f"{element} {'EELS edges' if source_norm == 'eels' else 'X-ray lines'}",
-                header,
-                "-" * len(header),
-            ]
-            for (feature, _, _), e in zip(rows, energy_vals):
-                lines.append(f"{feature:<{feature_w}}  {e:>{energy_w}}")
-
-        return "\n".join(lines)
+        return type(self)._build_spectral_table(
+            element=element, source=source_norm, rows=rows, precision=precision
+        )
 
     def format_xray_lines_table(
         self,
@@ -246,9 +281,13 @@ class Dataset3dspectroscopy(Dataset3d):
         precision: int = 4,
     ) -> str:
         """Print and return a formatted table of X-ray lines for one element."""
-        table = self.format_xray_lines_table(element, sort_by, ascending, precision)
-        print(table)
-        return table
+        return self._print_spectral_table(
+            element=element,
+            source="xray",
+            sort_by=sort_by,
+            ascending=ascending,
+            precision=precision,
+        )
 
     def print_eels_edges(
         self,
@@ -258,9 +297,13 @@ class Dataset3dspectroscopy(Dataset3d):
         precision: int = 4,
     ) -> str:
         """Print and return a formatted table of EELS edges for one element."""
-        table = self.format_eels_edges_table(element, sort_by, ascending, precision)
-        print(table)
-        return table
+        return self._print_spectral_table(
+            element=element,
+            source="eels",
+            sort_by=sort_by,
+            ascending=ascending,
+            precision=precision,
+        )
 
     def add_elements_to_model(self, elements):
         """
