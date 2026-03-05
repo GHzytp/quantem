@@ -130,29 +130,29 @@ class TomographyOpt(TomographyBase):
 
         return schedulers
 
-    def set_schedulers(self, params: dict[str, dict]):
+    def set_schedulers(self, params: dict[str, dict], num_iter: int | None = None):
         for key, scheduler_params in params.items():
             if key == "object":
-                self.obj_model.set_scheduler(scheduler_params)
+                self.obj_model.set_scheduler(scheduler_params, num_iter=num_iter)
             elif key == "pose":
-                self.dset.set_scheduler(scheduler_params)
+                self.dset.set_scheduler(scheduler_params, num_iter=num_iter)
             else:
                 raise ValueError(f"Unknown optimization key: {key}")
 
     def step_optimizers(self):
         for key in self.optimizer_params.keys():
-            if key == "object" and self.obj_model.has_optimizer():
+            if self.obj_model.has_optimizer():
                 self.obj_model.step_optimizer()
-            elif key == "pose" and self.dset.has_optimizer():
+            elif self.dset.has_optimizer():
                 self.dset.step_optimizer()
             else:
                 raise ValueError(f"Unknown optimization key: {key}")
 
     def zero_grad_all(self):
         for key in self.optimizer_params.keys():
-            if key == "object" and self.obj_model.has_optimizer():
+            if self.obj_model.has_optimizer():
                 self.obj_model.zero_optimizer_grad()
-            elif key == "pose" and self.dset.has_optimizer():
+            elif self.dset.has_optimizer():
                 self.dset.zero_optimizer_grad()
             else:
                 raise ValueError(f"Unknown optimization key: {key}")

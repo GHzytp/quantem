@@ -106,7 +106,7 @@ class Tomography(TomographyOpt, TomographyBase):
             new_scheduler = True
 
         if new_scheduler:
-            self.set_schedulers(self.scheduler_params)
+            self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
         if obj_constraints is not None:
             self.obj_model.constraints = cast(DefaultConstraintsTomography, obj_constraints)
