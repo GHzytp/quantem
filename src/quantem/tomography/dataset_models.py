@@ -14,20 +14,51 @@ from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.tomography.utils import tv_loss_1d
 
-
 # --- Constraints ---
-@dataclass(slots=False)
-class DefaultTomographyDatasetConstraints(Constraints):
-    """
-    Data class for constraints that can be applied to the parameters of a tomography dataset.
-    """
 
-    # Soft Constraints
-    tv_zs: float = 0.0
-    tv_shifts: float = 0.0
 
-    soft_constraint_keys = ["tv_zs", "tv_shifts"]
-    hard_constraint_keys = []
+class DatasetConstraintParams:
+    @dataclass
+    class BaseTomographyDatasetConstraints(Constraints):
+        tv_zs: float = 0.0
+        tv_shifts: float = 0.0
+
+        soft_constraint_keys = ["tv_zs", "tv_shifts"]
+        hard_constraint_keys = []
+
+    @dataclass
+    class ThroughFocalDatasetConstraints(BaseTomographyDatasetConstraints):
+        pass
+
+    @classmethod
+    def parse_dict(
+        cls, d: dict
+    ) -> BaseTomographyDatasetConstraints | ThroughFocalDatasetConstraints:
+        d = dict(d)
+        name = d.pop("name", None)
+        type_ = d.pop("type", None)
+        name = name or type_
+        if name is None:
+            raise ValueError("Must provide either 'name' or 'type' key")
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown dataset constraint type: {name}")
+        if name == "base_tomography_dataset":
+            return DatasetConstraintParams.BaseTomographyDatasetConstraints(**d)
+        elif name == "through_focal_dataset":
+            # return DatasetConstraintParams.ThroughFocalDatasetConstraints(**d)
+            raise NotImplementedError("Through focal dataset constraints are not implemented yet.")
+        else:
+            raise ValueError(f"Unknown dataset constraint type: {name.lower()}")
+
+
+DatasetConstraintsType = (
+    DatasetConstraintParams.BaseTomographyDatasetConstraints
+    | DatasetConstraintParams.ThroughFocalDatasetConstraints
+)
 
 
 @dataclass
@@ -245,11 +276,13 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
 
 class TomographyDatasetConstraints(BaseConstraints, TomographyDatasetBase):
-    DEFAULT_CONSTRAINTS = DefaultTomographyDatasetConstraints()
+    DEFAULT_CONSTRAINTS = DatasetConstraintParams.BaseTomographyDatasetConstraints()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.constraints: DefaultTomographyDatasetConstraints = self.DEFAULT_CONSTRAINTS.copy()
+        self.constraints: DatasetConstraintParams.BaseTomographyDatasetConstraints = (
+            self.DEFAULT_CONSTRAINTS.copy()
+        )
 
     def apply_soft_constraints(self) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=self.z1_params.device)
@@ -265,7 +298,6 @@ class TomographyDatasetConstraints(BaseConstraints, TomographyDatasetBase):
             tv_loss_shifts += tv_loss_1d(self.shifts_params[:, 1])
             tv_loss_shifts = self.constraints.tv_shifts * tv_loss_shifts
             soft_loss += tv_loss_shifts
-
         return soft_loss
 
     def apply_hard_constraints(self):

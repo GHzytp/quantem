@@ -454,7 +454,7 @@ class SchedulerParams:
         type_ = d.pop("type", None)
         name = name or type_
         if name is None:
-            raise ValueError("Must provide either 'name' or 'type' key")
+            name = "none"
         if isinstance(name, type):
             name = name.__name__.lower()
         elif isinstance(name, str):

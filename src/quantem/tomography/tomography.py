@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Literal, Self, Sequence, cast
+from typing import Literal, Self, Sequence
 
 import numpy as np
 import torch
@@ -10,10 +10,12 @@ from tqdm.auto import tqdm
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
-from quantem.core.utils.tomography_utils import (
-    torch_phase_cross_correlation,
+from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
+from quantem.tomography.dataset_models import (
+    DatasetConstraintParams,
+    DatasetConstraintsType,
+    DatasetModelType,
 )
-from quantem.tomography.dataset_models import DatasetModelType, DefaultTomographyDatasetConstraints
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
     ObjConstraintParams,
@@ -61,7 +63,7 @@ class Tomography(TomographyOpt, TomographyBase):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         obj_constraints: dict | ObjConstraintsType | None = None,
-        dset_constraints: dict = {},
+        dset_constraints: dict | DatasetConstraintsType = None,
         num_samples_per_ray: int | list[tuple[int, int]] | None = None,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
@@ -116,7 +118,10 @@ class Tomography(TomographyOpt, TomographyBase):
             self.obj_model.constraints = obj_constraints
 
         if dset_constraints is not None:
-            self.dset.constraints = cast(DefaultTomographyDatasetConstraints, dset_constraints)
+            if isinstance(dset_constraints, dict):
+                dset_constraints = DatasetConstraintParams.parse_dict(dset_constraints)
+
+            self.dset.constraints = dset_constraints
         # Setting up DDP
         if not hasattr(self, "dataloader") or reset_dset is not None:
             if reset_dset is not None:
