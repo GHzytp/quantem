@@ -159,7 +159,7 @@ class OptimizerParams:
         Accepts either ``"name"`` or ``"type"`` as the optimizer key.
         """
         d = dict(d)  # avoid mutating caller's dict
-        name = d.pop("name", None) or d.pop("type", None)
+        name = d.pop("name", "none") or d.pop("type", "none")
         if isinstance(name, type):
             name = name.__name__.lower()
         elif isinstance(name, str):
@@ -444,7 +444,7 @@ class SchedulerParams:
         Accepts either ``"name"`` or ``"type"`` as the scheduler key.
         """
         d = dict(d)  # avoid mutating caller's dict
-        name = d.pop("name", None) or d.pop("type", None)
+        name = d.pop("name", "none") or d.pop("type", "none")
         if isinstance(name, type):
             name = name.__name__.lower()
         elif isinstance(name, str):
