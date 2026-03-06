@@ -221,12 +221,12 @@ class Dataset3deds(Dataset3dspectroscopy):
             self._spectrum_images = {}
             self._spectrum_images = {**self._spectrum_images, **dict(zip(labels, maps))}
 
-        self.plot_spectrum_images()
+        self.show_spectrum_images()
 
         if return_maps:
             return maps, labels
 
-    def plot_spectrum_images(self, x_ray_lines=None, return_fig=False, **kwargs):
+    def show_spectrum_images(self, x_ray_lines=None, return_fig=False, **kwargs):
         """Plot cached spectrum-image maps from ``self._spectrum_images``.
 
         Parameters
