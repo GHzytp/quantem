@@ -221,8 +221,130 @@ class Dataset3deds(Dataset3dspectroscopy):
             self._spectrum_images = {}
             self._spectrum_images = {**self._spectrum_images, **dict(zip(labels, maps))}
 
+        self.plot_spectrum_images()
+
         if return_maps:
             return maps, labels
+
+    def plot_spectrum_images(self, x_ray_lines=None, **kwargs):
+        """Plot cached spectrum-image maps from ``self._spectrum_images``.
+
+        Parameters
+        ----------
+        x_ray_lines : None | str | sequence[str], optional
+            Selection behavior:
+            - ``None`` (default): sum and plot one map per element (e.g., all Au lines together)
+            - ``"Au"``: sum and plot all maps for element Au
+            - ``"AuKa1"``: plot a specific line map
+            - ``"AuK"``: sum and plot all matching line-prefix maps
+        **kwargs
+            Forwarded to :func:`quantem.core.visualization.show_2d`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)`` from ``show_2d``.
+        """
+        spectrum_images = getattr(self, "_spectrum_images", None)
+        if not isinstance(spectrum_images, dict) or len(spectrum_images) == 0:
+            raise ValueError("No spectrum images found. Run generage_spectrum_images(...) first.")
+
+        line_map = {str(label): np.asarray(image) for label, image in spectrum_images.items()}
+        if len(line_map) == 0:
+            raise ValueError("No spectrum images available to plot")
+
+        if type(self).element_info is None:
+            type(self).load_element_info()
+        known_elements = sorted(
+            [str(key) for key in (type(self).element_info or {}).keys()],
+            key=lambda k: (-len(k), k),
+        )
+
+        def _normalize_specs(specs):
+            if specs is None:
+                return None
+            if isinstance(specs, str):
+                return [s.strip() for s in specs.split(",") if s.strip()]
+            if isinstance(specs, (list, tuple, set)):
+                out = []
+                for item in specs:
+                    out.extend([s.strip() for s in str(item).split(",") if s.strip()])
+                return out
+            raise TypeError("x_ray_lines must be None, a string, or a sequence of strings")
+
+        def _resolve_element_from_label(label):
+            for element in known_elements:
+                if str(label).startswith(element):
+                    return element
+            m = re.match(r"^[A-Z][a-z]?", str(label))
+            return m.group(0) if m else None
+
+        def _sum_maps(labels):
+            maps = [line_map[label] for label in labels]
+            return np.sum(np.stack(maps, axis=0), axis=0)
+
+        lines_by_element = {}
+        for label in sorted(line_map.keys()):
+            element = _resolve_element_from_label(label)
+            if element is None:
+                continue
+            lines_by_element.setdefault(element, []).append(label)
+
+        normalized_label_map = {label.lower(): label for label in line_map.keys()}
+        normalized_element_map = {element.lower(): element for element in lines_by_element.keys()}
+
+        specs = _normalize_specs(x_ray_lines)
+        images_to_plot = []
+        titles = []
+
+        if specs is None or len(specs) == 0:
+            for element in sorted(lines_by_element.keys()):
+                labels = lines_by_element[element]
+                if len(labels) == 0:
+                    continue
+                images_to_plot.append(_sum_maps(labels))
+                titles.append(element)
+        else:
+            for raw_spec in specs:
+                spec = str(raw_spec).strip()
+                if not spec:
+                    continue
+
+                label_key = normalized_label_map.get(spec.lower())
+                if label_key is not None:
+                    images_to_plot.append(line_map[label_key])
+                    titles.append(label_key)
+                    continue
+
+                element_key = normalized_element_map.get(spec.lower())
+                if element_key is not None:
+                    labels = lines_by_element[element_key]
+                    images_to_plot.append(_sum_maps(labels))
+                    titles.append(element_key)
+                    continue
+
+                compact = re.sub(r"[\s_-]+", "", spec).lower()
+                matched_labels = [
+                    label
+                    for label in line_map.keys()
+                    if re.sub(r"[\s_-]+", "", label).lower().startswith(compact)
+                ]
+                if len(matched_labels) == 0:
+                    raise ValueError(
+                        f"No spectrum images matched selector '{spec}'. "
+                        f"Available examples: {', '.join(sorted(line_map.keys())[:10])}"
+                    )
+                if len(matched_labels) == 1:
+                    images_to_plot.append(line_map[matched_labels[0]])
+                    titles.append(matched_labels[0])
+                else:
+                    images_to_plot.append(_sum_maps(matched_labels))
+                    titles.append(spec)
+
+        if len(images_to_plot) == 0:
+            raise ValueError("No spectrum images selected for plotting")
+
+        return show_2d(images_to_plot, title=titles, **kwargs)
 
     def quantify_composition(
         self, roi=None, elements=None, k_factors=None, method="cliff_lorimer", mask=None
