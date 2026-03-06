@@ -226,7 +226,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         if return_maps:
             return maps, labels
 
-    def plot_spectrum_images(self, x_ray_lines=None, **kwargs):
+    def plot_spectrum_images(self, x_ray_lines=None, return_fig=False, **kwargs):
         """Plot cached spectrum-image maps from ``self._spectrum_images``.
 
         Parameters
@@ -345,7 +345,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             raise ValueError("No spectrum images selected for plotting")
 
         cmap = kwargs.pop("cmap", "magma")
-        return show_2d(
+        fig, ax = show_2d(
             images_to_plot,
             title=titles,
             cmap=cmap,
@@ -353,8 +353,39 @@ class Dataset3deds(Dataset3dspectroscopy):
                 "sampling": self.sampling[1],
                 "units": self.units[1],
             },
+            returnfig=True,
             **kwargs,
         )
+        if return_fig:
+            return fig, ax
+
+    def _build_pytorch_spectrum_images(
+        self, abundance_maps: np.ndarray, element_names: list[str] | tuple[str, ...]
+    ) -> dict[str, np.ndarray]:
+        """Build per-line maps from fitted per-element abundance maps."""
+        maps = np.asarray(abundance_maps)
+        if maps.ndim != 3:
+            return {}
+
+        line_maps = {}
+        for element_index, element_name in enumerate(element_names):
+            if element_index >= maps.shape[0]:
+                break
+
+            element_map = np.asarray(maps[element_index], dtype=float)
+            try:
+                _, line_weights, line_labels = self.x_ray_lookup(str(element_name))
+            except ValueError:
+                continue
+
+            for weight, label in zip(line_weights, line_labels):
+                try:
+                    weight_value = float(weight)
+                except (TypeError, ValueError):
+                    continue
+                line_maps[str(label)] = element_map * weight_value
+
+        return line_maps
 
     def quantify_composition(
         self, roi=None, elements=None, k_factors=None, method="cliff_lorimer", mask=None
@@ -2507,6 +2538,23 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             abundance_maps = conc_final.view(n_y, n_x, n_elements).permute(2, 0, 1).cpu().numpy()
             peak_widths = nn.functional.softplus(peak_width_params).detach().cpu().numpy()
+
+        pytorch_spectrum_images = self._build_pytorch_spectrum_images(
+            abundance_maps=abundance_maps,
+            element_names=list(global_model.peak_model.element_names),
+        )
+        if hasattr(self, "_spectrum_images_pytorch"):
+            self._spectrum_images_pytorch = {
+                **self._spectrum_images_pytorch,
+                **pytorch_spectrum_images,
+            }
+        else:
+            self._spectrum_images_pytorch = {}
+            self._spectrum_images_pytorch = {
+                **self._spectrum_images_pytorch,
+                **pytorch_spectrum_images,
+            }
+
         loss_history_array = np.asarray(loss_history)
         energy_axis_np = energy_axis.cpu().numpy()
 
@@ -2584,6 +2632,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             "fitted_spectrum_all_pixels": mean_fitted_spectrum_all,
             "background_spectrum_all_pixels": mean_background_spectrum_all,
             "fit_range": energy_range,
+            "spectrum_images_pytorch": self._spectrum_images_pytorch,
         }
 
     def calculate_background_powerlaw(self, spectrum):
