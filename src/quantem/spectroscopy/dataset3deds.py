@@ -78,7 +78,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         self._virtual_images = {}
         self.dataset_type = "EDS"
 
-    def lookup_x_ray_lines(
+    def x_ray_lookup(
         self, spec: str | list[str] | tuple[str, ...] | set[str]
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
         """Lookup EDS X-ray lines for element, shell, or specific line specifiers.
@@ -199,6 +199,30 @@ class Dataset3deds(Dataset3dspectroscopy):
         weights = np.asarray([row[2] for row in unique_rows], dtype=float)
         labels = [row[0] for row in unique_rows]
         return energies, weights, labels
+
+    def generage_spectrum_images(self, elements, width=0.15, return_maps=False):
+        energies, weights, labels = self.x_ray_lookup(elements)
+        energy_axis = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
+        energy_axis_2d = energy_axis[:, None]
+        energies_2d = (energies)[None, :]
+
+        mask = (energy_axis_2d > energies_2d - width) & (energy_axis_2d < energies_2d + width)
+
+        N, H, W = self.array.shape
+        K = mask.shape[1]
+        eds2 = self.array.reshape(N, -1)
+        w = mask.astype(self.array.dtype) * weights
+
+        maps = (w.T @ eds2).reshape(K, H, W)
+
+        if hasattr(self, "_spectrum_images"):
+            self._spectrum_images = {**self._spectrum_images, **dict(zip(labels, maps))}
+        else:
+            self._spectrum_images = {}
+            self._spectrum_images = {**self._spectrum_images, **dict(zip(labels, maps))}
+
+        if return_maps:
+            return maps, labels
 
     def quantify_composition(
         self, roi=None, elements=None, k_factors=None, method="cliff_lorimer", mask=None
