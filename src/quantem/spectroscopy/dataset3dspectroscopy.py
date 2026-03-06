@@ -48,27 +48,23 @@ class Dataset3dspectroscopy(Dataset3d):
 
     # loads elemental information
     @classmethod
-    def load_element_info(
-        cls,
-    ):
+    def load_element_info(cls):
         """Load element database for EDS (X-ray lines) or EELS (binding energies)."""
-        class_type = str(getattr(cls, "dataset_type", "")).strip().lower()
-        if class_type == "eels":
-            path = "eels_binding_energies.json"
-        elif class_type == "eds":
-            path = getattr(cls, "element_info_path", "x_ray_lines.csv")
-        else:
-            path = getattr(cls, "element_info_path", "x_ray_lines.csv")
-
         if cls.element_info is not None:
-            # don't reload if already loaded
             return
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        full_path = os.path.join(base_dir, path)
-        if str(path).lower().endswith(".csv"):
+
+        class_type = str(getattr(cls, "dataset_type", "")).strip().lower()
+        path = (
+            "eels_binding_energies.json"
+            if class_type == "eels"
+            else getattr(cls, "element_info_path", "x_ray_lines.csv")
+        )
+        full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+
+        if path.lower().endswith(".csv"):
             cls.element_info = load_xray_lines_database(full_path)
         else:
-            with open(full_path, "r") as f:
+            with open(full_path, "r", encoding="utf-8") as f:
                 cls.element_info = json.load(f)["elements"]
 
     @classmethod
@@ -77,8 +73,9 @@ class Dataset3dspectroscopy(Dataset3d):
         if cls.atomic_weights is not None:
             return
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        full_path = os.path.join(base_dir, cls.atomic_weights_path)
+        full_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), cls.atomic_weights_path
+        )
         data = {}
         with open(full_path, "r", newline="") as f:
             reader = csv.reader(f)
@@ -107,203 +104,41 @@ class Dataset3dspectroscopy(Dataset3d):
         cls.atomic_weights = data
 
     @staticmethod
-    def _resolve_spectral_source(source: str, dataset_type: str) -> str:
-        source_norm = source.strip().lower()
-        if source_norm not in {"auto", "xray", "eels"}:
-            raise ValueError("source must be one of: 'auto', 'xray', 'eels'")
-        if source_norm == "auto":
-            return "eels" if dataset_type.strip().lower() == "eels" else "xray"
-        return source_norm
+    def _normalize_element_specs(specs):
+        if isinstance(specs, str):
+            return [s.strip() for s in specs.split(",") if s.strip()]
+        if isinstance(specs, (list, tuple, set)):
+            out = []
+            for spec in specs:
+                out.extend([s.strip() for s in str(spec).split(",") if s.strip()])
+            return out
+        raise TypeError("elements must be a string or a sequence of strings")
 
     @staticmethod
-    def _build_spectral_table(
-        element: str, source: str, rows: list[tuple[str, float, float]], precision: int
-    ) -> str:
-        unit = "eV" if source == "eels" else "keV"
-        title = f"{element} {'EELS edges' if source == 'eels' else 'X-ray lines'}"
+    def _resolve_element_key(all_info, token):
+        token_norm = str(token).strip().lower()
+        return next((key for key in all_info if str(key).lower() == token_norm), None)
 
-        display_rows = [
-            (
-                feature,
-                f"{energy:.{precision}f}",
-                "" if not np.isfinite(weight) else f"{weight:.{precision}f}",
-            )
-            for feature, energy, weight in rows
-        ]
-        show_weight = any(weight for _, _, weight in display_rows)
+    @staticmethod
+    def _line_matches_selectors(line_name, selectors):
+        if not selectors:
+            return True
+        line_norm = str(line_name).strip().lower()
+        return any(line_norm == sel or line_norm.startswith(sel) for sel in selectors)
 
-        feature_w = max(len("Feature"), *(len(feature) for feature, _, _ in display_rows))
-        energy_header = f"Energy ({unit})"
-        energy_w = max(len(energy_header), *(len(energy) for _, energy, _ in display_rows))
+    @classmethod
+    def _select_lines(cls, line_dict, selectors):
+        if not isinstance(line_dict, dict):
+            return {}
+        if not selectors:
+            return dict(line_dict)
 
-        columns = [("Feature", feature_w, "<"), (energy_header, energy_w, ">")]
-        if show_weight:
-            weight_w = max(len("Weight"), *(len(weight) for _, _, weight in display_rows))
-            columns.append(("Weight", weight_w, ">"))
-
-        header = "  ".join(f"{name:{align}{width}}" for name, width, align in columns)
-        lines = [title, header, "-" * len(header)]
-        for feature, energy, weight in display_rows:
-            values = [feature, energy]
-            if show_weight:
-                values.append(weight)
-            line = "  ".join(
-                f"{value:{align}{width}}" for value, (_, width, align) in zip(values, columns)
-            )
-            lines.append(line)
-        return "\n".join(lines)
-
-    def _print_spectral_table(
-        self,
-        element: str,
-        source: str,
-        sort_by: str = "energy",
-        ascending: bool = True,
-        precision: int = 4,
-    ) -> str:
-        table = self.format_spectral_features_table(
-            element=element,
-            source=source,
-            sort_by=sort_by,
-            ascending=ascending,
-            precision=precision,
-        )
-        print(table)
-        return table
-
-    def format_spectral_features_table(
-        self,
-        element: str,
-        source: str = "auto",
-        sort_by: str = "energy",
-        ascending: bool = True,
-        precision: int = 4,
-    ) -> str:
-        """Format X-ray lines or EELS edges for one element as a simple text table."""
-        if type(self).element_info is None:
-            type(self).load_element_info()
-
-        all_info = type(self).element_info or {}
-        if element not in all_info:
-            available = sorted(all_info.keys())
-            msg = f"Element '{element}' not found."
-            if available:
-                msg += f" Available examples: {', '.join(available[:10])}"
-            raise ValueError(msg)
-
-        source_norm = type(self)._resolve_spectral_source(
-            source=source, dataset_type=str(getattr(type(self), "dataset_type", ""))
-        )
-
-        energy_keys = (
-            ("energy (eV)", "onset (eV)", "edge (eV)", "energy")
-            if source_norm == "eels"
-            else ("energy (keV)", "energy_keV", "energy")
-        )
-        rows = []
-        for feature_name, info in all_info[element].items():
-            if isinstance(info, dict):
-                energy_raw = next(
-                    (info.get(k) for k in energy_keys if info.get(k) is not None), None
-                )
-                weight_raw = info.get("weight", info.get("strength"))
-            else:
-                energy_raw = info
-                weight_raw = None
-
-            try:
-                energy = float(energy_raw)
-            except (TypeError, ValueError):
-                continue
-
-            try:
-                weight = float(weight_raw) if weight_raw is not None else np.nan
-            except (TypeError, ValueError):
-                weight = np.nan
-
-            rows.append((str(feature_name), energy, weight))
-
-        if not rows:
-            return f"{element}: no spectral features found."
-
-        sort_index = {
-            "feature": 0,
-            "line": 0,
-            "edge": 0,
-            "energy": 1,
-            "weight": 2,
-            "strength": 2,
-        }.get(sort_by.strip().lower())
-        if sort_index is None:
-            raise ValueError("sort_by must be one of: feature/line/edge, energy, weight/strength")
-        rows.sort(key=lambda r: r[sort_index], reverse=not ascending)
-        return type(self)._build_spectral_table(
-            element=element, source=source_norm, rows=rows, precision=precision
-        )
-
-    def format_xray_lines_table(
-        self,
-        element: str,
-        sort_by: str = "energy",
-        ascending: bool = True,
-        precision: int = 4,
-    ) -> str:
-        """Backward-compatible wrapper for X-ray lines."""
-        return self.format_spectral_features_table(
-            element=element,
-            source="xray",
-            sort_by=sort_by,
-            ascending=ascending,
-            precision=precision,
-        )
-
-    def format_eels_edges_table(
-        self,
-        element: str,
-        sort_by: str = "energy",
-        ascending: bool = True,
-        precision: int = 4,
-    ) -> str:
-        """Format EELS edge entries for one element."""
-        return self.format_spectral_features_table(
-            element=element,
-            source="eels",
-            sort_by=sort_by,
-            ascending=ascending,
-            precision=precision,
-        )
-
-    def print_xray_lines(
-        self,
-        element: str,
-        sort_by: str = "energy",
-        ascending: bool = True,
-        precision: int = 4,
-    ) -> str:
-        """Print and return a formatted table of X-ray lines for one element."""
-        return self._print_spectral_table(
-            element=element,
-            source="xray",
-            sort_by=sort_by,
-            ascending=ascending,
-            precision=precision,
-        )
-
-    def print_eels_edges(
-        self,
-        element: str,
-        sort_by: str = "energy",
-        ascending: bool = True,
-        precision: int = 4,
-    ) -> str:
-        """Print and return a formatted table of EELS edges for one element."""
-        return self._print_spectral_table(
-            element=element,
-            source="eels",
-            sort_by=sort_by,
-            ascending=ascending,
-            precision=precision,
-        )
+        selector_norm = [str(sel).strip().lower() for sel in selectors if str(sel).strip()]
+        return {
+            line_name: line_info
+            for line_name, line_info in line_dict.items()
+            if cls._line_matches_selectors(line_name, selector_norm)
+        }
 
     def add_elements_to_model(self, elements):
         """
@@ -321,60 +156,29 @@ class Dataset3dspectroscopy(Dataset3d):
         if type(self).element_info is None:
             type(self).load_element_info()
 
-        def _normalize_specs(specs):
-            if isinstance(specs, str):
-                return [s.strip() for s in specs.split(",") if s.strip()]
-            if isinstance(specs, (list, tuple, set)):
-                out = []
-                for spec in specs:
-                    out.extend([s.strip() for s in str(spec).split(",") if s.strip()])
-                return out
-            raise TypeError("elements must be a string or a sequence of strings")
-
-        def _resolve_element_key(all_info, token):
-            token_norm = str(token).strip().lower()
-            for key in all_info.keys():
-                if str(key).lower() == token_norm:
-                    return key
-            return None
-
-        def _select_lines(line_dict, selectors):
-            if not isinstance(line_dict, dict):
-                return {}
-            if selectors is None or len(selectors) == 0:
-                return dict(line_dict)
-
-            selector_norm = [str(sel).strip().lower() for sel in selectors if str(sel).strip()]
-            selected = {}
-            for line_name, line_info in line_dict.items():
-                line_norm = str(line_name).strip().lower()
-                if any(line_norm == sel or line_norm.startswith(sel) for sel in selector_norm):
-                    selected[line_name] = line_info
-            return selected
-
         all_info = type(self).element_info
         if all_info is None:
             return
 
-        specs = _normalize_specs(elements)
+        specs = type(self)._normalize_element_specs(elements)
         if self.model_elements is None:
             self.model_elements = {}
 
         for spec in specs:
             tokens = str(spec).split()
-            if len(tokens) == 0:
+            if not tokens:
                 continue
 
-            element_key = _resolve_element_key(all_info, tokens[0])
+            element_key = type(self)._resolve_element_key(all_info, tokens[0])
             if element_key is None:
                 continue
 
             selectors = tokens[1:]
-            selected_lines = _select_lines(all_info[element_key], selectors)
-            if len(selected_lines) == 0:
+            selected_lines = type(self)._select_lines(all_info[element_key], selectors)
+            if not selected_lines:
                 continue
 
-            if len(selectors) == 0:
+            if not selectors:
                 self.model_elements[element_key] = selected_lines
             else:
                 existing = self.model_elements.get(element_key)
@@ -383,7 +187,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 existing.update(selected_lines)
                 self.model_elements[element_key] = existing
 
-        if len(self.model_elements) == 0:
+        if not self.model_elements:
             self.model_elements = None
 
     def remove_elements_from_model(self, elements):
@@ -401,35 +205,18 @@ class Dataset3dspectroscopy(Dataset3d):
         if self.model_elements is None:
             return
 
-        def _normalize_specs(specs):
-            if isinstance(specs, str):
-                return [s.strip() for s in specs.split(",") if s.strip()]
-            if isinstance(specs, (list, tuple, set)):
-                out = []
-                for spec in specs:
-                    out.extend([s.strip() for s in str(spec).split(",") if s.strip()])
-                return out
-            raise TypeError("elements must be a string or a sequence of strings")
-
-        def _resolve_element_key(model_elements, token):
-            token_norm = str(token).strip().lower()
-            for key in model_elements.keys():
-                if str(key).lower() == token_norm:
-                    return key
-            return None
-
-        specs = _normalize_specs(elements)
+        specs = type(self)._normalize_element_specs(elements)
         for spec in specs:
             tokens = str(spec).split()
-            if len(tokens) == 0:
+            if not tokens:
                 continue
 
-            element_key = _resolve_element_key(self.model_elements, tokens[0])
+            element_key = type(self)._resolve_element_key(self.model_elements, tokens[0])
             if element_key is None:
                 continue
 
             selectors = [str(token).strip().lower() for token in tokens[1:] if str(token).strip()]
-            if len(selectors) == 0:
+            if not selectors:
                 self.model_elements.pop(element_key, None)
                 continue
 
@@ -438,15 +225,15 @@ class Dataset3dspectroscopy(Dataset3d):
                 self.model_elements.pop(element_key, None)
                 continue
 
-            for line_name in list(lines_info.keys()):
-                line_norm = str(line_name).strip().lower()
-                if any(line_norm == sel or line_norm.startswith(sel) for sel in selectors):
-                    lines_info.pop(line_name, None)
-
-            if len(lines_info) == 0:
+            self.model_elements[element_key] = {
+                line_name: line_info
+                for line_name, line_info in lines_info.items()
+                if not type(self)._line_matches_selectors(line_name, selectors)
+            }
+            if not self.model_elements[element_key]:
                 self.model_elements.pop(element_key, None)
 
-        if len(self.model_elements) == 0:
+        if not self.model_elements:
             self.model_elements = None
 
     def clear_model_elements(self):

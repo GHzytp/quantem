@@ -1,4 +1,5 @@
 import builtins
+import re
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -76,6 +77,128 @@ class Dataset3deds(Dataset3dspectroscopy):
         )
         self._virtual_images = {}
         self.dataset_type = "EDS"
+
+    def lookup_x_ray_lines(
+        self, spec: str | list[str] | tuple[str, ...] | set[str]
+    ) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Lookup EDS X-ray lines for element, shell, or specific line specifiers.
+
+        Parameters
+        ----------
+        spec : str or sequence of str
+            Supported examples:
+            - ``"Au"``: all Au lines
+            - ``"AuK"`` or ``"Au K"``: all Au K-shell lines
+            - ``"AuKa1"`` or ``"Au Ka1"``: specific line
+            - ``"AuKa"``: line family prefix (e.g., Ka1, Ka2, Ka1,2)
+
+        Returns
+        -------
+        tuple
+            ``(energies_keV, weights, line_labels)``, where:
+            - ``energies_keV`` is a 1D numpy array of line energies in keV
+            - ``weights`` is a 1D numpy array of corresponding line weights
+            - ``line_labels`` is a list like ``["AuKa1", "AuKa2", ...]``
+        """
+        if type(self).element_info is None:
+            type(self).load_element_info()
+
+        all_info = type(self).element_info or {}
+        if len(all_info) == 0:
+            raise ValueError("X-ray lines database is empty")
+
+        if isinstance(spec, str):
+            specs = [spec]
+        elif isinstance(spec, (list, tuple, set)):
+            specs = [str(item) for item in spec]
+        else:
+            raise TypeError("spec must be a string or a sequence of strings")
+
+        def _norm_token(text: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+        ordered_elements = sorted(
+            (str(key) for key in all_info.keys()), key=lambda k: (-len(k), k)
+        )
+        rows = []
+
+        for raw_spec in specs:
+            compact_spec = re.sub(r"[\s_-]+", "", str(raw_spec).strip())
+            if not compact_spec:
+                continue
+
+            element_key = next(
+                (key for key in ordered_elements if compact_spec.lower().startswith(key.lower())),
+                None,
+            )
+            if element_key is None:
+                raise ValueError(f"Could not resolve element from specifier '{raw_spec}'")
+
+            line_suffix = compact_spec[len(element_key) :]
+            lines_info = all_info.get(element_key, {})
+            if not isinstance(lines_info, dict) or len(lines_info) == 0:
+                raise ValueError(f"No X-ray lines found for element '{element_key}'")
+
+            selected_rows = []
+            if line_suffix == "":
+                selected_rows = list(lines_info.items())
+            else:
+                suffix_norm = _norm_token(line_suffix)
+                if not suffix_norm:
+                    raise ValueError(f"Could not parse line/edge token from '{raw_spec}'")
+
+                exact_matches = []
+                prefix_matches = []
+                for line_name, line_info in lines_info.items():
+                    line_norm = _norm_token(str(line_name).split("__", 1)[0])
+                    if line_norm == suffix_norm:
+                        exact_matches.append((line_name, line_info))
+                    if line_norm.startswith(suffix_norm):
+                        prefix_matches.append((line_name, line_info))
+
+                selected_rows = exact_matches if len(exact_matches) > 0 else prefix_matches
+                if len(selected_rows) == 0:
+                    raise ValueError(
+                        f"No X-ray lines matched specifier '{raw_spec}' for element '{element_key}'"
+                    )
+
+            for line_name, line_info in selected_rows:
+                if not isinstance(line_info, dict):
+                    continue
+
+                energy_raw = line_info.get("energy (keV)", line_info.get("energy"))
+                try:
+                    energy = float(energy_raw)
+                except (TypeError, ValueError):
+                    continue
+
+                try:
+                    weight = float(line_info.get("weight", 0.0))
+                except (TypeError, ValueError):
+                    weight = 0.0
+
+                canonical_line = str(line_name).split("__", 1)[0]
+                rows.append((f"{element_key}{canonical_line}", energy, weight))
+
+        if len(rows) == 0:
+            raise ValueError(f"No X-ray lines matched specifier(s): {specs}")
+
+        # Keep stable output order by sorting on energy, then stronger lines, then label.
+        rows = sorted(rows, key=lambda item: (item[1], -item[2], item[0]))
+
+        unique_rows = []
+        seen = set()
+        for label, energy, weight in rows:
+            key = (label, round(float(energy), 12), round(float(weight), 12))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append((label, energy, weight))
+
+        energies = np.asarray([row[1] for row in unique_rows], dtype=float)
+        weights = np.asarray([row[2] for row in unique_rows], dtype=float)
+        labels = [row[0] for row in unique_rows]
+        return energies, weights, labels
 
     def quantify_composition(
         self, roi=None, elements=None, k_factors=None, method="cliff_lorimer", mask=None
