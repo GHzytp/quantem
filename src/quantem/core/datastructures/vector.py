@@ -241,7 +241,7 @@ class Vector(AutoSerialize):
     @property
     def units(self) -> list[str]:
         """Return units for the selected fields."""
-        lookup = {field: unit for field, unit in zip(self._state["fields"], self._state["units"])}
+        lookup = dict(zip(self._state["fields"], self._state["units"]))
         return [lookup[field] for field in self.fields]
 
     @property
@@ -338,10 +338,7 @@ class Vector(AutoSerialize):
         if missing:
             raise KeyError(f"Unknown field(s): {missing}")
 
-        if selected == tuple(self._state["fields"]):
-            selected_fields = None
-        else:
-            selected_fields = selected
+        selected_fields = None if selected == tuple(self._state["fields"]) else selected
         return self._from_view(
             self._state,
             self.shape,
@@ -782,8 +779,6 @@ class Vector(AutoSerialize):
         """Return the full backing matrix for one cell."""
         start = int(self._state["cell_starts"][linear_index])
         length = int(self._state["cell_lengths"][linear_index])
-        if length == 0:
-            return self._state["data"][0:0]
         return self._state["data"][start : start + length]
 
     def _selected_cell_matrix(self, linear_index: int) -> NDArray[Any]:
@@ -817,11 +812,7 @@ class Vector(AutoSerialize):
         payloads = [array for array in normalized if array.shape[0] > 0]
         if payloads:
             appended = np.vstack(payloads)
-            data = self._state["data"]
-            if data.shape[0] == 0:
-                self._state["data"] = appended.copy()
-            else:
-                self._state["data"] = np.concatenate((data, appended), axis=0)
+            self._state["data"] = np.concatenate((self._state["data"], appended), axis=0)
 
         cursor = self._state["data"].shape[0] - sum(array.shape[0] for array in normalized)
         for target, array in zip(targets, normalized):
@@ -846,9 +837,7 @@ class Vector(AutoSerialize):
         """Compact automatically once dead rows become materially larger than live rows."""
         data = self._state["data"]
         used_rows = int(self._state["cell_lengths"].sum())
-        if data.shape[0] <= used_rows + 1024:
-            return
-        if data.shape[0] <= 2 * used_rows:
+        if data.shape[0] <= used_rows + 1024 or data.shape[0] <= 2 * used_rows:
             return
         self.compact()
 
