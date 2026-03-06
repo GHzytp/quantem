@@ -344,7 +344,17 @@ class Dataset3deds(Dataset3dspectroscopy):
         if len(images_to_plot) == 0:
             raise ValueError("No spectrum images selected for plotting")
 
-        return show_2d(images_to_plot, title=titles, **kwargs)
+        cmap = kwargs.pop("cmap", "magma")
+        return show_2d(
+            images_to_plot,
+            title=titles,
+            cmap=cmap,
+            scalebar={
+                "sampling": self.sampling[1],
+                "units": self.units[1],
+            },
+            **kwargs,
+        )
 
     def quantify_composition(
         self, roi=None, elements=None, k_factors=None, method="cliff_lorimer", mask=None
