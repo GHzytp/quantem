@@ -200,7 +200,13 @@ class Dataset3deds(Dataset3dspectroscopy):
         labels = [row[0] for row in unique_rows]
         return energies, weights, labels
 
-    def generage_spectrum_images(self, elements, width=0.15, return_maps=False):
+    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False):
+        if elements is None and self.model_elements is not None:
+            elements = list(self.model_elements.keys())
+            print(f"using model_elements {elements}")
+        else:
+            raise ValueError("elements must be specified")
+
         energies, weights, labels = self.x_ray_lookup(elements)
         energy_axis = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
         energy_axis_2d = energy_axis[:, None]
