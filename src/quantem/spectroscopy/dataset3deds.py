@@ -226,7 +226,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         if return_maps:
             return maps, labels
 
-    def show_spectrum_images(self, x_ray_lines=None, return_fig=False, **kwargs):
+    def show_spectrum_images(
+        self, x_ray_lines=None, return_fig=False, method="integration", **kwargs
+    ):
         """Plot cached spectrum-image maps from ``self._spectrum_images``.
 
         Parameters
@@ -237,6 +239,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             - ``"Au"``: sum and plot all maps for element Au
             - ``"AuKa1"``: plot a specific line map
             - ``"AuK"``: sum and plot all matching line-prefix maps
+        method : ``"integration"`` | str
+            ``"integration"`` : plots maps based on integration method
+            ``"fit"`` : plots maps based on fitting method
         **kwargs
             Forwarded to :func:`quantem.core.visualization.show_2d`.
 
@@ -245,7 +250,15 @@ class Dataset3deds(Dataset3dspectroscopy):
         tuple
             ``(fig, axs)`` from ``show_2d``.
         """
-        spectrum_images = getattr(self, "_spectrum_images", None)
+        if method == "integration":
+            spectrum_images = getattr(self, "_spectrum_images", None)
+        elif method == "fit":
+            spectrum_images = getattr(self, "_spectrum_images_pytorch", None)
+        else:
+            raise ValueError(
+                "Method {method}, is not supported, please choose 'integration' or 'fit'"
+            )
+
         if not isinstance(spectrum_images, dict) or len(spectrum_images) == 0:
             raise ValueError("No spectrum images found. Run generage_spectrum_images(...) first.")
 
@@ -2614,8 +2627,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             plt.tight_layout()
             plt.show()
 
-            map_titles = [f"{name}" for name in global_model.peak_model.element_names]
-            show_2d(list(abundance_maps), title=map_titles)
+            self.show_spectrum_images(method="fit")
 
         return {
             "abundance_maps": abundance_maps,
