@@ -211,7 +211,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         N, H, W = self.array.shape
         K = mask.shape[1]
         eds2 = self.array.reshape(N, -1)
-        w = mask.astype(self.array.dtype) * weights
+        w = mask.astype(self.array.dtype)
 
         maps = (w.T @ eds2).reshape(K, H, W)
 
