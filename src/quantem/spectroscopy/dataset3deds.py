@@ -659,19 +659,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         fig, (ax_img, ax_spec) = self.show_mean_spectrum(
             roi=roi,
             energy_range=energy_range,
-            elements=elements,
-            ignore_range=ignore_range,
-            threshold=threshold,
-            tolerance=tolerance,
             mask=mask,
-            show_lines=True,
-            show_text=show_text,
-            snr_min=snr_min,
-            snr_threshold=snr_threshold,
-            distance_threshold_for_sample=distance_threshold_for_sample,
-            grid_peaks=grid_peaks,
             data_type="eds",
-            peaks=peaks,
             show=False,
         )
 

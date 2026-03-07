@@ -607,19 +607,8 @@ class Dataset3dspectroscopy(Dataset3d):
         self,
         roi=None,
         energy_range=None,
-        elements=None,
-        ignore_range=None,
-        threshold=5.0,
-        tolerance=0.15,
         mask=None,
-        show_lines=True,
-        show_text=True,
-        snr_min=None,
-        snr_threshold=None,
-        distance_threshold_for_sample=0.05,
-        grid_peaks=None,
         data_type="eds",
-        peaks=15,
         show=True,
     ):
         """
@@ -638,8 +627,6 @@ class Dataset3dspectroscopy(Dataset3d):
             If roi=None, uses full image. Can also be [y, x] for single pixel.
         energy_range : list or tuple, optional
             Energy range to display as [min_energy, max_energy] in keV.
-        ignore_range : list or tuple, optional
-            Ignored in this plotting-only method. Kept for backward compatibility.
         mask : array, optional
             Boolean mask for pixel selection.
         show : bool, optional
@@ -677,7 +664,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # CALCULATE MEAN SPECTRUM FOR GIVEN ROI AND ENERGY RANGE --------------------------
 
-        spec = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+        spec = self.calculate_mean_spectrum(roi=roi, energy_range=energy_range, mask=mask)
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
@@ -686,10 +673,6 @@ class Dataset3dspectroscopy(Dataset3d):
         if energy_range is not None:
             indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
             E = E[indices]
-
-        # Store ignore_range for later use in element line filtering
-        if ignore_range is None:
-            ignore_range = [0, 0.25]  # Default: ignore 0-0.25 keV for element lines only
 
         # PLOTTING ---------------------------------------------------------------------------
 
@@ -723,8 +706,7 @@ class Dataset3dspectroscopy(Dataset3d):
         plt.colorbar(im, ax=ax_img)
 
         # RIGHT PLOT: Show spectrum
-        (spectrum_line,) = ax_spec.plot(E, spec, linewidth=1.5)
-        spectrum_color = spectrum_line.get_color()
+        ax_spec.plot(E, spec, linewidth=1.5)
         if data_type == "eds":
             ax_spec.set_xlabel("Energy (keV)")
         else:
@@ -732,66 +714,6 @@ class Dataset3dspectroscopy(Dataset3d):
         ax_spec.set_ylabel("Intensity")
         ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
         ax_spec.grid(True, alpha=0.1)
-
-        if show_lines and isinstance(self.model_elements, dict) and len(self.model_elements) > 0:
-            x_min = float(np.nanmin(E)) if E.size > 0 else None
-            x_max = float(np.nanmax(E)) if E.size > 0 else None
-            model_marker_energies = []
-
-            energy_keys = (
-                "energy (keV)",
-                "energy_keV",
-                "energy (eV)",
-                "onset (eV)",
-                "edge (eV)",
-                "energy",
-            )
-
-            for _, lines_info in self.model_elements.items():
-                if not isinstance(lines_info, dict):
-                    continue
-
-                for _, line_info in lines_info.items():
-                    if not isinstance(line_info, dict):
-                        continue
-
-                    line_energy = None
-                    for key in energy_keys:
-                        if key in line_info:
-                            try:
-                                line_energy = float(line_info[key])
-                                break
-                            except (TypeError, ValueError):
-                                continue
-
-                    if line_energy is None:
-                        continue
-                    if x_min is not None and (line_energy < x_min or line_energy > x_max):
-                        continue
-
-                    model_marker_energies.append(line_energy)
-
-            if len(model_marker_energies) > 0:
-                marker_x = np.unique(np.asarray(model_marker_energies, dtype=float))
-                y_min = float(np.nanmin(spec)) if spec.size > 0 else 0.0
-                y_max = float(np.nanmax(spec)) if spec.size > 0 else 1.0
-                y_scale = max(y_max - y_min, 1e-12)
-                y_dot = y_min - 0.04 * y_scale
-
-                ax_spec.plot(
-                    marker_x,
-                    np.full(marker_x.shape, y_dot, dtype=float),
-                    marker="o",
-                    markersize=2.5,
-                    color=spectrum_color,
-                    alpha=0.5,
-                    linestyle="None",
-                    zorder=5,
-                )
-
-                current_bottom, current_top = ax_spec.get_ylim()
-                dot_padding = 0.02 * y_scale
-                ax_spec.set_ylim(bottom=min(current_bottom, y_dot - dot_padding), top=current_top)
 
         fig.tight_layout()
         if show:
