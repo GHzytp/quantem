@@ -1013,5 +1013,7 @@ class Dataset3dspectroscopy(Dataset3d):
         else:
             print(f"Notice: no spectrum recorded to attached_spectra in {self}")
 
-
-Dataset3dspectroscopy.load_element_info()
+    @property
+    def energy_axis(self):
+        energy_axis = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
+        return energy_axis

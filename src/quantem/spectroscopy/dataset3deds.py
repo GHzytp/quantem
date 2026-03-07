@@ -32,10 +32,6 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     """
 
-    element_info = None
-    element_info_path = "x_ray_lines.csv"
-    dataset_type = "EDS"
-
     def __init__(
         self,
         array: NDArray | Any,
@@ -74,8 +70,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             signal_units=signal_units,
             _token=_token,
         )
-        self._virtual_images = {}
-        self.dataset_type = "EDS"
 
     @staticmethod
     def _normalize_specs(specs, param_name="spec", allow_none=False):
@@ -98,7 +92,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _ordered_element_keys(all_info):
-        return sorted([str(key) for key in all_info.keys()], key=lambda k: (-len(k), k))
+        return sorted([str(key) for key in all_info], key=lambda k: (-len(k), k))
 
     @classmethod
     def _resolve_element_from_label(cls, label, ordered_elements):
@@ -109,79 +103,132 @@ class Dataset3deds(Dataset3dspectroscopy):
         m = re.match(r"^[A-Z][a-z]?", label_str)
         return m.group(0) if m else None
 
+    @classmethod
+    def _ensure_element_info(cls):
+        """Load and return the element->lines info dict."""
+        if cls.element_info is None:
+            cls.load_element_info()
+        return cls.element_info or {}
+
+    @classmethod
+    def _parse_element_selectors(cls, specs, *, allow_none=False, param_name="spec"):
+        """Parse selectors like 'Fe', 'FeK', 'FeKa1' into {element: None|set[tokens]}."""
+        tokens = cls._normalize_specs(specs, param_name=param_name, allow_none=allow_none)
+        if tokens is None:
+            return None
+
+        info = cls._ensure_element_info()
+        ordered = cls._ordered_element_keys(info)
+        out: dict[str, set[str] | None] = {}
+
+        for raw in tokens:
+            compact = re.sub(r"[\s_-]+", "", str(raw).strip())
+            if not compact:
+                continue
+
+            element = next((k for k in ordered if compact.lower().startswith(k.lower())), None)
+            if element is None:
+                raise ValueError(f"Could not resolve element from specifier '{raw}'")
+
+            suffix = compact[len(element) :]
+            if not suffix:
+                out[element] = None
+            else:
+                out.setdefault(element, set())
+                if out[element] is not None:
+                    out[element].add(str(suffix))
+
+        return out or None
+
+    @staticmethod
+    def _canonical_line_name(line_name: str) -> str:
+        return str(line_name).split("__", 1)[0]
+
+    @classmethod
+    def _iter_selected_lines(cls, element: str, suffix: str, *, raw_spec: str):
+        """Yield (line_name, line_info) for an element based on suffix matching."""
+        info = cls._ensure_element_info()
+        lines = info.get(element) or {}
+        if not isinstance(lines, dict) or not lines:
+            raise ValueError(f"No X-ray lines found for element '{element}'")
+
+        if not suffix:
+            yield from lines.items()
+            return
+
+        suffix_norm = cls._normalize_token(suffix)
+        if not suffix_norm:
+            raise ValueError(f"Could not parse line/edge token from '{raw_spec}'")
+
+        exact, prefix = [], []
+        for ln, li in lines.items():
+            base = cls._canonical_line_name(str(ln))
+            ln_norm = cls._normalize_token(base)
+            if ln_norm == suffix_norm:
+                exact.append((ln, li))
+            if ln_norm.startswith(suffix_norm):
+                prefix.append((ln, li))
+
+        chosen = exact or prefix
+        if not chosen:
+            raise ValueError(
+                f"No X-ray lines matched specifier '{raw_spec}' for element '{element}'"
+            )
+        yield from chosen
+
+    @classmethod
+    def _group_labels_by_element(cls, labels: list[str]):
+        info = cls._ensure_element_info()
+        ordered = cls._ordered_element_keys(info)
+        grouped: dict[str, list[str]] = {}
+        for lbl in sorted(map(str, labels)):
+            element = cls._resolve_element_from_label(lbl, ordered)
+            if element:
+                grouped.setdefault(element, []).append(lbl)
+        return grouped
+
+    @classmethod
+    def _select_labels(
+        cls, selector: str, *, labels: list[str], labels_by_element: dict[str, list[str]]
+    ):
+        """Select labels from available spectrum-image labels using selector semantics."""
+        sel = str(selector).strip()
+        if not sel:
+            return []
+
+        lower_map = {lbl.lower(): lbl for lbl in labels}
+        if sel.lower() in lower_map:
+            return [lower_map[sel.lower()]]
+
+        elem_map = {elem.lower(): elem for elem in labels_by_element}
+        if sel.lower() in elem_map:
+            return list(labels_by_element[elem_map[sel.lower()]])
+
+        compact = cls._normalize_token(sel)
+        return [lbl for lbl in labels if cls._normalize_token(lbl).startswith(compact)]
+
     def x_ray_lookup(
         self, spec: str | list[str] | tuple[str, ...] | set[str]
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-        """Lookup EDS X-ray lines for element, shell, or specific line specifiers.
-
-        Parameters
-        ----------
-        spec : str or sequence of str
-            Supported examples:
-            - ``"Fe"``: all Fe lines
-            - ``"FeK"``: all Fe K-shell lines
-            - ``"FeKa1"``: specific line
-            - ``"FeKa"``: line family prefix (e.g., Ka1, Ka2)
-
-        Returns
-        -------
-        tuple
-            ``(energies_keV, weights, line_labels)``, where:
-            - ``energies_keV`` is a 1D numpy array of line energies in keV
-            - ``weights`` is a 1D numpy array of corresponding line weights
-            - ``line_labels`` is a list like ``["AuKa1", "AuKa2", ...]``
-        """
-        if type(self).element_info is None:
-            type(self).load_element_info()
-
-        all_info = type(self).element_info or {}
-        if len(all_info) == 0:
-            raise ValueError("X-ray lines database is empty")
-
+        """Lookup EDS X-ray lines for element, shell, or specific line specifiers."""
+        info = type(self)._ensure_element_info()
+        ordered = type(self)._ordered_element_keys(info)
         specs = type(self)._normalize_specs(spec, param_name="spec")
-        ordered_elements = type(self)._ordered_element_keys(all_info)
-        rows = []
 
-        for raw_spec in specs:
-            compact_spec = re.sub(r"[\s_-]+", "", str(raw_spec).strip())
-            if not compact_spec:
+        rows: list[tuple[str, float, float]] = []
+        for raw in specs:
+            compact = re.sub(r"[\s_-]+", "", str(raw).strip())
+            if not compact:
                 continue
 
-            element_key = next(
-                (key for key in ordered_elements if compact_spec.lower().startswith(key.lower())),
-                None,
-            )
-            if element_key is None:
-                raise ValueError(f"Could not resolve element from specifier '{raw_spec}'")
+            element = next((k for k in ordered if compact.lower().startswith(k.lower())), None)
+            if element is None:
+                raise ValueError(f"Could not resolve element from specifier '{raw}'")
 
-            line_suffix = compact_spec[len(element_key) :]
-            lines_info = all_info.get(element_key, {})
-            if not isinstance(lines_info, dict) or len(lines_info) == 0:
-                raise ValueError(f"No X-ray lines found for element '{element_key}'")
-
-            if line_suffix == "":
-                selected_rows = list(lines_info.items())
-            else:
-                suffix_norm = type(self)._normalize_token(line_suffix)
-                if not suffix_norm:
-                    raise ValueError(f"Could not parse line/edge token from '{raw_spec}'")
-
-                exact_matches = []
-                prefix_matches = []
-                for line_name, line_info in lines_info.items():
-                    line_norm = type(self)._normalize_token(str(line_name).split("__", 1)[0])
-                    if line_norm == suffix_norm:
-                        exact_matches.append((line_name, line_info))
-                    if line_norm.startswith(suffix_norm):
-                        prefix_matches.append((line_name, line_info))
-
-                selected_rows = exact_matches if len(exact_matches) > 0 else prefix_matches
-                if len(selected_rows) == 0:
-                    raise ValueError(
-                        f"No X-ray lines matched specifier '{raw_spec}' for element '{element_key}'"
-                    )
-
-            for line_name, line_info in selected_rows:
+            suffix = compact[len(element) :]
+            for line_name, line_info in type(self)._iter_selected_lines(
+                element, suffix, raw_spec=str(raw)
+            ):
                 if not isinstance(line_info, dict):
                     continue
 
@@ -196,25 +243,25 @@ class Dataset3deds(Dataset3dspectroscopy):
                 except (TypeError, ValueError):
                     weight = 0.0
 
-                canonical_line = str(line_name).split("__", 1)[0]
-                rows.append((f"{element_key}{canonical_line}", energy, weight))
+                canonical = type(self)._canonical_line_name(str(line_name))
+                rows.append((f"{element}{canonical}", energy, weight))
 
-        if len(rows) == 0:
+        if not rows:
             raise ValueError(f"No X-ray lines matched specifier(s): {specs}")
 
-        rows = sorted(rows, key=lambda item: (item[1], -item[2], item[0]))
-        unique_rows = []
+        rows.sort(key=lambda t: (t[1], -t[2], t[0]))
         seen = set()
-        for label, energy, weight in rows:
-            key = (label, round(float(energy), 12), round(float(weight), 12))
-            if key in seen:
+        unique = []
+        for lbl, e, w in rows:
+            k = (lbl, round(float(e), 12), round(float(w), 12))
+            if k in seen:
                 continue
-            seen.add(key)
-            unique_rows.append((label, energy, weight))
+            seen.add(k)
+            unique.append((lbl, e, w))
 
-        energies = np.asarray([row[1] for row in unique_rows], dtype=float)
-        weights = np.asarray([row[2] for row in unique_rows], dtype=float)
-        labels = [row[0] for row in unique_rows]
+        energies = np.asarray([e for _, e, _ in unique], dtype=float)
+        weights = np.asarray([w for _, _, w in unique], dtype=float)
+        labels = [lbl for lbl, _, _ in unique]
         return energies, weights, labels
 
     def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False):
@@ -224,8 +271,14 @@ class Dataset3deds(Dataset3dspectroscopy):
             elements = list(self.model_elements.keys())
             print(f"using model_elements {elements}")
 
-        energies, weights, labels = self.x_ray_lookup(elements)
-        energy_axis = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
+        energies, _, labels = self.x_ray_lookup(elements)
+        energy_max = self.energy_axis.max()
+        energy_min = self.energy_axis.min()
+        ind = np.logical_and(energies > energy_min, energies < energy_max)
+        energies = energies[ind]
+        labels = [label for label, keep in zip(labels, ind) if keep]
+
+        energy_axis = self.energy_axis.copy()
         energy_axis_2d = energy_axis[:, None]
         energies_2d = (energies)[None, :]
 
@@ -249,119 +302,59 @@ class Dataset3deds(Dataset3dspectroscopy):
     def show_spectrum_images(
         self, x_ray_lines=None, return_fig=False, method="integration", **kwargs
     ):
-        """Plot cached spectrum-image maps from ``self._spectrum_images``.
-
-        Parameters
-        ----------
-        x_ray_lines : None | str | sequence[str], optional
-            Selection behavior:
-            - ``"Fe"``: all Fe lines
-            - ``"FeK"``: all Fe K-shell lines
-            - ``"FeKa1"``: specific line
-            - ``"FeKa"``: line family prefix (e.g., Ka1, Ka2)
-        method : ``"integration"`` | str
-            ``"integration"`` : plots maps based on integration method
-            ``"fit"`` : plots maps based on fitting method
-        **kwargs
-            Forwarded to :func:`quantem.core.visualization.show_2d`.
-
-        Returns
-        -------
-        tuple
-            ``(fig, axs)`` from ``show_2d``.
-        """
-        if method == "integration":
-            spectrum_images = getattr(self, "_spectrum_images", None)
-        elif method == "fit":
-            spectrum_images = getattr(self, "_spectrum_images_pytorch", None)
-        else:
+        """Plot cached spectrum-image maps."""
+        spectrum_images = (
+            getattr(self, "_spectrum_images", None)
+            if method == "integration"
+            else getattr(self, "_spectrum_images_pytorch", None)
+            if method == "fit"
+            else None
+        )
+        if spectrum_images is None:
             raise ValueError(
-                "Method {method}, is not supported, please choose 'integration' or 'fit'"
+                f"Method {method!r} is not supported, please choose 'integration' or 'fit'"
             )
-
-        if not isinstance(spectrum_images, dict) or len(spectrum_images) == 0:
+        if not isinstance(spectrum_images, dict) or not spectrum_images:
             raise ValueError("No spectrum images found. Run generage_spectrum_images(...) first.")
 
-        line_map = {str(label): np.asarray(image) for label, image in spectrum_images.items()}
-        if len(line_map) == 0:
-            raise ValueError("No spectrum images available to plot")
+        line_map = {str(k): np.asarray(v) for k, v in spectrum_images.items()}
+        labels = list(line_map)
+        labels_by_element = type(self)._group_labels_by_element(labels)
 
-        known_elements = type(self)._ordered_element_keys(type(self).element_info or {})
-
-        def _sum_maps(labels):
-            maps = [line_map[label] for label in labels]
-            return np.sum(np.stack(maps, axis=0), axis=0)
-
-        lines_by_element = {}
-        for label in sorted(line_map.keys()):
-            element = type(self)._resolve_element_from_label(label, known_elements)
-            if element is None:
-                continue
-            lines_by_element.setdefault(element, []).append(label)
-
-        normalized_label_map = {label.lower(): label for label in line_map.keys()}
-        normalized_element_map = {element.lower(): element for element in lines_by_element.keys()}
+        def _sum_maps(lbls):
+            return np.sum(np.stack([line_map[lbl] for lbl in lbls], axis=0), axis=0)
 
         specs = type(self)._normalize_specs(x_ray_lines, param_name="x_ray_lines", allow_none=True)
-        images_to_plot = []
-        titles = []
+        images, titles = [], []
 
-        if specs is None or len(specs) == 0:
-            for element in sorted(lines_by_element.keys()):
-                labels = lines_by_element[element]
-                if len(labels) == 0:
-                    continue
-                images_to_plot.append(_sum_maps(labels))
-                titles.append(element)
+        if not specs:
+            for element in sorted(labels_by_element):
+                lbls = labels_by_element[element]
+                if lbls:
+                    images.append(_sum_maps(lbls))
+                    titles.append(element)
         else:
-            for raw_spec in specs:
-                spec = str(raw_spec).strip()
-                if not spec:
-                    continue
-
-                label_key = normalized_label_map.get(spec.lower())
-                if label_key is not None:
-                    images_to_plot.append(line_map[label_key])
-                    titles.append(label_key)
-                    continue
-
-                element_key = normalized_element_map.get(spec.lower())
-                if element_key is not None:
-                    labels = lines_by_element[element_key]
-                    images_to_plot.append(_sum_maps(labels))
-                    titles.append(element_key)
-                    continue
-
-                compact = type(self)._normalize_token(spec)
-                matched_labels = [
-                    label
-                    for label in line_map.keys()
-                    if type(self)._normalize_token(label).startswith(compact)
-                ]
-                if len(matched_labels) == 0:
+            for raw in specs:
+                selected = type(self)._select_labels(
+                    str(raw), labels=labels, labels_by_element=labels_by_element
+                )
+                if not selected:
                     raise ValueError(
-                        f"No spectrum images matched selector '{spec}'. "
-                        f"Available examples: {', '.join(sorted(line_map.keys())[:10])}"
+                        f"No spectrum images matched selector '{raw}'. "
+                        f"Available examples: {', '.join(sorted(labels)[:10])}"
                     )
-                if len(matched_labels) == 1:
-                    images_to_plot.append(line_map[matched_labels[0]])
-                    titles.append(matched_labels[0])
-                else:
-                    images_to_plot.append(_sum_maps(matched_labels))
-                    titles.append(spec)
+                images.append(line_map[selected[0]] if len(selected) == 1 else _sum_maps(selected))
+                titles.append(selected[0] if len(selected) == 1 else str(raw).strip())
 
-        if len(images_to_plot) == 0:
+        if not images:
             raise ValueError("No spectrum images selected for plotting")
 
         cmap = kwargs.pop("cmap", "magma")
         fig, ax = show_2d(
-            images_to_plot,
+            images,
             title=titles,
             cmap=cmap,
-            scalebar={
-                "sampling": self.sampling[1],
-                "units": self.units[1],
-            },
+            scalebar={"sampling": self.sampling[1], "units": self.units[1]},
             returnfig=True,
             **kwargs,
         )
@@ -399,95 +392,61 @@ class Dataset3deds(Dataset3dspectroscopy):
     def quantify_composition_cliff_lorimer(
         self, k_factors, method="integration", return_maps=False
     ):
-        """Quantify composition from cached spectrum maps using Cliff-Lorimer.
-
-        Parameters
-        ----------
-        k_factors : dict
-            Mapping selector -> k-factor, where selectors are element+edge/line, e.g.
-            ``"AuL"``, ``"TeL"``,.
-        method : {"integration", "fit"}
-            Source of maps:
-            - ``"integration"`` uses ``self._spectrum_images``
-            - ``"fit"`` uses ``self._spectrum_images_pytorch``
-        return_maps : bool, optional
-            If ``True``, include per-selector and per-element maps plus map-based
-            atomic/weight percent outputs.
-        """
-        if not isinstance(k_factors, dict) or len(k_factors) == 0:
+        """Quantify composition from cached spectrum maps using Cliff-Lorimer."""
+        if not isinstance(k_factors, dict) or not k_factors:
             raise ValueError("k_factors must be a non-empty dict")
 
-        if method == "integration":
-            spectrum_images = getattr(self, "_spectrum_images", None)
-        elif method == "fit":
-            spectrum_images = getattr(self, "_spectrum_images_pytorch", None)
-        else:
+        spectrum_images = (
+            getattr(self, "_spectrum_images", None)
+            if method == "integration"
+            else getattr(self, "_spectrum_images_pytorch", None)
+            if method == "fit"
+            else None
+        )
+        if spectrum_images is None:
             raise ValueError(
                 f"Method {method!r} is not supported, please choose 'integration' or 'fit'"
             )
-        if not isinstance(spectrum_images, dict) or len(spectrum_images) == 0:
+        if not isinstance(spectrum_images, dict) or not spectrum_images:
             raise ValueError("No spectrum images available for quantification")
 
-        if type(self).element_info is None:
-            type(self).load_element_info()
-
+        type(self)._ensure_element_info()
         ordered_elements = type(self)._ordered_element_keys(type(self).element_info or {})
-        line_map = {
-            str(label): np.asarray(image, dtype=float) for label, image in spectrum_images.items()
-        }
-        normalized_label_map = {str(label).lower(): str(label) for label in line_map}
 
-        def _match_labels(selector):
-            token = str(selector).strip()
-            if not token:
-                return []
+        line_map = {str(k): np.asarray(v, dtype=float) for k, v in spectrum_images.items()}
+        labels = list(line_map)
+        labels_by_element = type(self)._group_labels_by_element(labels)
 
-            exact = normalized_label_map.get(token.lower())
-            if exact is not None:
-                return [exact]
+        def _match(selector: str) -> list[str]:
+            return type(self)._select_labels(
+                selector, labels=labels, labels_by_element=labels_by_element
+            )
 
+        intensities: dict[str, float] = {}
+        weighted_intensities: dict[str, float] = {}
+        selector_maps = {} if return_maps else None
+        intensity_maps = {} if return_maps else None
+        weighted_intensity_maps = {} if return_maps else None
+
+        for selector, k_raw in k_factors.items():
             try:
-                _, _, labels_lookup = self.x_ray_lookup(token)
-                labels = [label for label in labels_lookup if label in line_map]
-                if len(labels) > 0:
-                    return labels
-            except ValueError:
-                pass
-
-            compact = type(self)._normalize_token(token)
-            return [
-                label
-                for label in line_map
-                if type(self)._normalize_token(label).startswith(compact)
-            ]
-
-        details = {}
-        intensities = {}
-        weighted_intensities = {}
-        selector_maps = {}
-        intensity_maps = {}
-        weighted_intensity_maps = {}
-        normalized_k = {}
-
-        for selector, k_value_raw in k_factors.items():
-            try:
-                k_value = float(k_value_raw)
+                k_val = float(k_raw)
             except (TypeError, ValueError):
                 raise ValueError(f"k_factors[{selector!r}] must be numeric")
-            if not np.isfinite(k_value) or k_value <= 0:
+            if not np.isfinite(k_val) or k_val <= 0:
                 raise ValueError(f"k_factors[{selector!r}] must be a positive finite number")
 
-            labels = _match_labels(selector)
-            if len(labels) == 0:
+            sel_labels = _match(str(selector).strip())
+            if not sel_labels:
                 raise ValueError(
                     f"No spectrum images matched selector {selector!r}. "
-                    f"Available examples: {', '.join(sorted(line_map.keys())[:10])}"
+                    f"Available examples: {', '.join(sorted(labels)[:10])}"
                 )
 
             matched_elements = {
-                type(self)._resolve_element_from_label(label, ordered_elements) for label in labels
+                type(self)._resolve_element_from_label(lbl, ordered_elements) for lbl in sel_labels
             }
-            matched_elements = {elem for elem in matched_elements if elem is not None}
+            matched_elements = {e for e in matched_elements if e is not None}
             if len(matched_elements) != 1:
                 raise ValueError(
                     f"Selector {selector!r} matched multiple elements: {sorted(matched_elements)}. "
@@ -495,61 +454,51 @@ class Dataset3deds(Dataset3dspectroscopy):
                 )
             element = next(iter(matched_elements))
 
-            grouped_map = np.sum(np.stack([line_map[label] for label in labels], axis=0), axis=0)
+            grouped_map = np.sum(np.stack([line_map[lbl] for lbl in sel_labels], axis=0), axis=0)
             intensity = float(np.sum(grouped_map))
-            weighted = float(k_value * intensity)
-            weighted_map = grouped_map * k_value
-
-            selector_key = str(selector)
-            normalized_k[selector_key] = k_value
-            selector_maps[selector_key] = grouped_map
-            details[selector_key] = {
-                "element": element,
-                "labels": list(labels),
-                "intensity": intensity,
-                "k_factor": k_value,
-                "weighted_intensity": weighted,
-            }
+            weighted = float(k_val * intensity)
 
             intensities[element] = float(intensities.get(element, 0.0)) + intensity
             weighted_intensities[element] = (
                 float(weighted_intensities.get(element, 0.0)) + weighted
             )
-            if element in intensity_maps:
-                intensity_maps[element] = intensity_maps[element] + grouped_map
-                weighted_intensity_maps[element] = weighted_intensity_maps[element] + weighted_map
-            else:
-                intensity_maps[element] = grouped_map.copy()
-                weighted_intensity_maps[element] = weighted_map.copy()
+
+            if return_maps:
+                weighted_map = grouped_map * k_val
+                selector_maps[str(selector)] = grouped_map
+                if element in intensity_maps:
+                    intensity_maps[element] = intensity_maps[element] + grouped_map
+                    weighted_intensity_maps[element] = (
+                        weighted_intensity_maps[element] + weighted_map
+                    )
+                else:
+                    intensity_maps[element] = grouped_map.copy()
+                    weighted_intensity_maps[element] = weighted_map.copy()
 
         if len(weighted_intensities) < 2:
             raise ValueError("At least two elements are required for Cliff-Lorimer quantification")
 
         weighted_sum = float(sum(weighted_intensities.values()))
         atomic_percent = {
-            element: (100.0 * value / weighted_sum if weighted_sum > 0 else 0.0)
-            for element, value in weighted_intensities.items()
+            el: (100.0 * val / weighted_sum if weighted_sum > 0 else 0.0)
+            for el, val in weighted_intensities.items()
         }
 
         if type(self).atomic_weights is None:
             type(self).load_atomic_weights()
         atomic_weights = type(self).atomic_weights or {}
-        missing = [element for element in atomic_percent if element not in atomic_weights]
+        missing = [el for el in atomic_percent if el not in atomic_weights]
         if missing:
             raise ValueError(f"Atomic weights not found for elements: {missing}")
 
         weight_sum = sum(
-            (atomic_percent[element] / 100.0) * float(atomic_weights[element])
-            for element in atomic_percent
+            (atomic_percent[el] / 100.0) * float(atomic_weights[el]) for el in atomic_percent
         )
         weight_percent = {
-            element: (
-                ((atomic_percent[element] / 100.0) * float(atomic_weights[element]) / weight_sum)
-                * 100.0
-                if weight_sum > 0
-                else 0.0
-            )
-            for element in atomic_percent
+            el: (((atomic_percent[el] / 100.0) * float(atomic_weights[el]) / weight_sum) * 100.0)
+            if weight_sum > 0
+            else 0.0
+            for el in atomic_percent
         }
 
         result = {
@@ -558,34 +507,33 @@ class Dataset3deds(Dataset3dspectroscopy):
             "atomic_percent": atomic_percent,
             "weight_percent": weight_percent,
         }
+
         if return_maps:
             weighted_stack = np.stack(list(weighted_intensity_maps.values()), axis=0)
             weighted_sum_map = np.sum(weighted_stack, axis=0)
             atomic_percent_maps = {
-                element: np.divide(
-                    weighted_map * 100.0,
+                el: np.divide(
+                    wmap * 100.0,
                     weighted_sum_map,
                     out=np.zeros_like(weighted_sum_map, dtype=float),
                     where=weighted_sum_map > 0,
                 )
-                for element, weighted_map in weighted_intensity_maps.items()
+                for el, wmap in weighted_intensity_maps.items()
             }
-
             mass_maps = {
-                element: (atomic_percent_maps[element] / 100.0) * float(atomic_weights[element])
-                for element in atomic_percent_maps
+                el: (atomic_percent_maps[el] / 100.0) * float(atomic_weights[el])
+                for el in atomic_percent_maps
             }
             mass_sum_map = np.sum(np.stack(list(mass_maps.values()), axis=0), axis=0)
             weight_percent_maps = {
-                element: np.divide(
-                    mass_map * 100.0,
+                el: np.divide(
+                    mmap * 100.0,
                     mass_sum_map,
                     out=np.zeros_like(mass_sum_map, dtype=float),
                     where=mass_sum_map > 0,
                 )
-                for element, mass_map in mass_maps.items()
+                for el, mmap in mass_maps.items()
             }
-
             result.update(
                 {
                     "selector_maps": selector_maps,
@@ -627,78 +575,28 @@ class Dataset3deds(Dataset3dspectroscopy):
             If True, return full internal results (matches/confidence/peaks).
             If False (default), return only figure and axes.
         """
-        if type(self).element_info is None:
-            type(self).load_element_info()
+        type(self)._ensure_element_info()
 
         if grid_peaks is None:
             grid_peaks = {}
 
-        if isinstance(elements, str):
-            elements = [elements]
-        if elements is not None and not isinstance(elements, (list, tuple, set)):
-            raise TypeError("elements must be None, a string, or a sequence of strings")
-
-        def _line_matches_selector(line_name: str, selector: str) -> bool:
-            line = str(line_name).strip().lower()
-            token = str(selector).strip().lower()
-            if token in {"k", "l", "m"}:
-                return line.startswith(token)
-            return token in line
-
-        def _parse_requested_elements_with_edges(element_specs):
-            if element_specs is None:
-                return None
-
-            parsed = {}
-            for spec in element_specs:
-                raw = str(spec).strip()
-                if not raw:
-                    continue
-
-                tokens = raw.replace(",", " ").split()
-                if len(tokens) == 0:
-                    continue
-
-                element_key = str(tokens[0])
-                selectors = [str(token).strip() for token in tokens[1:] if str(token).strip()]
-
-                if element_key not in parsed:
-                    parsed[element_key] = None if len(selectors) == 0 else set(selectors)
-                    continue
-
-                existing = parsed[element_key]
-                if existing is None:
-                    continue
-                if len(selectors) == 0:
-                    parsed[element_key] = None
-                else:
-                    existing.update(selectors)
-
-            return parsed if len(parsed) > 0 else None
-
-        def _edge_filters_from_saved_model(model_elements):
-            if not isinstance(model_elements, dict) or len(model_elements) == 0:
-                return None
-
-            parsed = {}
-            for element_name, lines_info in model_elements.items():
-                element_key = str(element_name)
-                if isinstance(lines_info, dict) and len(lines_info) > 0:
-                    parsed[element_key] = set(str(line_name) for line_name in lines_info.keys())
-                else:
-                    parsed[element_key] = None
-
-            return parsed if len(parsed) > 0 else None
-
-        requested_edge_filters = _parse_requested_elements_with_edges(elements)
-        saved_model_edge_filters = _edge_filters_from_saved_model(
-            getattr(self, "model_elements", None)
+        requested_edge_filters = type(self)._parse_element_selectors(
+            elements, allow_none=True, param_name="elements"
         )
+        saved_model_edge_filters = {
+            str(k): (set(map(str, v.keys())) if isinstance(v, dict) and v else None)
+            for k, v in (getattr(self, "model_elements", {}) or {}).items()
+        } or None
+
         using_saved_model_elements = False
-        if requested_edge_filters is None and elements is None:
-            if saved_model_edge_filters is not None:
-                requested_edge_filters = saved_model_edge_filters
-                using_saved_model_elements = True
+        if (
+            requested_edge_filters is None
+            and elements is None
+            and saved_model_edge_filters is not None
+        ):
+            requested_edge_filters = saved_model_edge_filters
+            using_saved_model_elements = True
+
         if requested_edge_filters is not None:
             elements = list(requested_edge_filters.keys())
 
@@ -737,7 +635,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         E = E0 + dE * np.arange(self.shape[0])
 
         if energy_range is not None:
-            indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
+            indices = np.where((energy_range[0] <= E) & (energy_range[1] >= E))[0]
             E = E[indices]
 
         if ignore_range is None:
@@ -828,6 +726,13 @@ class Dataset3deds(Dataset3dspectroscopy):
                 np.log1p(max(float(snr_value), 0.0)) * (0.5 + float(line_weight)) * (0.5 + quality)
             )
 
+        def _line_matches_selector(line_name: str, selector: str) -> bool:
+            line = str(line_name).strip().lower()
+            token = str(selector).strip().lower()
+            if token in {"k", "l", "m"}:
+                return line.startswith(token)
+            return token in line
+
         def _line_allowed_for_element(element_name, line_name, edge_filters=None):
             if edge_filters is None:
                 return True
@@ -876,10 +781,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             return best_element, best_line_name, best_line_weight, best_distance
 
-        if elements is not None:
-            search_elements = set(elements)
-        else:
-            search_elements = None
+        search_elements = set(elements) if elements is not None else None
 
         for peak_idx, height, peak_energy, snr in display_peaks:
             best_match_info = _best_line_match(
@@ -1124,7 +1026,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 return "None"
 
             formatted = []
-            for element_name in sorted(str(name) for name in edge_filters.keys()):
+            for element_name in sorted(str(name) for name in edge_filters):
                 selectors = edge_filters.get(element_name)
                 if selectors is None or len(selectors) == 0:
                     formatted.append(f"{element_name} [all]")
@@ -1725,7 +1627,13 @@ class Dataset3deds(Dataset3dspectroscopy):
         if device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
 
-        energy_axis_np = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
+        if elements_to_fit is None:
+            if self.model_elements is None:
+                raise ValueError("elements_to_fit must be specified")
+            elements_to_fit = list(self.model_elements.keys())
+            print(f"using model_elements {elements_to_fit}")
+
+        energy_axis_np = self.energy_axis.copy()
         energy_axis = torch.tensor(energy_axis_np, dtype=torch.float32, device=device)
         spectra = torch.tensor(self.array, dtype=torch.float32, device=device)
 
@@ -1881,7 +1789,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             If ``None``, the full energy axis is used.
         elements_to_fit : sequence[str] | None, optional
             Element symbols (or model-supported element labels) to include in the
-            fit. If ``None``, all supported elements from the model are considered.
+            fit. If ``None``, uses keys from ``self.model_elements``.
         peak_width : float, optional
             Initial peak width (FWHM-like parameter in keV) for model peaks.
         num_iters : int, optional
@@ -1995,6 +1903,13 @@ class Dataset3deds(Dataset3dspectroscopy):
         if background_prior_lambda < 0:
             raise ValueError("constrain_background must be >= 0")
 
+        if elements_to_fit is None:
+            if self.model_elements is None:
+                raise ValueError("elements_to_fit must be specified")
+            elements_to_fit = list(self.model_elements.keys())
+            if verbose:
+                print(f"using model_elements {elements_to_fit}")
+
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -2005,7 +1920,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         effective_lr_global = lr_global
         effective_lr_local = lr_local
 
-        energy_axis_np = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
+        energy_axis_np = self.energy_axis.copy()
         energy_axis = torch.tensor(energy_axis_np, dtype=torch.float32, device=device)
         spectra = torch.tensor(self.array, dtype=torch.float32, device=device)
 
