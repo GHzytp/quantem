@@ -390,9 +390,25 @@ class Dataset3deds(Dataset3dspectroscopy):
         return line_maps
 
     def quantify_composition_cliff_lorimer(
-        self, k_factors, method="integration", return_maps=False
+        self,
+        k_factors,
+        method="integration",
+        return_maps=False,
+        verbose=True,
     ):
-        """Quantify composition from cached spectrum maps using Cliff-Lorimer."""
+        """Quantify composition from cached spectrum maps using Cliff-Lorimer.
+
+        Parameters
+        ----------
+        k_factors : dict
+            Mapping of selector -> k-factor.
+        method : {"integration", "fit"}, optional
+            Source map set to use.
+        return_maps : bool, optional
+            If True, include per-element/per-selector map outputs.
+        verbose : bool, optional
+            If True, print a small scalar text table (no maps).
+        """
         if not isinstance(k_factors, dict) or not k_factors:
             raise ValueError("k_factors must be a non-empty dict")
 
@@ -507,6 +523,28 @@ class Dataset3deds(Dataset3dspectroscopy):
             "atomic_percent": atomic_percent,
             "weight_percent": weight_percent,
         }
+
+        ordered_elements = sorted(
+            weighted_intensities.keys(),
+            key=lambda element_name: weighted_intensities[element_name],
+            reverse=True,
+        )
+        table_lines = [
+            "Element  Intensity      Weighted Intensity    Atomic %    Weight %",
+            "-------  -------------  --------------------  ----------  ----------",
+        ]
+        for element_name in ordered_elements:
+            table_lines.append(
+                f"{element_name:<7}  "
+                f"{intensities[element_name]:>13.3f}  "
+                f"{weighted_intensities[element_name]:>20.3f}  "
+                f"{atomic_percent[element_name]:>10.3f}  "
+                f"{weight_percent[element_name]:>10.3f}"
+            )
+        table_text = "\n".join(table_lines)
+        result["summary_table"] = table_text
+        if verbose:
+            print(table_text)
 
         if return_maps:
             weighted_stack = np.stack(list(weighted_intensity_maps.values()), axis=0)
