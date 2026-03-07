@@ -587,6 +587,8 @@ class Dataset3deds(Dataset3dspectroscopy):
     def clear_spectrum_images(self):
         if self._spectrum_images is not None:
             self._spectrum_images = {}
+
+    def clear_spectrum_images_pytorch(self):
         if self._spectrum_images_pytorch is not None:
             self._spectrum_images = {}
 
