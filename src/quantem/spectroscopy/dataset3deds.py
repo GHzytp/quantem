@@ -584,6 +584,12 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         return result
 
+    def clear_spectrum_images(self):
+        if self._spectrum_images is not None:
+            self._spectrum_images = {}
+        if self._spectrum_images_pytorch is not None:
+            self._spectrum_images = {}
+
     def peak_autoid(
         self,
         roi=None,
@@ -2184,7 +2190,6 @@ class Dataset3deds(Dataset3dspectroscopy):
                 trainable_params,
                 lr=local_lr,
                 line_search_fn="strong_wolfe",
-                history_size=10,
             )
 
         loss_history = []
