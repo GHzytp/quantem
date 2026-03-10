@@ -867,8 +867,13 @@ class PtychographyVisualizations(PtychographyBase):
         Examples
         --------
         >>> ptycho.show_scan_positions()
+        Scan grid: 192 x 192 positions
+        FOV: 133.46 x 133.46 Å
+        Probe diameter (rough estimate): 3.46 Å
+        Step size: 0.70 Å
+        Probe overlap (rough estimate): 79.8%
 
-        >>> ptycho.show_scan_positions(axsize=(10, 10), num_probes=10, edgecolors="b", linewidths=0.5)
+        >>> ptycho.show_scan_positions(num_probes=10, edgecolors="b", linewidths=0.5)
         """
         # for each scan position, sum the intensity of self.probe at that position
         scan_positions = self.dset.scan_positions_px.cpu().detach().numpy()
