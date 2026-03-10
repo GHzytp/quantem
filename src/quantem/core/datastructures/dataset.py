@@ -454,12 +454,6 @@ class Dataset(AutoSerialize):
     ) -> Self | None:
         """Select a sub-region of the dataset along specified axes
 
-        Unlike regular slicing (``dset[64:192, ...]``), which creates a
-        view that keeps the full original array in memory,
-        ``modify_in_place=True`` replaces the array and frees the original.
-        This is important for large 4D-STEM datasets where memory is
-        limited.
-
         Each ``crop_widths`` entry is a ``(start, stop)`` pair defining
         which elements to keep. A ``stop`` of ``0`` keeps everything from
         ``start`` to the end.
