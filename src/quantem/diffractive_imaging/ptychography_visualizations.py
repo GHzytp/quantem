@@ -1,3 +1,4 @@
+
 import warnings
 from typing import Any, Literal
 
@@ -886,7 +887,7 @@ class PtychographyVisualizations(PtychographyBase):
         scan_sampling = self.dset.scan_sampling
         fov = scan_sampling * (np.array(scan_gpts) - 1)
         print(f"Scan grid: {scan_gpts[0]} x {scan_gpts[1]} positions")
-        print(f"FOV: {fov[0]:.2f} x {fov[1]:.2f} Å")
+        print(f"Object FOV: {fov[0]:.2f} x {fov[1]:.2f} Å")
 
         if conv_angle is not None and energy is not None:
             from quantem.core.utils.utils import electron_wavelength_angstrom
