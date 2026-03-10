@@ -840,6 +840,7 @@ class Dataset3dspectroscopy(Dataset3d):
         ignore_range=None,
         mask=None,
         target_edge=None,
+        window_size=10,
         data_type="eds",
         method="powerlaw",
         return_dataset=True,
@@ -867,7 +868,9 @@ class Dataset3dspectroscopy(Dataset3d):
             background = self.calculate_background_powerlaw(spec)
         elif data_type == "eels":
             if method == "powerlaw":
-                background = self.powerlaw_backgroundfit_eels(spec, energy_range, target_edge)
+                background = self.powerlaw_backgroundfit_eels(
+                    spec, energy_range, target_edge, window_size
+                )
             elif method == "iterative":
                 background = self.calculate_background_iterative(spec)
 
