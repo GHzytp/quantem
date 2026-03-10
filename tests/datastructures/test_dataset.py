@@ -252,6 +252,25 @@ class TestDatasetMethods:
         sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)), modify_in_place=True)
         assert sample_dataset_2d.shape == (8, 8)
 
+    def test_crop_4dstem_kspace(self):
+        """Test cropping k-space axes of a 4D-STEM dataset."""
+        dset = Dataset.from_array(np.random.rand(8, 8, 96, 96))
+        cropped = dset.crop(crop_widths=((4, 92), (4, 92)), axes=(2, 3))
+        assert cropped.shape == (8, 8, 88, 88)
+        assert dset.shape == (8, 8, 96, 96)
+
+    def test_crop_4dstem_realspace_in_place(self):
+        """Test in-place real-space crop of a 4D-STEM dataset."""
+        dset = Dataset.from_array(np.random.rand(16, 16, 32, 32))
+        dset.crop(crop_widths=((4, 12), (4, 12)), axes=(0, 1), modify_in_place=True)
+        assert dset.shape == (8, 8, 32, 32)
+
+    def test_crop_4dstem_stop_zero(self):
+        """Test that stop=0 keeps all remaining elements."""
+        dset = Dataset.from_array(np.random.rand(8, 8, 96, 96))
+        cropped = dset.crop(crop_widths=((10, 0), (10, 0)), axes=(2, 3))
+        assert cropped.shape == (8, 8, 86, 86)
+
     def test_bin(self, sample_dataset_2d):
         """Test bin method."""
         # Bin by factor of 2
