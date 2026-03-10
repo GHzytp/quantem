@@ -241,13 +241,10 @@ class TestDatasetMethods:
         """Test crop method."""
         # Crop 1 pixel from each side
         cropped_dataset = sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)))
-
         # Check shape
         assert cropped_dataset.shape == (8, 8)  # Original (10, 10) - 1 from each side
-
         # Check that the original dataset is unchanged
         assert sample_dataset_2d.shape == (10, 10)
-
         # Test modify_in_place
         sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)), modify_in_place=True)
         assert sample_dataset_2d.shape == (8, 8)
@@ -275,13 +272,10 @@ class TestDatasetMethods:
         """Test bin method."""
         # Bin by factor of 2
         binned_dataset = sample_dataset_2d.bin(bin_factors=2)
-
         # Check shape
         assert binned_dataset.shape == (5, 5)  # Original (10, 10) / 2
-
         # Check that the original dataset is unchanged
         assert sample_dataset_2d.shape == (10, 10)
-
         # Test modify_in_place
         sample_dataset_2d.bin(bin_factors=2, modify_in_place=True)
         assert sample_dataset_2d.shape == (5, 5)
