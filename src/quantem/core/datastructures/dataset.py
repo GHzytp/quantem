@@ -579,8 +579,8 @@ class Dataset(AutoSerialize):
             If True, modifies this dataset in-place. If False, returns
             a new dataset.
         reducer : {"sum", "mean"}
-            ``"sum"`` (default) preserves total counts; ``"mean"``
-            averages over each block.
+            Reduction applied within each block. "sum" (default) preserves
+            counts; "mean" averages over each block.
 
         Returns
         -------
@@ -592,7 +592,7 @@ class Dataset(AutoSerialize):
         - Any remainder (shape % factor) is dropped on each binned axis.
         - Sampling is multiplied by the factor on each binned axis.
         - Origin is shifted to the center of the first block:
-            ``origin_new = origin_old + 0.5 * (factor - 1) * sampling_old``
+            origin_new = origin_old + 0.5 * (factor - 1) * sampling_old
 
         Examples
         --------
