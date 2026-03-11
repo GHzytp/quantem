@@ -1,12 +1,10 @@
 from typing import Any
 
 import numpy as np
-
-from scipy.interpolate import interp1d
-
-from scipy.ndimage import median_filter
-
 from numpy.typing import NDArray
+from scipy.interpolate import interp1d
+from scipy.ndimage import median_filter
+from scipy.optimize import curve_fit
 
 from quantem.spectroscopy import Dataset3dspectroscopy
 
@@ -112,13 +110,65 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return background_fit
 
+    def powerlaw_backgroundfit_eels(self, spectrum, energy_range, target_edge, window_size):
+        """
+        Using a window of the energy axis preceding the target edge, fit a power law function to use for background subtraction.
+        The input window size should be 10-30% of the target edge energy.
+        """
+
+        dE = float(self.sampling[0])
+        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
+        E = E0 + dE * np.arange(self.shape[0])
+
+        if energy_range is not None:
+            energy_range[0] = np.maximum(energy_range[0], E[0])
+            energy_range[1] = np.minimum(energy_range[1], E[-1])
+
+            indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
+            E = E[indices]
+        else:
+            indices = np.arange(self.shape[0])
+
+        # Check that input window size is between 10% and 30%
+
+        if window_size < 10 or window_size > 30:
+            raise ValueError("Invalid window size. Please input a value of between 10 and 30.")
+
+        # Check that the target edge is within the energy range of the spectrum
+        # and that a pre-edge region of size at least 10% of the target edge, ending 5 eV before the target edge
+        # exists for pre-edge fitting.
+
+        if target_edge < E[0] or target_edge > E[-1]:
+            raise ValueError("Target edge is outside of energy range.")
+        elif ((target_edge - 5) - target_edge * (window_size / 100)) < E[0]:
+            raise ValueError(
+                "Insufficient pre-edge background fitting region for this target edge and window size within given energy range."
+            )
+
+        # Fit power law function to spectrum within window region of the energy exis
+
+        window_minE = (target_edge - 5) - target_edge * (window_size / 100)
+        window_maxE = target_edge - 5
+
+        window_indices = np.where((E >= window_minE) & E <= window_maxE)[0]
+
+        window_E = E[window_indices]
+        window_I = spectrum[window_indices]
+
+        def powerlaw_function(E, A, r):
+            return A * (E ^ (-r))
+
+        background_fit = curve_fit(powerlaw_function, window_E, window_I)
+
+        return background_fit
+
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
         Calibrate the energy axis by centering the zero loss peak at 0 eV.
         Finds the ZLP at every pixel, fits a 2D plane to the ZLP positions,
         and shifts each spectrum individually so the ZLP sits at 0, while aligning
-        all ZLPs to the same channel index, allowing a single origin to correctly 
-        calibrate the entire dataset. 
+        all ZLPs to the same channel index, allowing a single origin to correctly
+        calibrate the entire dataset.
 
         Parameters
         ----------
@@ -174,9 +224,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         # This smooths out noisy per-pixel ZLP measurements by assuming
         # the drift varies linearly across the scan area.
 
-        y_coords, x_coords = np.meshgrid(
-            np.arange(n_y), np.arange(n_x), indexing="ij"
-        )
+        y_coords, x_coords = np.meshgrid(np.arange(n_y), np.arange(n_x), indexing="ij")
         y_flat = y_coords.ravel()
         x_flat = x_coords.ravel()
         z_flat = zlp_map.ravel()

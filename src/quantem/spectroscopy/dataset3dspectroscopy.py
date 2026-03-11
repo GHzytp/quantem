@@ -839,7 +839,10 @@ class Dataset3dspectroscopy(Dataset3d):
         energy_range=None,
         ignore_range=None,
         mask=None,
+        target_edge=None,
+        window_size=10,
         data_type="eds",
+        method="powerlaw",
         return_dataset=True,
         attach_spectrum=True,
     ):
@@ -864,7 +867,12 @@ class Dataset3dspectroscopy(Dataset3d):
         if data_type == "eds":
             background = self.calculate_background_powerlaw(spec)
         elif data_type == "eels":
-            background = self.calculate_background_iterative(spec)
+            if method == "powerlaw":
+                background = self.powerlaw_backgroundfit_eels(
+                    spec, energy_range, target_edge, window_size
+                )
+            elif method == "iterative":
+                background = self.calculate_background_iterative(spec)
 
         subtracted_mean_spectrum = np.maximum(spec - background, 0)
 
