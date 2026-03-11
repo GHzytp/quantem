@@ -1,5 +1,6 @@
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
@@ -118,14 +119,16 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
-        E = E0 + dE * np.arange(self.shape[0])
+        energy_axis = E0 + dE * np.arange(self.shape[0])
 
         if energy_range is not None:
-            energy_range[0] = np.maximum(energy_range[0], E[0])
-            energy_range[1] = np.minimum(energy_range[1], E[-1])
+            energy_range[0] = np.maximum(energy_range[0], energy_axis[0])
+            energy_range[1] = np.minimum(energy_range[1], energy_axis[-1])
 
-            indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
-            E = E[indices]
+            indices = np.where(
+                (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
+            )[0]
+            energy_axis = energy_axis[indices]
         else:
             indices = np.arange(self.shape[0])
 
@@ -138,9 +141,9 @@ class Dataset3deels(Dataset3dspectroscopy):
         # and that a pre-edge region of size at least 10% of the target edge, ending 5 eV before the target edge
         # exists for pre-edge fitting.
 
-        if target_edge < E[0] or target_edge > E[-1]:
+        if target_edge < energy_axis[0] or target_edge > energy_axis[-1]:
             raise ValueError("Target edge is outside of energy range.")
-        elif ((target_edge - 5) - target_edge * (window_size / 100)) < E[0]:
+        elif ((target_edge - 5) - target_edge * (window_size / 100)) < energy_axis[0]:
             raise ValueError(
                 "Insufficient pre-edge background fitting region for this target edge and window size within given energy range."
             )
@@ -150,15 +153,32 @@ class Dataset3deels(Dataset3dspectroscopy):
         window_minE = (target_edge - 5) - target_edge * (window_size / 100)
         window_maxE = target_edge - 5
 
-        window_indices = np.where((E >= window_minE) & E <= window_maxE)[0]
+        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
 
-        window_E = E[window_indices]
+        window_E = energy_axis[window_indices]
         window_I = spectrum[window_indices]
 
         def powerlaw_function(E, A, r):
-            return A * (E ^ (-r))
+            return A * (E ** (-r))
 
-        background_fit = curve_fit(powerlaw_function, window_E, window_I)
+        popt, _ = curve_fit(powerlaw_function, window_E, window_I)
+        background_fit = powerlaw_function(energy_axis, popt[0], popt[1])
+
+        # Plot the region of the spectrum between user-specified energy range, overlaid with the background fit curve, with background estimation
+        # window boundaries indicated
+
+        fig, ax = plt.subplots()
+        ax.plot(energy_axis, spectrum, label="spectrum", color="b")
+        ax.plot(energy_axis, background_fit, label="background", color="r")
+        ax.vlines(
+            x=[window_minE, window_maxE],
+            ymin=0,
+            ymax=np.max(spectrum),
+            label="window limits",
+            color="k",
+            linestyle="dashed",
+        )
+        ax.legend()
 
         return background_fit
 
