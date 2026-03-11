@@ -161,7 +161,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         def powerlaw_function(E, A, r):
             return A * (E ** (-r))
 
-        popt, _ = curve_fit(powerlaw_function, window_E, window_I)
+        popt, _ = curve_fit(powerlaw_function, window_E, window_I, maxfev=2000)
         background_fit = powerlaw_function(energy_axis, popt[0], popt[1])
 
         # Plot the region of the spectrum between user-specified energy range, overlaid with the background fit curve, with background estimation
