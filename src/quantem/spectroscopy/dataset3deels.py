@@ -6,6 +6,7 @@ from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
+from sklearn.decomposition import PCA
 
 from quantem.spectroscopy import Dataset3dspectroscopy
 
@@ -181,6 +182,79 @@ class Dataset3deels(Dataset3dspectroscopy):
         ax.legend()
 
         return background_fit
+
+    def smooth_eels_pca(self, roi=None, energy_range=None, ignore_range=None, mask=None):
+        pca = PCA(n_components=2)
+        # kpca = KernelPCA(n_components=10, kernel='rbf', gamma=50, fit_inverse_transform=True)
+
+        # #test on mean spectrum
+        # spec = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+
+        dE = float(self.sampling[0])
+        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
+        energy_axis = E0 + dE * np.arange(self.shape[0])
+
+        # if energy_range is not None:
+        #     energy_range[0] = np.maximum(energy_range[0], energy_axis[0])
+        #     energy_range[1] = np.minimum(energy_range[1], energy_axis[-1])
+
+        #     indices = np.where(
+        #         (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
+        #     )[0]
+        #     energy_axis = energy_axis[indices]
+        # else:
+        #     indices = np.arange(self.shape[0])
+
+        # Try denoising on 2D SI images
+
+        # transformed_array3d = np.empty([self.array.shape[0], self.array.shape[1], self.array.shape[2]], dtype=float)
+
+        # for kk in range(self.array.shape[1]):
+        #     spec_image = self.array[:,kk,:]
+        #     # array2d_transformed = pca.fit(spec_image)
+        #     # array2d_smoothed = pca.inverse_transform(array2d_transformed)
+        #     array2d_transformed = kpca.fit_transform(spec_image)
+        #     array2d_smoothed = kpca.inverse_transform(array2d_transformed)
+        #     transformed_array3d[:,kk,:] = array2d_smoothed
+
+        # Reduce 3D dataset to two dimensions
+
+        # array2d = self.array.reshape(self.array.shape[0],self.array.shape[1]*self.array.shape[2])
+        # array2d_transformed = kpca.fit_transform(array2d)
+        # array2d_smoothed = kpca.inverse_transform(array2d_transformed)
+
+        array2d = self.array.reshape(
+            self.array.shape[0], self.array.shape[1] * self.array.shape[2]
+        )
+        pca.fit(array2d)
+        variance = pca.explained_variance_
+
+        array2d_smoothed = pca.inverse_transform(pca.transform(array2d))
+        array3d_smoothed = array2d_smoothed.reshape(self.array.shape)
+
+        fig, scree = plt.subplots()
+        values = np.arange(len(variance)) + 1
+        scree.plot(values, variance, label="Scree plot", marker="o")
+        scree.legend()
+
+        smoothed_data3d = Dataset3deels.from_array(
+            array=array3d_smoothed,
+            sampling=self.sampling,
+            origin=self.origin,
+            units=self.units,
+        )
+
+        mean_spectrum_raw = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+        mean_spectrum_smoothed = smoothed_data3d.calculate_mean_spectrum(
+            roi, energy_range, ignore_range, mask
+        )
+
+        fig, ax = plt.subplots()
+        ax.plot(energy_axis, mean_spectrum_raw, label="raw spectrum", color="b")
+        ax.plot(energy_axis, mean_spectrum_smoothed, label="kpca-fit spectrum", color="r")
+        ax.legend()
+
+        return smoothed_data3d
 
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
