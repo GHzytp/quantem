@@ -254,7 +254,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         fig, ax = plt.subplots()
         ax.plot(energy_axis, mean_spectrum_raw, label="raw spectrum", color="b")
-        ax.plot(energy_axis, mean_spectrum_smoothed, label="kpca-fit spectrum", color="r")
+        ax.plot(energy_axis, mean_spectrum_smoothed, label="pca-fit spectrum", color="r")
         ax.legend()
 
         return smoothed_data3d
