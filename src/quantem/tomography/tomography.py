@@ -402,6 +402,7 @@ class TomographyConventional(TomographyBase):
         num_iter: int = 10,
         obj_constraints: dict | ObjConstraintsType | None = None,
         mode: Literal["sirt", "fbp"] = "sirt",
+        relaxation: float = 0.25,
         reset: bool = False,
         inline_alignment: bool = False,
         smoothing_sigma: float | None = None,
@@ -433,6 +434,7 @@ class TomographyConventional(TomographyBase):
                 mode=mode,
                 proj_forward=proj_forward,
                 gaussian_kernel=gaussian_kernel,
+                relaxation=relaxation,
             )
 
             pbar.set_description(f"{mode} Reconstruction | Loss: {loss.item():.4f}")
@@ -449,6 +451,7 @@ class TomographyConventional(TomographyBase):
         inline_alignment: bool,
         mode: Literal["sirt", "fbp"],
         proj_forward: torch.Tensor,
+        relaxation: float,
         gaussian_kernel: torch.Tensor | None = None,
     ):
         loss = 0
@@ -506,7 +509,7 @@ class TomographyConventional(TomographyBase):
 
             correction /= normalization
 
-            self.obj_model.obj += correction
+            self.obj_model.obj += correction * relaxation
 
             if gaussian_kernel is not None:
                 self.obj_model.obj = gaussian_filter_2d_stack(self.obj_model.obj, gaussian_kernel)

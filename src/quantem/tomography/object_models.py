@@ -517,6 +517,13 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
             soft_loss += self.constraints.tv_vol * grad_norm.mean()
 
+            # grad_outputs: [num, 3]
+            # for us: grad_outputs: [num, 4] # 4 is t, xyz
+            # grad_norm_volf: norm(grad_outpus[:, 1:])
+            # grad_time: grad_outputs[:, 0]
+            # grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
+            # soft_loss += self.constraints.tv_vol * grad_norm.mean()
+
         if (
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
             and self.constraints.sparsity > 0

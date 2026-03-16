@@ -273,7 +273,7 @@ class SchedulerParams:
         min_lr : float or None
             Absolute lower bound on the learning rate. Overrides ``min_lr_factor`` when set.
             Default: None.
-        factor : float
+        factor :     float
             Factor by which the LR is reduced: ``new_lr = lr * factor``. Default: 0.5.
         patience : int
             Number of epochs with no improvement before reducing LR. Default: 10.
