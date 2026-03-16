@@ -302,6 +302,9 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 self.logger.flush()
+            if not self.verbose:
+                if self.global_rank == 0:
+                    print(f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}")
 
     # --- Helper Functions ---
 
