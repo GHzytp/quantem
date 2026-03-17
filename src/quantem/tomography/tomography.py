@@ -304,7 +304,9 @@ class Tomography(TomographyOpt, TomographyBase):
                 self.logger.flush()
             if not self.verbose:
                 if self.global_rank == 0:
-                    print(f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}")
+                    print(
+                        f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
+                    )
 
     # --- Helper Functions ---
 
@@ -431,6 +433,7 @@ class TomographyConventional(TomographyBase):
         else:
             gaussian_kernel = None
 
+        patience = self.dset.tilt_angles.max() // 10
         for iter in pbar:
             proj_forward, loss = self._reconstruction_epoch(
                 inline_alignment=inline_alignment,
@@ -444,10 +447,23 @@ class TomographyConventional(TomographyBase):
 
             self._epoch_losses.append(loss.item())
 
+            # Change relaxation parameter if loss greater than last epoch
+            if len(self._epoch_losses) > 1 and self._epoch_losses[-1] > self._epoch_losses[-2]:
+                if patience == 0:
+                    relaxation *= 0.85
+                    print(f"Relaxation parameter changed to: {relaxation}")
+                    patience = 10
+                else:
+                    patience -= 1
+
             if mode == "fbp":
                 break
 
     # --- Conventional reconstruction method ---
+    def _adaptive_relaxation(self, n_power_iter: int = 10) -> float:
+        raise NotImplementedError(
+            "Adaptive relaxation hasn't been implemented, please input a valid relaxation parameter."
+        )
 
     def _reconstruction_epoch(
         self,
@@ -458,7 +474,9 @@ class TomographyConventional(TomographyBase):
         gaussian_kernel: torch.Tensor | None = None,
     ):
         loss = 0
-
+        if relaxation == 0.0:
+            relaxation = self._adaptive_relaxation()
+            print(f"Adaptive relaxation: {relaxation}")
         if inline_alignment:
             for ind in range(len(self.dset.tilt_angles)):
                 im_proj = proj_forward[:, ind, :]
