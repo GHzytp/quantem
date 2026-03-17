@@ -1,6 +1,7 @@
 import importlib
 from os import PathLike
 from pathlib import Path
+from typing import Any
 
 import h5py
 
@@ -160,7 +161,7 @@ def read_emdfile_to_4dstem(
         data_keys = ["datacube_root", "datacube", "data"] if data_keys is None else data_keys
         print("keys: ", data_keys)
         try:
-            data = file
+            data: Any = file
             for key in data_keys:
                 data = data[key]
         except KeyError:
@@ -206,7 +207,7 @@ def read_abtem(url: str | PathLike):
         import zarr
 
         if url.endswith(".zip"):
-            store = zarr.storage.ZipStore(url, mode="r")  # ty:ignore[possibly-missing-attribute]
+            store = zarr.storage.ZipStore(url, mode="r")  # type: ignore
             return zarr.open(store=store, mode="r")
         return zarr.open(url, mode="r")
 
@@ -231,7 +232,7 @@ def read_abtem(url: str | PathLike):
             yield i
             i += 1
 
-    def _decode_types(obj):
+    def _decode_types(obj) -> Any:
         if isinstance(obj, dict):
             if obj.get("_type") == "tuple":
                 return tuple(_decode_types(v) for v in obj["_value"])
