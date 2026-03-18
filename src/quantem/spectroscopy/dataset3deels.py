@@ -183,9 +183,61 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return background_fit
 
+    def smooth_eels_rollingaverage(
+        self, roi=None, energy_range=None, ignore_range=None, mask=None, kernel_size=10
+    ):
+        dE = float(self.sampling[0])
+        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
+        energy_axis = E0 + dE * np.arange(self.shape[0])
+
+        if energy_range is not None:
+            energy_range[0] = np.maximum(energy_range[0], energy_axis[0])
+            energy_range[1] = np.minimum(energy_range[1], energy_axis[-1])
+
+            indices = np.where(
+                (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
+            )[0]
+            energy_axis = energy_axis[indices]
+        else:
+            indices = np.arange(self.shape[0])
+
+        array3d_subrange = self.array[indices, :, :]
+
+        kernel = np.ones(kernel_size) / kernel_size
+
+        # For each probe position, convolve spectral data with smoothing kernel
+
+        array3d_smoothed = np.zeros(array3d_subrange.shape)
+
+        for kk in range(array3d_subrange.shape[1]):
+            for ll in range(array3d_subrange.shape[2]):
+                probe_spectrum = self.array[:, kk, ll]
+                spectrum_smoothed = np.convolve(probe_spectrum, kernel, mode="same")
+                array3d_smoothed[:, kk, ll] = spectrum_smoothed
+
+        smoothed_data3d = Dataset3deels.from_array(
+            array=array3d_smoothed,
+            sampling=self.sampling,
+            origin=energy_axis[0],
+            units=self.units,
+        )
+
+        # Plot raw and smoothed mean spectra on the same set of axes
+
+        mean_spectrum_raw = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+        mean_spectrum_smoothed = smoothed_data3d.calculate_mean_spectrum(
+            roi, energy_range, ignore_range, mask
+        )
+
+        fig, ax = plt.subplots()
+        ax.plot(energy_axis, mean_spectrum_raw, label="raw spectrum", color="b")
+        ax.plot(energy_axis, mean_spectrum_smoothed, label="kernel-smoothed spectrum", color="r")
+        ax.legend()
+
+        return smoothed_data3d
+
     def smooth_eels_pca(self, roi=None, energy_range=None, ignore_range=None, mask=None):
         pca = PCA(n_components=2)
-        # kpca = KernelPCA(n_components=10, kernel='rbf', gamma=50, fit_inverse_transform=True)
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
@@ -203,7 +255,6 @@ class Dataset3deels(Dataset3dspectroscopy):
             indices = np.arange(self.shape[0])
 
         array3d_subrange = self.array[indices, :, :]
-        print(array3d_subrange.shape)
 
         # Try denoising on 2D SI images
 
@@ -220,25 +271,27 @@ class Dataset3deels(Dataset3dspectroscopy):
         # Reduce 3D dataset to two dimensions
 
         # array2d = self.array.reshape(self.array.shape[0],self.array.shape[1]*self.array.shape[2])
-        # array2d_transformed = kpca.fit_transform(array2d)
-        # array2d_smoothed = kpca.inverse_transform(array2d_transformed)
 
         array2d = array3d_subrange.reshape(
             energy_axis.shape[0], array3d_subrange.shape[1] * array3d_subrange.shape[2]
         )
+
         pca.fit(array2d)
         variance = pca.explained_variance_
 
-        array2d_smoothed = pca.inverse_transform(pca.transform(array2d))
+        array2d_smoothed = pca.inverse_transform(pca.fit_transform(array2d))
         array3d_smoothed = array2d_smoothed.reshape(
             energy_axis.shape[0], array3d_subrange.shape[1], array3d_subrange.shape[2]
         )
-        print(array3d_smoothed.shape)
+
+        # Generate PCA scree plot
 
         fig, scree = plt.subplots()
         values = np.arange(len(variance)) + 1
         scree.plot(values, variance, label="Scree plot", marker="o")
         scree.legend()
+
+        # Write PCA-smooted data to new Dataset3deels object
 
         smoothed_data3d = Dataset3deels.from_array(
             array=array3d_smoothed,
@@ -246,6 +299,8 @@ class Dataset3deels(Dataset3dspectroscopy):
             origin=energy_axis[0],
             units=self.units,
         )
+
+        # Plot raw and smoothed mean spectra on the same set of axes
 
         mean_spectrum_raw = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
         mean_spectrum_smoothed = smoothed_data3d.calculate_mean_spectrum(
