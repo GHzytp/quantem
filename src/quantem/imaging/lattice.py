@@ -22,7 +22,7 @@ class Lattice(AutoSerialize):
             raise RuntimeError("Use Lattice.from_data() to instantiate this class.")
         self._image: Dataset2d = image
 
-    # --- Constructors ---
+    ### --- Constructors ---
     @classmethod
     def from_data(
         cls,
@@ -92,7 +92,7 @@ class Lattice(AutoSerialize):
 
         return cls(image=ds2d, _token=cls._token)
 
-    # --- Properties ---
+    ### --- Properties ---
     @property
     def image(self) -> Dataset2d:
         return self._image
@@ -120,7 +120,7 @@ class Lattice(AutoSerialize):
             else:
                 self._image = Dataset2d(arr)  # type: ignore[call-arg]
 
-    # --- Functions ---
+    ### --- Functions ---
     def define_lattice(
         self,
         origin,
@@ -226,7 +226,6 @@ class Lattice(AutoSerialize):
             PENALTY = 1e10
             H_CLIP = H - 2
             W_CLIP = W - 2
-
             a_range = np.arange(max(a_min, -max_ind), min(a_max, max_ind) + 1, dtype=np.int32)
             b_range = np.arange(max(b_min, -max_ind), min(b_max, max_ind) + 1, dtype=np.int32)
             aa, bb = np.meshgrid(a_range, b_range, indexing="ij")
@@ -239,7 +238,6 @@ class Lattice(AutoSerialize):
                 a_max_blk = min(a_max, curr_block_size)
                 b_min_blk = max(b_min, -curr_block_size)
                 b_max_blk = min(b_max, curr_block_size)
-
                 mask = (
                     (aa >= a_min_blk) & (aa <= a_max_blk) & (bb >= b_min_blk) & (bb <= b_max_blk)
                 )
