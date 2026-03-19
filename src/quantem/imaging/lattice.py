@@ -189,7 +189,8 @@ class Lattice(AutoSerialize):
         if refine_lattice:
             from scipy.optimize import minimize
 
-            assert block_size is None or block_size > 0, "block_size must be positive or None."
+            if block_size is not None and block_size < 0:
+                raise ValueError("block_size must be positive or None.")
 
             H, W = self._image.shape
             im = np.asarray(self._image.array, dtype=float)
