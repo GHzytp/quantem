@@ -6,9 +6,8 @@ from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
-from sklearn.decomposition import PCA
 
-from quantem.spectroscopy import Dataset3dspectroscopy
+from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy, _run_pca
 
 
 class Dataset3deels(Dataset3dspectroscopy):
@@ -237,8 +236,6 @@ class Dataset3deels(Dataset3dspectroscopy):
         return smoothed_data3d
 
     def smooth_eels_pca(self, roi=None, energy_range=None, ignore_range=None, mask=None):
-        pca = PCA(n_components=2)
-
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
         energy_axis = E0 + dE * np.arange(self.shape[0])
@@ -276,10 +273,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             energy_axis.shape[0], array3d_subrange.shape[1] * array3d_subrange.shape[2]
         )
 
-        pca.fit(array2d)
-        variance = pca.explained_variance_
-
-        array2d_smoothed = pca.inverse_transform(pca.fit_transform(array2d))
+        _, _, variance, _, array2d_smoothed = _run_pca(array2d, 2)
         array3d_smoothed = array2d_smoothed.reshape(
             energy_axis.shape[0], array3d_subrange.shape[1], array3d_subrange.shape[2]
         )

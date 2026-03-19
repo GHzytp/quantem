@@ -5,12 +5,39 @@ from typing import Any, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib.patches import Rectangle
 from numpy.typing import NDArray
-from sklearn.decomposition import PCA
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.spectroscopy.utils import load_xray_lines_database
+
+
+def _run_pca(data: NDArray | Any, n_components: int):
+    array = np.asarray(data, dtype=float)
+    n_samples, n_features = array.shape
+    max_components = min(n_samples, n_features)
+    if not 1 <= n_components <= max_components:
+        raise ValueError(f"n_components={n_components} must be between 1 and {max_components}")
+
+    mean = np.mean(array, axis=0)
+    centered = torch.as_tensor(array - mean, dtype=torch.float64)
+    _, s, vh = torch.linalg.svd(centered, full_matrices=False)
+
+    components = vh[:n_components].cpu().numpy()
+    loadings = (centered @ vh[:n_components].T).cpu().numpy()
+
+    denom = max(n_samples - 1, 1)
+    explained_variance = ((s[:n_components] ** 2) / denom).cpu().numpy()
+    total_variance = torch.sum((s**2) / denom).item()
+    explained_variance_ratio = (
+        explained_variance / total_variance
+        if total_variance > 0
+        else np.zeros_like(explained_variance)
+    )
+    reconstructed = loadings @ components + mean
+
+    return components, loadings, explained_variance, explained_variance_ratio, reconstructed
 
 
 class Dataset3dspectroscopy(Dataset3d):
@@ -337,15 +364,18 @@ class Dataset3dspectroscopy(Dataset3d):
             data_processed = data_masked
 
         # Perform PCA
-        pca = PCA(n_components=n_components, random_state=random_state)
-        loadings = pca.fit_transform(data_processed)  # (n_pixels, n_components)
-        components = pca.components_  # (n_components, n_energy)
+        del random_state
+        (
+            components,
+            loadings,
+            explained_variance,
+            explained_variance_ratio,
+            reconstructed,
+        ) = _run_pca(data_processed, n_components)
 
         # Reconstruct data
         if standardize:
-            reconstructed = pca.inverse_transform(loadings) * std + mean
-        else:
-            reconstructed = pca.inverse_transform(loadings)
+            reconstructed = reconstructed * std + mean
 
         if mask is None:
             loadings_spatial = loadings.T.reshape(n_components, ny, nx)
@@ -358,16 +388,20 @@ class Dataset3dspectroscopy(Dataset3d):
             self._plot_pca_results(
                 components,
                 loadings_spatial,
-                pca.explained_variance_ratio_,
+                explained_variance_ratio,
                 n_show=min(4, n_components),
             )
 
         return {
-            "pca": pca,
+            "pca": {
+                "components_": components,
+                "explained_variance_": explained_variance,
+                "explained_variance_ratio_": explained_variance_ratio,
+            },
             "components": components,
             "loadings": loadings_spatial,
-            "explained_variance_ratio": pca.explained_variance_ratio_,
-            "explained_variance": pca.explained_variance_,
+            "explained_variance_ratio": explained_variance_ratio,
+            "explained_variance": explained_variance,
             "reconstructed": reconstructed.T.reshape(n_energy, ny, nx)
             if mask is None
             else reconstructed,
