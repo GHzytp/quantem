@@ -130,7 +130,7 @@ class TestDefineLattice:
             lattice.define_lattice(origin=[1, 2, 3], u=[5, 0], v=[0, 5], plot_lattice=False)
 
         # Negative block_size
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             lattice.define_lattice(
                 origin=[50, 50], u=[5, 0], v=[0, 5], block_size=-1, plot_lattice=False
             )
