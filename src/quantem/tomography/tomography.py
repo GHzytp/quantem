@@ -212,12 +212,18 @@ class Tomography(TomographyOpt, TomographyBase):
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
 
-            self.step_schedulers(loss=total_loss)
-            # TODO: Maybe reorganize the losses so that the order makes sense lol.
+            if self.world_size > 1:
+                dist.all_reduce(total_loss, dist.ReduceOp.AVG)
+                dist.all_reduce(consistency_loss, dist.ReduceOp.AVG)
+                dist.all_reduce(epoch_soft_constraint_loss, dist.ReduceOp.AVG)
+
 
             total_loss = total_loss.item() / len(self.dataloader)
             consistency_loss = consistency_loss.item() / len(self.dataloader)
             epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
+
+            self.step_schedulers(loss=total_loss)
+            # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
             if self.val_dataloader is not None:
                 print("Validating...")
