@@ -271,19 +271,19 @@ class Dataset3dspectroscopy(Dataset3d):
 
     def add_spectrum_to_data(self, spectrum, energy_axis):
         """
-        Store processed spectra in the 3D spectroscopy dataset structure, in a 1D array of 2D arrays. By default, calculate_mean_spectrum will
+        Store processed spectra in the 3D spectroscopy dataset structure, in a 1D array of 2D arrays. By default, calculate_mean_spectrum will store spectrum at first available index
         """
         from quantem.core.datastructures.dataset1d import Dataset1d
 
-        two_d_spectrum = Dataset1d.from_array(
+        one_d_spectrum = Dataset1d.from_array(
             array=spectrum, origin=energy_axis[0], sampling=self.sampling[0], units=self.units[0]
         )
 
         if self.attached_spectra is not None:
-            self.attached_spectra.append(two_d_spectrum)
+            self.attached_spectra.append(one_d_spectrum)
         else:
             self.attached_spectra = []
-            self.attached_spectra.append(two_d_spectrum)
+            self.attached_spectra.append(one_d_spectrum)
 
     def clear_attached_spectra(self):
         self.attached_spectra = None
@@ -341,8 +341,16 @@ class Dataset3dspectroscopy(Dataset3d):
             - 'components': principal component spectra (n_components x n_energy)
             - 'loadings': spatial loadings (n_components x n_pixels)
             - 'explained_variance_ratio': explained variance for each component
-            - 'reconstructed': reconstructed dataset using n_components
+            - 'reconstructed': reconstructed dataset (dataset3dspectroscopy) using n_components
         """
+
+        from quantem.spectroscopy import (
+            Dataset3deds as Dataset3deds,
+        )
+        from quantem.spectroscopy import (
+            Dataset3deels as Dataset3deels,
+        )
+
         data = np.asarray(self.array, dtype=float)
         n_energy, ny, nx = data.shape
 
@@ -392,6 +400,21 @@ class Dataset3dspectroscopy(Dataset3d):
                 n_show=min(4, n_components),
             )
 
+        if self.dataset_type == "EDS":
+            reconstructed_data3d = Dataset3deds.from_array(
+                array=reconstructed.T.reshape(n_energy, ny, nx),
+                sampling=self.sampling,
+                origin=self.origin,
+                units=self.units,
+            )
+        elif self.dataset_type == "EELS":
+            reconstructed_data3d = Dataset3deels.from_array(
+                array=reconstructed.T.reshape(n_energy, ny, nx),
+                sampling=self.sampling,
+                origin=self.origin,
+                units=self.units,
+            )
+
         return {
             "pca": {
                 "components_": components,
@@ -402,9 +425,7 @@ class Dataset3dspectroscopy(Dataset3d):
             "loadings": loadings_spatial,
             "explained_variance_ratio": explained_variance_ratio,
             "explained_variance": explained_variance,
-            "reconstructed": reconstructed.T.reshape(n_energy, ny, nx)
-            if mask is None
-            else reconstructed,
+            "reconstructed": reconstructed_data3d if mask is None else reconstructed_data3d,
         }
 
     def _plot_pca_results(

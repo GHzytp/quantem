@@ -70,6 +70,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             signal_units=signal_units,
             _token=_token,
         )
+        self.dataset_type = "EDS"
 
     @staticmethod
     def _normalize_specs(specs, param_name="spec", allow_none=False):
