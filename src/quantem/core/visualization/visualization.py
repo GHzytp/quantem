@@ -454,9 +454,8 @@ def show_2d(
     norm : NormalizationConfig or dict or str, optional
         Configuration for normalizing the data before visualization. This can be a string,
         dictionary, or a NormalizationConfig object. Strings for preset normalization types
-        include: ``"linear_auto"`` (quantile), ``"linear_minmax"``, ``"linear_centered"``,
-        ``"log_auto"``, ``"log_minmax"``, ``"power_squared"``, ``"power_sqrt"``,
-        ``"asinh_centered"``. Dict form example: ``{"power": 0.5}``.
+        include: ``"linear_auto"`` (quantile), ``"log_auto"``, ``"power_sqrt"``.
+        Dict form example: ``{"power": 0.5}``.
     scalebar : ScalebarConfig or dict or bool, optional
         Configuration for adding a scale bar to the plot.
         Dict form example: ``{"sampling": 0.5, "units": "Å"}`` or
