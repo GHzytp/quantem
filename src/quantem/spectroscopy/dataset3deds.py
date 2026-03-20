@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from matplotlib.lines import Line2D
 from numpy.typing import NDArray
 from scipy.signal import find_peaks
 
@@ -70,7 +71,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             signal_units=signal_units,
             _token=_token,
         )
-        self.dataset_type = "EDS"
 
     @staticmethod
     def _normalize_specs(specs, param_name="spec", allow_none=False):
@@ -208,6 +208,45 @@ class Dataset3deds(Dataset3dspectroscopy):
         compact = cls._normalize_token(sel)
         return [lbl for lbl in labels if cls._normalize_token(lbl).startswith(compact)]
 
+    @staticmethod
+    def _line_shell(line_name: str) -> str:
+        line_upper = str(line_name).upper()
+        if line_upper.startswith("K"):
+            return "K"
+        if line_upper.startswith("L"):
+            return "L"
+        if line_upper.startswith("M"):
+            return "M"
+        return "?"
+
+    @staticmethod
+    def _peak_confidence(
+        snr_value: float, line_weight: float, distance_value: float, tolerance: float
+    ) -> float:
+        quality = max(0.0, 1.0 - (distance_value / max(float(tolerance), 1e-9)))
+        return np.log1p(max(float(snr_value), 0.0)) * (0.5 + float(line_weight)) * (
+            0.5 + quality
+        )
+
+    @staticmethod
+    def _line_matches_selector(line_name: str, selector: str) -> bool:
+        line = str(line_name).strip().lower()
+        token = str(selector).strip().lower()
+        if token in {"k", "l", "m"}:
+            return line.startswith(token)
+        return token in line
+
+    @classmethod
+    def _line_allowed_for_element(
+        cls, element_name: str, line_name: str, edge_filters=None
+    ) -> bool:
+        if edge_filters is None:
+            return True
+        selectors = edge_filters.get(str(element_name))
+        if selectors is None:
+            return True
+        return any(cls._line_matches_selector(line_name, token) for token in selectors)
+
     def x_ray_lookup(
         self, spec: str | list[str] | tuple[str, ...] | set[str]
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -265,7 +304,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         labels = [lbl for lbl, _, _ in unique]
         return energies, weights, labels
 
-    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False):
+    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False, show=True):
         if elements is None:
             if self.model_elements is None:
                 raise ValueError("elements must be specified")
@@ -295,10 +334,108 @@ class Dataset3deds(Dataset3dspectroscopy):
         existing = getattr(self, "_spectrum_images", {})
         self._spectrum_images = {**existing, **dict(zip(labels, maps))}
 
-        self.show_spectrum_images()
+        if show:
+            self.show_spectrum_images(x_ray_lines=elements)
 
         if return_maps:
             return maps, labels
+
+    def Integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
+        """Integrate selected X-ray lines and return combined map(s).
+
+        This method builds per-selector energy masks (union of line windows)
+        and integrates the dataset over those masks. For single-selector
+        plotting it reuses ``show_energy_window_map`` with the computed mask.
+
+        Parameters
+        ----------
+        spec : str | list[str] | tuple[str, ...] | set[str]
+            Selector(s) like ``"Au"``, ``"AuK"``, ``"AuKa1"``.
+            Element selectors (e.g. ``"Au"``) integrate all available lines.
+        width : float, optional
+            Half-width in keV for line-window integration, by default 0.15.
+        return_maps : bool, optional
+            If True, always return ``dict[selector, map]``.
+            If False and a single selector is provided, return only that 2D map.
+        show : bool, optional
+            If True, display the integrated map(s).
+        """
+        try:
+            width = float(width)
+        except (TypeError, ValueError):
+            raise ValueError("width must be a positive finite number")
+        if not np.isfinite(width) or width <= 0:
+            raise ValueError("width must be a positive finite number")
+
+        specs = type(self)._normalize_specs(spec, param_name="spec")
+        arr = np.asarray(self.array, dtype=float)
+        energy_axis = np.asarray(self.energy_axis, dtype=float)
+        energy_min = float(np.min(energy_axis))
+        energy_max = float(np.max(energy_axis))
+
+        integrated_maps = {}
+        selector_masks = {}
+        for raw in specs:
+            selector = str(raw).strip()
+            line_energies, _, _ = self.x_ray_lookup(selector)
+            in_range = np.logical_and(line_energies >= energy_min, line_energies <= energy_max)
+            line_energies = np.asarray(line_energies[in_range], dtype=float)
+            if line_energies.size == 0:
+                raise ValueError(
+                    f"No X-ray lines for selector '{selector}' are within the dataset energy range"
+                )
+
+            selector_mask = np.zeros(energy_axis.shape, dtype=bool)
+            for line_energy in line_energies:
+                selector_mask |= np.logical_and(
+                    energy_axis >= (float(line_energy) - width),
+                    energy_axis <= (float(line_energy) + width),
+                )
+
+            if not np.any(selector_mask):
+                raise ValueError(
+                    f"No energy channels selected for selector '{selector}'. "
+                    "Try increasing width."
+                )
+
+            selector_masks[selector] = selector_mask
+            integrated_maps[selector] = arr[selector_mask, :, :].sum(axis=0)
+
+        if show:
+            if len(integrated_maps) == 1:
+                selector = next(iter(integrated_maps.keys()))
+                self.show_energy_window_map(
+                    energy_window=[energy_min, energy_max],
+                    roi=kwargs.pop("roi", None),
+                    roi_px=kwargs.pop("roi_px", None),
+                    roi_cal=kwargs.pop("roi_cal", None),
+                    mask=selector_masks[selector],
+                    data_type=kwargs.pop("data_type", "eds"),
+                    cmap=kwargs.pop("cmap", "magma"),
+                    show=True,
+                )
+            else:
+                show_2d(
+                    list(integrated_maps.values()),
+                    title=list(integrated_maps.keys()),
+                    cmap=kwargs.pop("cmap", "magma"),
+                    scalebar={"sampling": self.sampling[1], "units": self.units[1]},
+                    **kwargs,
+                )
+
+        if return_maps or len(integrated_maps) != 1:
+            return integrated_maps
+        return next(iter(integrated_maps.values()))
+
+    def integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
+        """Lowercase alias for :meth:`Integrate`."""
+        return self.Integrate(
+            spec=spec,
+            width=width,
+            return_maps=return_maps,
+            show=show,
+            **kwargs,
+        )
 
     def show_spectrum_images(
         self, x_ray_lines=None, return_fig=False, method="integration", **kwargs
@@ -596,8 +733,11 @@ class Dataset3deds(Dataset3dspectroscopy):
     def peak_autoid(
         self,
         roi=None,
+        roi_px=None,
+        roi_cal=None,
         energy_range=None,
         elements=None,
+        refline=None,
         ignore_elements=None,
         ignore_range=None,
         threshold=5.0,
@@ -635,14 +775,21 @@ class Dataset3deds(Dataset3dspectroscopy):
             for k, v in (getattr(self, "model_elements", {}) or {}).items()
         } or None
 
-        using_saved_model_elements = False
-        if (
-            requested_edge_filters is None
-            and elements is None
-            and saved_model_edge_filters is not None
-        ):
+        if saved_model_edge_filters is not None and requested_edge_filters is not None:
+            merged_edge_filters = dict(saved_model_edge_filters)
+            for element_name, selectors in requested_edge_filters.items():
+                if element_name not in merged_edge_filters:
+                    merged_edge_filters[element_name] = selectors
+                    continue
+
+                existing = merged_edge_filters[element_name]
+                if existing is None or selectors is None:
+                    merged_edge_filters[element_name] = None
+                else:
+                    merged_edge_filters[element_name] = set(existing).union(set(selectors))
+            requested_edge_filters = merged_edge_filters
+        elif requested_edge_filters is None and saved_model_edge_filters is not None:
             requested_edge_filters = saved_model_edge_filters
-            using_saved_model_elements = True
 
         if requested_edge_filters is not None:
             elements = list(requested_edge_filters.keys())
@@ -659,13 +806,22 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         fig, (ax_img, ax_spec) = self.show_mean_spectrum(
             roi=roi,
+            roi_px=roi_px,
+            roi_cal=roi_cal,
             energy_range=energy_range,
             mask=mask,
             data_type="eds",
             show=False,
         )
 
-        spec = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+        spec = self.calculate_mean_spectrum(
+            roi=roi,
+            roi_px=roi_px,
+            roi_cal=roi_cal,
+            energy_range=energy_range,
+            ignore_range=ignore_range,
+            mask=mask,
+        )
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
         E = E0 + dE * np.arange(self.shape[0])
@@ -691,36 +847,48 @@ class Dataset3deds(Dataset3dspectroscopy):
             initial_snrs.append(height / background_std)
 
         if len(initial_snrs) > 0:
-            # snr_median = float(np.nanmedian(initial_snrs))
-            snr_75th = float(np.nanpercentile(initial_snrs, 75))
-            num_high_snr_peaks = int(np.sum(np.array(initial_snrs) > 50))
+            snr_values = np.asarray(initial_snrs, dtype=float)
+            snr_values = snr_values[np.isfinite(snr_values)]
         else:
-            # snr_median = 0.0
-            snr_75th = 0.0
-            num_high_snr_peaks = 0
+            snr_values = np.asarray([], dtype=float)
 
         if snr_min is None:
-            if len(initial_snrs) > 0:
-                snr_values = np.asarray(initial_snrs, dtype=float)
-                target_rank = max(1, min(int(peaks), int(snr_values.size)))
-                kth_largest_snr = float(np.sort(snr_values)[-target_rank])
-                distribution_cutoff = float(np.percentile(snr_values, 55))
-                adaptive_cutoff = min(distribution_cutoff, 0.9 * kth_largest_snr)
-                min_snr = float(np.clip(adaptive_cutoff, 8.0, 20.0))
+            if snr_values.size > 0:
+                sorted_snrs = np.sort(snr_values)
+                target_rank = int(np.clip(2 * int(peaks), 12, 64))
+                target_rank = min(target_rank, int(sorted_snrs.size))
+                rank_cutoff = float(sorted_snrs[-target_rank])
+                q30 = float(np.percentile(sorted_snrs, 30))
+                q40 = float(np.percentile(sorted_snrs, 40))
+                q50 = float(np.percentile(sorted_snrs, 50))
+                adaptive_cutoff = min(q50, max(q30, 0.35 * rank_cutoff, 0.9 * q40))
+                # Keep the display threshold permissive so moderate-SNR peaks remain visible.
+                min_snr = float(np.clip(adaptive_cutoff, 7.0, 14.0))
             else:
                 min_snr = 8.0
         else:
             min_snr = float(snr_min)
 
         if snr_threshold is None:
-            if num_high_snr_peaks > 50:
-                snr_threshold_for_sample = min(80.0, snr_75th * 1.2)
-            elif num_high_snr_peaks > 20:
-                snr_threshold_for_sample = min(60.0, snr_75th * 1.1)
-            elif num_high_snr_peaks < 10:
-                snr_threshold_for_sample = max(30.0, snr_75th * 0.8)
+            if snr_values.size > 0:
+                high_snr_pool = snr_values[snr_values >= min_snr]
+                if high_snr_pool.size == 0:
+                    high_snr_pool = snr_values
+                sorted_high = np.sort(high_snr_pool)[::-1]
+                anchor_count = int(np.clip(int(peaks), 10, 40))
+                anchor_count = min(anchor_count, int(sorted_high.size))
+                anchor_pool = sorted_high[:anchor_count]
+                anchor_median = float(np.percentile(anchor_pool, 50))
+                anchor_q75 = float(np.percentile(anchor_pool, 75))
+                anchor_q90 = float(np.percentile(anchor_pool, 90))
+                adaptive_threshold = max(anchor_median, 0.7 * anchor_q75, 2.5 * min_snr)
+                # Anchor to the strongest displayed-peak regime so defaults do not
+                # collapse toward the low-SNR bulk when peak counts are large.
+                snr_threshold_for_sample = float(
+                    np.clip(adaptive_threshold, max(2.5 * min_snr, min_snr), anchor_q90)
+                )
             else:
-                snr_threshold_for_sample = 40.0
+                snr_threshold_for_sample = max(4.0 * min_snr, 30.0)
         else:
             snr_threshold_for_sample = float(snr_threshold)
 
@@ -874,6 +1042,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                     "strong_matches": 0,
                     "match_count": 0,
                     "best_match_conf": 0.0,
+                    "best_match_snr": 0.0,
                     "best_match_energy": 0.0,
                     "best_match_distance": float("inf"),
                     "best_match_weight": 0.0,
@@ -889,6 +1058,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             if float(match_confidence) > float(element_stats[element_name]["best_match_conf"]):
                 element_stats[element_name]["best_match_conf"] = float(match_confidence)
+                element_stats[element_name]["best_match_snr"] = float(snr)
                 element_stats[element_name]["best_match_energy"] = float(peak_energy)
                 element_stats[element_name]["best_match_distance"] = float(distance)
                 element_stats[element_name]["best_match_weight"] = float(line_weight)
@@ -918,11 +1088,19 @@ class Dataset3deds(Dataset3dspectroscopy):
                 stats = element_stats[element_name]
                 valid_shells = {shell for shell in stats["shells"] if shell in {"K", "L", "M"}}
                 has_major_shell = len(valid_shells.intersection({"K", "L"})) > 0
-                is_supported = confidence >= confidence_cutoff
+                is_supported = (
+                    confidence >= confidence_cutoff
+                    and (
+                        stats["strong_matches"] >= 1
+                        or stats["best_match_snr"]
+                        >= max(min_snr, 0.6 * snr_threshold_for_sample)
+                    )
+                )
                 is_near_cutoff_but_consistent = (
                     confidence >= 0.75 * confidence_cutoff
                     and stats["match_count"] >= 2
                     and has_major_shell
+                    and stats["best_match_snr"] >= max(min_snr, 0.5 * snr_threshold_for_sample)
                 )
                 is_high_energy_singleton_anchor = (
                     stats["match_count"] == 1
@@ -931,11 +1109,20 @@ class Dataset3deds(Dataset3dspectroscopy):
                     and stats["best_match_distance"] <= 0.35 * tolerance
                     and confidence >= 0.45 * confidence_cutoff
                 )
+                is_high_quality_singleton = (
+                    stats["match_count"] == 1
+                    and has_major_shell
+                    and stats["best_match_snr"] >= max(min_snr, 0.6 * snr_threshold_for_sample)
+                    and stats["best_match_weight"] >= 0.5
+                    and stats["best_match_distance"] <= 0.30 * tolerance
+                    and confidence >= 0.35 * confidence_cutoff
+                )
 
                 if (
                     is_supported
                     or is_near_cutoff_but_consistent
                     or is_high_energy_singleton_anchor
+                    or is_high_quality_singleton
                 ):
                     detected_elements.add(element_name)
 
@@ -999,6 +1186,91 @@ class Dataset3deds(Dataset3dspectroscopy):
                         best_tuple = (element_name, line_name, line_weight, distance)
 
             return best_tuple
+
+        def _top_supported_line_matches_with_prior(
+            peak_energy, snr, allowed_elements, edge_filters=None, top_k=3
+        ):
+            if not all_info or top_k <= 0:
+                return []
+
+            scored_matches = []
+            denom = max(float(max_detected_conf), 1e-9)
+
+            for element_name, lines in all_info.items():
+                if allowed_elements is not None and element_name not in allowed_elements:
+                    continue
+
+                prior = float(element_confidence.get(element_name, 0.0)) / denom
+                prior_factor = 1.0 + 0.5 * prior
+
+                for line_name, line_info in lines.items():
+                    if not _line_allowed_for_element(element_name, line_name, edge_filters):
+                        continue
+                    line_energy = line_info["energy (keV)"]
+                    line_weight = line_info.get("weight", 0.5)
+                    distance = abs(peak_energy - line_energy)
+                    shell = _line_shell(line_name)
+
+                    is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
+                    effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
+
+                    if line_weight <= 0.3 or distance > effective_tolerance:
+                        continue
+
+                    local_conf = _peak_confidence(snr, line_weight, distance)
+                    anchor_boost = 1.0
+                    if element_name in anchor_elements and shell == "M" and peak_energy <= 3.0:
+                        anchor_boost = 2.2
+                    elif element_name in anchor_elements and shell in {"K", "L"}:
+                        anchor_boost = 1.15
+
+                    score = local_conf * prior_factor * anchor_boost
+                    scored_matches.append(
+                        (float(score), str(element_name), str(line_name), float(line_weight), float(distance))
+                    )
+
+            scored_matches.sort(key=lambda item: item[0], reverse=True)
+            unique = []
+            seen_labels = set()
+            for score, element_name, line_name, line_weight, distance in scored_matches:
+                label = f"{element_name} {line_name}"
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                unique.append((element_name, line_name, line_weight, distance, score))
+
+            if len(unique) == 0:
+                return []
+
+            # Keep the top-scoring best match first, then prefer alternatives
+            # from different elements before falling back to same-element lines.
+            best_match = unique[0]
+            selected = [best_match]
+            selected_labels = {f"{best_match[0]} {best_match[1]}"}
+            used_elements = {str(best_match[0])}
+
+            for candidate in unique[1:]:
+                element_name, line_name, _, _, _ = candidate
+                label = f"{element_name} {line_name}"
+                if label in selected_labels or str(element_name) in used_elements:
+                    continue
+                selected.append(candidate)
+                selected_labels.add(label)
+                used_elements.add(str(element_name))
+                if len(selected) >= int(top_k):
+                    return selected
+
+            for candidate in unique[1:]:
+                element_name, line_name, _, _, _ = candidate
+                label = f"{element_name} {line_name}"
+                if label in selected_labels:
+                    continue
+                selected.append(candidate)
+                selected_labels.add(label)
+                if len(selected) >= int(top_k):
+                    break
+
+            return selected
 
         for peak_idx, height, peak_energy, snr in display_peaks:
             match = raw_match_by_idx.get(int(peak_idx))
@@ -1085,11 +1357,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                     formatted.append(str(element_name))
             return ", ".join(formatted)
 
-        model_elements_header = (
-            "Saved Model Elements (Plotted):\n"
-            if using_saved_model_elements
-            else "Saved Model Elements (Not Plotted When Elements Specified):\n"
-        )
+        model_elements_header = "Saved Model Elements (Plotted):\n"
         print(
             f"\n{model_elements_header} {_format_saved_model_elements(saved_model_edge_filters)}"
         )
@@ -1137,14 +1405,56 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         table_rows = []
         matched_row_count = 0
+
+        def _mark_autodetected_label(label_text):
+            if not label_text or label_text == "-":
+                return label_text
+            element_token = str(label_text).split()[0]
+            if element_token in detected_elements:
+                return f"{label_text}*"
+            return label_text
+
         for peak_idx, height, peak_energy, snr in display_peaks:
             match = refined_match_by_idx.get(int(peak_idx))
             if match is not None:
-                table_rows.append((peak_energy, height, snr, str(match[5])))
+                if search_elements is not None:
+                    allowed_for_table = set(str(element_name) for element_name in search_elements)
+                else:
+                    allowed_for_table = {
+                        str(element_name)
+                        for element_name in (all_info or {}).keys()
+                        if str(element_name) not in ignored_elements
+                    }
+                    if len(allowed_for_table) == 0:
+                        allowed_for_table = None
+
+                top_matches = _top_supported_line_matches_with_prior(
+                    peak_energy,
+                    snr,
+                    allowed_for_table,
+                    requested_edge_filters,
+                    top_k=3,
+                )
+                best_match = _mark_autodetected_label(str(match[5]))
+                alt_2 = "-"
+                alt_3 = "-"
+
+                if len(top_matches) > 0:
+                    ranked_labels = [
+                        f"{element_name} {line_name}"
+                        for element_name, line_name, _, _, _ in top_matches
+                    ]
+                    best_match = _mark_autodetected_label(ranked_labels[0])
+                    if len(ranked_labels) > 1:
+                        alt_2 = _mark_autodetected_label(ranked_labels[1])
+                    if len(ranked_labels) > 2:
+                        alt_3 = _mark_autodetected_label(ranked_labels[2])
+
+                table_rows.append((peak_energy, height, snr, best_match, alt_2, alt_3))
                 matched_row_count += 1
             else:
                 row_label = "Unmatched" if search_elements is not None else "Unknown"
-                table_rows.append((peak_energy, height, snr, row_label))
+                table_rows.append((peak_energy, height, snr, row_label, "-", "-"))
 
         sorted_table_rows = sorted(table_rows, key=lambda item: item[0])
 
@@ -1222,6 +1532,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         for peak_idx, height, peak_energy, snr in display_peaks:
             is_sample = detected_sample_peaks.get(peak_energy, False)
             match = refined_match_by_idx.get(int(peak_idx))
+            is_possible = match is not None and str(match[4]) not in detected_elements
             if match is not None:
                 peak_element = match[4]
                 line_color = element_color_map.get(peak_element, "red")
@@ -1239,6 +1550,14 @@ class Dataset3deds(Dataset3dspectroscopy):
                     linestyle="-",
                     alpha=0.5,
                     linewidth=1.5,
+                )
+            elif is_possible:
+                ax_spec.axvline(
+                    peak_energy,
+                    color=line_color,
+                    linestyle="--",
+                    alpha=0.45,
+                    linewidth=1.25,
                 )
             else:
                 ax_spec.plot(
@@ -1278,10 +1597,13 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         # If elements were explicitly requested, overlay reference X-ray lines from the
         # database even when they are not peak-matched by auto-id.
-        dotted_reference_rows = []
+        all_label_candidates = []
         if search_elements is not None:
             energy_min = float(np.min(E))
             energy_max = float(np.max(E))
+            displayed_peak_energies = [float(peak_energy) for _, _, peak_energy, _ in display_peaks]
+            display_peak_tolerance = max(0.05, 0.5 * tolerance)
+            possible_elements_set = set(str(element_name) for element_name in candidate_elements)
             reference_label_counts = {}
             existing_matches_by_element = {}
             for (
@@ -1301,11 +1623,12 @@ class Dataset3deds(Dataset3dspectroscopy):
                     existing_matches_by_element[element_key] = []
                 existing_matches_by_element[element_key].append(float(peak_energy))
 
-            y_top = float(np.nanmax(spec)) if len(spec) > 0 else 1.0
-            y_top = max(y_top, 1.0)
-
             for element_name in sorted(search_elements):
                 element_key = str(element_name)
+                is_reference_only = (
+                    element_key not in detected_elements
+                    and element_key not in possible_elements_set
+                )
                 lines_info = all_info.get(element_key, {}) if all_info is not None else {}
                 if not isinstance(lines_info, dict) or len(lines_info) == 0:
                     continue
@@ -1346,6 +1669,16 @@ class Dataset3deds(Dataset3dspectroscopy):
                     )[:6]
 
                 for line_name, line_energy, line_weight in filtered_lines:
+                    # For possible elements, draw guides only near peaks that already
+                    # passed snr_min. For reference-only requested elements, keep
+                    # explicit refline guides even without nearby peaks.
+                    if not is_reference_only:
+                        if not any(
+                            abs(line_energy - peak_energy) <= display_peak_tolerance
+                            for peak_energy in displayed_peak_energies
+                        ):
+                            continue
+
                     matched_energies = existing_matches_by_element.get(element_key, [])
                     if any(
                         abs(line_energy - matched_energy) <= max(0.05, 0.5 * tolerance)
@@ -1354,30 +1687,37 @@ class Dataset3deds(Dataset3dspectroscopy):
                         continue
 
                     line_color = element_color_map.get(element_key, "black")
+                    line_style = ":" if is_reference_only else "--"
+                    line_alpha = 0.35 if is_reference_only else 0.3
                     ax_spec.axvline(
                         line_energy,
                         color=line_color,
-                        linestyle="--",
-                        alpha=0.3,
+                        linestyle=line_style,
+                        alpha=line_alpha,
                         linewidth=1.2,
                     )
-                    dotted_reference_rows.append((element_key, str(line_name), float(line_energy)))
                     label_index = reference_label_counts.get(element_key, 0)
                     reference_label_counts[element_key] = label_index + 1
-                    y_label = y_top * (0.95 - 0.05 * (label_index % 3))
-                    ax_spec.text(
-                        line_energy,
-                        y_label,
-                        f"{element_key} {line_name}",
-                        ha="center",
-                        va="bottom",
-                        fontsize=8,
-                        color=line_color,
-                        rotation=90,
-                        alpha=0.8,
+                    # Keep dashed reference labels inside the axes near the top border.
+                    y_label_axes = 0.98 - 0.06 * (label_index % 3)
+                    all_label_candidates.append(
+                        (
+                            float(line_energy),
+                            f"{element_key} {line_name}",
+                            line_color,
+                            line_style,
+                            float(y_label_axes),
+                            "axes_top",
+                            8,
+                            "normal",
+                            0.8,
+                        )
                     )
 
-        if detected_elements:
+        legend_handles = []
+        legend_labels = set()
+
+        if show_text and peak_matches:
             labels_to_plot = []
             for (
                 peak_idx,
@@ -1391,142 +1731,221 @@ class Dataset3deds(Dataset3dspectroscopy):
                 line_weight,
                 match_confidence,
             ) in peak_matches:
-                if element_name in detected_elements and detected_sample_peaks.get(
+                is_detected_peak = element_name in detected_elements and detected_sample_peaks.get(
                     peak_energy, False
-                ):
-                    line_name = match_str.split()[-1] if match_str else ""
-                    label_text = f"{element_name} {line_name}" if line_name else element_name
-                    color = element_color_map.get(element_name, "black")
-                    labels_to_plot.append((peak_energy, label_text, color, height))
+                )
+                is_possible_peak = element_name not in detected_elements
+                if not (is_detected_peak or is_possible_peak):
+                    continue
 
-            labels_to_plot.sort(key=lambda item: item[0])
+                line_name = match_str.split()[-1] if match_str else ""
+                label_text = f"{element_name} {line_name}" if line_name else element_name
+                if is_detected_peak:
+                    label_text = f"{label_text}*"
+                color = element_color_map.get(element_name, "black")
+                linestyle = "-" if is_detected_peak else "--"
+                labels_to_plot.append((peak_energy, label_text, color, height, linestyle))
 
-            if show_text:
-                # Merge labels that are too close in energy into a single line of text
-                # to avoid unreadable overlap.
-                overlap_threshold = max(0.10, 0.7 * float(tolerance))
-                same_label_overlap_threshold = max(0.16, 1.1 * float(tolerance))
-                same_color_overlap_threshold = max(0.22, 1.6 * float(tolerance))
-                grouped_labels = []
-                current_group = []
+            label_vertical_offset = max(0.03 * y_scale, 0.08)
+            for peak_energy, label_text, color, height, linestyle in labels_to_plot:
+                if linestyle == "--":
+                    all_label_candidates.append(
+                        (
+                            float(peak_energy),
+                            label_text,
+                            color,
+                            linestyle,
+                            0.90,
+                            "axes_top",
+                            9,
+                            "normal",
+                            0.9,
+                        )
+                    )
+                else:
+                    all_label_candidates.append(
+                        (
+                            float(peak_energy),
+                            label_text,
+                            color,
+                            linestyle,
+                            float(height + label_vertical_offset),
+                            "data",
+                            10,
+                            "bold",
+                            1.0,
+                        )
+                    )
 
-                def _same_color(c1, c2):
-                    try:
-                        return np.allclose(np.asarray(c1), np.asarray(c2))
-                    except Exception:
-                        return str(c1) == str(c2)
+        if show_text and all_label_candidates:
+            all_label_candidates.sort(key=lambda item: item[0])
 
-                for label in labels_to_plot:
-                    if not current_group:
-                        current_group.append(label)
-                        continue
+            overlap_threshold = max(0.10, 0.7 * float(tolerance))
+            same_label_overlap_threshold = max(0.16, 1.1 * float(tolerance))
+            same_color_overlap_threshold = max(0.22, 1.6 * float(tolerance))
+            grouped_labels = []
+            current_group = []
 
-                    prev_energy = current_group[-1][0]
-                    prev_text = current_group[-1][1]
-                    prev_color = current_group[-1][2]
-                    energy_delta = abs(label[0] - prev_energy)
+            def _same_color(c1, c2):
+                try:
+                    return np.allclose(np.asarray(c1), np.asarray(c2))
+                except Exception:
+                    return str(c1) == str(c2)
 
-                    should_group = energy_delta <= overlap_threshold
-                    if not should_group and label[1] == prev_text:
-                        should_group = energy_delta <= same_label_overlap_threshold
-                    if not should_group and _same_color(label[2], prev_color):
-                        should_group = energy_delta <= same_color_overlap_threshold
+            for label in all_label_candidates:
+                if not current_group:
+                    current_group.append(label)
+                    continue
 
-                    if should_group:
-                        current_group.append(label)
-                    else:
-                        grouped_labels.append(current_group)
-                        current_group = [label]
+                prev_energy = current_group[-1][0]
+                prev_text = current_group[-1][1]
+                prev_color = current_group[-1][2]
+                energy_delta = abs(label[0] - prev_energy)
 
-                if current_group:
+                should_group = energy_delta <= overlap_threshold
+                if not should_group and label[1] == prev_text:
+                    should_group = energy_delta <= same_label_overlap_threshold
+                if not should_group and _same_color(label[2], prev_color):
+                    should_group = energy_delta <= same_color_overlap_threshold
+
+                if should_group:
+                    current_group.append(label)
+                else:
                     grouped_labels.append(current_group)
+                    current_group = [label]
 
-                label_vertical_offset = max(0.03 * y_scale, 0.08)
-                grouped_bucket_step = max(0.02 * y_scale, 0.05)
+            if current_group:
+                grouped_labels.append(current_group)
 
-                for group in grouped_labels:
-                    if len(group) == 1:
-                        peak_energy, label_text, color, height = group[0]
-                        y_pos = height + label_vertical_offset
+            for group in grouped_labels:
+                if len(group) == 1:
+                    (
+                        peak_energy,
+                        label_text,
+                        color,
+                        linestyle,
+                        y_value,
+                        y_mode,
+                        font_size,
+                        font_weight,
+                        alpha_value,
+                    ) = group[0]
+                    if y_mode == "axes_top":
                         ax_spec.text(
                             peak_energy,
-                            y_pos,
+                            y_value,
+                            label_text,
+                            ha="center",
+                            va="top",
+                            fontsize=font_size,
+                            color=color,
+                            weight=font_weight,
+                            rotation=90,
+                            alpha=alpha_value,
+                            transform=ax_spec.get_xaxis_transform(),
+                            clip_on=True,
+                        )
+                    else:
+                        ax_spec.text(
+                            peak_energy,
+                            y_value,
                             label_text,
                             ha="center",
                             va="bottom",
-                            fontsize=10,
+                            fontsize=font_size,
                             color=color,
-                            weight="bold",
+                            weight=font_weight,
                             rotation=90,
+                            alpha=alpha_value,
                         )
-                    else:
-                        x_pos = float(np.mean([item[0] for item in group]))
-                        y_pos = max(item[3] for item in group) + label_vertical_offset
-                        merged_text = ", ".join(item[1] for item in group)
-                        first_color = group[0][2]
-                        all_same_color = all(_same_color(item[2], first_color) for item in group)
-                        if all_same_color:
-                            ax_spec.text(
-                                x_pos,
-                                y_pos,
-                                merged_text,
-                                ha="center",
-                                va="bottom",
-                                fontsize=9,
-                                color=group[0][2],
-                                weight="bold",
-                                rotation=90,
+                else:
+                    for _, label_text, color, linestyle, _, _, _, _, _ in group:
+                        legend_key = (label_text, str(color), linestyle)
+                        if legend_key in legend_labels:
+                            continue
+                        legend_labels.add(legend_key)
+                        legend_handles.append(
+                            Line2D(
+                                [0],
+                                [0],
+                                color=color,
+                                linestyle=linestyle,
+                                linewidth=1.5,
+                                label=label_text,
                             )
-                        else:
-                            # Keep grouped behavior, but color by respective line colors.
-                            # Build one comma-list per color and stack them tightly.
-                            color_buckets = []
-                            for _, label_text, label_color, _ in group:
-                                matched_bucket = None
-                                for bucket in color_buckets:
-                                    if _same_color(bucket["color"], label_color):
-                                        matched_bucket = bucket
-                                        break
+                        )
 
-                                if matched_bucket is None:
-                                    color_buckets.append(
-                                        {"color": label_color, "labels": [label_text]}
-                                    )
-                                else:
-                                    matched_bucket["labels"].append(label_text)
+        overlap_legend = None
+        if legend_handles:
+            overlap_legend = ax_spec.legend(
+                handles=legend_handles,
+                loc="upper right",
+                fontsize=8,
+                title="Overlapping Labels",
+            )
 
-                            for bucket_index, bucket in enumerate(color_buckets):
-                                bucket_text = ", ".join(bucket["labels"])
-                                y_offset = bucket_index * grouped_bucket_step
-                                ax_spec.text(
-                                    x_pos,
-                                    y_pos + y_offset,
-                                    bucket_text,
-                                    ha="center",
-                                    va="bottom",
-                                    fontsize=9,
-                                    color=bucket["color"],
-                                    weight="bold",
-                                    rotation=90,
-                                )
+        style_legend_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="gray",
+                linestyle="None",
+                marker="|",
+                markersize=8,
+                markeredgewidth=1.5,
+                label="Gray tick: above snr_min, unmatched",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linestyle="--",
+                linewidth=1.5,
+                label="Dashed line: possible",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linestyle=":",
+                linewidth=1.5,
+                label="Dotted line: requested refline",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linestyle="-",
+                linewidth=1.5,
+                label="Solid line: autodetected",
+            ),
+        ]
+        style_legend = ax_spec.legend(
+            handles=style_legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.16),
+            ncol=4,
+            fontsize=8,
+            frameon=True,
+            title="Peak Marker Guide",
+        )
+        if overlap_legend is not None:
+            ax_spec.add_artist(overlap_legend)
 
-        fig.tight_layout()
+        fig.tight_layout(rect=[0, 0.08, 1, 1])
         plt.show()
 
-        print(f"{'Energy (keV)':<12} {'Intensity':<12} {'SNR':<8} {'Best Match':<25}")
-        print("-" * 60)
-        for peak_energy, height, snr, best_match in sorted_table_rows:
-            print(f"{peak_energy:<12.3f} {height:<12.1f} {snr:<8.1f} {best_match:<25}")
-        if dotted_reference_rows:
-            print("-" * 60)
-            for element_key, line_name, line_energy in sorted(
-                dotted_reference_rows, key=lambda item: item[2]
-            ):
-                print(
-                    f"{line_energy:<12.3f} {'-':<12} {'-':<8} "
-                    f"{(element_key + ' ' + line_name + ' (ref)'):<25}"
-                )
-        print("-" * 60)
+        print(
+            f"{'Energy (keV)':<12} {'Intensity':<12} {'SNR':<8} "
+            f"{'Best Match':<22} {'Alt 2':<22} {'Alt 3':<22}"
+        )
+        print("-" * 105)
+        for peak_energy, height, snr, best_match, alt_2, alt_3 in sorted_table_rows:
+            print(
+                f"{peak_energy:<12.3f} {height:<12.1f} {snr:<8.1f} "
+                f"{best_match:<22} {alt_2:<22} {alt_3:<22}"
+            )
+        print("-" * 105)
         print(
             f"{displayed_peak_count} of {total_over_snr_peak_count} peaks above "
             f"snr_min={min_snr:.1f}, snr_threshold={snr_threshold_for_sample:.1f} displayed.\n"

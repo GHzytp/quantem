@@ -10,7 +10,9 @@ from matplotlib.patches import Rectangle
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset3d import Dataset3d
+from quantem.core.visualization import show_2d
 from quantem.spectroscopy.utils import load_xray_lines_database
+
 
 
 def _run_pca(data: NDArray | Any, n_components: int):
@@ -191,6 +193,8 @@ class Dataset3dspectroscopy(Dataset3d):
         if self.model_elements is None:
             self.model_elements = {}
 
+        added_this_call = {}
+
         for spec in specs:
             tokens = str(spec).split()
             if not tokens:
@@ -205,6 +209,10 @@ class Dataset3dspectroscopy(Dataset3d):
             if not selected_lines:
                 continue
 
+            existing_before = self.model_elements.get(element_key)
+            if not isinstance(existing_before, dict):
+                existing_before = {}
+            existing_keys_before = set(existing_before.keys())
             if not selectors:
                 self.model_elements[element_key] = selected_lines
             else:
@@ -214,8 +222,23 @@ class Dataset3dspectroscopy(Dataset3d):
                 existing.update(selected_lines)
                 self.model_elements[element_key] = existing
 
+            added_keys = [
+                line_name for line_name in selected_lines.keys() if line_name not in existing_keys_before
+            ]
+            if added_keys:
+                if element_key not in added_this_call:
+                    added_this_call[element_key] = []
+                added_this_call[element_key].extend(added_keys)
         if not self.model_elements:
             self.model_elements = None
+
+        if added_this_call:
+            print("Added to model:")
+            for element_key in sorted(added_this_call.keys()):
+                unique_lines = sorted(set(str(line_name) for line_name in added_this_call[element_key]))
+                print(f" - {element_key}: {', '.join(unique_lines)}")
+        else:
+            print("Added to model: nothing new")
 
     def remove_elements_from_model(self, elements):
         """
@@ -275,15 +298,15 @@ class Dataset3dspectroscopy(Dataset3d):
         """
         from quantem.core.datastructures.dataset1d import Dataset1d
 
-        one_d_spectrum = Dataset1d.from_array(
+        two_d_spectrum = Dataset1d.from_array(
             array=spectrum, origin=energy_axis[0], sampling=self.sampling[0], units=self.units[0]
         )
 
         if self.attached_spectra is not None:
-            self.attached_spectra.append(one_d_spectrum)
+            self.attached_spectra.append(two_d_spectrum)
         else:
             self.attached_spectra = []
-            self.attached_spectra.append(one_d_spectrum)
+            self.attached_spectra.append(two_d_spectrum)
 
     def clear_attached_spectra(self):
         self.attached_spectra = None
@@ -521,46 +544,46 @@ class Dataset3dspectroscopy(Dataset3d):
         plt.tight_layout()
         plt.show()
 
-    def calculate_mean_spectrum(
-        self, roi=None, energy_range=None, ignore_range=None, mask=None, attach_mean_spectrum=True
-    ):
-        # ADJUST ROI BASED ON GIVEN FLAGS -----------------------------------------------
-        # Parse ROI parameter
-        if roi is None:
-            # Full image
-            y, x, dy, dx = 0, 0, int(self.shape[1]), int(self.shape[2])
-        elif len(roi) == 2:
-            # Single pixel [y, x]
-            y, x, dy, dx = int(roi[0]), int(roi[1]), 1, 1
-        elif len(roi) == 4:
-            # Full ROI [y, x, dy, dx] with None support for defaults
-            y_val, x_val, dy_val, dx_val = roi
+    def _calibrated_position_to_pixel(self, value, axis):
+        if value is None:
+            return None
 
-            # Handle None values with defaults
-            y = 0 if y_val is None else int(y_val)
-            x = 0 if x_val is None else int(x_val)
-            dy = int(self.shape[1]) - y if dy_val is None else int(dy_val)
-            dx = int(self.shape[2]) - x if dx_val is None else int(dx_val)
-        else:
+        sampling = float(self.sampling[axis])
+        if sampling == 0:
+            raise ValueError(f"Cannot convert calibrated ROI on axis {axis}: sampling is zero")
+
+        origin = float(self.origin[axis]) if hasattr(self, "origin") else 0.0
+        return int(np.round((float(value) - origin) / sampling))
+
+    def _calibrated_span_to_pixels(self, value, axis):
+        if value is None:
+            return None
+
+        sampling = abs(float(self.sampling[axis]))
+        if sampling == 0:
             raise ValueError(
-                "roi must be None, [y, x], or [y, x, dy, dx] (with None for defaults)"
+                f"Cannot convert calibrated ROI span on axis {axis}: sampling is zero"
             )
 
-        # VALIDATE ROI BOUNDS ---------------------------------------------------------------------------
-        errs = []
-        Ymax = int(self.shape[1])
-        Xmax = int(self.shape[2])
+        pixels = int(np.round(float(value) / sampling))
+        if pixels < 1:
+            raise ValueError(
+                f"Calibrated ROI span on axis {axis} converts to {pixels} pixels; expected >= 1"
+            )
+        return pixels
 
-        # type/NaN checks (optional if you already cast to int above)
+    def _validate_roi_bounds(self, y, x, dy, dx):
+        errs = []
+        ymax = int(self.shape[1])
+        xmax = int(self.shape[2])
+
         for name, val in (("y", y), ("x", x), ("dy", dy), ("dx", dx)):
             if val is None:
                 errs.append(f"{name} is None (missing after normalization).")
 
-        # if any None, bail early to avoid arithmetic errors
         if errs:
             raise ValueError("Invalid ROI:\n - " + "\n - ".join(errs))
 
-        # basic constraints
         if y < 0:
             errs.append(f"y={y} < 0")
         if x < 0:
@@ -570,22 +593,80 @@ class Dataset3dspectroscopy(Dataset3d):
         if dx < 1:
             errs.append(f"dx={dx} < 1")
 
-        # starts within image
-        if y >= Ymax:
-            errs.append(f"y start {y} out of bounds [0, {Ymax - 1}]")
-        if x >= Xmax:
-            errs.append(f"x start {x} out of bounds [0, {Xmax - 1}]")
+        if y >= ymax:
+            errs.append(f"y start {y} out of bounds [0, {ymax - 1}]")
+        if x >= xmax:
+            errs.append(f"x start {x} out of bounds [0, {xmax - 1}]")
 
-        # ends within image
         end_y = y + dy
         end_x = x + dx
-        if end_y > Ymax:
-            errs.append(f"y+dy = {end_y} exceeds height {Ymax}")
-        if end_x > Xmax:
-            errs.append(f"x+dx = {end_x} exceeds width {Xmax}")
+        if end_y > ymax:
+            errs.append(f"y+dy = {end_y} exceeds height {ymax}")
+        if end_x > xmax:
+            errs.append(f"x+dx = {end_x} exceeds width {xmax}")
 
         if errs:
             raise ValueError("Invalid ROI:\n - " + "\n - ".join(errs))
+
+    def _resolve_roi_px(self, roi=None, roi_px=None, roi_cal=None):
+        selector_count = int(roi is not None) + int(roi_px is not None) + int(roi_cal is not None)
+        if selector_count > 1:
+            raise ValueError("Use only one ROI selector: roi, roi_px, or roi_cal")
+
+        if roi_px is not None:
+            roi_spec = roi_px
+        elif roi is not None:
+            roi_spec = roi
+        elif roi_cal is not None:
+            if len(roi_cal) == 2:
+                y_cal, x_cal = roi_cal
+                roi_spec = [
+                    self._calibrated_position_to_pixel(y_cal, axis=1),
+                    self._calibrated_position_to_pixel(x_cal, axis=2),
+                ]
+            elif len(roi_cal) == 4:
+                y_cal, x_cal, dy_cal, dx_cal = roi_cal
+                roi_spec = [
+                    self._calibrated_position_to_pixel(y_cal, axis=1),
+                    self._calibrated_position_to_pixel(x_cal, axis=2),
+                    self._calibrated_span_to_pixels(dy_cal, axis=1),
+                    self._calibrated_span_to_pixels(dx_cal, axis=2),
+                ]
+            else:
+                raise ValueError("roi_cal must be [y, x] or [y, x, dy, dx]")
+        else:
+            roi_spec = None
+
+        if roi_spec is None:
+            y, x, dy, dx = 0, 0, int(self.shape[1]), int(self.shape[2])
+        elif len(roi_spec) == 2:
+            y, x = roi_spec
+            y, x, dy, dx = int(y), int(x), 1, 1
+        elif len(roi_spec) == 4:
+            y_val, x_val, dy_val, dx_val = roi_spec
+            y = 0 if y_val is None else int(y_val)
+            x = 0 if x_val is None else int(x_val)
+            dy = int(self.shape[1]) - y if dy_val is None else int(dy_val)
+            dx = int(self.shape[2]) - x if dx_val is None else int(dx_val)
+        else:
+            raise ValueError(
+                "ROI must be None, [y, x], or [y, x, dy, dx]. Use one selector: roi, roi_px, roi_cal"
+            )
+
+        self._validate_roi_bounds(y, x, dy, dx)
+        return y, x, dy, dx
+
+    def calculate_mean_spectrum(
+        self,
+        roi=None,
+        energy_range=None,
+        ignore_range=None,
+        mask=None,
+        attach_mean_spectrum=True,
+        roi_px=None,
+        roi_cal=None,
+    ):
+        y, x, dy, dx = self._resolve_roi_px(roi=roi, roi_px=roi_px, roi_cal=roi_cal)
 
         # SPECTRUM CALCULATION --------------------------------------------------------------
 
@@ -629,10 +710,10 @@ class Dataset3dspectroscopy(Dataset3d):
             spec = np.empty(self.shape[0], dtype=float)
             for k in range(self.shape[0]):
                 img = np.asarray(self.array[k], dtype=float)
-                roi = img[y : y + dy, x : x + dx]
-                if roi.size == 0:
+                roi_data = img[y : y + dy, x : x + dx]
+                if roi_data.size == 0:
                     raise ValueError("ROI is empty; check y/x/dy/dx.")
-                spec[k] = roi.mean()
+                spec[k] = roi_data.mean()
 
         # APPLY ENERGY RANGE ---------------------------------------------------------------
 
@@ -661,6 +742,8 @@ class Dataset3dspectroscopy(Dataset3d):
     def show_mean_spectrum(
         self,
         roi=None,
+        roi_px=None,
+        roi_cal=None,
         energy_range=None,
         mask=None,
         data_type="eds",
@@ -719,7 +802,15 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # CALCULATE MEAN SPECTRUM FOR GIVEN ROI AND ENERGY RANGE --------------------------
 
-        spec = self.calculate_mean_spectrum(roi=roi, energy_range=energy_range, mask=mask)
+        y, x, dy, dx = self._resolve_roi_px(roi=roi, roi_px=roi_px, roi_cal=roi_cal)
+
+        spec = self.calculate_mean_spectrum(
+            roi=roi,
+            roi_px=roi_px,
+            roi_cal=roi_cal,
+            energy_range=energy_range,
+            mask=mask,
+        )
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
@@ -743,11 +834,19 @@ class Dataset3dspectroscopy(Dataset3d):
             sum_img = np.asarray(self.array, dtype=float).sum(axis=0)
             title_suffix = ""
 
-        im = ax_img.imshow(sum_img, cmap="viridis", origin="lower")
-        if data_type == "eds":
-            ax_img.set_title(f"EDS Sum Image{title_suffix}")
-        else:
-            ax_img.set_title(f"EELS Sum Image{title_suffix}")
+        map_title = f"Integrated Intensity Map{title_suffix}"
+        show_2d(
+            sum_img,
+            figax=(fig, ax_img),
+            title=map_title,
+            cmap="viridis",
+            cbar=True,
+            show_ticks=True,
+            scalebar={
+                "sampling": float(self.sampling[1]),
+                "units": str(self.units[1]),
+            },
+        )
         ax_img.set_xlabel("X (pixels)")
         ax_img.set_ylabel("Y (pixels)")
 
@@ -756,9 +855,6 @@ class Dataset3dspectroscopy(Dataset3d):
             (x - 0.5, y - 0.5), dx, dy, linewidth=2, edgecolor="red", facecolor="none", alpha=0.8
         )
         ax_img.add_patch(rect)
-
-        # Add colorbar for the image
-        plt.colorbar(im, ax=ax_img)
 
         # RIGHT PLOT: Show spectrum
         ax_spec.plot(E, spec, linewidth=1.5)
@@ -775,10 +871,123 @@ class Dataset3dspectroscopy(Dataset3d):
             plt.show()
         return fig, (ax_img, ax_spec)
 
+    def refline(
+        self,
+        elements,
+        ax=None,
+        energy=None,
+        energy_range=None,
+        linestyle=":",
+        linewidth=1.2,
+        alpha=0.35,
+        show_text=True,
+    ):
+        """Overlay reference lines for selected element specifiers on a spectrum axis.
+
+        This is plotting-only and does not modify auto-identification behavior.
+        """
+        if elements is None:
+            raise ValueError("elements must be specified")
+        if energy is not None and energy_range is not None:
+            raise ValueError("Specify either energy or energy_range, not both")
+
+        if type(self).element_info is None:
+            type(self).load_element_info()
+        all_info = type(self).element_info or {}
+
+        specs = type(self)._normalize_element_specs(elements)
+        if len(specs) == 0:
+            raise ValueError("elements must contain at least one selector")
+
+        if ax is None:
+            ax = plt.gca()
+
+        if energy_range is not None:
+            if len(energy_range) != 2:
+                raise ValueError("energy_range must be [min_energy, max_energy]")
+            e_min = float(min(energy_range[0], energy_range[1]))
+            e_max = float(max(energy_range[0], energy_range[1]))
+        elif energy is not None:
+            tol = max(2.0 * abs(float(self.sampling[0])), 1e-9)
+            center = float(energy)
+            e_min = center - tol
+            e_max = center + tol
+        else:
+            xlim = ax.get_xlim()
+            e_min = float(min(xlim))
+            e_max = float(max(xlim))
+
+        artists = []
+        labels = []
+        energies = []
+
+        y_top = ax.get_ylim()[1]
+        y_text = y_top - 0.08 * max(abs(y_top), 1e-12)
+
+        for spec in specs:
+            tokens = str(spec).split()
+            if len(tokens) == 0:
+                continue
+
+            element_key = type(self)._resolve_element_key(all_info, tokens[0])
+            if element_key is None:
+                continue
+
+            selectors = tokens[1:]
+            selected_lines = type(self)._select_lines(all_info.get(element_key, {}), selectors)
+
+            for line_name, line_info in selected_lines.items():
+                if not isinstance(line_info, dict):
+                    continue
+
+                energy_value = line_info.get("energy (keV)")
+                if energy_value is None:
+                    energy_value = line_info.get("onset_energy (eV)")
+                if energy_value is None:
+                    energy_value = line_info.get("energy")
+                if energy_value is None:
+                    continue
+
+                try:
+                    line_energy = float(energy_value)
+                except (TypeError, ValueError):
+                    continue
+
+                if not (e_min <= line_energy <= e_max):
+                    continue
+
+                label = f"{element_key} {line_name}"
+                line_artist = ax.axvline(
+                    line_energy,
+                    linestyle=linestyle,
+                    linewidth=linewidth,
+                    alpha=alpha,
+                )
+                artists.append(line_artist)
+                labels.append(label)
+                energies.append(line_energy)
+
+                if show_text:
+                    text_artist = ax.text(
+                        line_energy,
+                        y_text,
+                        label,
+                        rotation=90,
+                        ha="center",
+                        va="top",
+                        alpha=min(1.0, alpha + 0.2),
+                        clip_on=True,
+                    )
+                    artists.append(text_artist)
+
+        return {"ax": ax, "artists": artists, "labels": labels, "energies": np.asarray(energies)}
+
     def show_energy_window_map(
         self,
-        energy_window,
+        energy_window=None,
         roi=None,
+        roi_px=None,
+        roi_cal=None,
         mask=None,
         data_type="eds",
         cmap="viridis",
@@ -792,8 +1001,9 @@ class Dataset3dspectroscopy(Dataset3d):
 
         Parameters
         ----------
-        energy_window : list[float] | tuple[float, float]
-            Energy interval [emin, emax] to integrate.
+        energy_window : list[float] | tuple[float, float] | None
+            Energy interval [emin, emax] to integrate. If None, use the
+            full calibrated energy range of the dataset.
         roi : list | tuple | None, optional
             ROI as ``[y, x]`` or ``[y, x, dy, dx]`` (with ``None`` defaults),
             used only for overlay rectangle.
@@ -810,38 +1020,28 @@ class Dataset3dspectroscopy(Dataset3d):
         Returns
         -------
         tuple
-            ``(fig, ax, energy_map)`` where ``energy_map`` is the integrated 2D array.
+            ``(fig, (ax_map, ax_spec), energy_map)`` where ``energy_map`` is the integrated 2D array.
         """
-        if energy_window is None or len(energy_window) != 2:
-            raise ValueError("energy_window must be [min_energy, max_energy]")
-
-        emin = float(energy_window[0])
-        emax = float(energy_window[1])
-        if not np.isfinite(emin) or not np.isfinite(emax) or emin >= emax:
-            raise ValueError(
-                "Invalid energy_window. Expected [min_energy, max_energy] with min < max"
-            )
-
-        # Parse ROI (for optional overlay only)
-        if roi is None:
-            y, x, dy, dx = 0, 0, int(self.shape[1]), int(self.shape[2])
-            has_roi_overlay = False
-        elif len(roi) == 2:
-            y, x, dy, dx = int(roi[0]), int(roi[1]), 1, 1
-            has_roi_overlay = True
-        elif len(roi) == 4:
-            y_val, x_val, dy_val, dx_val = roi
-            y = 0 if y_val is None else int(y_val)
-            x = 0 if x_val is None else int(x_val)
-            dy = int(self.shape[1]) - y if dy_val is None else int(dy_val)
-            dx = int(self.shape[2]) - x if dx_val is None else int(dx_val)
-            has_roi_overlay = True
-        else:
-            raise ValueError("roi must be None, [y, x], or [y, x, dy, dx] (with None defaults)")
+        y, x, dy, dx = self._resolve_roi_px(roi=roi, roi_px=roi_px, roi_cal=roi_cal)
+        has_roi_overlay = any(val is not None for val in (roi, roi_px, roi_cal))
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
         E = E0 + dE * np.arange(self.shape[0])
+
+        if energy_window is None:
+            emin = float(np.min(E))
+            emax = float(np.max(E))
+        else:
+            if len(energy_window) != 2:
+                raise ValueError("energy_window must be [min_energy, max_energy]")
+
+            emin = float(energy_window[0])
+            emax = float(energy_window[1])
+            if not np.isfinite(emin) or not np.isfinite(emax) or emin >= emax:
+                raise ValueError(
+                    "Invalid energy_window. Expected [min_energy, max_energy] with min < max"
+                )
 
         window_mask = (E >= emin) & (E <= emax)
         if mask is not None:
@@ -858,13 +1058,35 @@ class Dataset3dspectroscopy(Dataset3d):
         arr = np.asarray(self.array, dtype=float)
         energy_map = arr[window_mask, :, :].sum(axis=0)
 
-        fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-        im = ax.imshow(energy_map, cmap=cmap, origin="lower")
+        spec = self.calculate_mean_spectrum(
+            roi=roi,
+            roi_px=roi_px,
+            roi_cal=roi_cal,
+            mask=mask,
+            attach_mean_spectrum=False,
+        )
+        if mask is not None:
+            E_spec = E[mask]
+        else:
+            E_spec = E
 
         unit_label = "keV" if str(data_type).lower() == "eds" else "eV"
-        ax.set_title(f"Energy-Window Map [{emin:.3f}, {emax:.3f}] {unit_label}")
-        ax.set_xlabel("X (pixels)")
-        ax.set_ylabel("Y (pixels)")
+        fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(12, 4))
+        show_2d(
+            energy_map,
+            figax=(fig, ax_map),
+            title=f"Energy-Window Map [{emin:.3f}, {emax:.3f}] {unit_label}",
+            cmap=cmap,
+            cbar=True,
+            show_ticks=True,
+            scalebar={
+                "sampling": float(self.sampling[1]),
+                "units": str(self.units[1]),
+            },
+        )
+
+        ax_map.set_xlabel("X (pixels)")
+        ax_map.set_ylabel("Y (pixels)")
 
         if has_roi_overlay:
             rect = Rectangle(
@@ -876,15 +1098,22 @@ class Dataset3dspectroscopy(Dataset3d):
                 facecolor="none",
                 alpha=0.8,
             )
-            ax.add_patch(rect)
+            ax_map.add_patch(rect)
 
-        plt.colorbar(im, ax=ax, label="Integrated Intensity")
+        ax_spec.plot(E_spec, spec, linewidth=1.5)
+        ax_spec.axvspan(emin, emax, color="orange", alpha=0.2, label="Selected window")
+        ax_spec.set_xlabel(f"Energy ({unit_label})")
+        ax_spec.set_ylabel("Intensity")
+        ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
+        ax_spec.grid(True, alpha=0.1)
+        ax_spec.legend(loc="best")
+
         fig.tight_layout()
 
         if show:
             plt.show()
 
-        return fig, ax, energy_map
+        return fig, (ax_map, ax_spec), energy_map
 
     # BACKGROND SUBTRACTION
 
