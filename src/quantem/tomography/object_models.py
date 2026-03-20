@@ -836,7 +836,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if isinstance(device, str):
             device = torch.device(device)
         self._device = device
-        self._model = self._model.to(device)
+        if self.world_size == 1:
+            self._model = self._model.to(device)
+        elif not isinstance(self._model, torch.nn.parallel.DistributedDataParallel):
+            self.distribute_model(self._model)
         self.reconnect_optimizer_to_parameters()
 
 
