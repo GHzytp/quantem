@@ -98,6 +98,7 @@ class DDPMixin:
             pin_memory=pin_mem,
             drop_last=True,
             persistent_workers=persist,
+            multiprocessing_context="spawn"
         )
 
         if val_dataset:
@@ -110,6 +111,7 @@ class DDPMixin:
                 pin_memory=pin_mem,
                 drop_last=False,
                 persistent_workers=persist,
+                multiprocessing_context="spawn"
             )
             val_dataloader = val_dataloader
         else:
