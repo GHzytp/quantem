@@ -746,7 +746,7 @@ class Dataset3dspectroscopy(Dataset3d):
         roi_cal=None,
         energy_range=None,
         mask=None,
-        data_type="eds",
+        data_type=None,
         show=True,
     ):
         """
