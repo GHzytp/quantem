@@ -427,7 +427,11 @@ def _normalize_show_args_to_grid(
 def show_2d(
     arrays: Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
     *,
-    norm: NormalizationConfig | dict | str | Sequence[dict | str] | None = None,
+    norm: NormalizationConfig
+    | dict
+    | str
+    | Sequence[dict | str]
+    | None = None,  # TODO: Revamp NormalizationConfig, ScalebarConfig with Dataclasses
     scalebar: ScalebarConfig | dict | bool | Sequence[bool | dict | None] | None = None,
     cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
