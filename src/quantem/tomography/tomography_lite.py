@@ -91,8 +91,8 @@ class TomographyLiteINR(Tomography):
         ] = "none",
         scheduler_params: dict = {},
         new_optimizers: bool = False,
-        obj_constraints: ObjConstraintsType | dict = {},
-        dset_constraints: DatasetConstraintsType | dict = {},
+        obj_constraints: ObjConstraintsType | dict | None = None,
+        dset_constraints: DatasetConstraintsType | dict | None = None,
     ):
         if self.num_epochs == 0:
             opt_params = {
@@ -118,7 +118,9 @@ class TomographyLiteINR(Tomography):
                 )
         else:
             opt_params = None
-            all_scheduler_params = {}
+            all_scheduler_params = None
+            obj_constraints = None
+            dset_constraints = None
 
         num_samples_per_ray = int(max(self.dset.tilt_stack.shape))
         return super().reconstruct(

@@ -192,9 +192,8 @@ class Tomography(TomographyOpt, TomographyBase):
                         len(batch["target_value"]),
                     )
 
-
                 pred = integrated_densities.float()
-                if a0 > 0:
+                if self.num_epochs > 0:
                     soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred)
                 else:
                     soft_constraints_loss = 0.0
@@ -220,7 +219,6 @@ class Tomography(TomographyOpt, TomographyBase):
                 dist.all_reduce(total_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(consistency_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(epoch_soft_constraint_loss, dist.ReduceOp.AVG)
-
 
             total_loss = total_loss.item() / len(self.dataloader)
             consistency_loss = consistency_loss.item() / len(self.dataloader)

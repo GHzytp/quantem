@@ -146,6 +146,7 @@ class DDPMixin:
         Returns the model.
         """
         model = model.to(self.device)
+
         if self.world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -158,7 +159,7 @@ class DDPMixin:
             )
 
             if self.global_rank == 0:
-                print("Model wrapped with DDP")
+                print("Model wrapped with DDP and compiled")
 
         if self.world_size > 1:
             if self.global_rank == 0:
