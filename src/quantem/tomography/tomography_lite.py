@@ -7,12 +7,17 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.ml.inr import HSiren
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerParams,
+    SchedulerParams,
+)
 from quantem.tomography.dataset_models import (
+    DatasetConstraintsType,
     TomographyINRDataset,
     TomographyPixDataset,
 )
 from quantem.tomography.logger_tomography import LoggerTomography
-from quantem.tomography.object_models import ObjectINR, ObjectPixelated
+from quantem.tomography.object_models import ObjConstraintsType, ObjectINR, ObjectPixelated
 from quantem.tomography.tomography import Tomography, TomographyConventional
 
 
@@ -53,7 +58,7 @@ class TomographyLiteINR(Tomography):
 
         if log_dir is not None:
             logger = LoggerTomography(
-                log_dir=log_dir,
+                log_dir=str(log_dir),
                 run_prefix="tomography_lite_inr",
                 run_suffix="",
                 log_images_every=log_images_every,
@@ -84,38 +89,36 @@ class TomographyLiteINR(Tomography):
         scheduler_type: Literal[
             "exp", "cyclic", "plateau", "cosine_annealing", "linear", "full_warmup", "none"
         ] = "none",
-        scheduler_factor: float = 0.5,
+        scheduler_params: dict = {},
         new_optimizers: bool = False,
-        obj_constraints: dict = {},
-        dset_constraints: dict = {},
+        obj_constraints: ObjConstraintsType | dict = {},
+        dset_constraints: DatasetConstraintsType | dict = {},
     ):
         if self.num_epochs == 0:
             opt_params = {
-                "object": {
-                    "type": "adam",
-                    "lr": obj_lr,
-                },
+                "object": OptimizerParams.Adam(lr=obj_lr),
             }
 
-            scheduler_params = {
-                "object": {
-                    "type": scheduler_type,
-                    "factor": scheduler_factor,
-                },
+            all_scheduler_params = {
+                "object": SchedulerParams.parse_dict(
+                    {
+                        "name": scheduler_type,
+                        **scheduler_params,
+                    }
+                ),
             }
 
             if learn_pose:
-                opt_params["pose"] = {
-                    "type": "adam",
-                    "lr": pose_lr,
-                }
-                scheduler_params["pose"] = {
-                    "type": scheduler_type,
-                }
-
+                opt_params["pose"] = OptimizerParams.Adam(lr=pose_lr)
+                all_scheduler_params["pose"] = SchedulerParams.parse_dict(
+                    {
+                        "name": scheduler_type,
+                        **scheduler_params,
+                    }
+                )
         else:
             opt_params = None
-            scheduler_params = None
+            all_scheduler_params = {}
 
         num_samples_per_ray = int(max(self.dset.tilt_stack.shape))
         return super().reconstruct(
@@ -125,7 +128,7 @@ class TomographyLiteINR(Tomography):
             reset=reset,
             num_samples_per_ray=num_samples_per_ray,
             optimizer_params=opt_params,
-            scheduler_params=scheduler_params,
+            scheduler_params=all_scheduler_params,
             obj_constraints=obj_constraints,
             dset_constraints=dset_constraints,
         )

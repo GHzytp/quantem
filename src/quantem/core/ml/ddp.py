@@ -8,6 +8,10 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_spl
 from quantem.tomography.dataset_models import DatasetModelType
 
 
+def worker_init_fn(worker_id):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
 class DDPMixin:
     """
     Class for setting up all distributed training.
@@ -98,7 +102,8 @@ class DDPMixin:
             pin_memory=pin_mem,
             drop_last=True,
             persistent_workers=persist,
-            multiprocessing_context="spawn"
+            multiprocessing_context="spawn",
+            worker_init_fn=worker_init_fn,
         )
 
         if val_dataset:
@@ -111,7 +116,8 @@ class DDPMixin:
                 pin_memory=pin_mem,
                 drop_last=False,
                 persistent_workers=persist,
-                multiprocessing_context="spawn"
+                multiprocessing_context="spawn",
+                worker_init_fn=worker_init_fn,
             )
             val_dataloader = val_dataloader
         else:
