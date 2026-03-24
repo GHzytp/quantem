@@ -118,10 +118,10 @@ class Siren(nn.Module):
                 rng = torch.Generator()
                 rng.manual_seed(42)
             with torch.no_grad():
-                self.net[0].linear.weight += (  # pyright: ignore[reportAttributeAccessIssue]
+                self.net[0].linear.weight += (  # type: ignore[reportAttributeAccessIssue]
                     torch.randn_like(self.net[0].linear.weight) * 5 / self.first_omega_0  # type:ignore
                 )
-                self.net[1].linear.weight += (  # pyright: ignore[reportAttributeAccessIssue]
+                self.net[1].linear.weight += (  # type: ignore[reportAttributeAccessIssue]
                     torch.randn_like(self.net[1].linear.weight) * 0.1 / self.hidden_omega_0  # type:ignore
                 )
 
