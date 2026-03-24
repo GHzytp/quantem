@@ -80,7 +80,12 @@ def radon_torch(images, theta=None, device=None):
 
 
 def iradon_torch(
-    sinograms, theta=None, output_size=None, filter_name="ramp", circle=True, device=None
+    sinograms,
+    theta=None,
+    output_size=None,
+    filter_name: str | None = "ramp",
+    circle=True,
+    device=None,
 ):
     if sinograms.ndim == 2:
         sinograms = sinograms.unsqueeze(0)

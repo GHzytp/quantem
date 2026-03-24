@@ -16,6 +16,8 @@ from quantem.tomography.dataset_models import (
     DatasetConstraintParams,
     DatasetConstraintsType,
     DatasetModelType,
+    TomographyINRDataset,
+    TomographyPixDataset,
 )
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
@@ -148,6 +150,13 @@ class Tomography(TomographyOpt, TomographyBase):
                     val_fraction=val_fraction,
                 )
             )
+
+        # Type check for INR-based reconstruction
+        if not isinstance(self.dset, TomographyINRDataset):
+            raise NotImplementedError(
+                "Only TomographyINRDataset is supported for this reconstruction method."
+            )
+
         N = max(self.obj_model.shape)
 
         if num_samples_per_ray is None:
@@ -167,10 +176,15 @@ class Tomography(TomographyOpt, TomographyBase):
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
-            consistency_loss = 0.0
-            total_loss = 0.0
-            epoch_soft_constraint_loss = 0.0
-            self.obj_model.model.train()
+            consistency_loss = torch.tensor(0.0, device=self.device)
+            total_loss = torch.tensor(0.0, device=self.device)
+            epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
+            if isinstance(self.obj_model, ObjectINR):
+                self.obj_model.model.train()
+            else:
+                raise NotImplementedError(
+                    "AD Pixelated reconstruction is not yet implemented. Use ObjectINR instead."
+                )
             self.dset.train()
             # self._reset_iter_constraints()
 
@@ -200,10 +214,9 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 pred = integrated_densities.float()
+                soft_constraints_loss = 0.0
                 if self.num_epochs > 0:
                     soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred)
-                else:
-                    soft_constraints_loss = 0.0
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 
@@ -234,12 +247,13 @@ class Tomography(TomographyOpt, TomographyBase):
             self.step_schedulers(loss=total_loss)
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
+            avg_val_loss = None
             if self.val_dataloader is not None:
                 print("Validating...")
                 self.obj_model.model.eval()
                 self.dset.eval()
                 with torch.no_grad():
-                    val_loss = 0.0
+                    val_loss = torch.tensor(0.0, device=self.device)
 
                     for batch in self.val_dataloader:
                         with torch.autocast(
@@ -265,7 +279,7 @@ class Tomography(TomographyOpt, TomographyBase):
                                 integrated_densities, target
                             )
 
-                            val_loss += batch_val_loss.detach() + soft_constraints_loss.detach()
+                            val_loss += batch_val_loss.detach()
 
                     avg_val_loss = val_loss.item() / len(self.val_dataloader)
 
@@ -286,7 +300,7 @@ class Tomography(TomographyOpt, TomographyBase):
             self._consistency_losses.append(consistency_loss)
             self.append_learning_rates(self.get_current_lrs())
             self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
-            if self.val_dataloader is not None:
+            if avg_val_loss is not None:
                 self._val_losses.append(avg_val_loss)
 
             if self.logger is not None:
@@ -294,7 +308,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.logger.log_images_every > 0
                     and self.num_epochs % self.logger.log_images_every == 0
                 ):
-                    pred_full = self.obj_model.create_volume(return_vol=True)
+                    pred_full = self.obj_model.obj_view
 
                     if self.global_rank == 0:
                         self.logger.log_iter_images(
@@ -423,7 +437,7 @@ class TomographyConventional(TomographyBase):
     @classmethod
     def from_models(
         cls,
-        dset: DatasetModelType,
+        dset: TomographyPixDataset,
         obj_model: ObjectPixelated,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
@@ -516,13 +530,14 @@ class TomographyConventional(TomographyBase):
         gaussian_kernel: torch.Tensor | None = None,
     ):
         loss = 0
+
         if relaxation == 0.0:
             relaxation = self._adaptive_relaxation()
             print(f"Adaptive relaxation: {relaxation}")
         if inline_alignment:
             for ind in range(len(self.dset.tilt_angles)):
                 im_proj = proj_forward[:, ind, :]
-                im_meas = self.dset.forward(ind).target
+                im_meas = self.dset.forward(ind).target  # type: ignore
                 shift = torch_phase_cross_correlation(im_proj, im_meas)
                 if torch.linalg.norm(shift) <= 32:
                     shifted = torch.fft.ifft2(

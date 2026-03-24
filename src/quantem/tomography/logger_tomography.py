@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
 from quantem.core.ml.logger import LoggerBase
@@ -46,7 +47,7 @@ class LoggerTomography(LoggerBase):
 
     def log_iter_images(
         self,
-        pred_volume: torch.Tensor,
+        pred_volume: np.ndarray,
         dataset_model: DatasetModelType,
         iter: int,
         logger_cmap: str = "turbo",

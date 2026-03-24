@@ -209,6 +209,13 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
             """
             raise NotImplementedError
 
+        @property
+        def model(self) -> nn.Module:
+            """
+            Returns the model, should be implemented in subclasses.
+            """
+            raise NotImplementedError
+
         @abstractmethod
         def dtype(self) -> torch.dtype:
             """
@@ -475,6 +482,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     @property
     def obj(self) -> torch.Tensor:
         return self._obj
+
+    @obj.setter
+    def obj(self, obj: torch.Tensor):
+        self._obj = obj
 
     @property
     def obj_view(self) -> np.ndarray:
