@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from typing import Literal, Self, Sequence
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -77,6 +78,7 @@ class Tomography(TomographyOpt, TomographyBase):
         ] = "l2",
         loss_func_kwargs: dict = {},
         reset_dset: DatasetModelType | None = None,
+        show_metrics: bool = False,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -277,6 +279,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
             self._epoch_losses.append(total_loss)
             self._consistency_losses.append(consistency_loss)
+            self.append_learning_rates(self.get_current_lrs())
             self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
             if self.val_dataloader is not None:
                 self._val_losses.append(avg_val_loss)
@@ -315,6 +318,27 @@ class Tomography(TomographyOpt, TomographyBase):
                     print(
                         f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
                     )
+        if show_metrics and self.world_size == 1:
+            fig, ax = plt.subplots(figsize=(10, 4), ncols=2)
+
+            ax[0].plot(self._epoch_losses, label="Total Training Loss")
+            if len(self._val_losses) > 0:
+                ax[0].plot(self._val_losses, label="Validation Loss")
+            ax[0].legend()
+
+            for key, value in self._lrs.items():
+                ax[1].plot(value, label=key)
+
+            ax[1].legend()
+            ax[0].legend()
+            ax[0].set_yscale("log")
+            ax[1].set_yscale("log")
+            ax[0].set_xlabel("Epoch")
+            ax[1].set_xlabel("Epoch")
+            ax[0].set_ylabel("Loss")
+            ax[1].set_ylabel("Learning Rate")
+
+            fig.tight_layout()
 
     # --- Helper Functions ---
 

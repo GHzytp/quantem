@@ -93,6 +93,7 @@ class TomographyLiteINR(Tomography):
         new_optimizers: bool = False,
         obj_constraints: ObjConstraintsType | dict | None = None,
         dset_constraints: DatasetConstraintsType | dict | None = None,
+        show_metrics: bool = False,
     ):
         if self.num_epochs == 0:
             opt_params = {
@@ -133,6 +134,7 @@ class TomographyLiteINR(Tomography):
             scheduler_params=all_scheduler_params,
             obj_constraints=obj_constraints,
             dset_constraints=dset_constraints,
+            show_metrics=show_metrics,
         )
 
 
