@@ -149,7 +149,9 @@ def iradon_torch(
     return recon.squeeze(0) if B == 1 else recon
 
 
-def get_fourier_filter_torch(size, filter_name="ramp", device=None, dtype=torch.float32):
+def get_fourier_filter_torch(
+    size, filter_name: str | None = "ramp", device=None, dtype=torch.float32
+):
     """
     Construct the Fourier filter in PyTorch.
     """
