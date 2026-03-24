@@ -160,7 +160,8 @@ class Tomography(TomographyOpt, TomographyBase):
                     raise ValueError(
                         "num_samples_per_ray schedule must have the same length as num_iter"
                     )
-                print("num_samples_per_ray schedule provided.")
+                if self.global_rank == 0:
+                    print("num_samples_per_ray schedule provided.")
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
 
