@@ -9,3 +9,4 @@ from quantem.core.visualization.visualization_utils import (
     turbo_black as turbo_black,
     axes_with_inset as axes_with_inset,
 )
+from quantem.core.visualization.line_scan import linescan as linescan

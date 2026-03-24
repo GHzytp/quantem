@@ -1,9 +1,9 @@
-from __future__ import annotations
+# from __future__ import annotations
 
 import os
 import warnings
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, Union, cast
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -31,7 +31,10 @@ from quantem.core.visualization.visualization_utils import (
     combine_arrays_to_rgba,
 )
 
-ArrayLike = NDArray | torch.Tensor
+if TYPE_CHECKING:
+    from quantem.core.datastructures import Dataset2d
+
+ArrayLike: TypeAlias = Union[NDArray, torch.Tensor, "Dataset2d"]  # union required here
 
 
 def _show_2d_array(
@@ -404,12 +407,14 @@ def _normalize_show_args_to_grid(
     | dict
     | str
     | Sequence[NormalizationConfig | ShowParams.Norm | dict | str]
+    | Sequence[Sequence[NormalizationConfig | ShowParams.Norm | dict | str]]
     | None = None,
     scalebar: ScalebarConfig
     | ShowParams.Scalebar
     | dict
     | bool
     | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
+    | Sequence[Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]]
     | None = None,
     cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
@@ -444,6 +449,7 @@ def _normalize_show_args_to_grid(
     return args
 
 
+# the type hinting is a bit of a mess, but not sure how to improve it
 def show_2d(
     arrays: ArrayLike | Sequence[ArrayLike] | Sequence[Sequence[ArrayLike]],
     *,
@@ -453,6 +459,7 @@ def show_2d(
         | dict
         | str
         | Sequence[NormalizationConfig | ShowParams.Norm | dict | str]
+        | Sequence[Sequence[NormalizationConfig | ShowParams.Norm | dict | str]]
         | None
     ) = None,
     scalebar: ScalebarConfig
@@ -460,6 +467,7 @@ def show_2d(
     | dict
     | bool
     | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
+    | Sequence[Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]]
     | None = None,
     cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
