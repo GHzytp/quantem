@@ -342,7 +342,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     # --- Helper Functions ---
     @abstractmethod
-    def to(self, device: torch.device | str):
+    def to(self, device: torch.device | str):  # type: ignore
         """
         Moves the dataset to the device, and also insantiates the aux params to the device.
         """
@@ -375,8 +375,11 @@ class TomographyDatasetConstraints(BaseConstraints, TomographyDatasetBase):
             soft_loss += tv_loss_shifts
         return soft_loss
 
-    def apply_hard_constraints(self):
-        pass
+    def apply_hard_constraints(self) -> torch.Tensor:
+        """
+        No hard constraints have been implemented yet.
+        """
+        return torch.tensor(0.0)
 
 
 class TomographyPixDataset(TomographyDatasetConstraints):
@@ -402,7 +405,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
             _token=_token,
         )
 
-    def forward(
+    def forward(  # type:ignore
         self,
         proj_idx: int,
     ) -> DatasetValue:
@@ -413,7 +416,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
 
         return DatasetValue(
             target=self.tilt_stack[proj_idx],
-            tilt_angle=self.tilt_angles[proj_idx],
+            tilt_angle=self.tilt_angles[proj_idx].item(),
             pixel_loc=None,
         )
 
