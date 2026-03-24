@@ -176,7 +176,6 @@ def _show_2d_combined(
     *,
     norm: NormalizationConfig | ShowParams.Norm | dict | str | None = None,
     scalebar: ScalebarConfig | ShowParams.Scalebar | dict | bool | None = None,
-    cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
     figax: tuple[Any, Any] | None = None,
@@ -591,7 +590,22 @@ def show_2d(
     if kwargs.pop("combine_images", False):
         if nrows > 1:
             raise ValueError()
-        fig, axs = _show_2d_combined(grid[0], figax=figax, **kwargs)  # TODO pass args here
+        if isinstance(norm, Sequence):  # flatten norm
+            norm = norm[0] if not isinstance(norm[0], Sequence) else norm[0][0]
+        if isinstance(scalebar, Sequence):  # flatten scalebar
+            scalebar = scalebar[0] if not isinstance(scalebar[0], Sequence) else scalebar[0][0]
+        if isinstance(title, Sequence) and not isinstance(title, str):  # flatten title
+            title = title[0] if isinstance(title[0], str) else title[0][0]
+
+        fig, axs = _show_2d_combined(
+            grid[0],
+            norm=norm,
+            scalebar=scalebar,
+            figax=figax,
+            title=title,
+            figsize=kwargs.pop("figsize", axsize),
+            **kwargs,
+        )
     else:
         normalized_args = _normalize_show_args_to_grid(
             shape=(nrows, ncols),
