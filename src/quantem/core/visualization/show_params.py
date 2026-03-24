@@ -1,6 +1,8 @@
+import warnings
 from dataclasses import dataclass, fields
 from typing import Literal, Optional
 
+from quantem.core.utils.validators import validate_gt, validate_lt
 from quantem.core.visualization.custom_normalizations import NormalizationConfig
 from quantem.core.visualization.visualization_utils import ScalebarConfig
 
@@ -72,7 +74,7 @@ class ShowParams:
         >>> ShowParams.Norm.centered(half_range=5)   # centered ± 5, linear
         """
 
-        interval_type: Literal["quantile", "manual", "centered"] = "quantile"
+        interval_type: Optional[Literal["quantile", "manual", "centered"]] = None
         stretch_type: Literal["linear", "power", "logarithmic", "asinh"] = "linear"
         lower_quantile: float = 0.02
         upper_quantile: float = 0.98
@@ -85,12 +87,91 @@ class ShowParams:
         asinh_linear_range: float = 0.1
 
         def __post_init__(self) -> None:
-            if self.interval_type != "quantile":
-                return
-            if self.vmin is not None or self.vmax is not None:
-                self.interval_type = "manual"
-            elif self.vcenter != 0.0 or self.half_range is not None:
-                self.interval_type = "centered"
+            manual_set = self.vmin is not None or self.vmax is not None
+            centered_set = self.vcenter != 0.0 or self.half_range is not None
+            quantile_set = self.lower_quantile != 0.02 or self.upper_quantile != 0.98
+            user_chose = self.interval_type is not None
+
+            # --- auto-infer interval_type when not explicitly provided ---
+            if not user_chose:
+                if manual_set and centered_set:
+                    warnings.warn(
+                        "Both vmin/vmax and vcenter/half_range were set; "
+                        "defaulting to interval_type='manual'.",
+                        stacklevel=2,
+                    )
+                    self.interval_type = "manual"
+                elif manual_set:
+                    self.interval_type = "manual"
+                elif centered_set:
+                    self.interval_type = "centered"
+                else:
+                    self.interval_type = "quantile"
+
+            # --- warn about ignored interval fields ---
+            if self.interval_type == "manual" and quantile_set:
+                warnings.warn(
+                    "lower_quantile/upper_quantile are ignored when interval_type='manual'.",
+                    stacklevel=2,
+                )
+            if self.interval_type == "manual" and centered_set:
+                warnings.warn(
+                    "vcenter/half_range are ignored when interval_type='manual'.",
+                    stacklevel=2,
+                )
+            if self.interval_type == "quantile" and manual_set:
+                warnings.warn(
+                    "vmin/vmax are ignored when interval_type='quantile'.",
+                    stacklevel=2,
+                )
+            if self.interval_type == "quantile" and centered_set:
+                warnings.warn(
+                    "vcenter/half_range are ignored when interval_type='quantile'.",
+                    stacklevel=2,
+                )
+            if self.interval_type == "centered" and manual_set:
+                warnings.warn(
+                    "vmin/vmax are ignored when interval_type='centered'.",
+                    stacklevel=2,
+                )
+            if self.interval_type == "centered" and quantile_set:
+                warnings.warn(
+                    "lower_quantile/upper_quantile are ignored when interval_type='centered'.",
+                    stacklevel=2,
+                )
+
+            # --- warn about ignored stretch fields ---
+            if self.power != 1.0 and self.stretch_type not in ("power", "linear"):
+                warnings.warn(
+                    f"power={self.power} is ignored when stretch_type='{self.stretch_type}'.",
+                    stacklevel=2,
+                )
+            if self.logarithmic_index != 1000.0 and self.stretch_type != "logarithmic":
+                warnings.warn(
+                    f"logarithmic_index={self.logarithmic_index} is ignored "
+                    f"when stretch_type='{self.stretch_type}'.",
+                    stacklevel=2,
+                )
+            if self.asinh_linear_range != 0.1 and self.stretch_type != "asinh":
+                warnings.warn(
+                    f"asinh_linear_range={self.asinh_linear_range} is ignored "
+                    f"when stretch_type='{self.stretch_type}'.",
+                    stacklevel=2,
+                )
+
+            # --- invalid value checks ---
+            if self.vmin is not None and self.vmax is not None:
+                validate_gt(self.vmax, self.vmin, "vmax", geq=False)
+            validate_gt(self.lower_quantile, 0, "lower_quantile", geq=True)
+            validate_gt(self.upper_quantile, self.lower_quantile, "upper_quantile")
+            validate_lt(self.upper_quantile, 1.0, "upper_quantile", leq=True)
+            if self.upper_quantile > 1.0:
+                raise ValueError(f"upper_quantile must be <= 1, got {self.upper_quantile}.")
+            if self.half_range is not None:
+                validate_gt(self.half_range, 0, "half_range", geq=True)
+            validate_gt(self.power, 0, "power")
+            validate_gt(self.logarithmic_index, 0, "logarithmic_index")
+            validate_gt(self.asinh_linear_range, 0, "asinh_linear_range")
 
         def to_config(self) -> NormalizationConfig:
             """Convert to a ``NormalizationConfig``."""
@@ -183,6 +264,13 @@ class ShowParams:
         loc: Literal["lower right", "lower left", "upper right", "upper left"] = "lower right"
         fontsize: int = 12
         bold: bool = False
+
+        def __post_init__(self) -> None:
+            validate_gt(self.sampling, 0, "sampling")
+            if self.length is not None:
+                validate_gt(self.length, 0, "length")
+            validate_gt(self.width_px, 0, "width_px")
+            validate_gt(self.fontsize, 0, "fontsize")
 
         def to_config(self) -> ScalebarConfig:
             """Convert to a ``ScalebarConfig``."""
