@@ -2,7 +2,6 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 from numpy.typing import NDArray
@@ -185,12 +184,11 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
 
-        # TODO: Maybe have the validation in here too.
-        max_val = np.quantile(tilt_stack, 0.95)
         if type(tilt_stack) is not torch.Tensor:
             tilt_stack = torch.from_numpy(tilt_stack)
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
+        max_val = torch.quantile(tilt_stack, 0.95)
 
         # Tilt stack normalization
         tilt_stack = tilt_stack / max_val
