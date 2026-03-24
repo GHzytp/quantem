@@ -16,7 +16,7 @@ class LoggerTomography(LoggerBase):
         self,
         log_dir: str,
         run_prefix: str,
-        run_suffix: str | None = None,
+        run_suffix: str = "",
         log_images_every: int = 10,
     ):
         super().__init__(log_dir, run_prefix, run_suffix, log_images_every)
