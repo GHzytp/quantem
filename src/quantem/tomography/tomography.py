@@ -64,7 +64,7 @@ class Tomography(TomographyOpt, TomographyBase):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         obj_constraints: dict | ObjConstraintsType | None = None,
-        dset_constraints: dict | DatasetConstraintsType = None,
+        dset_constraints: dict | DatasetConstraintsType | None = None,
         num_samples_per_ray: int | list[tuple[int, int]] | None = None,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
