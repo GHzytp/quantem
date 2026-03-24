@@ -1,6 +1,6 @@
 import warnings
 from dataclasses import dataclass, fields
-from typing import Literal, Optional
+from typing import Literal
 
 from quantem.core.utils.validators import validate_gt, validate_lt
 from quantem.core.visualization.custom_normalizations import NormalizationConfig
@@ -74,14 +74,14 @@ class ShowParams:
         >>> ShowParams.Norm.centered(half_range=5)   # centered ± 5, linear
         """
 
-        interval_type: Optional[Literal["quantile", "manual", "centered"]] = None
+        interval_type: Literal["quantile", "manual", "centered"] | None = None
         stretch_type: Literal["linear", "power", "logarithmic", "asinh"] = "linear"
         lower_quantile: float = 0.02
         upper_quantile: float = 0.98
-        vmin: Optional[float] = None
-        vmax: Optional[float] = None
+        vmin: float | None = None
+        vmax: float | None = None
         vcenter: float = 0.0
-        half_range: Optional[float] = None
+        half_range: float | None = None
         power: float = 1.0
         logarithmic_index: float = 1000.0
         asinh_linear_range: float = 0.1
@@ -191,7 +191,7 @@ class ShowParams:
 
         @classmethod
         def centered(
-            cls, vcenter: float = 0.0, half_range: Optional[float] = None, **kw
+            cls, vcenter: float = 0.0, half_range: float | None = None, **kw
         ) -> "ShowParams.Norm":
             """Centered interval + linear stretch."""
             return cls(interval_type="centered", vcenter=vcenter, half_range=half_range, **kw)
@@ -257,7 +257,7 @@ class ShowParams:
 
         sampling: float = 1.0
         units: str = "pixels"
-        length: Optional[float] = None
+        length: float | None = None
         width_px: float = 1
         pad_px: float = 0.5
         color: str = "white"

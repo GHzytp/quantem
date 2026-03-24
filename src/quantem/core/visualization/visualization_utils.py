@@ -1,7 +1,8 @@
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, cast
 
 import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 from colorspacious import cspace_convert
 from matplotlib import cm, colors, legend, ticker
@@ -18,9 +19,9 @@ from quantem.core.visualization.custom_normalizations import CustomNormalization
 
 def array_to_rgba(
     scaled_amplitude: NDArray,
-    scaled_angle: Optional[NDArray] = None,
+    scaled_angle: NDArray | None = None,
     *,
-    cmap: Union[str, colors.Colormap] = "gray",
+    cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1,
 ) -> NDArray:
     """Convert amplitude and angle arrays to an RGBA color array.
@@ -73,7 +74,7 @@ def array_to_rgba(
 
 
 def list_of_arrays_to_rgba(
-    list_of_arrays: List[NDArray],
+    list_of_arrays: list[NDArray],
     *,
     norm: CustomNormalization = CustomNormalization(),
     chroma_boost: float = 1,
@@ -147,11 +148,11 @@ class ScalebarConfig:
 
     sampling: float = 1.0
     units: str = "pixels"
-    length: Optional[float] = None
+    length: float | None = None
     width_px: float = 1
     pad_px: float = 0.5
     color: str = "white"
-    loc: Union[str, int] = "lower right"
+    loc: str | int = "lower right"
     fontsize: int = 12
     bold: bool = False
 
@@ -162,7 +163,7 @@ SCALEBAR_KWARGS = [
 ]
 
 
-def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
+def _resolve_scalebar(cfg: Any, **kwargs) -> ScalebarConfig | None:
     """Resolve various input types to a ScalebarConfig object.
 
     Parameters
@@ -204,7 +205,7 @@ def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
         )
 
 
-def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, float]:
+def estimate_scalebar_length(length: float, sampling: float) -> tuple[float, float]:
     """Estimate an appropriate scale bar length based on data dimensions.
 
     This function calculates a "nice" scale bar length that is a multiple of
@@ -277,12 +278,12 @@ def add_scalebar_to_ax(
     ax: Axes,
     array_size: float,
     sampling: float,
-    length_units: Optional[float],
+    length_units: float | None,
     units: str,
     width_px: float,
     pad_px: float,
     color: str,
-    loc: Union[str, int],
+    loc: str | int,
     fontsize: int = 12,
     bold: bool = True,
 ) -> None:
@@ -444,7 +445,7 @@ def add_arg_cbar_to_ax(
     return cb_angle
 
 
-def turbo_black(num_colors: int = 256, fade_len: Optional[int] = None) -> colors.ListedColormap:
+def turbo_black(num_colors: int = 256, fade_len: int | None = None) -> colors.ListedColormap:
     """Create a modified version of the 'turbo' colormap that fades to black.
 
     This function creates a colormap based on the 'turbo' colormap but with
@@ -483,12 +484,12 @@ except ValueError:
 
 
 def bilinear_histogram_2d(
-    shape: Tuple[int, int],
+    shape: tuple[int, int],
     x: NDArray,
     y: NDArray,
     weight: NDArray,
-    origin: Tuple[float, float] = (0.0, 0.0),
-    sampling: Tuple[float, float] = (1.0, 1.0),
+    origin: tuple[float, float] = (0.0, 0.0),
+    sampling: tuple[float, float] = (1.0, 1.0),
     statistic: str = "sum",
 ) -> NDArray:
     """Create a 2D histogram with bilinear binning.
@@ -533,7 +534,7 @@ def bilinear_histogram_2d(
         )
 
     # Convert shape tuple to list for binned_statistic_2d
-    bins: Sequence[int] = [Nx, Ny]
+    bins: list[int] = [Nx, Ny]
     hist, _, _, _ = binned_statistic_2d(
         x,
         y,
@@ -568,7 +569,7 @@ def axes_with_inset(
     - Fractional inset by default (relative to main axes size).
     - Only the inset axes background is set to black (main axes stays default).
     """
-    fig, ax_main = mpl.pyplot.subplots(1, 1, figsize=axsize)
+    fig, ax_main = plt.subplots(1, 1, figsize=axsize)
 
     # lazy import here (some environments need it this way)
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes

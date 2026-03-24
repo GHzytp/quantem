@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import Any, cast
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib import colors
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from numpy.typing import NDArray
@@ -30,22 +31,19 @@ from quantem.core.visualization.visualization_utils import (
     list_of_arrays_to_rgba,
 )
 
-if TYPE_CHECKING:
-    import torch
-
-ArrayLike = Union[NDArray, "torch.Tensor"]
+ArrayLike = NDArray | torch.Tensor
 
 
 def _show_2d_array(
     array: NDArray,
     *,
-    norm: Optional[Union[NormalizationConfig, ShowParams.Norm, dict, str]] = None,
-    scalebar: Optional[Union[ScalebarConfig, ShowParams.Scalebar, dict, bool]] = None,
-    cmap: Union[str, colors.Colormap] = "gray",
+    norm: NormalizationConfig | ShowParams.Norm | dict | str | None = None,
+    scalebar: ScalebarConfig | ShowParams.Scalebar | dict | bool | None = None,
+    cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
-    title: Optional[str] = None,
-    figax: Optional[tuple[Any, Any]] = None,
+    title: str | None = None,
+    figax: tuple[Any, Any] | None = None,
     figsize: tuple[int, int] = (8, 8),
     show_ticks: bool = False,
     **kwargs: Any,
@@ -173,14 +171,14 @@ def _show_2d_array(
 def _show_2d_combined(
     list_of_arrays: Sequence[NDArray],
     *,
-    norm: Optional[Union[NormalizationConfig, ShowParams.Norm, dict, str]] = None,
-    scalebar: Optional[Union[ScalebarConfig, ShowParams.Scalebar, dict, bool]] = None,
-    cmap: Union[str, colors.Colormap] = "gray",
+    norm: NormalizationConfig | ShowParams.Norm | dict | str | None = None,
+    scalebar: ScalebarConfig | ShowParams.Scalebar | dict | bool | None = None,
+    cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
-    figax: Optional[tuple[Any, Any]] = None,
+    figax: tuple[Any, Any] | None = None,
     figsize: tuple[int, int] = (8, 8),
-    title: Optional[str] = None,
+    title: str | None = None,
     show_ticks: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
@@ -285,7 +283,7 @@ def _show_2d_combined(
 
 
 def _normalize_show_input_to_grid(
-    arrays: Any,  # Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
+    arrays: Any,  # NDArray | Sequence[NDArray] | Sequence[Sequence[NDArray]]
 ) -> list[list[NDArray]]:
     """Convert various input formats to a consistent grid format for visualization.
 
