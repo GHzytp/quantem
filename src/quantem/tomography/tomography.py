@@ -324,26 +324,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
                     )
         if show_metrics and self.world_size == 1:
-            fig, ax = plt.subplots(figsize=(10, 4), ncols=2)
-
-            ax[0].plot(self._epoch_losses, label="Total Training Loss")
-            if len(self._val_losses) > 0:
-                ax[0].plot(self._val_losses, label="Validation Loss")
-            ax[0].legend()
-
-            for key, value in self._lrs.items():
-                ax[1].plot(value, label=key)
-
-            ax[1].legend()
-            ax[0].legend()
-            ax[0].set_yscale("log")
-            ax[1].set_yscale("log")
-            ax[0].set_xlabel("Epoch")
-            ax[1].set_xlabel("Epoch")
-            ax[0].set_ylabel("Loss")
-            ax[1].set_ylabel("Learning Rate")
-
-            fig.tight_layout()
+            self.plot_losses()
 
     # --- Helper Functions ---
 
@@ -411,6 +392,26 @@ class Tomography(TomographyOpt, TomographyBase):
             skip=skip,
             compression_level=compression_level,
         )
+
+    def plot_losses(self):
+        fig, ax = plt.subplots(figsize=(10, 4), ncols=2)
+
+        ax[0].plot(self._epoch_losses, label="Total Training Loss")
+        if len(self._val_losses) > 0:
+            ax[0].plot(self._val_losses, label="Validation Loss")
+        ax[0].legend()
+
+        for key, value in self._lrs.items():
+            ax[1].plot(value, label=key)
+
+        ax[1].legend()
+        ax[0].legend()
+        ax[0].set_yscale("log")
+        ax[1].set_yscale("log")
+        ax[0].set_xlabel("Epoch")
+        ax[1].set_xlabel("Epoch")
+        ax[0].set_ylabel("Loss")
+        ax[1].set_ylabel("Learning Rate")
 
 
 class TomographyConventional(TomographyBase):
@@ -498,13 +499,7 @@ class TomographyConventional(TomographyBase):
                 break
 
         if show_metrics:
-            fig, ax = plt.subplots()
-            ax.plot(self._epoch_losses)
-            ax.set_xlabel("Iteration")
-            ax.set_ylabel("Loss")
-            ax.set_title("Reconstruction Loss")
-            ax.set_yscale("log")
-            plt.show()
+            self.plot_losses()
 
     # --- Conventional reconstruction method ---
     def _adaptive_relaxation(self, n_power_iter: int = 10) -> float:
@@ -585,3 +580,14 @@ class TomographyConventional(TomographyBase):
         loss = torch.mean(torch.abs(error))
 
         return proj_forward, loss
+
+    # --- Helper Functions ---
+
+    def plot_losses(self):
+        fig, ax = plt.subplots()
+        ax.plot(self._epoch_losses)
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Loss")
+        ax.set_title("Reconstruction Loss")
+        ax.set_yscale("log")
+        plt.show()
