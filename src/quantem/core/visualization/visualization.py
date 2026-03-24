@@ -28,7 +28,7 @@ from quantem.core.visualization.visualization_utils import (
     add_cbar_to_ax,
     add_scalebar_to_ax,
     array_to_rgba,
-    list_of_arrays_to_rgba,
+    combine_arrays_to_rgba,
 )
 
 ArrayLike = NDArray | torch.Tensor
@@ -233,7 +233,7 @@ def _show_2d_combined(
         lower_quantile=norm_config.lower_quantile,
         upper_quantile=norm_config.upper_quantile,
         vmin=norm_config.vmin,
-        vmax=norm_config.vmin,
+        vmax=norm_config.vmax,
         vcenter=norm_config.vcenter,
         half_range=norm_config.half_range,
         power=norm_config.power,
@@ -243,7 +243,7 @@ def _show_2d_combined(
 
     # Convert Sequence to list for list_of_arrays_to_rgba
     list_of_arrays_list = list(list_of_arrays)
-    rgba = list_of_arrays_to_rgba(
+    rgba = combine_arrays_to_rgba(
         list_of_arrays_list,
         norm=norm_obj,
         chroma_boost=chroma_boost,

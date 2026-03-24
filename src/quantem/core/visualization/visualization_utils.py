@@ -73,7 +73,7 @@ def array_to_rgba(
     return rgba
 
 
-def list_of_arrays_to_rgba(
+def combine_arrays_to_rgba(
     list_of_arrays: list[NDArray],
     *,
     norm: CustomNormalization = CustomNormalization(),
