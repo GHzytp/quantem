@@ -443,6 +443,7 @@ class TomographyConventional(TomographyBase):
         reset: bool = False,
         inline_alignment: bool = False,
         smoothing_sigma: float | None = None,
+        show_metrics: bool = False,
     ):
         if obj_constraints is not None:
             if isinstance(obj_constraints, dict):
@@ -490,6 +491,15 @@ class TomographyConventional(TomographyBase):
 
             if mode == "fbp":
                 break
+
+        if show_metrics:
+            fig, ax = plt.subplots()
+            ax.plot(self._epoch_losses)
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel("Loss")
+            ax.set_title("Reconstruction Loss")
+            ax.set_yscale("log")
+            plt.show()
 
     # --- Conventional reconstruction method ---
     def _adaptive_relaxation(self, n_power_iter: int = 10) -> float:
