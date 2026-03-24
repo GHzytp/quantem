@@ -10,20 +10,11 @@ from scipy.special import comb
 from tqdm.auto import tqdm
 
 from quantem.core.utils.imaging_utils import cross_correlation_shift
+from quantem.core.utils.utils import to_numpy
 from quantem.core.visualization import show_2d
 
 ImageType = NDArray[Any]
 BoolArray = NDArray[np.bool_]
-
-
-def _as_array(x: ImageType) -> NDArray[Any]:
-    return (
-        x.array
-        if isinstance(
-            x,
-        )
-        else np.asarray(x)
-    )
 
 
 def _bernstein_basis_1d(n: int, t: NDArray[Any]) -> NDArray[Any]:
@@ -66,7 +57,7 @@ def background_subtract(
     - If `True`: (ImageType, numpy.ndarray, numpy.ndarray[bool])
       where background and mask are always NumPy.
     """
-    im = _as_array(image).astype(float, copy=True)
+    im = to_numpy(image).astype(float, copy=True)
     if im.ndim != 2:
         raise ValueError("`image` must be 2D")
 
