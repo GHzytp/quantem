@@ -52,7 +52,8 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._lrs: dict[str, float] = {}
         # DDP Initialization
         if isinstance(obj_model, ObjectINR):
-            print("Setting up DDP for obj_model")
+            if self.global_rank == 0:
+                print("Setting up DDP for obj_model")
             self.setup_distributed(device=device)
 
         self.dset = dset
