@@ -102,7 +102,7 @@ class DDPMixin:
             pin_memory=pin_mem,
             drop_last=True,
             persistent_workers=persist,
-            multiprocessing_context="forkserver",
+            multiprocessing_context="spawn",
             worker_init_fn=worker_init_fn,
         )
 
@@ -116,7 +116,7 @@ class DDPMixin:
                 pin_memory=pin_mem,
                 drop_last=False,
                 persistent_workers=persist,
-                multiprocessing_context="forkserver",
+                multiprocessing_context="spawn",
                 worker_init_fn=worker_init_fn,
             )
             val_dataloader = val_dataloader
