@@ -230,7 +230,7 @@ def centering_com_alignment(image_stack):
 
 def differentiable_shift_2d(image, shift_x, shift_y, sampling_rate):
     """
-    Shifts a 2D image using grid_sample in a differentiable manner.
+    Shifts a 2D image using grid_sample in a differentiable manner with boundary conditions applied.
 
     Args:
         image: Tensor of shape [H, W]
