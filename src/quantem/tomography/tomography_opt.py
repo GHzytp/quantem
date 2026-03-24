@@ -1,6 +1,8 @@
+from collections.abc import Mapping
+
 import torch
 
-from quantem.core.ml.optimizer_mixin import OptimizerParams, OptimizerType
+from quantem.core.ml.optimizer_mixin import OptimizerParams, OptimizerType, SchedulerType
 from quantem.tomography.tomography_base import TomographyBase
 
 
@@ -25,7 +27,7 @@ class TomographyOpt(TomographyBase):
             raise ValueError(f"Unknown optimization key: {key}")
 
     @property
-    def optimizer_params(self) -> dict[str, dict]:
+    def optimizer_params(self) -> dict[str, OptimizerType]:
         return {
             key: params
             for key, params in [
@@ -57,10 +59,14 @@ class TomographyOpt(TomographyBase):
 
     @property
     def optimizers(self) -> dict[str, torch.optim.Optimizer]:
-        return {
-            "object": self.obj_model.optimizer,
-            "pose": self.dset.optimizer,
-        }
+        optimizers = {}
+
+        if self.obj_model.optimizer is not None:
+            optimizers["object"] = self.obj_model.optimizer
+        if self.dset.optimizer is not None:
+            optimizers["pose"] = self.dset.optimizer
+
+        return optimizers
 
     def set_optimizers(self):
         for key, params in self.optimizer_params.items():
@@ -94,7 +100,7 @@ class TomographyOpt(TomographyBase):
             raise ValueError(f"Unknown optimization key: {key}")
 
     @property
-    def scheduler_params(self) -> dict[str, dict]:
+    def scheduler_params(self) -> dict[str, SchedulerType]:
         """Returns the parameters used to set the schedulers."""
         return {
             "object": self.obj_model.scheduler_params,
@@ -129,7 +135,9 @@ class TomographyOpt(TomographyBase):
 
         return schedulers
 
-    def set_schedulers(self, params: dict[str, dict], num_iter: int | None = None):
+    def set_schedulers(
+        self, params: Mapping[str, SchedulerType | dict], num_iter: int | None = None
+    ):
         for key, scheduler_params in params.items():
             if key == "object":
                 self.obj_model.set_scheduler(scheduler_params, num_iter=num_iter)
