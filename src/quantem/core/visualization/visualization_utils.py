@@ -247,31 +247,92 @@ def estimate_scalebar_length(length: float, sampling: float) -> tuple[float, flo
 
 def _normalize_length_units(length_units: float, units: str) -> tuple[float, str]:
     """
-    pick intelligent units for the scalebar length
+    Pick intelligent units for the scalebar length. Handles both direct and inverse units.
     """
-    if units in ["A", "Å", "angstrom", "Angstrom"]:
-        length_A = length_units
-    elif units in ["nm", "nanometer", "nanometre"]:
-        length_A = length_units * 10
-    elif units in ["um", "μm", "micrometer", "micrometre"]:
-        length_A = length_units * 1e4
-    elif units in ["mm", "millimeter", "millimetre"]:
-        length_A = length_units * 1e7
-    elif units in ["cm", "centimeter", "centimetre"]:
-        length_A = length_units * 1e8
-    else:
-        return length_units, units
+    inverse_unit_map = {
+        "1/A": "$\\mathrm{Å}^{-1}$",
+        "1/Å": "$\\mathrm{Å}^{-1}$",
+        "A^-1": "$\\mathrm{Å}^{-1}$",
+        "1/angstrom": "$\\mathrm{Å}^{-1}$",
+        "1/Angstrom": "$\\mathrm{Å}^{-1}$",
+        "1/nm": "$\\mathrm{nm}^{-1}$",
+        "1/nanometer": "$\\mathrm{nm}^{-1}$",
+        "1/nanometre": "$\\mathrm{nm}^{-1}$",
+    }
+    direct_unit_map = {
+        "A": "Å",
+        "Å": "Å",
+        "angstrom": "Å",
+        "Angstrom": "Å",
+        "nm": "nm",
+        "nanometer": "nm",
+        "nanometre": "nm",
+        "um": "μm",
+        "μm": "μm",
+        "micrometer": "μm",
+        "micrometre": "μm",
+        "micron": "μm",
+        "mm": "mm",
+        "millimeter": "mm",
+        "millimetre": "mm",
+        "cm": "cm",
+        "centimeter": "cm",
+        "centimetre": "cm",
+        "m": "m",
+        "meter": "m",
+        "metre": "m",
+    }
 
-    if length_A < 0.1:
-        return length_A * 100, "pm"
-    elif length_A < 10:
-        return length_A, "Å"
-    elif length_A < 3e4:
-        return length_A / 10, "nm"
-    elif length_A < 1e7:
-        return length_A / 1e4, "μm"
-    else:
-        return length_A / 1e7, "mm"
+    # Handle inverse units first
+    if units in inverse_unit_map:
+        # Convert everything to 1/Å then scale
+        units = inverse_unit_map[units]
+        if units == "$\\mathrm{Å}^{-1}$":
+            length_invA = length_units
+        else:  # units == "$\\mathrm{nm}^{-1}$":
+            length_invA = length_units / 10
+
+        if length_invA < 0.1:
+            return length_invA * 10, "$\\mathrm{nm}^{-1}$"
+        elif length_invA < 100:
+            return length_invA, "$\\mathrm{Å}^{-1}$"
+        else:  # length_invA >= 10:
+            return length_invA / 100, "$\\mathrm{pm}^{-1}$"
+
+    # Handle direct metric units (distance)
+    if units in direct_unit_map:
+        # Everything to Å
+        if units in ["A", "Å", "angstrom", "Angstrom"]:
+            length_A = length_units
+        elif units in ["nm", "nanometer", "nanometre"]:
+            length_A = length_units * 10
+        elif units in ["um", "μm", "micrometer", "micrometre", "micron"]:
+            length_A = length_units * 1e4
+        elif units in ["mm", "millimeter", "millimetre"]:
+            length_A = length_units * 1e7
+        elif units in ["cm", "centimeter", "centimetre"]:
+            length_A = length_units * 1e8
+        elif units in ["m", "meter", "metre"]:
+            length_A = length_units * 1e10
+        else:
+            # fallback, should not happen due to keys in direct_unit_map
+            return length_units, units
+
+        if length_A <= 0.1:
+            return length_A * 100, "pm"
+        elif length_A < 10:
+            return length_A, "Å"
+        elif length_A < 1e4:
+            return length_A / 10, "nm"
+        elif length_A < 1e7:
+            return length_A / 1e4, "μm"
+        elif length_A < 1e10:
+            return length_A / 1e7, "mm"
+        else:
+            return length_A / 1e10, "m"
+
+    # fallback: unknown unit, return as is
+    return length_units, units
 
 
 def add_scalebar_to_ax(
@@ -336,6 +397,7 @@ def add_scalebar_to_ax(
 
     fontprops = FontProperties(size=fontsize, weight="bold" if bold else "normal")
 
+    label_top = loc[:3] == "low"
     bar = AnchoredSizeBar(
         ax.transData,
         length_px,
@@ -344,9 +406,10 @@ def add_scalebar_to_ax(
         pad=pad_px,
         color=color,
         frameon=False,
-        label_top=loc[:3] == "low",
+        label_top=label_top,
         size_vertical=int(width_px),
         fontproperties=fontprops,
+        sep=2 if label_top else int(round(0.3 * fontsize)),
     )
     ax.add_artist(bar)
 

@@ -131,10 +131,10 @@ def _show_2d_array(
 
     ax.imshow(rgba, interpolation=config.get("viz.interpolation"))
 
-    if show_ticks:
-        ax.set(title=title)
-    else:
-        ax.set(xticks=[], yticks=[], title=title)
+    if title is not None:
+        ax.set_title(title, fontsize=kwargs.get("title_fontsize", 12))
+    if not show_ticks:
+        ax.set(xticks=[], yticks=[])
 
     if cbar:
         divider = make_axes_locatable(ax)
@@ -258,10 +258,10 @@ def _show_2d_combined(
 
     ax.imshow(rgba, interpolation=config.get("viz.interpolation"))
 
-    if show_ticks:
-        ax.set(title=title)
-    else:
-        ax.set(xticks=[], yticks=[], title=title)
+    if title is not None:
+        ax.set_title(title, fontsize=kwargs.get("title_fontsize", 12))
+    if not show_ticks:
+        ax.set(xticks=[], yticks=[])
 
     if cbar:
         raise NotImplementedError()
@@ -415,7 +415,10 @@ def _normalize_show_args_to_grid(
     | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
     | Sequence[Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]]
     | None = None,
-    cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
+    cmap: str
+    | colors.Colormap
+    | Sequence[str | colors.Colormap]
+    | Sequence[Sequence[str | colors.Colormap]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     chroma_boost: float | Sequence[float] = 1.0,
@@ -468,7 +471,10 @@ def show_2d(
     | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
     | Sequence[Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]]
     | None = None,
-    cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
+    cmap: str
+    | colors.Colormap
+    | Sequence[str | colors.Colormap]
+    | Sequence[Sequence[str | colors.Colormap]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     figax: tuple[Any, Any] | None = None,
