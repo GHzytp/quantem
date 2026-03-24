@@ -139,6 +139,10 @@ class ScalebarConfig:
     loc : str or int, default="lower right"
         Location of the scale bar on the plot. Can be a string like "lower right"
         or an integer location code.
+    fontsize : int, default=12
+        Font size of the scale bar label in points.
+    bold : bool, default=True
+        Whether to render the scale bar label in bold.
     """
 
     sampling: float = 1.0
@@ -148,6 +152,8 @@ class ScalebarConfig:
     pad_px: float = 0.5
     color: str = "white"
     loc: Union[str, int] = "lower right"
+    fontsize: int = 12
+    bold: bool = False
 
 
 SCALEBAR_KWARGS = [
@@ -190,8 +196,12 @@ def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
         return ScalebarConfig(**cfg)
     elif isinstance(cfg, ScalebarConfig):
         return cfg
+    elif hasattr(cfg, "to_config"):
+        return cfg.to_config()
     else:
-        raise TypeError("scalebar must be None, dict, bool, or ScalebarConfig")
+        raise TypeError(
+            "scalebar must be None, dict, bool, ScalebarConfig, or ShowParams.Scalebar"
+        )
 
 
 def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, float]:
@@ -273,6 +283,8 @@ def add_scalebar_to_ax(
     pad_px: float,
     color: str,
     loc: Union[str, int],
+    fontsize: int = 12,
+    bold: bool = True,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -297,7 +309,13 @@ def add_scalebar_to_ax(
         Color of the scale bar.
     loc : str or int
         Location of the scale bar on the plot.
+    fontsize : int
+        Font size of the scale bar label in points.
+    bold : bool
+        Whether to render the scale bar label in bold.
     """
+    from matplotlib.font_manager import FontProperties
+
     if length_units is None:
         length_units, length_px = estimate_scalebar_length(array_size, sampling)
     else:
@@ -315,6 +333,8 @@ def add_scalebar_to_ax(
         loc_strings = {v: k for k, v in loc_codes.items()}
         loc = loc_strings[loc]
 
+    fontprops = FontProperties(size=fontsize, weight="bold" if bold else "normal")
+
     bar = AnchoredSizeBar(
         ax.transData,
         length_px,
@@ -324,7 +344,8 @@ def add_scalebar_to_ax(
         color=color,
         frameon=False,
         label_top=loc[:3] == "low",
-        size_vertical=int(width_px),  # Convert to int as required by AnchoredSizeBar
+        size_vertical=int(width_px),
+        fontproperties=fontprops,
     )
     ax.add_artist(bar)
 

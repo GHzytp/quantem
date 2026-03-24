@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import os
 import warnings
 from collections.abc import Sequence
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -17,6 +19,7 @@ from quantem.core.visualization.custom_normalizations import (
     NormalizationConfig,
     _resolve_normalization,
 )
+from quantem.core.visualization.show_params import ShowParams
 from quantem.core.visualization.visualization_utils import (
     ScalebarConfig,
     _resolve_scalebar,
@@ -27,12 +30,17 @@ from quantem.core.visualization.visualization_utils import (
     list_of_arrays_to_rgba,
 )
 
+if TYPE_CHECKING:
+    import torch
+
+ArrayLike = Union[NDArray, "torch.Tensor"]
+
 
 def _show_2d_array(
     array: NDArray,
     *,
-    norm: Optional[Union[NormalizationConfig, dict, str]] = None,
-    scalebar: Optional[Union[ScalebarConfig, dict, bool]] = None,
+    norm: Optional[Union[NormalizationConfig, ShowParams.Norm, dict, str]] = None,
+    scalebar: Optional[Union[ScalebarConfig, ShowParams.Scalebar, dict, bool]] = None,
     cmap: Union[str, colors.Colormap] = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
@@ -151,6 +159,8 @@ def _show_2d_array(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.fontsize,
+            scalebar_config.bold,
         )
 
     for spine in ax.spines.values():  # fixes asymmetry of bbox for some reason
@@ -163,8 +173,8 @@ def _show_2d_array(
 def _show_2d_combined(
     list_of_arrays: Sequence[NDArray],
     *,
-    norm: Optional[Union[NormalizationConfig, dict, str]] = None,
-    scalebar: Optional[Union[ScalebarConfig, dict, bool]] = None,
+    norm: Optional[Union[NormalizationConfig, ShowParams.Norm, dict, str]] = None,
+    scalebar: Optional[Union[ScalebarConfig, ShowParams.Scalebar, dict, bool]] = None,
     cmap: Union[str, colors.Colormap] = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
@@ -267,6 +277,8 @@ def _show_2d_combined(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.fontsize,
+            scalebar_config.bold,
         )
 
     return fig, ax
@@ -389,8 +401,18 @@ def _norm_show_args(
 
 def _normalize_show_args_to_grid(
     shape: tuple[int, int],
-    norm: NormalizationConfig | dict | str | Sequence[dict | str] | None = None,
-    scalebar: ScalebarConfig | dict | bool | Sequence[bool | dict | None] | None = None,
+    norm: NormalizationConfig
+    | ShowParams.Norm
+    | dict
+    | str
+    | Sequence[NormalizationConfig | ShowParams.Norm | dict | str]
+    | None = None,
+    scalebar: ScalebarConfig
+    | ShowParams.Scalebar
+    | dict
+    | bool
+    | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
+    | None = None,
     cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
@@ -425,14 +447,22 @@ def _normalize_show_args_to_grid(
 
 
 def show_2d(
-    arrays: Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
+    arrays: ArrayLike | Sequence[ArrayLike] | Sequence[Sequence[ArrayLike]],
     *,
-    norm: NormalizationConfig
+    norm: (
+        NormalizationConfig
+        | ShowParams.Norm
+        | dict
+        | str
+        | Sequence[NormalizationConfig | ShowParams.Norm | dict | str]
+        | None
+    ) = None,
+    scalebar: ScalebarConfig
+    | ShowParams.Scalebar
     | dict
-    | str
-    | Sequence[dict | str]
-    | None = None,  # TODO: Revamp NormalizationConfig, ScalebarConfig with Dataclasses
-    scalebar: ScalebarConfig | dict | bool | Sequence[bool | dict | None] | None = None,
+    | bool
+    | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
+    | None = None,
     cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
