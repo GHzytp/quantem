@@ -49,7 +49,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._epoch_losses: list[float] = []
         self._consistency_losses: list[float] = []
         self._val_losses: list[float] = []
-        self._lrs: dict[str, float] = {}
+        self._lrs: dict[str, list] = {}
         # DDP Initialization
         if isinstance(obj_model, ObjectINR):
             self.setup_distributed(device=device)
@@ -128,7 +128,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         return np.array(self._consistency_losses)
 
     @property
-    def learning_rates(self) -> dict[str, float]:
+    def learning_rates(self) -> dict[str, list]:
         """
         Returns the learning rates for each epoch ran.
         """

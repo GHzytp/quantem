@@ -76,7 +76,7 @@ class TomographyLiteINR(Tomography):
 
         return tomography
 
-    def reconstruct(
+    def reconstruct(  # type:ignore[reportIncompatibleMethodOverride] ## easier than overloads
         self,
         num_iter: int = 10,
         reset: bool = False,
