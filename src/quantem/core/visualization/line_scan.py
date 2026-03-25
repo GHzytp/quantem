@@ -19,7 +19,7 @@ def linescan(
     sampling: tuple[float, float] | np.ndarray | None = None,
     sampling_units: str | None = None,
     **kwargs,
-) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, tuple[Any, Any]]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Generate a line scan through an image.
 
@@ -111,7 +111,7 @@ def linescan(
         sampling_units = "pixels"
 
     if show:
-        fig, axs = _show_linescan(
+        _fig, _axs = _show_linescan(
             scan_image,
             profile,
             positions,
@@ -121,13 +121,8 @@ def linescan(
             sampling_units,
             **kwargs,
         )
-    else:
-        fig, axs = None, None
 
-    if kwargs.get("return_fig", False) and show:
-        return positions, profile, (fig, axs)
-    else:
-        return positions, profile
+    return positions, profile
 
 
 def _calculate_line_endpoints(

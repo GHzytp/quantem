@@ -499,7 +499,7 @@ def add_arg_cbar_to_ax(
     cb_angle = fig.colorbar(sm, cax=cax)
 
     cb_angle.set_label("arg", rotation=0, ha="center", va="bottom")
-    cb_angle.ax.yaxis.set_label_coords(0.5, -0.05)
+    cb_angle.ax.yaxis.set_label_coords(0.5, -0.07)
     cb_angle.set_ticks([-np.pi, -np.pi / 2, 0, np.pi / 2, np.pi])
     cb_angle.set_ticklabels(
         [r"$-\pi$", r"$-\dfrac{\pi}{2}$", "$0$", r"$\dfrac{\pi}{2}$", r"$\pi$"]

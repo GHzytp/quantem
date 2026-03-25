@@ -144,10 +144,10 @@ def _show_2d_array(
         cb_abs = add_cbar_to_ax(fig, ax_cb_abs, norm_obj, cmap_obj)
 
         if is_complex:
-            ax_cb_angle = divider.append_axes("right", size="5%", pad="10%")
+            ax_cb_angle = divider.append_axes("right", size="5%", pad="15%")
             add_arg_cbar_to_ax(fig, ax_cb_angle, chroma_boost=chroma_boost)
             cb_abs.set_label("abs", rotation=0, ha="center", va="bottom")
-            cb_abs.ax.yaxis.set_label_coords(0.5, -0.05)
+            cb_abs.ax.yaxis.set_label_coords(0.5, -0.07)
 
     if scalebar_config is not None:
         add_scalebar_to_ax(
