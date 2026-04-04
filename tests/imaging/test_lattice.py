@@ -76,16 +76,16 @@ class TestLatticeImage:
             lattice.image = np.array([1, 2, 3])
 
 
-class TestDefineLattice:
-    """Test define_lattice method."""
+class TestDefineLatticeVectors:
+    """Test define_lattice_vectors method."""
 
     def test_basic_define(self):
         """Test basic lattice definition."""
         image = np.random.randn(100, 100)
         lattice = Lattice.from_data(image)
 
-        result = lattice.define_lattice(
-            origin=[50, 50], u=[5, 0], v=[0, 5], refine_lattice=False, plot_lattice=False
+        result = lattice.define_lattice_vectors(
+            origin=[50, 50], u=[5, 0], v=[0, 5], refine_lattice=False
         )
 
         assert result is lattice
@@ -98,25 +98,23 @@ class TestDefineLattice:
         lattice = Lattice.from_data(image)
 
         # With refinement
-        lattice.define_lattice(
+        lattice.define_lattice_vectors(
             origin=[50, 50],
             u=[5, 0],
             v=[0, 5],
             refine_lattice=True,
             refine_maxiter=5,
-            plot_lattice=False,
         )
         assert lattice._lat.shape == (3, 2)
 
         # With block_size
-        lattice.define_lattice(
+        lattice.define_lattice_vectors(
             origin=[50, 50],
             u=[5, 0],
             v=[0, 5],
             refine_lattice=True,
             refine_maxiter=5,
             block_size=5,
-            plot_lattice=False,
         )
         assert lattice._lat.shape == (3, 2)
 
@@ -127,13 +125,11 @@ class TestDefineLattice:
 
         # Wrong shape
         with pytest.raises(ValueError):
-            lattice.define_lattice(origin=[1, 2, 3], u=[5, 0], v=[0, 5], plot_lattice=False)
+            lattice.define_lattice_vectors(origin=[1, 2, 3], u=[5, 0], v=[0, 5])
 
         # Negative block_size
         with pytest.raises(ValueError):
-            lattice.define_lattice(
-                origin=[50, 50], u=[5, 0], v=[0, 5], block_size=-1, plot_lattice=False
-            )
+            lattice.define_lattice_vectors(origin=[50, 50], u=[5, 0], v=[0, 5], block_size=-1)
 
 
 class TestLatticeSerialize:
@@ -145,9 +141,7 @@ class TestLatticeSerialize:
         # Create lattice with image and defined lattice
         image = np.random.randn(100, 100)
         lattice = Lattice.from_data(image)
-        lattice.define_lattice(
-            origin=[50, 50], u=[5, 0], v=[0, 5], refine_lattice=False, plot_lattice=False
-        )
+        lattice.define_lattice_vectors(origin=[50, 50], u=[5, 0], v=[0, 5], refine_lattice=False)
 
         # Save
         filepath = tmp_path / ("lattice.zip" if store == "zip" else "lattice_dir")

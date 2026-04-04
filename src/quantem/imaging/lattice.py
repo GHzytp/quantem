@@ -1,9 +1,11 @@
+import inspect
+
 import numpy as np
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.visualization import show_2d
+from quantem.imaging.lattice_visualization import PLOT_REGISTRY
 
 
 class Lattice(AutoSerialize):
@@ -121,17 +123,14 @@ class Lattice(AutoSerialize):
                 self._image = Dataset2d(arr)  # type: ignore[call-arg]
 
     ### --- Functions ---
-    def define_lattice(
+    def define_lattice_vectors(
         self,
         origin,
         u,
         v,
         refine_lattice: bool = True,
         block_size: int | None = None,
-        plot_lattice: bool = True,
-        bound_num_vectors: int | None = None,
         refine_maxiter: int = 200,
-        **kwargs,
     ) -> "Lattice":
         """
         Define the lattice for the image using the origin and the u and v vectors starting from the origin.
@@ -156,22 +155,19 @@ class Lattice(AutoSerialize):
             For example, if block_size = 5, then the lattice points will be fit in steps of
             (-5, 5)u * (-5, 5)v -> (-10, 10)u * (-10, 10)v -> ...
             block_size = None means the entire image will be fit at once.
-        plot_lattice : bool, default=True
-            If True, the lattice vectors and lines will be plotted overlaid on the image.
-        bound_num_vectors : int | None, default=None
-            The maximum number of lattice vectors to plot in each direction.
-            For example, if bound_num_vectors = 5, lattice lines between (-5, 5)u * (-5, 5)v will be plotted.
-            If None, the plotting bounds are set to the image edges.
         refine_maxiter : int, default=200
             Maximum number of iterations for the lattice refinement optimizer (Powell method).
-        **kwargs
-            Additional keyword arguments forwarded to the plotting function (show_2d), e.g., cmap, title, etc.
 
         Returns
         -------
         self : Lattice
             Returns the same object, modified in-place.
             The final values of r0, u, v are stored in self._lat.
+
+        Side Effects
+        ------------
+            Creates self._lat with rows corresponding to r0, u and v
+            Sets self.default_plot to "lattice_vectors"
         """
         # Lattice
         self._lat = np.vstack(
@@ -342,162 +338,99 @@ class Lattice(AutoSerialize):
                 lat_flat = res.x
                 self._lat = res.x.reshape(3, 2)
 
-        # plotting
-        if plot_lattice:
-            fig, ax = show_2d(
-                self._image.array,
-                returnfig=True,
-                **kwargs,
-            )
-
-            # Put the image at lowest zorder so overlays sit on top
-            if ax.images:
-                ax.images[-1].set_zorder(0)
-
-            H, W = self._image.shape
-            r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-
-            # Origin marker (TOP of stack)
-            ax.scatter(
-                r0[1],
-                r0[0],  # (y, x)
-                s=60,
-                edgecolor=(0, 0, 0),
-                facecolor=(0, 0.5, 0),
-                marker="s",
-                zorder=30,
-            )
-
-            # Lattice vectors as arrows
-            n_vec = int(bound_num_vectors) if bound_num_vectors is not None else 1
-
-            # draw n_vec arrows for u (red)
-            for k in range(1, n_vec + 1):
-                tip = r0 + k * u
-                ax.arrow(
-                    r0[1],
-                    r0[0],  # base (y, x)
-                    (tip - r0)[1],
-                    (tip - r0)[0],  # delta (y, x)
-                    length_includes_head=True,
-                    head_width=4.0,
-                    head_length=6.0,
-                    linewidth=2.0,
-                    color="red",
-                    zorder=20,
-                )
-
-            # draw n_vec arrows for v (cyan)
-            for k in range(1, n_vec + 1):
-                tip = r0 + k * v
-                ax.arrow(
-                    r0[1],
-                    r0[0],
-                    (tip - r0)[1],
-                    (tip - r0)[0],
-                    length_includes_head=True,
-                    head_width=4.0,
-                    head_length=6.0,
-                    linewidth=2.0,
-                    color=(0.0, 0.7, 1.0),
-                    zorder=20,
-                )
-
-            # Solve for a,b at plot corners (bounds)
-            if bound_num_vectors is None:
-                corners = np.array(
-                    [
-                        [0.0, 0.0],
-                        [float(H), 0.0],
-                        [0.0, float(W)],
-                        [float(H), float(W)],
-                    ]
-                )
-            else:
-                n = float(bound_num_vectors)
-                corners = np.array(
-                    [
-                        r0 - n * u,
-                        r0 - n * v,
-                        r0 + n * u,
-                        r0 + n * v,
-                    ],
-                    dtype=float,
-                )
-
-            # a,b from corners; A = [u v] in columns (2x2), rhs = (corner - r0)
-            A = np.column_stack((u, v))
-            ab = np.linalg.lstsq(A, (corners - r0[None, :]).T, rcond=None)[0]
-
-            a_min, a_max = int(np.floor(np.min(ab[0]))), int(np.ceil(np.max(ab[0])))
-            b_min, b_max = int(np.floor(np.min(ab[1]))), int(np.ceil(np.max(ab[1])))
-
-            # Clipping rectangle (image or custom)
-            if bound_num_vectors is None:
-                x_lo, x_hi = 0.0, float(H)
-                y_lo, y_hi = 0.0, float(W)
-            else:
-                # Bounds are the min/max over the provided corners
-                x_lo, x_hi = float(np.min(corners[:, 0])), float(np.max(corners[:, 0]))
-                y_lo, y_hi = float(np.min(corners[:, 1])), float(np.max(corners[:, 1]))
-
-            def clipped_segment(base: np.ndarray, direction: np.ndarray):
-                """Clip base + t*direction to rectangle [x_lo,x_hi] x [y_lo,y_hi]."""
-                x0, y0 = base
-                dx, dy = direction
-                t0, t1 = -np.inf, np.inf
-                eps = 1e-12
-
-                # x in [x_lo, x_hi]
-                if abs(dx) < eps:
-                    if not (x_lo <= x0 <= x_hi):
-                        return None
-                else:
-                    tx0 = (x_lo - x0) / dx
-                    tx1 = (x_hi - x0) / dx
-                    t_enter, t_exit = (tx0, tx1) if tx0 <= tx1 else (tx1, tx0)
-                    t0, t1 = max(t0, t_enter), min(t1, t_exit)
-
-                # y in [y_lo, y_hi]
-                if abs(dy) < eps:
-                    if not (y_lo <= y0 <= y_hi):
-                        return None
-                else:
-                    ty0 = (y_lo - y0) / dy
-                    ty1 = (y_hi - y0) / dy
-                    t_enter, t_exit = (ty0, ty1) if ty0 <= ty1 else (ty1, ty0)
-                    t0, t1 = max(t0, t_enter), min(t1, t_exit)
-
-                if t0 > t1:
-                    return None
-
-                p1 = base + t0 * direction  # (x, y)
-                p2 = base + t1 * direction
-                return p1, p2
-
-            # Lattice lines (zorder above image)
-            # Using x=rows, y=cols: plot(y, x)
-
-            # Lines parallel to v (vary a)
-            for a in range(a_min, a_max + 1):
-                base = r0 + a * u
-                seg = clipped_segment(base, v)
-                if seg is None:
-                    continue
-                (x1, y1), (x2, y2) = seg
-                ax.plot([y1, y2], [x1, x2], color=(0.0, 0.7, 1.0), lw=1, clip_on=True, zorder=10)
-
-            # Lines parallel to u (vary b)
-            for b in range(b_min, b_max + 1):
-                base = r0 + b * v
-                seg = clipped_segment(base, u)
-                if seg is None:
-                    continue
-                (x1, y1), (x2, y2) = seg
-                ax.plot([y1, y2], [x1, x2], color="red", lw=1, clip_on=True, zorder=10)
-
-            # Axes limits (x=rows vertical; y=cols horizontal)
-            ax.set_xlim(y_lo, y_hi)
-            ax.set_ylim(x_hi, x_lo)
+        self.default_plot = "lattice_vectors"
 
         return self
+
+    ### --- Plot dispatcher ---
+    def plot(self, kind: str | None = None, show_docstring: bool = False, **kwargs):
+        """
+        Dispatch to a registered visualization function.
+
+        The function is selected by ``kind`` if given, otherwise by
+        ``self.default_plot``.  Passing ``kind`` here does not mutate the instance.
+
+        Parameters
+        ----------
+        kind : str | None
+            Name of the plot.  Registered names:
+
+            "image" | "dataset"
+                Shows the image using the default show_2d with no overlays.
+                Default if default_plot is not set.
+
+            "lattice_vectors"
+                Lattice vectors + grid lines overlaid on the image.
+                Call after define_lattice_vectors().
+
+        show_docstring : bool, default False
+            If True, return formatted signature and docstring of the plotting
+            function instead of calling it. If False, call the function and
+            return its result.
+
+        **kwargs
+            Forwarded verbatim to the selected plotting function.
+
+        Returns
+        -------
+        str or function return
+            If ``show_docstring`` is True, returns a formatted string with the
+            function signature and docstring. Otherwise, returns whatever the
+            selected function returns (typically ``(fig, ax)``).
+
+        Raises
+        ------
+        ValueError
+            If ``kind`` or ``self.default_plot`` is not in PLOT_REGISTRY.
+
+        Examples
+        --------
+        ::
+
+            lat.plot(kind="lattice_vectors")
+            lat.plot(kind="lattice_vectors", show_docstring=True)
+        """
+        if not hasattr(self, "default_plot") or kind in ["image", "dataset"]:
+            from quantem.core.visualization import show_2d
+
+            return show_2d(self.image, **kwargs)  # type:ignore
+
+        plot_name = kind if kind is not None else self.default_plot
+        if plot_name not in PLOT_REGISTRY:
+            raise ValueError(
+                f"Unknown plot kind {plot_name!r}. Available: {sorted(PLOT_REGISTRY)}"
+            )
+
+        plot_func = PLOT_REGISTRY[plot_name]
+        if show_docstring:
+            plot_func = PLOT_REGISTRY[plot_name]
+            sig = inspect.signature(plot_func)
+            doc = inspect.getdoc(plot_func)
+
+            if kind is None:
+                print(f"Current default plot: {self.default_plot}")
+
+            print("\nSignature:")
+            # Format signature across multiple lines
+            params = []
+            for param_name, param in sig.parameters.items():
+                params.append(f"    {param}")
+
+            param_str = ",\n".join(params)
+            return_annotation = (
+                f" -> {sig.return_annotation}"
+                if sig.return_annotation != inspect.Signature.empty
+                else ""
+            )
+
+            print(f"def {plot_func.__name__}(\n{param_str}\n){return_annotation}:")
+
+            print("\nDocstring:")
+            if doc:
+                print(doc)
+            else:
+                print("[No docstring]")
+
+            return None
+
+        return plot_func(self, **kwargs)
