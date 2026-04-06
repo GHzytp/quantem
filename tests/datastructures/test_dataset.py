@@ -243,11 +243,14 @@ class TestDatasetMethods:
         cropped_dataset = sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)))
         # Check shape
         assert cropped_dataset.shape == (8, 8)  # Original (10, 10) - 1 from each side
+        assert np.array_equal(cropped_dataset.origin, np.array([1, 1]))
         # Check that the original dataset is unchanged
         assert sample_dataset_2d.shape == (10, 10)
+        assert np.array_equal(sample_dataset_2d.origin, np.array([0, 0]))
         # Test modify_in_place
         sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)), modify_in_place=True)
         assert sample_dataset_2d.shape == (8, 8)
+        assert np.array_equal(sample_dataset_2d.origin, np.array([1, 1]))
 
     def test_crop_4dstem_kspace(self):
         """Test cropping k-space axes of a 4D-STEM dataset."""
@@ -258,15 +261,31 @@ class TestDatasetMethods:
 
     def test_crop_4dstem_realspace_in_place(self):
         """Test in-place real-space crop of a 4D-STEM dataset."""
-        dset = Dataset.from_array(np.random.rand(16, 16, 32, 32))
+        dset = Dataset.from_array(
+            np.random.rand(16, 16, 32, 32),
+            origin=(10, 20, 30, 40),
+            sampling=(0.5, 0.25, 2, 3),
+        )
         dset.crop(crop_widths=((4, 12), (4, 12)), axes=(0, 1), modify_in_place=True)
         assert dset.shape == (8, 8, 32, 32)
+        assert np.array_equal(dset.origin, np.array([12, 21, 30, 40]))
 
     def test_crop_4dstem_stop_zero(self):
         """Test that stop=0 keeps all remaining elements."""
         dset = Dataset.from_array(np.random.rand(8, 8, 96, 96))
         cropped = dset.crop(crop_widths=((10, 0), (10, 0)), axes=(2, 3))
         assert cropped.shape == (8, 8, 86, 86)
+
+    def test_crop_single_axis_updates_origin_in_place(self):
+        """Test in-place single-axis crop updates origin."""
+        dset = Dataset.from_array(
+            np.random.rand(2048, 64),
+            origin=(5, 7),
+            sampling=(0.5, 2),
+        )
+        dset.crop(crop_widths=((80, 2000),), axes=0, modify_in_place=True)
+        assert dset.shape == (1920, 64)
+        assert np.array_equal(dset.origin, np.array([45, 7]))
 
     def test_bin(self, sample_dataset_2d):
         """Test bin method."""

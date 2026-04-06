@@ -511,22 +511,28 @@ class Dataset(AutoSerialize):
             raise ValueError("Length of crop_widths must match length of axes.")
 
         full_slices = []
+        new_origin = self.origin.astype(float).copy()
         crop_dict = dict(zip(axes, crop_widths))
-        for axis, _ in enumerate(self.shape):
+        for axis, axis_size in enumerate(self.shape):
             if axis in crop_dict:
                 before, after = crop_dict[axis]
                 start = before
                 stop = after if after != 0 else None
-                full_slices.append(slice(start, stop))
+                axis_slice = slice(start, stop)
+                normalized_start, _, _ = axis_slice.indices(axis_size)
+                full_slices.append(axis_slice)
+                new_origin[axis] = new_origin[axis] + normalized_start * self.sampling[axis]
             else:
                 full_slices.append(slice(None))
 
         if modify_in_place is False:
             dataset = self.copy()
             dataset.array = dataset.array[tuple(full_slices)]
+            dataset.origin = new_origin
             return dataset
 
         self.array = self.array[tuple(full_slices)]
+        self.origin = new_origin
         return None
 
     @overload
