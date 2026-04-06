@@ -63,7 +63,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             _token=_token,
         )
         self._virtual_images = {}
-        self.dataset_type = "EELS"
+        self.dataset_type = "eels"
 
     def calculate_background_iterative(self, spectrum):
         """

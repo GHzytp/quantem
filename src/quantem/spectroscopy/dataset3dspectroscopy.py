@@ -14,42 +14,8 @@ from quantem.core.visualization import show_2d
 from quantem.spectroscopy.utils import load_xray_lines_database
 
 
-
-def _run_pca(data: NDArray | Any, n_components: int):
-    array = np.asarray(data, dtype=float)
-    n_samples, n_features = array.shape
-    max_components = min(n_samples, n_features)
-    if not 1 <= n_components <= max_components:
-        raise ValueError(f"n_components={n_components} must be between 1 and {max_components}")
-
-    mean = np.mean(array, axis=0)
-    centered = torch.as_tensor(array - mean, dtype=torch.float64)
-    _, s, vh = torch.linalg.svd(centered, full_matrices=False)
-
-    components = vh[:n_components].cpu().numpy()
-    loadings = (centered @ vh[:n_components].T).cpu().numpy()
-
-    denom = max(n_samples - 1, 1)
-    explained_variance = ((s[:n_components] ** 2) / denom).cpu().numpy()
-    total_variance = torch.sum((s**2) / denom).item()
-    explained_variance_ratio = (
-        explained_variance / total_variance
-        if total_variance > 0
-        else np.zeros_like(explained_variance)
-    )
-    reconstructed = loadings @ components + mean
-
-    return components, loadings, explained_variance, explained_variance_ratio, reconstructed
-
-
 class Dataset3dspectroscopy(Dataset3d):
     # stores the element line info so you don't need to reload each time
-    element_info = None
-    element_info_path = "x_ray_lines.csv"
-    atomic_weights = None
-    atomic_weights_path = "atomic_weights.csv"
-    dataset_type = "EDS"
-
     def __init__(
         self,
         array: NDArray | Any,
@@ -70,23 +36,22 @@ class Dataset3dspectroscopy(Dataset3d):
             _token=type(self)._token if _token is None else _token,
         )
 
-        # Initialize model elements storage
         self.model_elements = None
-        # Initialize spectra storage
         self.attached_spectra = None
+        self.element_info = None
 
     # loads elemental information
     @classmethod
     def load_element_info(cls):
         """Load element database for EDS (X-ray lines) or EELS (binding energies)."""
-        if cls.element_info is not None:
+        if hasattr(cls, "element_info"):
             return
 
         class_type = str(getattr(cls, "dataset_type", "")).strip().lower()
         path = (
             "eels_binding_energies.json"
             if class_type == "eels"
-            else getattr(cls, "element_info_path", "x_ray_lines.csv")
+            else getattr(cls, "x_ray_lines.csv", "x_ray_lines.csv")
         )
         full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
 
@@ -102,9 +67,8 @@ class Dataset3dspectroscopy(Dataset3d):
         if cls.atomic_weights is not None:
             return
 
-        full_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), cls.atomic_weights_path
-        )
+        atomic_weights_path = "atomic_weights.csv"
+        full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), atomic_weights_path)
         data = {}
         with open(full_path, "r", newline="") as f:
             reader = csv.reader(f)
@@ -113,7 +77,7 @@ class Dataset3dspectroscopy(Dataset3d):
                     continue
                 if len(row) < 2:
                     raise ValueError(
-                        f"{cls.atomic_weights_path} row {row_index} must contain element symbol and weight"
+                        f"{atomic_weights_path} row {row_index} must contain element symbol and weight"
                     )
                 symbol = str(row[0]).strip()
                 weight_raw = str(row[1]).strip()
@@ -123,12 +87,12 @@ class Dataset3dspectroscopy(Dataset3d):
                     weight = float(weight_raw)
                 except ValueError as exc:
                     raise ValueError(
-                        f"{cls.atomic_weights_path} row {row_index} has invalid weight: {weight_raw!r}"
+                        f"{atomic_weights_path} row {row_index} has invalid weight: {weight_raw!r}"
                     ) from exc
                 data[symbol] = weight
 
         if not data:
-            raise ValueError(f"{cls.atomic_weights_path} did not contain any atomic weights")
+            raise ValueError(f"{atomic_weights_path} did not contain any atomic weights")
 
         cls.atomic_weights = data
 
@@ -223,7 +187,9 @@ class Dataset3dspectroscopy(Dataset3d):
                 self.model_elements[element_key] = existing
 
             added_keys = [
-                line_name for line_name in selected_lines.keys() if line_name not in existing_keys_before
+                line_name
+                for line_name in selected_lines.keys()
+                if line_name not in existing_keys_before
             ]
             if added_keys:
                 if element_key not in added_this_call:
@@ -235,7 +201,9 @@ class Dataset3dspectroscopy(Dataset3d):
         if added_this_call:
             print("Added to model:")
             for element_key in sorted(added_this_call.keys()):
-                unique_lines = sorted(set(str(line_name) for line_name in added_this_call[element_key]))
+                unique_lines = sorted(
+                    set(str(line_name) for line_name in added_this_call[element_key])
+                )
                 print(f" - {element_key}: {', '.join(unique_lines)}")
         else:
             print("Added to model: nothing new")
@@ -331,7 +299,6 @@ class Dataset3dspectroscopy(Dataset3d):
         plt.show()
 
     ## PCA ANALYSIS METHODS
-
     def perform_pca(
         self,
         n_components: int = 10,
@@ -402,7 +369,7 @@ class Dataset3dspectroscopy(Dataset3d):
             explained_variance,
             explained_variance_ratio,
             reconstructed,
-        ) = _run_pca(data_processed, n_components)
+        ) = self._run_pca(data_processed, n_components)
 
         # Reconstruct data
         if standardize:
@@ -423,14 +390,14 @@ class Dataset3dspectroscopy(Dataset3d):
                 n_show=min(4, n_components),
             )
 
-        if self.dataset_type == "EDS":
+        if self.dataset_type == "eds":
             reconstructed_data3d = Dataset3deds.from_array(
                 array=reconstructed.T.reshape(n_energy, ny, nx),
                 sampling=self.sampling,
                 origin=self.origin,
                 units=self.units,
             )
-        elif self.dataset_type == "EELS":
+        elif self.dataset_type == "eels":
             reconstructed_data3d = Dataset3deels.from_array(
                 array=reconstructed.T.reshape(n_energy, ny, nx),
                 sampling=self.sampling,
@@ -450,6 +417,40 @@ class Dataset3dspectroscopy(Dataset3d):
             "explained_variance": explained_variance,
             "reconstructed": reconstructed_data3d if mask is None else reconstructed_data3d,
         }
+
+        def _run_pca(self, data: NDArray | Any, n_components: int):
+            array = np.asarray(data, dtype=float)
+            n_samples, n_features = array.shape
+            max_components = min(n_samples, n_features)
+            if not 1 <= n_components <= max_components:
+                raise ValueError(
+                    f"n_components={n_components} must be between 1 and {max_components}"
+                )
+
+            mean = np.mean(array, axis=0)
+            centered = torch.as_tensor(array - mean, dtype=torch.float64)
+            _, s, vh = torch.linalg.svd(centered, full_matrices=False)
+
+            components = vh[:n_components].cpu().numpy()
+            loadings = (centered @ vh[:n_components].T).cpu().numpy()
+
+            denom = max(n_samples - 1, 1)
+            explained_variance = ((s[:n_components] ** 2) / denom).cpu().numpy()
+            total_variance = torch.sum((s**2) / denom).item()
+            explained_variance_ratio = (
+                explained_variance / total_variance
+                if total_variance > 0
+                else np.zeros_like(explained_variance)
+            )
+            reconstructed = loadings @ components + mean
+
+            return (
+                components,
+                loadings,
+                explained_variance,
+                explained_variance_ratio,
+                reconstructed,
+            )
 
     def _plot_pca_results(
         self,
@@ -742,8 +743,8 @@ class Dataset3dspectroscopy(Dataset3d):
         roi_units=None,
         energy_range=None,
         mask=None,
-        data_type=None,
-        show=True,
+        intensity_range=None,
+        **kwargs,
     ):
         """
         Plot the mean spectrum from a spatial ROI in a 3D spectroscopy cube (E, Y, X).
@@ -763,11 +764,8 @@ class Dataset3dspectroscopy(Dataset3d):
             Energy range to display as [min_energy, max_energy] in keV.
         mask : array, optional
             Boolean mask for pixel selection.
-        show : bool, optional
-            If True, display the plot with ``plt.show()``. Set False to add overlays before showing.
-        data_type : str, optional
-            Type of spectroscopy data. Options: 'eds' (default) or 'eels'.
-
+        intensity_range : 2-tuple, None
+            If not None, sets intensity range on spectrum plot
         Returns
         -------
         (fig, ax) : tuple
@@ -841,6 +839,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 "sampling": float(self.sampling[1]),
                 "units": str(self.units[1]),
             },
+            **kwargs,
         )
         ax_img.set_xlabel("X (pixels)")
         ax_img.set_ylabel("Y (pixels)")
@@ -853,17 +852,17 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # RIGHT PLOT: Show spectrum
         ax_spec.plot(E, spec, linewidth=1.5)
-        if data_type == "eds":
+        if self.dataset_type == "eds":
             ax_spec.set_xlabel("Energy (keV)")
         else:
             ax_spec.set_xlabel("Energy (eV)")
         ax_spec.set_ylabel("Intensity")
         ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
         ax_spec.grid(True, alpha=0.1)
+        if intensity_range is not None:
+            ax_spec.set_ylim([intensity_range[0], intensity_range[1]])
 
         fig.tight_layout()
-        if show:
-            plt.show()
         return fig, (ax_img, ax_spec)
 
     def refline(
