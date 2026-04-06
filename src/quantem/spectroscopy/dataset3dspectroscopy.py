@@ -608,24 +608,22 @@ class Dataset3dspectroscopy(Dataset3d):
         if errs:
             raise ValueError("Invalid ROI:\n - " + "\n - ".join(errs))
 
-    def _resolve_roi_px(self, roi=None, roi_px=None, roi_cal=None):
-        selector_count = int(roi is not None) + int(roi_px is not None) + int(roi_cal is not None)
+    def _resolve_roi(self, roi=None, roi_units=None):
+        selector_count = int(roi is not None) + int(roi_units is not None)
         if selector_count > 1:
-            raise ValueError("Use only one ROI selector: roi, roi_px, or roi_cal")
+            raise ValueError("Use only one ROI selector: roi or roi_units")
 
-        if roi_px is not None:
-            roi_spec = roi_px
-        elif roi is not None:
+        if roi is not None:
             roi_spec = roi
-        elif roi_cal is not None:
-            if len(roi_cal) == 2:
-                y_cal, x_cal = roi_cal
+        elif roi_units is not None:
+            if len(roi_units) == 2:
+                y_cal, x_cal = roi_units
                 roi_spec = [
                     self._calibrated_position_to_pixel(y_cal, axis=1),
                     self._calibrated_position_to_pixel(x_cal, axis=2),
                 ]
-            elif len(roi_cal) == 4:
-                y_cal, x_cal, dy_cal, dx_cal = roi_cal
+            elif len(roi_units) == 4:
+                y_cal, x_cal, dy_cal, dx_cal = roi_units
                 roi_spec = [
                     self._calibrated_position_to_pixel(y_cal, axis=1),
                     self._calibrated_position_to_pixel(x_cal, axis=2),
@@ -633,7 +631,7 @@ class Dataset3dspectroscopy(Dataset3d):
                     self._calibrated_span_to_pixels(dx_cal, axis=2),
                 ]
             else:
-                raise ValueError("roi_cal must be [y, x] or [y, x, dy, dx]")
+                raise ValueError("roi_units must be [y, x] or [y, x, dy, dx]")
         else:
             roi_spec = None
 
@@ -650,7 +648,7 @@ class Dataset3dspectroscopy(Dataset3d):
             dx = int(self.shape[2]) - x if dx_val is None else int(dx_val)
         else:
             raise ValueError(
-                "ROI must be None, [y, x], or [y, x, dy, dx]. Use one selector: roi, roi_px, roi_cal"
+                "ROI must be None, [y, x], or [y, x, dy, dx]. Use one selector: roi or roi_units"
             )
 
         self._validate_roi_bounds(y, x, dy, dx)
@@ -663,10 +661,9 @@ class Dataset3dspectroscopy(Dataset3d):
         ignore_range=None,
         mask=None,
         attach_mean_spectrum=True,
-        roi_px=None,
-        roi_cal=None,
+        roi_units=None,
     ):
-        y, x, dy, dx = self._resolve_roi_px(roi=roi, roi_px=roi_px, roi_cal=roi_cal)
+        y, x, dy, dx = self._resolve_roi(roi=roi, roi_units=roi_units)
 
         # SPECTRUM CALCULATION --------------------------------------------------------------
 
@@ -742,8 +739,7 @@ class Dataset3dspectroscopy(Dataset3d):
     def show_mean_spectrum(
         self,
         roi=None,
-        roi_px=None,
-        roi_cal=None,
+        roi_units=None,
         energy_range=None,
         mask=None,
         data_type=None,
@@ -802,12 +798,11 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # CALCULATE MEAN SPECTRUM FOR GIVEN ROI AND ENERGY RANGE --------------------------
 
-        y, x, dy, dx = self._resolve_roi_px(roi=roi, roi_px=roi_px, roi_cal=roi_cal)
+        y, x, dy, dx = self._resolve_roi(roi=roi, roi_units=roi_units)
 
         spec = self.calculate_mean_spectrum(
             roi=roi,
-            roi_px=roi_px,
-            roi_cal=roi_cal,
+            roi_units=roi_units,
             energy_range=energy_range,
             mask=mask,
         )
@@ -986,8 +981,7 @@ class Dataset3dspectroscopy(Dataset3d):
         self,
         energy_window=None,
         roi=None,
-        roi_px=None,
-        roi_cal=None,
+        roi_units=None,
         mask=None,
         data_type="eds",
         cmap="viridis",
@@ -1022,8 +1016,8 @@ class Dataset3dspectroscopy(Dataset3d):
         tuple
             ``(fig, (ax_map, ax_spec), energy_map)`` where ``energy_map`` is the integrated 2D array.
         """
-        y, x, dy, dx = self._resolve_roi_px(roi=roi, roi_px=roi_px, roi_cal=roi_cal)
-        has_roi_overlay = any(val is not None for val in (roi, roi_px, roi_cal))
+        y, x, dy, dx = self._resolve_roi(roi=roi, roi_units=roi_units)
+        has_roi_overlay = any(val is not None for val in (roi, roi_units))
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
@@ -1060,8 +1054,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         spec = self.calculate_mean_spectrum(
             roi=roi,
-            roi_px=roi_px,
-            roi_cal=roi_cal,
+            roi_units=roi_units,
             mask=mask,
             attach_mean_spectrum=False,
         )

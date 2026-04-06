@@ -223,10 +223,17 @@ class Dataset3deds(Dataset3dspectroscopy):
     def _peak_confidence(
         snr_value: float, line_weight: float, distance_value: float, tolerance: float
     ) -> float:
-        quality = max(0.0, 1.0 - (distance_value / max(float(tolerance), 1e-9)))
-        return np.log1p(max(float(snr_value), 0.0)) * (0.5 + float(line_weight)) * (
-            0.5 + quality
-        )
+        # Use a Gaussian distance likelihood: exp(-0.5 * (d/sigma)^2).
+        # sigma = tolerance / 3 so the hard cutoff sits at ~3sigma,
+        # giving a steep penalty for distance while tolerance stays as a
+        # generous search window.  This prevents heavy-element Ma1 lines
+        # (weight 1.0) from overshadowing lighter-element K-lines at much
+        # closer distances (e.g. Os Ma1 vs P Ka1 near 2 keV).
+        sigma = max(float(tolerance) / 3.0, 1e-9)
+        snr_term = np.log1p(max(float(snr_value), 0.0))
+        weight_term = max(float(line_weight), 0.0)
+        distance_term = np.exp(-0.5 * (float(distance_value) / sigma) ** 2)
+        return snr_term * weight_term * distance_term
 
     @staticmethod
     def _line_matches_selector(line_name: str, selector: str) -> bool:
@@ -402,13 +409,14 @@ class Dataset3deds(Dataset3dspectroscopy):
             integrated_maps[selector] = arr[selector_mask, :, :].sum(axis=0)
 
         if show:
+            if "roi_px" in kwargs or "roi_cal" in kwargs:
+                raise ValueError("Use roi (pixel) or roi_units (calibrated). roi_px/roi_cal are not supported")
             if len(integrated_maps) == 1:
                 selector = next(iter(integrated_maps.keys()))
                 self.show_energy_window_map(
                     energy_window=[energy_min, energy_max],
                     roi=kwargs.pop("roi", None),
-                    roi_px=kwargs.pop("roi_px", None),
-                    roi_cal=kwargs.pop("roi_cal", None),
+                    roi_units=kwargs.pop("roi_units", None),
                     mask=selector_masks[selector],
                     data_type=kwargs.pop("data_type", "eds"),
                     cmap=kwargs.pop("cmap", "magma"),
@@ -733,8 +741,7 @@ class Dataset3deds(Dataset3dspectroscopy):
     def peak_autoid(
         self,
         roi=None,
-        roi_px=None,
-        roi_cal=None,
+        roi_units=None,
         energy_range=None,
         elements=None,
         refline=None,
@@ -742,6 +749,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         ignore_range=None,
         threshold=5.0,
         tolerance=0.15,
+        min_line_weight=0.0,
         mask=None,
         show_text=True,
         snr_min=None,
@@ -749,6 +757,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         distance_threshold_for_sample=0.05,
         grid_peaks=None,
         peaks=15,
+        mode=None,
         return_details=False,
     ):
         """Auto-detect and label EDS peaks from the mean ROI spectrum.
@@ -758,6 +767,20 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         Parameters
         ----------
+        min_line_weight : float, optional
+            Minimum X-ray line weight required for a line to be eligible during
+            matching and ranking. Set to 0 to allow all lines.
+                mode : str | None, optional
+                        Controls how element constraints are applied:
+                        - "autofill": auto-ID over all elements while optionally overlaying
+                            requested/saved-model element references.
+                        - "elements_preferred": keep autofill enabled, but bias final
+                            matching toward requested/saved-model elements.
+                        - "elements_only": if elements are provided explicitly or via saved
+                            model, only those elements are considered during matching.
+                        - None: choose context-aware default. If no requested/saved-model
+                            elements are present, defaults to "autofill". If requested or
+                            saved-model elements exist, defaults to "elements_only".
         return_details : bool, optional
             If True, return full internal results (matches/confidence/peaks).
             If False (default), return only figure and axes.
@@ -794,10 +817,44 @@ class Dataset3deds(Dataset3dspectroscopy):
         if requested_edge_filters is not None:
             elements = list(requested_edge_filters.keys())
 
+        requested_elements = set(elements) if elements is not None else None
+
+        mode_normalized = None if mode is None else str(mode).strip().lower()
+        valid_modes = {"autofill", "elements_only", "elements_preferred"}
+        if mode_normalized is not None and mode_normalized not in valid_modes:
+            raise ValueError("mode must be one of: autofill, elements_only, elements_preferred")
+
+        if mode_normalized is None:
+            mode_normalized = "elements_only" if requested_elements is not None else "autofill"
+
+        if mode_normalized == "elements_only" and requested_elements is None:
+            raise ValueError("mode='elements_only' requires elements to be specified or saved")
+        if mode_normalized == "elements_preferred" and requested_elements is None:
+            raise ValueError("mode='elements_preferred' requires elements to be specified or saved")
+
+        match_elements = requested_elements if mode_normalized == "elements_only" else None
+        preferred_elements_set = (
+            set(str(element_name) for element_name in requested_elements)
+            if mode_normalized == "elements_preferred" and requested_elements is not None
+            else set()
+        )
+        reference_elements = (
+            requested_elements
+            if mode_normalized in {"elements_only", "autofill", "elements_preferred"}
+            and requested_elements is not None
+            else None
+        )
+
         if isinstance(ignore_elements, str):
             ignore_elements = [ignore_elements]
         if ignore_elements is not None and not isinstance(ignore_elements, (list, tuple, set)):
             raise TypeError("ignore_elements must be None, a string, or a sequence of strings")
+        try:
+            min_line_weight = float(min_line_weight)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("min_line_weight must be a number") from exc
+        if min_line_weight < 0:
+            raise ValueError("min_line_weight must be >= 0")
         ignored_elements = (
             {str(element_name) for element_name in ignore_elements}
             if ignore_elements is not None
@@ -806,8 +863,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         fig, (ax_img, ax_spec) = self.show_mean_spectrum(
             roi=roi,
-            roi_px=roi_px,
-            roi_cal=roi_cal,
+            roi_units=roi_units,
             energy_range=energy_range,
             mask=mask,
             data_type="eds",
@@ -816,8 +872,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         spec = self.calculate_mean_spectrum(
             roi=roi,
-            roi_px=roi_px,
-            roi_cal=roi_cal,
+            roi_units=roi_units,
             energy_range=energy_range,
             ignore_range=ignore_range,
             mask=mask,
@@ -832,6 +887,12 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         if ignore_range is None:
             ignore_range = [0, 0.25]
+
+        def _is_in_ignored_range(energy_value: float) -> bool:
+            if ignore_range is None or len(ignore_range) != 2:
+                return False
+            min_ignore, max_ignore = ignore_range
+            return float(min_ignore) <= float(energy_value) <= float(max_ignore)
 
         peak_indices, peak_properties = find_peaks(spec, height=0, distance=5)
         peak_heights = peak_properties["peak_heights"]
@@ -897,10 +958,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         for peak_idx, height in zip(peak_indices, peak_heights):
             peak_energy = E[peak_idx]
 
-            if ignore_range is not None and len(ignore_range) == 2:
-                min_ignore, max_ignore = ignore_range
-                if min_ignore <= peak_energy <= max_ignore:
-                    continue
+            if _is_in_ignored_range(peak_energy):
+                continue
 
             snr = height / background_std
             all_candidate_peaks.append((peak_idx, height, peak_energy, snr))
@@ -924,10 +983,21 @@ class Dataset3deds(Dataset3dspectroscopy):
                 return "M"
             return "?"
 
+        def _shell_preference_factor(shell_name):
+            # Keep K and L comparable; only downweight M lines because they
+            # are more prone to overlap-driven false assignments.
+            if shell_name in {"K", "L"}:
+                return 1.0
+            if shell_name == "M":
+                return 0.72
+            return 1.0
+
         def _peak_confidence(snr_value, line_weight, distance_value):
-            quality = max(0.0, 1.0 - (distance_value / max(tolerance, 1e-9)))
-            return (
-                np.log1p(max(float(snr_value), 0.0)) * (0.5 + float(line_weight)) * (0.5 + quality)
+            return type(self)._peak_confidence(
+                snr_value=snr_value,
+                line_weight=line_weight,
+                distance_value=distance_value,
+                tolerance=tolerance,
             )
 
         def _line_matches_selector(line_name: str, selector: str) -> bool:
@@ -947,11 +1017,12 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             return any(_line_matches_selector(line_name, token) for token in selectors)
 
-        def _best_line_match(peak_energy, allowed_elements=None, edge_filters=None):
-            best_distance = float("inf")
+        def _best_line_match(peak_energy, peak_snr, allowed_elements=None, edge_filters=None):
+            best_score = -float("inf")
             best_element = None
             best_line_name = None
             best_line_weight = 0.0
+            best_distance = float("inf")
 
             if not all_info:
                 return None
@@ -966,30 +1037,36 @@ class Dataset3deds(Dataset3dspectroscopy):
                     line_energy = line_info["energy (keV)"]
                     line_weight = line_info.get("weight", 0.5)
                     distance = abs(peak_energy - line_energy)
+                    shell = _line_shell(line_name)
 
                     is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
                     effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
 
                     if (
-                        line_weight > 0.3
+                        line_weight >= min_line_weight
                         and distance <= effective_tolerance
-                        and distance < best_distance
                     ):
-                        best_distance = distance
-                        best_element = element_name
-                        best_line_name = line_name
-                        best_line_weight = line_weight
+                        # Use score-based ranking: confidence with weight and distance
+                        # This matches rematcher logic and avoids distance-driven artifacts
+                        score = _peak_confidence(peak_snr, line_weight, distance)
+                        score *= _shell_preference_factor(shell)
+                        if score > best_score:
+                            best_score = score
+                            best_element = element_name
+                            best_line_name = line_name
+                            best_line_weight = line_weight
+                            best_distance = distance
 
             if best_element is None:
                 return None
 
             return best_element, best_line_name, best_line_weight, best_distance
 
-        search_elements = set(elements) if elements is not None else None
+        search_elements = match_elements
 
         for peak_idx, height, peak_energy, snr in display_peaks:
             best_match_info = _best_line_match(
-                peak_energy, search_elements, requested_edge_filters
+                peak_energy, snr, search_elements, requested_edge_filters
             )
             if best_match_info is not None:
                 best_element, best_line_name, best_line_weight, best_distance = best_match_info
@@ -1016,6 +1093,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         detected_sample_peaks = {}
         element_confidence = {}
         element_stats = {}
+        line_evidence = {}
         for (
             peak_idx,
             height,
@@ -1034,6 +1112,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 continue
 
             shell = _line_shell(line_name)
+            line_label = f"{element_name} {line_name}"
             if element_name not in element_stats:
                 element_stats[element_name] = {
                     "raw_conf": 0.0,
@@ -1047,6 +1126,15 @@ class Dataset3deds(Dataset3dspectroscopy):
                     "best_match_distance": float("inf"),
                     "best_match_weight": 0.0,
                     "best_match_shell": "?",
+                }
+
+            if line_label not in line_evidence:
+                line_evidence[line_label] = {
+                    "match_count": 0,
+                    "strong_matches": 0,
+                    "best_conf": 0.0,
+                    "best_snr": 0.0,
+                    "energies": [],
                 }
 
             element_stats[element_name]["raw_conf"] += float(match_confidence)
@@ -1064,40 +1152,84 @@ class Dataset3deds(Dataset3dspectroscopy):
                 element_stats[element_name]["best_match_weight"] = float(line_weight)
                 element_stats[element_name]["best_match_shell"] = shell
 
+            line_evidence[line_label]["match_count"] += 1
+            line_evidence[line_label]["energies"].append(float(peak_energy))
+            if snr > snr_threshold_for_sample and distance < distance_threshold_for_sample:
+                line_evidence[line_label]["strong_matches"] += 1
+            if float(match_confidence) > float(line_evidence[line_label]["best_conf"]):
+                line_evidence[line_label]["best_conf"] = float(match_confidence)
+                line_evidence[line_label]["best_snr"] = float(snr)
+
         for element_name, stats in element_stats.items():
             valid_shells = {shell for shell in stats["shells"] if shell in {"K", "L", "M"}}
             num_shells = len(valid_shells)
             num_lines = len(stats["lines"])
             has_major_shell = len(valid_shells.intersection({"K", "L"})) > 0
 
-            shell_bonus = 1.0 + 0.45 * max(0, num_shells - 1)
-            line_bonus = 1.0 + 0.15 * max(0, min(num_lines, 4) - 1)
-            strong_bonus = 1.0 + 0.20 * stats["strong_matches"]
-            major_bonus = 1.15 if has_major_shell else 1.0
+            # Shell bonus: each additional confirmed shell is independent evidence.
+            # Two independent shells give P(element|K∧L) ∝ P_K · P_L, so the
+            # log-likelihood adds linearly and the likelihood ratio scales as
+            # sqrt(n_shells) in the geometric-mean sense (Jaynes, Prob. Theory).
+            shell_bonus = float(np.sqrt(max(1, num_shells)))
+
+            # Line bonus: each additional distinct matched line reduces the
+            # probability of a chance coincidence. Diminishing returns are
+            # captured by log1p (each doubling of evidence adds a fixed increment).
+            line_bonus = 1.0 + 0.30 * float(np.log1p(max(0, num_lines - 1)))
+
+            # Strong-match bonus: the Poisson false-peak rate at SNR > T scales
+            # as erfc(T/√2); n independent strong peaks compound multiplicatively
+            # so log1p(n) correctly models the diminishing-returns likelihood ratio.
+            strong_bonus = 1.0 + 0.40 * float(np.log1p(stats["strong_matches"]))
+
+            # K/L shell presence is strong physical prior: these are the primary
+            # transitions expected in any sample above Z≈10.
+            major_bonus = 1.20 if has_major_shell else 1.0
 
             confidence = stats["raw_conf"] * shell_bonus * line_bonus * strong_bonus * major_bonus
             element_confidence[element_name] = float(confidence)
 
         if element_confidence:
             conf_values = np.array(list(element_confidence.values()), dtype=float)
+            # Absolute Poisson MDL floor (Currie 1968, Anal. Chem. 40:586):
+            # a peak is physically detectable only when SNR >= 3σ of background.
+            # The minimum confidence a single real peak can produce is:
+            #   log1p(3.0) * 0.5 * exp(-0.5*(1σ distance)²) ≈ 0.334
+            # (half-weight line, 1-sigma spatial offset, SNR=3).
+            # No element below this floor can have a statistically detectable peak.
+            poisson_mdl_snr = 3.0
+            _mdl_conf_floor = (
+                float(np.log1p(poisson_mdl_snr)) * 0.5 * float(np.exp(-0.5))
+            )
             confidence_cutoff = max(
-                np.percentile(conf_values, 45), 0.30 * float(conf_values.max())
+                float(np.percentile(conf_values, 45)),
+                0.30 * float(conf_values.max()),
+                _mdl_conf_floor,
             )
 
             for element_name, confidence in element_confidence.items():
                 stats = element_stats[element_name]
                 valid_shells = {shell for shell in stats["shells"] if shell in {"K", "L", "M"}}
                 has_major_shell = len(valid_shells.intersection({"K", "L"})) > 0
+                # is_supported: best peak must clear the 3σ Poisson MDL
+                # (Currie 1968) — any peak below SNR=3 cannot be distinguished
+                # from background noise regardless of fit quality.
                 is_supported = (
                     confidence >= confidence_cutoff
+                    and stats["best_match_snr"] >= poisson_mdl_snr
                     and (
                         stats["strong_matches"] >= 1
                         or stats["best_match_snr"]
                         >= max(min_snr, 0.6 * snr_threshold_for_sample)
                     )
                 )
+                # is_near_cutoff_but_consistent: two independent peaks above the
+                # 3σ MDL have a joint false-positive probability ≈ p₁·p₂ ≈ negligible
+                # (akin to requiring both the critical level Lc and detection limit Ld
+                # to be satisfied on independent lines — Currie 1968, §IV).
                 is_near_cutoff_but_consistent = (
                     confidence >= 0.75 * confidence_cutoff
+                    and stats["best_match_snr"] >= poisson_mdl_snr
                     and stats["match_count"] >= 2
                     and has_major_shell
                     and stats["best_match_snr"] >= max(min_snr, 0.5 * snr_threshold_for_sample)
@@ -1140,6 +1272,109 @@ class Dataset3deds(Dataset3dspectroscopy):
             if len(detected_elements) > 0
             else 0.0
         )
+        dominant_elements = set()
+        if element_confidence:
+            conf_values = np.array(list(element_confidence.values()), dtype=float)
+            conf_median = float(np.median(conf_values)) if len(conf_values) > 0 else 0.0
+            conf_p80 = float(np.percentile(conf_values, 80)) if len(conf_values) > 1 else 0.0
+            conf_floor = max(conf_median, 1e-9)
+
+            for element_name, confidence in element_confidence.items():
+                stats = element_stats.get(str(element_name), {})
+                has_repeat_support = (
+                    int(stats.get("match_count", 0)) >= 2
+                    or int(stats.get("strong_matches", 0)) >= 1
+                )
+                if (
+                    float(confidence) >= conf_p80
+                    and float(confidence) >= 1.8 * conf_floor
+                    and has_repeat_support
+                ):
+                    dominant_elements.add(str(element_name))
+
+        def _element_prior_factor(element_name, denom):
+            prior = float(element_confidence.get(element_name, 0.0)) / denom
+            prior_factor = 1.0 + 0.5 * prior
+
+            # When an element is already strongly supported by the spectrum,
+            # bias nearby ambiguous peaks toward that same element.
+            if prior >= 0.90:
+                prior_factor *= 1.9
+            elif prior >= 0.75:
+                prior_factor *= 1.5
+            elif prior >= 0.55:
+                prior_factor *= 1.2
+
+            return prior, prior_factor
+
+        def _line_consistency_boost(element_name, line_name, peak_energy, denom):
+            # Use dominant_elements membership rather than a normalized-prior
+            # threshold.  The normalized prior can be suppressed when one or
+            # two elements have very large confidence (e.g. Au driving the
+            # denominator high), causing legitimate dominant elements like Cu
+            # to silently fail the old `prior >= 0.75` gate even though they
+            # clearly belong in the sample.
+            if str(element_name) not in dominant_elements:
+                return 1.0
+
+            line_label = f"{element_name} {line_name}"
+            evidence = line_evidence.get(line_label)
+            if evidence is None:
+                return 1.0
+
+            # Require support from another peak for this exact line so we
+            # don't self-reinforce a single spurious match.
+            has_other_peak_support = any(
+                abs(float(peak_energy) - float(prev_energy)) >= 0.04
+                for prev_energy in evidence.get("energies", [])
+            )
+            if not has_other_peak_support:
+                return 1.0
+
+            best_line_conf = float(evidence.get("best_conf", 0.0))
+            best_line_snr = float(evidence.get("best_snr", 0.0))
+            strong_line_matches = int(evidence.get("strong_matches", 0))
+
+            # Scale by line weight: high-weight primary lines (K/L α, weight
+            # ≈ 0.7–1.0) get proportionally stronger boosts than low-weight
+            # secondary lines (weight < 0.4).  This prevents a low-weight
+            # line from an equally-dominant element from outscoring a
+            # confirmed primary line purely via prior amplification.
+            line_info_entry = (all_info or {}).get(str(element_name), {}).get(str(line_name), {})
+            line_weight = float(line_info_entry.get("weight", 0.5)) if isinstance(line_info_entry, dict) else 0.5
+            weight_tier = 1.0 + 0.7 * max(0.0, line_weight - 0.35)
+
+            if strong_line_matches >= 1 and best_line_conf >= 1.4:
+                return min(3.2, 2.4 * weight_tier)
+            if best_line_conf >= 1.1 and best_line_snr >= max(min_snr, 0.75 * snr_threshold_for_sample):
+                return min(2.6, 1.9 * weight_tier)
+            if best_line_conf >= 0.8:
+                return min(2.0, 1.5 * weight_tier)
+            return min(1.5, 1.2 * weight_tier)
+
+        def _dominant_element_boost(element_name, denom):
+            element_key = str(element_name)
+            if element_key not in dominant_elements:
+                return 1.0
+
+            prior, _ = _element_prior_factor(element_key, denom)
+            stats = element_stats.get(element_key, {})
+            repeat_support = max(
+                int(stats.get("strong_matches", 0)),
+                max(0, int(stats.get("match_count", 0)) - 1),
+            )
+
+            if prior >= 0.90:
+                base_boost = 2.30
+            elif prior >= 0.75:
+                base_boost = 1.85
+            else:
+                base_boost = 1.45
+
+            if repeat_support >= 2:
+                base_boost *= 1.10
+
+            return min(base_boost, 2.60)
 
         def _best_supported_line_match_with_prior(
             peak_energy, snr, allowed_elements, edge_filters=None
@@ -1149,14 +1384,16 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             best_tuple = None
             best_score = -float("inf")
+            best_preferred_tuple = None
+            best_preferred_score = -float("inf")
             denom = max(float(max_detected_conf), 1e-9)
 
             for element_name, lines in all_info.items():
                 if element_name not in allowed_elements:
                     continue
 
-                prior = float(element_confidence.get(element_name, 0.0)) / denom
-                prior_factor = 1.0 + 0.5 * prior
+                prior, prior_factor = _element_prior_factor(element_name, denom)
+                preferred_factor = 1.35 if str(element_name) in preferred_elements_set else 1.0
 
                 for line_name, line_info in lines.items():
                     if not _line_allowed_for_element(element_name, line_name, edge_filters):
@@ -1169,21 +1406,54 @@ class Dataset3deds(Dataset3dspectroscopy):
                     is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
                     effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
 
-                    if line_weight <= 0.3 or distance > effective_tolerance:
+                    if line_weight < min_line_weight or distance > effective_tolerance:
                         continue
 
                     local_conf = _peak_confidence(snr, line_weight, distance)
                     anchor_boost = 1.0
-                    if element_name in anchor_elements and shell == "M" and peak_energy <= 3.0:
-                        anchor_boost = 2.2
-                    elif element_name in anchor_elements and shell in {"K", "L"}:
+                    if element_name in anchor_elements and shell in {"K", "L"}:
                         anchor_boost = 1.15
 
-                    score = local_conf * prior_factor * anchor_boost
+                    consistency_boost = _line_consistency_boost(
+                        element_name, line_name, peak_energy, denom
+                    )
+                    dominant_boost = _dominant_element_boost(element_name, denom)
+
+                    # M-lines are secondary transitions confirmed by K/L lines
+                    # from the same element.  The large cascade boosts designed
+                    # for K/L cross-peak propagation must not override a
+                    # better-fitting primary K/L line from another element
+                    # (e.g. P Ka1 vs Pt Ma1 near 2.03 keV: P Ka1 has higher
+                    # local_conf but Pt is dominant via La1 at 9.47 keV).
+                    if shell == "M":
+                        eff_prior_factor = 1.0 + 0.3 * prior
+                        eff_consistency = 1.0
+                        eff_dominant = min(dominant_boost, 1.30)
+                    else:
+                        eff_prior_factor = prior_factor
+                        eff_consistency = consistency_boost
+                        eff_dominant = dominant_boost
+
+                    score = (
+                        local_conf
+                        * eff_prior_factor
+                        * anchor_boost
+                        * preferred_factor
+                        * eff_consistency
+                        * eff_dominant
+                    )
+                    score *= _shell_preference_factor(shell)
+
+                    if str(element_name) in preferred_elements_set and score > best_preferred_score:
+                        best_preferred_score = score
+                        best_preferred_tuple = (element_name, line_name, line_weight, distance)
 
                     if score > best_score:
                         best_score = score
                         best_tuple = (element_name, line_name, line_weight, distance)
+
+            if mode_normalized == "elements_preferred" and best_preferred_tuple is not None:
+                return best_preferred_tuple
 
             return best_tuple
 
@@ -1200,8 +1470,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                 if allowed_elements is not None and element_name not in allowed_elements:
                     continue
 
-                prior = float(element_confidence.get(element_name, 0.0)) / denom
-                prior_factor = 1.0 + 0.5 * prior
+                prior, prior_factor = _element_prior_factor(element_name, denom)
+                preferred_factor = 1.35 if str(element_name) in preferred_elements_set else 1.0
 
                 for line_name, line_info in lines.items():
                     if not _line_allowed_for_element(element_name, line_name, edge_filters):
@@ -1214,22 +1484,53 @@ class Dataset3deds(Dataset3dspectroscopy):
                     is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
                     effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
 
-                    if line_weight <= 0.3 or distance > effective_tolerance:
+                    if line_weight < min_line_weight or distance > effective_tolerance:
                         continue
 
                     local_conf = _peak_confidence(snr, line_weight, distance)
                     anchor_boost = 1.0
-                    if element_name in anchor_elements and shell == "M" and peak_energy <= 3.0:
-                        anchor_boost = 2.2
-                    elif element_name in anchor_elements and shell in {"K", "L"}:
+                    if element_name in anchor_elements and shell in {"K", "L"}:
                         anchor_boost = 1.15
 
-                    score = local_conf * prior_factor * anchor_boost
+                    consistency_boost = _line_consistency_boost(
+                        element_name, line_name, peak_energy, denom
+                    )
+                    dominant_boost = _dominant_element_boost(element_name, denom)
+
+                    if shell == "M":
+                        eff_prior_factor = 1.0 + 0.3 * prior
+                        eff_consistency = 1.0
+                        eff_dominant = min(dominant_boost, 1.30)
+                    else:
+                        eff_prior_factor = prior_factor
+                        eff_consistency = consistency_boost
+                        eff_dominant = dominant_boost
+
+                    score = (
+                        local_conf
+                        * eff_prior_factor
+                        * anchor_boost
+                        * preferred_factor
+                        * eff_consistency
+                        * eff_dominant
+                    )
+                    score *= _shell_preference_factor(shell)
                     scored_matches.append(
                         (float(score), str(element_name), str(line_name), float(line_weight), float(distance))
                     )
 
             scored_matches.sort(key=lambda item: item[0], reverse=True)
+
+            if mode_normalized == "elements_preferred" and preferred_elements_set:
+                preferred_scored_matches = [
+                    item for item in scored_matches if str(item[1]) in preferred_elements_set
+                ]
+                if len(preferred_scored_matches) > 0:
+                    non_preferred_scored_matches = [
+                        item for item in scored_matches if str(item[1]) not in preferred_elements_set
+                    ]
+                    scored_matches = preferred_scored_matches + non_preferred_scored_matches
+
             unique = []
             seen_labels = set()
             for score, element_name, line_name, line_weight, distance in scored_matches:
@@ -1272,12 +1573,22 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             return selected
 
+        first_pass_elements = {
+            str(match[4])
+            for match in peak_matches
+            if len(match) > 4 and str(match[4]) not in ignored_elements
+        }
+        rematch_allowed_elements = set(str(element_name) for element_name in detected_elements)
+        rematch_allowed_elements.update(first_pass_elements)
+        if preferred_elements_set:
+            rematch_allowed_elements.update(preferred_elements_set)
+
         for peak_idx, height, peak_energy, snr in display_peaks:
             match = raw_match_by_idx.get(int(peak_idx))
 
-            if detected_elements:
+            if rematch_allowed_elements:
                 alt_match_info = _best_supported_line_match_with_prior(
-                    peak_energy, snr, detected_elements, requested_edge_filters
+                    peak_energy, snr, rematch_allowed_elements, requested_edge_filters
                 )
                 if alt_match_info is not None:
                     alt_element, alt_line_name, alt_line_weight, alt_distance = alt_match_info
@@ -1311,6 +1622,12 @@ class Dataset3deds(Dataset3dspectroscopy):
             for element_name in detected_elements
             if str(element_name) in matched_elements
         }
+        if mode_normalized == "elements_preferred" and preferred_elements_set:
+            detected_elements.update(
+                str(element_name)
+                for element_name in preferred_elements_set
+                if str(element_name) in matched_elements
+            )
         if ignored_elements:
             detected_elements = {
                 str(element_name)
@@ -1320,14 +1637,49 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         refined_match_by_idx = {int(match[0]): match for match in peak_matches}
 
+        final_matches_by_element: dict[str, set[str]] = {}
+        for (
+            _peak_idx,
+            _height,
+            _peak_energy,
+            _snr,
+            element_name,
+            _match_str,
+            _distance,
+            line_name,
+            _line_weight,
+            _match_confidence,
+        ) in peak_matches:
+            element_key = str(element_name)
+            if element_key in ignored_elements:
+                continue
+            final_matches_by_element.setdefault(element_key, set()).add(str(line_name))
+
         displayed_peak_count = len(display_peaks)
         total_over_snr_peak_count = len(significant_peaks)
 
         candidate_elements = sorted(
             str(element_name)
-            for element_name in set(element_stats.keys())
+            for element_name in final_matches_by_element
             if str(element_name) not in detected_elements
         )
+        possible_elements_set = set(candidate_elements)
+        possible_line_labels = {
+            f"{str(element_name)} {str(line_name)}"
+            for (
+                _,
+                _,
+                _,
+                _,
+                element_name,
+                _,
+                _,
+                line_name,
+                _,
+                _,
+            ) in peak_matches
+            if str(element_name) in possible_elements_set
+        }
 
         def _format_saved_model_elements(edge_filters):
             if edge_filters is None:
@@ -1348,13 +1700,17 @@ class Dataset3deds(Dataset3dspectroscopy):
         def _format_elements_with_lines(element_names):
             formatted = []
             for element_name in sorted(str(name) for name in element_names):
-                stats = element_stats.get(str(element_name), {})
-                lines = stats.get("lines", set())
-                line_names = sorted(str(line_name) for line_name in lines)
+                line_names = sorted(str(line_name) for line_name in final_matches_by_element.get(
+                    str(element_name), set()
+                ))
+                confidence_value = float(element_confidence.get(str(element_name), 0.0))
+                confidence_suffix = f" conf={confidence_value:.2f}"
                 if len(line_names) > 0:
-                    formatted.append(f"{element_name} [{', '.join(line_names)}]")
+                    formatted.append(
+                        f"{element_name} [{', '.join(line_names)}]{confidence_suffix}"
+                    )
                 else:
-                    formatted.append(str(element_name))
+                    formatted.append(f"{str(element_name)}{confidence_suffix}")
             return ", ".join(formatted)
 
         model_elements_header = "Saved Model Elements (Plotted):\n"
@@ -1366,6 +1722,17 @@ class Dataset3deds(Dataset3dspectroscopy):
             print(f"\nAutodetected: {_format_elements_with_lines(detected_elements)}")
         else:
             print("\nAutodetected: None")
+        if dominant_elements:
+            dominant_sorted = sorted(
+                dominant_elements,
+                key=lambda el: element_confidence.get(str(el), 0.0),
+                reverse=True,
+            )
+            dominant_str = ", ".join(
+                f"{el} (conf={element_confidence.get(str(el), 0.0):.2f})"
+                for el in dominant_sorted
+            )
+            print(f"Dominant (strong prior): {dominant_str}")
         if candidate_elements:
             print(f"Possible: {_format_elements_with_lines(candidate_elements)}")
         else:
@@ -1414,6 +1781,11 @@ class Dataset3deds(Dataset3dspectroscopy):
                 return f"{label_text}*"
             return label_text
 
+        def _format_label_with_score(label_text, score_value):
+            if score_value is None:
+                return str(label_text)
+            return f"{label_text} ({float(score_value):.3f})"
+
         for peak_idx, height, peak_energy, snr in display_peaks:
             match = refined_match_by_idx.get(int(peak_idx))
             if match is not None:
@@ -1435,20 +1807,40 @@ class Dataset3deds(Dataset3dspectroscopy):
                     requested_edge_filters,
                     top_k=3,
                 )
-                best_match = _mark_autodetected_label(str(match[5]))
+                best_label = f"{str(match[4])} {str(match[7])}"
+                score_by_label = {
+                    f"{element_name} {line_name}".lower(): float(score)
+                    for element_name, line_name, _, _, score in top_matches
+                }
+                best_score = score_by_label.get(str(best_label).lower())
+                best_match = _mark_autodetected_label(
+                    _format_label_with_score(best_label, best_score)
+                )
                 alt_2 = "-"
                 alt_3 = "-"
 
                 if len(top_matches) > 0:
-                    ranked_labels = [
-                        f"{element_name} {line_name}"
-                        for element_name, line_name, _, _, _ in top_matches
+                    ranked_entries = [
+                        (f"{element_name} {line_name}", float(score))
+                        for element_name, line_name, _, _, score in top_matches
                     ]
-                    best_match = _mark_autodetected_label(ranked_labels[0])
-                    if len(ranked_labels) > 1:
-                        alt_2 = _mark_autodetected_label(ranked_labels[1])
-                    if len(ranked_labels) > 2:
-                        alt_3 = _mark_autodetected_label(ranked_labels[2])
+                    ranked_entries = [
+                        (label, score)
+                        for label, score in ranked_entries
+                        if str(label).lower() != str(best_label).lower()
+                    ]
+                    if len(ranked_entries) > 0:
+                        alt_2 = _mark_autodetected_label(
+                            _format_label_with_score(
+                                ranked_entries[0][0], ranked_entries[0][1]
+                            )
+                        )
+                    if len(ranked_entries) > 1:
+                        alt_3 = _mark_autodetected_label(
+                            _format_label_with_score(
+                                ranked_entries[1][0], ranked_entries[1][1]
+                            )
+                        )
 
                 table_rows.append((peak_energy, height, snr, best_match, alt_2, alt_3))
                 matched_row_count += 1
@@ -1499,12 +1891,12 @@ class Dataset3deds(Dataset3dspectroscopy):
         y_dot = -0.04 * y_scale
 
         def _infer_requested_element_for_color(peak_energy):
-            if search_elements is None or not all_info:
+            if reference_elements is None or not all_info:
                 return None
 
             best_element = None
             best_distance = float("inf")
-            for element_name in search_elements:
+            for element_name in reference_elements:
                 element_key = str(element_name)
                 lines_info = all_info.get(element_key, {})
                 if not isinstance(lines_info, dict):
@@ -1530,9 +1922,11 @@ class Dataset3deds(Dataset3dspectroscopy):
             return best_element
 
         for peak_idx, height, peak_energy, snr in display_peaks:
+            if _is_in_ignored_range(peak_energy):
+                continue
             is_sample = detected_sample_peaks.get(peak_energy, False)
             match = refined_match_by_idx.get(int(peak_idx))
-            is_possible = match is not None and str(match[4]) not in detected_elements
+            is_possible = match is not None and str(match[4]) in possible_elements_set
             if match is not None:
                 peak_element = match[4]
                 line_color = element_color_map.get(peak_element, "red")
@@ -1598,13 +1992,12 @@ class Dataset3deds(Dataset3dspectroscopy):
         # If elements were explicitly requested, overlay reference X-ray lines from the
         # database even when they are not peak-matched by auto-id.
         all_label_candidates = []
-        if search_elements is not None:
+        unified_axes_top_label_y = 0.92
+        if reference_elements is not None:
             energy_min = float(np.min(E))
             energy_max = float(np.max(E))
             displayed_peak_energies = [float(peak_energy) for _, _, peak_energy, _ in display_peaks]
             display_peak_tolerance = max(0.05, 0.5 * tolerance)
-            possible_elements_set = set(str(element_name) for element_name in candidate_elements)
-            reference_label_counts = {}
             existing_matches_by_element = {}
             for (
                 peak_idx,
@@ -1623,12 +2016,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                     existing_matches_by_element[element_key] = []
                 existing_matches_by_element[element_key].append(float(peak_energy))
 
-            for element_name in sorted(search_elements):
+            for element_name in sorted(reference_elements):
                 element_key = str(element_name)
-                is_reference_only = (
-                    element_key not in detected_elements
-                    and element_key not in possible_elements_set
-                )
                 lines_info = all_info.get(element_key, {}) if all_info is not None else {}
                 if not isinstance(lines_info, dict) or len(lines_info) == 0:
                     continue
@@ -1669,10 +2058,16 @@ class Dataset3deds(Dataset3dspectroscopy):
                     )[:6]
 
                 for line_name, line_energy, line_weight in filtered_lines:
+                    if _is_in_ignored_range(line_energy):
+                        continue
+
+                    line_label = f"{element_key} {line_name}"
+                    is_possible_line = line_label in possible_line_labels
+
                     # For possible elements, draw guides only near peaks that already
                     # passed snr_min. For reference-only requested elements, keep
                     # explicit refline guides even without nearby peaks.
-                    if not is_reference_only:
+                    if is_possible_line:
                         if not any(
                             abs(line_energy - peak_energy) <= display_peak_tolerance
                             for peak_energy in displayed_peak_energies
@@ -1687,8 +2082,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                         continue
 
                     line_color = element_color_map.get(element_key, "black")
-                    line_style = ":" if is_reference_only else "--"
-                    line_alpha = 0.35 if is_reference_only else 0.3
+                    line_style = "--" if is_possible_line else ":"
+                    line_alpha = 0.3 if is_possible_line else 0.35
                     ax_spec.axvline(
                         line_energy,
                         color=line_color,
@@ -1696,17 +2091,13 @@ class Dataset3deds(Dataset3dspectroscopy):
                         alpha=line_alpha,
                         linewidth=1.2,
                     )
-                    label_index = reference_label_counts.get(element_key, 0)
-                    reference_label_counts[element_key] = label_index + 1
-                    # Keep dashed reference labels inside the axes near the top border.
-                    y_label_axes = 0.98 - 0.06 * (label_index % 3)
                     all_label_candidates.append(
                         (
                             float(line_energy),
                             f"{element_key} {line_name}",
                             line_color,
                             line_style,
-                            float(y_label_axes),
+                            float(unified_axes_top_label_y),
                             "axes_top",
                             8,
                             "normal",
@@ -1734,7 +2125,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 is_detected_peak = element_name in detected_elements and detected_sample_peaks.get(
                     peak_energy, False
                 )
-                is_possible_peak = element_name not in detected_elements
+                is_possible_peak = str(element_name) in possible_elements_set
                 if not (is_detected_peak or is_possible_peak):
                     continue
 
@@ -1748,6 +2139,8 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             label_vertical_offset = max(0.03 * y_scale, 0.08)
             for peak_energy, label_text, color, height, linestyle in labels_to_plot:
+                if _is_in_ignored_range(peak_energy):
+                    continue
                 if linestyle == "--":
                     all_label_candidates.append(
                         (
@@ -1755,7 +2148,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                             label_text,
                             color,
                             linestyle,
-                            0.90,
+                            float(unified_axes_top_label_y),
                             "axes_top",
                             9,
                             "normal",
@@ -1780,17 +2173,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         if show_text and all_label_candidates:
             all_label_candidates.sort(key=lambda item: item[0])
 
-            overlap_threshold = max(0.10, 0.7 * float(tolerance))
-            same_label_overlap_threshold = max(0.16, 1.1 * float(tolerance))
-            same_color_overlap_threshold = max(0.22, 1.6 * float(tolerance))
+            overlap_threshold = max(0.16, 1.10 * float(tolerance))
             grouped_labels = []
             current_group = []
-
-            def _same_color(c1, c2):
-                try:
-                    return np.allclose(np.asarray(c1), np.asarray(c2))
-                except Exception:
-                    return str(c1) == str(c2)
 
             for label in all_label_candidates:
                 if not current_group:
@@ -1798,15 +2183,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                     continue
 
                 prev_energy = current_group[-1][0]
-                prev_text = current_group[-1][1]
-                prev_color = current_group[-1][2]
                 energy_delta = abs(label[0] - prev_energy)
-
                 should_group = energy_delta <= overlap_threshold
-                if not should_group and label[1] == prev_text:
-                    should_group = energy_delta <= same_label_overlap_threshold
-                if not should_group and _same_color(label[2], prev_color):
-                    should_group = energy_delta <= same_color_overlap_threshold
 
                 if should_group:
                     current_group.append(label)
@@ -1883,56 +2261,10 @@ class Dataset3deds(Dataset3dspectroscopy):
                 fontsize=8,
                 title="Overlapping Labels",
             )
-
-        style_legend_handles = [
-            Line2D(
-                [0],
-                [0],
-                color="gray",
-                linestyle="None",
-                marker="|",
-                markersize=8,
-                markeredgewidth=1.5,
-                label="Gray tick: above snr_min, unmatched",
-            ),
-            Line2D(
-                [0],
-                [0],
-                color="black",
-                linestyle="--",
-                linewidth=1.5,
-                label="Dashed line: possible",
-            ),
-            Line2D(
-                [0],
-                [0],
-                color="black",
-                linestyle=":",
-                linewidth=1.5,
-                label="Dotted line: requested refline",
-            ),
-            Line2D(
-                [0],
-                [0],
-                color="black",
-                linestyle="-",
-                linewidth=1.5,
-                label="Solid line: autodetected",
-            ),
-        ]
-        style_legend = ax_spec.legend(
-            handles=style_legend_handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.16),
-            ncol=4,
-            fontsize=8,
-            frameon=True,
-            title="Peak Marker Guide",
-        )
         if overlap_legend is not None:
             ax_spec.add_artist(overlap_legend)
 
-        fig.tight_layout(rect=[0, 0.08, 1, 1])
+        fig.tight_layout()
         plt.show()
 
         print(
