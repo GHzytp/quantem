@@ -643,188 +643,185 @@ class Dataset3deels(Dataset3dspectroscopy):
         )
         return thickness_nm
 
+    def plot_dual_eels_picker(ll, hl, coords=None, title="QuantEM: Dual-EELS Analysis"):
+        """
+        Dual-EELS Picker with starting coordinates.
+        """
+        # 1. Setup Data
+        sum_ll = np.sum(ll.array, axis=0)
+        sum_hl = np.sum(hl.array, axis=0)
+        energy_ll = ll.origin[0] + np.arange(ll.shape[0]) * ll.sampling[0]
+        energy_hl = hl.origin[0] + np.arange(hl.shape[0]) * hl.sampling[0]
 
-def plot_dual_eels_picker(ll, hl, coords=None, title="QuantEM: Dual-EELS Analysis"):
-    """
-    Dual-EELS Picker with starting coordinates.
-    """
-    # 1. Setup Data
-    sum_ll = np.sum(ll.array, axis=0)
-    sum_hl = np.sum(hl.array, axis=0)
-    energy_ll = ll.origin[0] + np.arange(ll.shape[0]) * ll.sampling[0]
-    energy_hl = hl.origin[0] + np.arange(hl.shape[0]) * hl.sampling[0]
+        # 2. Handle Initial Coordinates
+        if coords is not None:
+            cx, cy = coords
+        else:
+            cx, cy = ll.shape[2] // 2, ll.shape[1] // 2
 
-    # 2. Handle Initial Coordinates
-    if coords is not None:
-        cx, cy = coords
-    else:
-        cx, cy = ll.shape[2] // 2, ll.shape[1] // 2
+        # 3. Create Figure
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+        fig.suptitle(f"{title}\n(Click on maps to update spectra)", fontsize=16)
+        ax_map_ll, ax_spec_ll = axes[0, 0], axes[0, 1]
+        ax_map_hl, ax_spec_hl = axes[1, 0], axes[1, 1]
 
-    # 3. Create Figure
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    fig.suptitle(f"{title}\n(Click on maps to update spectra)", fontsize=16)
-    ax_map_ll, ax_spec_ll = axes[0, 0], axes[0, 1]
-    ax_map_hl, ax_spec_hl = axes[1, 0], axes[1, 1]
+        # Plot Maps & Markers
+        ax_map_ll.imshow(sum_ll, cmap="viridis", origin="lower")
+        (marker_ll,) = ax_map_ll.plot(cx, cy, "r+", ms=15, mew=2)
 
-    # Plot Maps & Markers
-    ax_map_ll.imshow(sum_ll, cmap="viridis", origin="lower")
-    (marker_ll,) = ax_map_ll.plot(cx, cy, "r+", ms=15, mew=2)
+        ax_map_hl.imshow(sum_hl, cmap="magma", origin="lower")
+        (marker_hl,) = ax_map_hl.plot(cx, cy, "r+", ms=15, mew=2)
 
-    ax_map_hl.imshow(sum_hl, cmap="magma", origin="lower")
-    (marker_hl,) = ax_map_hl.plot(cx, cy, "r+", ms=15, mew=2)
+        # Plot Initial Spectra
+        (line_ll,) = ax_spec_ll.plot(energy_ll, ll.array[:, cy, cx], color="tab:blue")
+        (line_hl,) = ax_spec_hl.plot(energy_hl, hl.array[:, cy, cx], color="tab:red")
 
-    # Plot Initial Spectra
-    (line_ll,) = ax_spec_ll.plot(energy_ll, ll.array[:, cy, cx], color="tab:blue")
-    (line_hl,) = ax_spec_hl.plot(energy_hl, hl.array[:, cy, cx], color="tab:red")
+        def update_plots(x, y):
+            marker_ll.set_data([x], [y])
+            marker_hl.set_data([x], [y])
 
-    def update_plots(x, y):
-        marker_ll.set_data([x], [y])
-        marker_hl.set_data([x], [y])
+            new_ll = ll.array[:, y, x]
+            new_hl = hl.array[:, y, x]
+            line_ll.set_ydata(new_ll)
+            line_hl.set_ydata(new_hl)
 
-        new_ll = ll.array[:, y, x]
-        new_hl = hl.array[:, y, x]
-        line_ll.set_ydata(new_ll)
-        line_hl.set_ydata(new_hl)
+            # Rescale
+            ax_spec_ll.set_ylim(0, np.max(new_ll) * 1.1)
+            ax_spec_hl.set_ylim(0, np.max(new_hl) * 1.1)
 
-        # Rescale
-        ax_spec_ll.set_ylim(0, np.max(new_ll) * 1.1)
-        ax_spec_hl.set_ylim(0, np.max(new_hl) * 1.1)
+            ax_spec_ll.set_title(f"LL Spectrum at ({x}, {y})")
+            ax_spec_hl.set_title(f"HL Spectrum at ({x}, {y})")
+            fig.canvas.draw_idle()
 
-        ax_spec_ll.set_title(f"LL Spectrum at ({x}, {y})")
-        ax_spec_hl.set_title(f"HL Spectrum at ({x}, {y})")
-        fig.canvas.draw_idle()
+        def on_click(event):
+            if event.inaxes in [ax_map_ll, ax_map_hl]:
+                ix, iy = int(round(event.xdata)), int(round(event.ydata))
+                if 0 <= ix < ll.shape[2] and 0 <= iy < ll.shape[1]:
+                    update_plots(ix, iy)
 
-    def on_click(event):
-        if event.inaxes in [ax_map_ll, ax_map_hl]:
-            ix, iy = int(round(event.xdata)), int(round(event.ydata))
-            if 0 <= ix < ll.shape[2] and 0 <= iy < ll.shape[1]:
-                update_plots(ix, iy)
+        fig.canvas.mpl_connect("button_press_event", on_click)
 
-    fig.canvas.mpl_connect("button_press_event", on_click)
+        ax_spec_ll.set_title(f"LL Spectrum at ({cx}, {cy})")
+        ax_spec_hl.set_title(f"HL Spectrum at ({cx}, {cy})")
 
-    ax_spec_ll.set_title(f"LL Spectrum at ({cx}, {cy})")
-    ax_spec_hl.set_title(f"HL Spectrum at ({cx}, {cy})")
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)  # Prevents double-plotting in VS Code
+        return fig
 
-    plt.tight_layout()
-    plt.show()
-    plt.close(fig)  # Prevents double-plotting in VS Code
-    return fig
+    def plot_quantem_diagnostic(dataset, zlp_window=5.0, title_suffix=""):
+        """
+        QuantEM Diagnostic Dashboard: Visualizes mean spectra, spatial variation,
+        and Zero Loss Peak (ZLP) centering accuracy.
 
+        1. Global Average Spectrum (Top Left): Shows the mean intensity across the entire scan.
+        It is used to check the signal-to-noise ratio and see if the Zero Loss Peak (ZLP) is roughly centered at 0 eV.
+        2. Spatial Variation (Top Right): Plots spectra from a 5x5 grid of pixels across your sample.
+        This helps you see if the energy shift or intensity changes drastically from one side of the scan to the other
+        (e.g., due to sample thickness changes or beam drift).
+        3. Integrated Intensity Map (Bottom Left): A spatial image of the total counts.
+        This is your "search image" to help you correlate the spectral data with the physical structure of your sample.
+        4. ZLP Alignment Detail (Bottom Right): A high-zoom view of the energy region around 0 eV of the Mean Spectrum.
+        It includes a dashed green line at the "Target 0" to show exactly how much residual calibration error remains
+        after your alignment.
 
-def plot_quantem_diagnostic(dataset, zlp_window=5.0, title_suffix=""):
-    """
-    QuantEM Diagnostic Dashboard: Visualizes mean spectra, spatial variation,
-    and Zero Loss Peak (ZLP) centering accuracy.
+        Parameters:
+        -----------
+        dataset : QuantEM Object
+            The EELS dataset containing .array, .origin, and .sampling attributes.
+        zlp_window : float, optional
+            The energy range (± eV) to display in the ZLP zoom plot. Default is 5.0.
+        title_suffix : str, optional
+            Additional text to append to the figure title (e.g., "(RAW)" or "(Aligned)").
 
-    1. Global Average Spectrum (Top Left): Shows the mean intensity across the entire scan.
-    It is used to check the signal-to-noise ratio and see if the Zero Loss Peak (ZLP) is roughly centered at 0 eV.
-    2. Spatial Variation (Top Right): Plots spectra from a 5x5 grid of pixels across your sample.
-    This helps you see if the energy shift or intensity changes drastically from one side of the scan to the other
-    (e.g., due to sample thickness changes or beam drift).
-    3. Integrated Intensity Map (Bottom Left): A spatial image of the total counts.
-    This is your "search image" to help you correlate the spectral data with the physical structure of your sample.
-    4. ZLP Alignment Detail (Bottom Right): A high-zoom view of the energy region around 0 eV of the Mean Spectrum.
-    It includes a dashed green line at the "Target 0" to show exactly how much residual calibration error remains
-    after your alignment.
+        Returns:
+        --------
+        fig : matplotlib.figure.Figure
+            The figure object for further manipulation or saving.
+        """
+        data = dataset.array
+        energy = dataset.origin[0] + np.arange(data.shape[0]) * dataset.sampling[0]
 
-    Parameters:
-    -----------
-    dataset : QuantEM Object
-        The EELS dataset containing .array, .origin, and .sampling attributes.
-    zlp_window : float, optional
-        The energy range (± eV) to display in the ZLP zoom plot. Default is 5.0.
-    title_suffix : str, optional
-        Additional text to append to the figure title (e.g., "(RAW)" or "(Aligned)").
+        mean_spec = np.mean(data, axis=(1, 2))
+        zlp_pos = energy[np.argmax(mean_spec)]
+        sum_img = np.sum(data, axis=0)
 
-    Returns:
-    --------
-    fig : matplotlib.figure.Figure
-        The figure object for further manipulation or saving.
-    """
-    data = dataset.array
-    energy = dataset.origin[0] + np.arange(data.shape[0]) * dataset.sampling[0]
+        fig = plt.figure(figsize=(14, 9))
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.2)
+        fig.suptitle(f"QuantEM Diagnostic: {dataset.name} {title_suffix}", fontsize=16)
 
-    mean_spec = np.mean(data, axis=(1, 2))
-    zlp_pos = energy[np.argmax(mean_spec)]
-    sum_img = np.sum(data, axis=0)
+        # 1. Mean Spectrum
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.plot(energy, mean_spec, color="black", label="Mean")
+        ax1.axvline(0, color="green", ls=":", label="Target")
+        ax1.set_title("Global Average Spectrum")
+        ax1.legend()
 
-    fig = plt.figure(figsize=(14, 9))
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.2)
-    fig.suptitle(f"QuantEM Diagnostic: {dataset.name} {title_suffix}", fontsize=16)
+        # 2. Spatial Variability
+        ax2 = fig.add_subplot(gs[0, 1])
+        # Take a 5x5 grid for better representation than 3x3
+        yy, xx = np.meshgrid(
+            np.linspace(0, data.shape[1] - 1, 5, dtype=int),
+            np.linspace(0, data.shape[2] - 1, 5, dtype=int),
+        )
+        for y, x in zip(yy.flatten(), xx.flatten()):
+            ax2.plot(energy, data[:, y, x], alpha=0.3, lw=0.5)
+        ax2.set_title("Spatial Variation (Grid Samples)")
 
-    # 1. Mean Spectrum
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(energy, mean_spec, color="black", label="Mean")
-    ax1.axvline(0, color="green", ls=":", label="Target")
-    ax1.set_title("Global Average Spectrum")
-    ax1.legend()
+        # 3. Map
+        ax3 = fig.add_subplot(gs[1, 0])
+        im = ax3.imshow(sum_img, cmap="viridis", origin="lower")
+        plt.colorbar(im, ax=ax3)
+        ax3.set_title("Integrated Intensity")
 
-    # 2. Spatial Variability
-    ax2 = fig.add_subplot(gs[0, 1])
-    # Take a 5x5 grid for better representation than 3x3
-    yy, xx = np.meshgrid(
-        np.linspace(0, data.shape[1] - 1, 5, dtype=int),
-        np.linspace(0, data.shape[2] - 1, 5, dtype=int),
-    )
-    for y, x in zip(yy.flatten(), xx.flatten()):
-        ax2.plot(energy, data[:, y, x], alpha=0.3, lw=0.5)
-    ax2.set_title("Spatial Variation (Grid Samples)")
+        # 4. ZLP Zoom
+        ax4 = fig.add_subplot(gs[1, 1])
+        mask = (energy > zlp_pos - zlp_window) & (energy < zlp_pos + zlp_window)
+        ax4.plot(energy[mask], mean_spec[mask], lw=2)
+        ax4.axvline(0, color="green", ls=":")
+        ax4.set_title("ZLP Alignment Detail")
+        plt.close(fig)
 
-    # 3. Map
-    ax3 = fig.add_subplot(gs[1, 0])
-    im = ax3.imshow(sum_img, cmap="viridis", origin="lower")
-    plt.colorbar(im, ax=ax3)
-    ax3.set_title("Integrated Intensity")
+        return fig
 
-    # 4. ZLP Zoom
-    ax4 = fig.add_subplot(gs[1, 1])
-    mask = (energy > zlp_pos - zlp_window) & (energy < zlp_pos + zlp_window)
-    ax4.plot(energy[mask], mean_spec[mask], lw=2)
-    ax4.axvline(0, color="green", ls=":")
-    ax4.set_title("ZLP Alignment Detail")
-    plt.close(fig)
+    def plot_zlp_drift_diagnostics(dataset, title="ZLP Drift Analysis"):
+        """
+        QuantEM Diagnostic: Maps the ZLP position and calculates the drift distribution.
+        Uses scipy.stats for Gaussian fitting.
+        """
+        data = dataset.array
+        energy = dataset.origin[0] + np.arange(data.shape[0]) * dataset.sampling[0]
 
-    return fig
+        # 1. Mask and find peak per pixel
+        search_mask = (energy > -2.0) & (energy < 2.0)
+        search_energies = energy[search_mask]
+        peak_indices = np.argmax(data[search_mask, :, :], axis=0)
+        zlp_map = search_energies[peak_indices]
 
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        fig.suptitle(f"QuantEM: {dataset.name} - {title}", fontsize=16)
 
-def plot_zlp_drift_diagnostics(dataset, title="ZLP Drift Analysis"):
-    """
-    QuantEM Diagnostic: Maps the ZLP position and calculates the drift distribution.
-    Uses scipy.stats for Gaussian fitting.
-    """
-    data = dataset.array
-    energy = dataset.origin[0] + np.arange(data.shape[0]) * dataset.sampling[0]
+        # Plot A: Map
+        im = ax1.imshow(zlp_map, cmap="RdYlBu_r", origin="lower")
+        plt.colorbar(im, ax=ax1, label="Energy Shift (eV)")
 
-    # 1. Mask and find peak per pixel
-    search_mask = (energy > -2.0) & (energy < 2.0)
-    search_energies = energy[search_mask]
-    peak_indices = np.argmax(data[search_mask, :, :], axis=0)
-    zlp_map = search_energies[peak_indices]
+        # Plot B: Histogram + Scipy Fit
+        flat_pos = zlp_map.flatten()
+        mu, std = norm.fit(flat_pos)  # Professional scipy fitting
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    fig.suptitle(f"QuantEM: {dataset.name} - {title}", fontsize=16)
+        ax2.hist(flat_pos, bins=30, density=True, alpha=0.6, color="skyblue")
+        x_range = np.linspace(np.min(flat_pos), np.max(flat_pos), 100)
+        ax2.plot(
+            x_range,
+            norm.pdf(x_range, mu, std),
+            color="darkred",
+            lw=2,
+            label=f"Fit: μ={mu:.3f} eV, σ={std:.3f} eV",
+        )
+        ax2.legend()
 
-    # Plot A: Map
-    im = ax1.imshow(zlp_map, cmap="RdYlBu_r", origin="lower")
-    plt.colorbar(im, ax=ax1, label="Energy Shift (eV)")
+        plt.tight_layout()
 
-    # Plot B: Histogram + Scipy Fit
-    flat_pos = zlp_map.flatten()
-    mu, std = norm.fit(flat_pos)  # Professional scipy fitting
+        plt.close(fig)
 
-    ax2.hist(flat_pos, bins=30, density=True, alpha=0.6, color="skyblue")
-    x_range = np.linspace(np.min(flat_pos), np.max(flat_pos), 100)
-    ax2.plot(
-        x_range,
-        norm.pdf(x_range, mu, std),
-        color="darkred",
-        lw=2,
-        label=f"Fit: μ={mu:.3f} eV, σ={std:.3f} eV",
-    )
-    ax2.legend()
-
-    plt.tight_layout()
-
-    plt.close(fig)
-
-    return fig
+        return fig
