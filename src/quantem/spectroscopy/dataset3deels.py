@@ -705,7 +705,6 @@ class Dataset3deels(Dataset3dspectroscopy):
         ax_spec_hl.set_title(f"HL Spectrum at ({cx}, {cy})")
 
         plt.tight_layout()
-        plt.show()
         plt.close(fig)  # Prevents double-plotting in VS Code
         return fig
 
