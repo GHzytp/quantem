@@ -287,6 +287,39 @@ class TestDatasetMethods:
         assert dset.shape == (1920, 64)
         assert np.array_equal(dset.origin, np.array([45, 7]))
 
+    def test_getitem_slice_updates_origin_like_crop(self):
+        """Test slicing keeps origin aligned with crop semantics."""
+        dset = Dataset.from_array(
+            np.random.rand(16, 8),
+            origin=(10, 20),
+            sampling=(0.5, 2.0),
+            units=["nm", "nm"],
+        )
+
+        sliced = dset[4:12]
+        cropped = dset.crop(crop_widths=((4, 12),), axes=0)
+
+        assert sliced.shape == (8, 8)
+        assert np.array_equal(sliced.origin, np.array([12, 20]))
+        assert np.array_equal(sliced.origin, cropped.origin)
+        assert np.array_equal(sliced.sampling, cropped.sampling)
+
+    def test_getitem_slice_reduced_rank_updates_origin_and_sampling(self):
+        """Test slicing before integer indexing updates remaining metadata."""
+        dset = Dataset.from_array(
+            np.random.rand(10, 6, 4),
+            origin=(1.5, 10, -2),
+            sampling=(0.25, 2.0, 5.0),
+            units=["nm", "nm", "1/nm"],
+        )
+
+        sliced = dset[2:8:2, 3]
+
+        assert sliced.shape == (3, 4)
+        assert np.allclose(sliced.origin, np.array([2.0, -2.0]))
+        assert np.allclose(sliced.sampling, np.array([0.5, 5.0]))
+        assert sliced.units == ["nm", "1/nm"]
+
     def test_bin(self, sample_dataset_2d):
         """Test bin method."""
         # Bin by factor of 2
