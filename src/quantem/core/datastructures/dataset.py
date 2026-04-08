@@ -23,7 +23,7 @@ class Dataset(AutoSerialize):
     Attributes (Properties):
         array (NDArray): The underlying n-dimensional NumPy array data.
         name (str): A descriptive name for the dataset.
-        origin (NDArray): The origin coordinates for each dimension (1D array).
+        origin (NDArray): The origin coordinates for each dimension (1D array) in calibrated units.
         sampling (NDArray): The sampling rate/spacing for each dimension (1D array).
         units (list[str]): Units for each dimension.
         signal_units (str): Units for the array values.
@@ -84,7 +84,7 @@ class Dataset(AutoSerialize):
         name: str | None
             The name of the Dataset.
         origin: NDArray | tuple | list | float | int | None
-            The origin of the Dataset.
+            The origin of the Dataset in calibrated units.
         sampling: NDArray | tuple | list | float | int | None
             The sampling of the Dataset.
         units: list[str] | tuple | list | None
