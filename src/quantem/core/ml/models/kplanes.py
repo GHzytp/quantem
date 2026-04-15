@@ -2,6 +2,7 @@
 Tensor Decomposition Methods for INR-based reconstructions
 """
 
+import itertools
 from typing import Any, Callable, Optional, Sequence
 
 import tinycudann as tcnn
@@ -209,8 +210,6 @@ class KPlanes(nn.Module, PPLR):
             },
         )
 
-
-
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
 
@@ -229,29 +228,14 @@ class KPlanes(nn.Module, PPLR):
     ):
         return self.get_densities(pts)
     
-
-    def get_optimization_parameters(self) -> Dict[str, list[torch.nn.Parameter]]:
-        return [
-            {"params": }
-        ]
-
-    
     def get_params(self) -> dict[str, list[torch.nn.Parameter]]:
         return {
             "grids": [p for grid in self.grids for p in grid],  # flatten ParameterLists
             "sigma_net": list(self.sigma_net.parameters()),
         }
 
- 
-    def set_optimizer(self, optimizer_params: dict[str, Any]):
-        
-        self._grids.set_optimizer(optimizer_params["grids"])
-        self._sigmanet.set_optimizer(optimizer_params["sigmanet"])
-
+    @property
+    def param_keys(self) -> list[str]:
+        return ["grids", "sigma_net"]
 
     
-    def get_params(self) -> dict[str, list[torch.nn.Parameter]]:
-        return {
-            "grids": self._grids.params  # flatten ParameterLists
-            "sigma_net": self._sigma_net.params
-        }

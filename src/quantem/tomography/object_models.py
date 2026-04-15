@@ -10,10 +10,12 @@ import torch.nn as nn
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml import OptimizerParams
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.models.model_base import PPLR
+from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 
@@ -552,10 +554,64 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     # --- Optimization Parameters ---
     @property
     def params(self) -> Generator[torch.nn.Parameter, None, None]:
+        """
+        Returns the optimization parameters, here we also check if PPLR is used and return the appropriate parameters.
+        """
+   
         return self.model.parameters()  # type: ignore[attr-defined]
 
     def get_optimization_parameters(self) -> list[nn.Parameter]:
+        
+        if isinstance(self.model, PPLR):
+
+            # DEBUG
+            for key, value in self.optimizer_params.items():
+                print(key, value)
+            return [
+                {
+                    "params": self.model.get_params()[key], 
+                    **self.optimizer_params[key].params(),
+                }
+                for key in self.model.param_keys
+            ]
         return list(self.params)
+
+
+    # --- DDP Mixin Overloads in the case of PPLR ---
+
+    @property
+    def optimizer_params(self) -> OptimizerType | dict[str, OptimizerType]:
+        """Get the optimizer parameters."""
+        return self._optimizer_params
+
+    @optimizer_params.setter
+    def optimizer_params(self, params: OptimizerType | dict[str, OptimizerType] | dict[str, Any]):
+        """Set the optimizer parameters."""
+        if isinstance(params, OptimizerType):
+            self._optimizer_params = params
+            return
+        if isinstance(self.model, PPLR):
+            if not isinstance(params, dict):
+                raise TypeError(f"optimizer parameters must be a dict for PPLR, got {type(params)}")
+                
+            object_params = params
+            
+            if set(object_params.keys()) != set(self.model.param_keys):
+                raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}")
+
+            params = {}
+            for key, value in object_params.items():
+                if isinstance(value, dict):
+                    params[key] = OptimizerParams.parse_dict(d=value)
+                elif isinstance(value, OptimizerType):
+                    params[key] = value
+                else:
+                    raise TypeError(f"optimizer parameters must be a dict or OptimizerType, got {type(value)}")
+
+            self._optimizer_params = params
+        else:
+            raise TypeError(f"optimizer parameters must be a dict for non-PPLR, got {type(params)}")
+
 
     # Pretraining
     @property

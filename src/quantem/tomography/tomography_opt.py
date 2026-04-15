@@ -52,8 +52,8 @@ class TomographyOpt(TomographyBase):
             if k not in targets:
                 raise ValueError(f"Unknown optimization key: {k}")
 
-            if not isinstance(v, OptimizerType):
-                v = OptimizerParams.parse_dict(v)
+            # if not isinstance(v, OptimizerType):
+            #     v = OptimizerParams.parse_dict(v)
 
             targets[k].optimizer_params = v
 
