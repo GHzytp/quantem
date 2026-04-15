@@ -36,12 +36,35 @@ if TYPE_CHECKING:
 
 ArrayLike: TypeAlias = Union[NDArray, torch.Tensor, "Dataset2d"]  # union required here
 
+# --- show_2d / grid broadcast inputs ---
+# There might be a cleaner way to do this, but better to have it here than in the functions
+NormInputCell: TypeAlias = NormalizationConfig | ShowParams.Norm | dict | str
+Show2dNormInput: TypeAlias = (
+    NormInputCell
+    | None
+    | Sequence[NormInputCell]
+    | Sequence[Sequence[NormInputCell]]
+)
+
+ScalebarInputCell: TypeAlias = ScalebarConfig | ShowParams.Scalebar | dict | bool | None
+Show2dScalebarInput: TypeAlias = (
+    ScalebarConfig
+    | ShowParams.Scalebar
+    | dict
+    | bool
+    | None
+    | Sequence[ScalebarInputCell]
+    | Sequence[Sequence[ScalebarInputCell]]
+)
+
+CmapType: TypeAlias = str | colors.Colormap 
+
 
 def _show_2d_array(
     array: NDArray,
     *,
-    norm: NormalizationConfig | ShowParams.Norm | dict | str | None = None,
-    scalebar: ScalebarConfig | ShowParams.Scalebar | dict | bool | None = None,
+    norm: NormInputCell | None = None,
+    scalebar: ScalebarInputCell = None,
     cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
@@ -51,11 +74,9 @@ def _show_2d_array(
     show_ticks: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
-    """Display a 2D array as an image with optional colorbar and scalebar.
+    """Render a single 2D array (real or complex) with optional colorbar/scalebar.
 
-    This function visualizes a 2D array, handling both real and complex data.
-    For complex data, it displays amplitude and phase information using a
-    perceptually-uniform color representation.
+    Complex data uses amplitude + phase in a perceptually uniform RGB encoding.
 
     Parameters
     ----------
@@ -174,8 +195,8 @@ def _show_2d_array(
 def _show_2d_combined(
     list_of_arrays: Sequence[NDArray],
     *,
-    norm: NormalizationConfig | ShowParams.Norm | dict | str | None = None,
-    scalebar: ScalebarConfig | ShowParams.Scalebar | dict | bool | None = None,
+    norm: NormInputCell | None = None,
+    scalebar: ScalebarInputCell = None,
     chroma_boost: float = 1.0,
     cbar: bool = False,
     figax: tuple[Any, Any] | None = None,
@@ -184,7 +205,7 @@ def _show_2d_combined(
     show_ticks: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
-    """Display multiple 2D arrays as a single combined image.
+    """Fuse multiple 2D arrays into one RGB panel (``show_2d(..., combine_images=True)``).
 
     This function takes a list of 2D arrays and creates a single visualization
     where each array is assigned a unique color, and their amplitudes determine
@@ -401,24 +422,9 @@ def _norm_show_args(
 
 def _normalize_show_args_to_grid(
     shape: tuple[int, int],
-    norm: NormalizationConfig
-    | ShowParams.Norm
-    | dict
-    | str
-    | Sequence[NormalizationConfig | ShowParams.Norm | dict | str]
-    | Sequence[Sequence[NormalizationConfig | ShowParams.Norm | dict | str]]
-    | None = None,
-    scalebar: ScalebarConfig
-    | ShowParams.Scalebar
-    | dict
-    | bool
-    | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
-    | Sequence[Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]]
-    | None = None,
-    cmap: str
-    | colors.Colormap
-    | Sequence[str | colors.Colormap]
-    | Sequence[Sequence[str | colors.Colormap]] = "gray",
+    norm: Show2dNormInput = None,
+    scalebar: Show2dScalebarInput = None,
+    cmap: CmapType | Sequence[CmapType] | Sequence[Sequence[CmapType]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     chroma_boost: float | Sequence[float] = 1.0,
@@ -451,30 +457,12 @@ def _normalize_show_args_to_grid(
     return args
 
 
-# the type hinting is a bit of a mess, but not sure how to improve it
 def show_2d(
     arrays: ArrayLike | Sequence[ArrayLike] | Sequence[Sequence[ArrayLike]],
     *,
-    norm: (
-        NormalizationConfig
-        | ShowParams.Norm
-        | dict
-        | str
-        | Sequence[NormalizationConfig | ShowParams.Norm | dict | str]
-        | Sequence[Sequence[NormalizationConfig | ShowParams.Norm | dict | str]]
-        | None
-    ) = None,
-    scalebar: ScalebarConfig
-    | ShowParams.Scalebar
-    | dict
-    | bool
-    | Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]
-    | Sequence[Sequence[ScalebarConfig | ShowParams.Scalebar | dict | bool | None]]
-    | None = None,
-    cmap: str
-    | colors.Colormap
-    | Sequence[str | colors.Colormap]
-    | Sequence[Sequence[str | colors.Colormap]] = "gray",
+    norm: Show2dNormInput = None,
+    scalebar: Show2dScalebarInput = None,
+    cmap: CmapType | Sequence[CmapType] | Sequence[Sequence[CmapType]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     figax: tuple[Any, Any] | None = None,
@@ -484,12 +472,8 @@ def show_2d(
 ) -> tuple[Any, Any]:
     """Display one or more 2D arrays in a grid layout.
 
-    This is the main visualization function that can display a single array,
-    a list of arrays, or a grid of arrays. It supports both individual and
-    combined visualization modes.
-
-    The display arguments, i.e. everything except figax and axsize, can be given as single values
-    or as sequences that will be broadcasted to the grid shape defined by the input arrays.
+    ``norm``, ``scalebar``, ``cmap``, ``cbar``, and ``title`` may be scalars or nested
+    sequences broadcast to the panel grid.
 
     Parameters
     ----------
@@ -558,35 +542,33 @@ def show_2d(
 
     Examples
     --------
-    Display a single image:
+    Typed normalization and scale bar (same information as str/dict forms):
 
     >>> import numpy as np
-    >>> from quantem.core.visualization import show_2d
-    >>> image = np.random.rand(256, 256)
-    >>> fig, ax = show_2d(image, axsize=(3, 3))
-
-    Display a 2-row grid with titles and a scale bar:
-
-    >>> image_rows = [[np.random.rand(128, 128) for _ in range(3)] for _ in range(2)]
-    >>> label_rows = [["BF", "ADF", "ABF"], ["HAADF", "DPC", "SSB"]]
-    >>> fig, axs = show_2d(
-    ...     image_rows,
-    ...     title=label_rows,
-    ...     cmap="gray",
-    ...     scalebar={"sampling": 0.5, "units": "Å"},
+    >>> from quantem.core.visualization import show_2d, ShowParams
+    >>> img = np.random.rand(128, 128)
+    >>> fig, ax = show_2d(
+    ...     img,
+    ...     norm=ShowParams.Norm.log_auto(),
+    ...     scalebar=ShowParams.Scalebar(sampling=0.5, units="Å"),
+    ...     cbar=True,
     ... )
 
-    Display diffraction patterns with log normalization, colorbar, and scale bar:
+    Preset strings and dicts:
 
-    >>> dps = [np.random.rand(256, 256) ** 3 for _ in range(3)]
     >>> fig, axs = show_2d(
-    ...     dps,
-    ...     title=["Zone axis", "Off-axis", "CBED"],
+    ...     [np.random.rand(64, 64) ** 3 for _ in range(3)],
     ...     norm="log_auto",
-    ...     cbar=True,
     ...     cmap="turbo",
+    ...     title=["a", "b", "c"],
     ...     scalebar={"sampling": 0.02, "units": "1/Å"},
     ... )
+
+    Multi-row grid with titles:
+
+    >>> rows = [[np.random.rand(48, 48) for _ in range(3)] for _ in range(2)]
+    >>> labels = [["BF", "ADF", "ABF"], ["HAADF", "DPC", "SSB"]]
+    >>> fig, axs = show_2d(rows, title=labels, cmap="gray", scalebar={"sampling": 0.5, "units": "Å"})
     """
     arrays = to_cpu(arrays)
     grid = _normalize_show_input_to_grid(arrays)

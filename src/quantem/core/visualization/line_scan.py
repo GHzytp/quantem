@@ -9,6 +9,7 @@ from quantem.core.visualization import show_2d
 
 
 # TODO update sampling to allow for 3D and to plot with appropriate units along xy/z
+# TODO proper normalization for line going through edges/corner with finite linewidth
 def linescan(
     image: np.ndarray,
     center: tuple[int, int] | None = None,
@@ -234,11 +235,13 @@ def _show_linescan(
 
     if profile.ndim == 1:
         ax0.plot(positions, profile, linewidth=2)
+        title = "Image"
     else:
         # For 3D input, show as image
         # im = ax0.imshow(profile, aspect="equal", origin="upper")
-        im = ax0.imshow(profile, aspect="auto", origin="upper")
+        im = ax0.matshow(profile, aspect="auto", origin="upper")
         plt.colorbar(im, ax=ax0)
+        title = "Mean of depth slices"
 
     ax0.set_xlabel(f"Position ({sampling_units})")
     ax0.set_ylabel("Intensity" if profile.ndim == 1 else "Depth (pixels)")
@@ -259,7 +262,7 @@ def _show_linescan(
 
     ax1.set_xlim(0, image.shape[1] - 1)
     ax1.set_ylim(image.shape[0] - 1, 0)
-    ax1.set_title("Image with Line Scan")
+    ax1.set_title(title)
 
     plt.tight_layout()
     return fig, (ax0, ax1)
