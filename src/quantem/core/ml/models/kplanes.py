@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .model_base import PPLR
+
 """
 K-planes utility functions
 """
@@ -150,7 +152,7 @@ def interpolate_ms_features(
 """
 K-planes Model
 """
-class KPlanes(nn.Module):
+class KPlanes(nn.Module, PPLR):
 
     def __init__(
         self,
@@ -226,7 +228,14 @@ class KPlanes(nn.Module):
         pts: torch.Tensor,
     ):
         return self.get_densities(pts)
+    
 
+    def get_optimization_parameters(self) -> Dict[str, list[torch.nn.Parameter]]:
+        return [
+            {"params": }
+        ]
+
+    
     def get_params(self) -> dict[str, list[torch.nn.Parameter]]:
         return {
             "grids": [p for grid in self.grids for p in grid],  # flatten ParameterLists
