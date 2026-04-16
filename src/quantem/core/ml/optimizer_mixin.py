@@ -733,7 +733,7 @@ class OptimizerMixin:
 
         if not optimizable_params:
             print(
-                f"souldn't be getting here! No optimizable parameters found for {self.__class__.__name__}, removing optimizer"
+                f"shouldn't be getting here! No optimizable parameters found for {self.__class__.__name__}, removing optimizer"
             )
             self.remove_optimizer()
             return

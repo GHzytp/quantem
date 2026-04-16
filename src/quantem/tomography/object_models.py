@@ -14,6 +14,7 @@ from quantem.core.ml import OptimizerParams
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.models.kplanes import KPlanes, KPlanesTILTED
 from quantem.core.ml.models.model_base import PPLR
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType
 from quantem.core.utils.rng import RNGMixin
@@ -499,6 +500,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         self.create_volume()
         return self._obj.cpu().numpy().transpose(0, 1, 3, 2)
 
+    # --- Constraints ---
+
     def apply_soft_constraints(
         self,
         coords: torch.Tensor,
@@ -506,42 +509,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     ) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=pred.device)
         if self.constraints.tv_vol > 0:
-
-            if isinstance(self.model, PPLR): # TODO: Temporary
-                for plane in self.model.grids:
-                    # plane: (3*T, C, H, W)
-                    # Differences along H (axis -2) and W (axis -1)
-                    diff_h = plane[..., 1:, :] - plane[..., :-1, :]  # (3*T, C, H-1, W)
-                    diff_w = plane[..., :, 1:] - plane[..., :, :-1]  # (3*T, C, H, W-1)
-
-
-                    soft_loss += diff_h.pow(2).mean() + diff_w.pow(2).mean()
-
-                soft_loss /= len(self.model.grids)
-            else:
-                num_tv_samples = min(10_000, coords.shape[0])
-                tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
-
-                tv_coords = coords[tv_indices].detach().requires_grad_(True)
-                tv_densities_recomputed = self.model(tv_coords)
-                if isinstance(tv_densities_recomputed, tuple):
-                    tv_densities_recomputed = tv_densities_recomputed[0]
-
-                # Ensure shape is [num_samples, num_channels]
-                if tv_densities_recomputed.dim() == 1:
-                    tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
-
-                # Compute gradients for each channel
-                grad_outputs = torch.autograd.grad(
-                    outputs=tv_densities_recomputed,
-                    inputs=tv_coords,
-                    grad_outputs=torch.ones_like(tv_densities_recomputed),
-                    create_graph=True,
-                )[0]  # Shape: [num_samples, coord_dim]
-
-                # Compute TV loss - gradient magnitude per sample
-                grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
-                soft_loss += self.constraints.tv_vol * grad_norm.mean()
+            soft_loss += self.get_tv_loss(coords, pred)
 
         if (
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
@@ -551,6 +519,53 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             soft_loss += sparsity_loss
 
         return soft_loss
+
+    def get_tv_loss(self, coords: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate the TV loss for the given coordinates and predictions.
+
+        Current supported architectures are KPlanes and INRs
+        """
+        
+        if isinstance(self.model, (KPlanes, KPlanesTILTED)):
+
+            per_level = []
+
+            for p in self.model.grids:
+                dh = p[:, :, 1:, :] - p[:, :, :-1, :]
+                dw = p[:, :, :, 1:] - p[:, :, :, :-1]
+                tv = 0.0
+                if self.constraints.tv_vol > 0:
+                    tv = tv + self.constraints.tv_vol * (dh.pow(2).mean() + dw.pow(2).mean())
+                per_level.append(tv)
+            
+            return torch.stack(per_level).sum()
+        else:
+            num_tv_samples = min(10_000, coords.shape[0])
+            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+
+            tv_coords = coords[tv_indices].detach().requires_grad_(True)
+            tv_densities_recomputed = self.model(tv_coords)
+            if isinstance(tv_densities_recomputed, tuple):
+                tv_densities_recomputed = tv_densities_recomputed[0]
+
+            # Ensure shape is [num_samples, num_channels]
+            if tv_densities_recomputed.dim() == 1:
+                tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
+
+            # Compute gradients for each channel
+            grad_outputs = torch.autograd.grad(
+                outputs=tv_densities_recomputed,
+                inputs=tv_coords,
+                grad_outputs=torch.ones_like(tv_densities_recomputed),
+                create_graph=True,
+            )[0]  # Shape: [num_samples, coord_dim]
+
+            # Compute TV loss - gradient magnitude per sample
+            grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
+            return self.constraints.tv_vol * grad_norm.mean()
+
+
 
     def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
         """
@@ -573,7 +588,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
    
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self) -> list[nn.Parameter]:
+    def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
         
         if isinstance(self.model, PPLR):
 
@@ -622,6 +637,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         else:
             raise TypeError(f"optimizer parameters must be a dict for non-PPLR, got {type(params)}")
 
+
     def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
         """
         Set the optimizer for this model.
@@ -642,6 +658,66 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         params = self.get_optimization_parameters()
         
         self._optimizer = torch.optim.Adam(params)
+
+    def reconnect_optimizer_to_parameters(self) -> None:
+        """
+        Reconnect optimizer overload, defaults back to the standard implementation if no `PPLR` is detected.
+        """
+
+        if self.optimizer is None:
+            return
+            
+        if isinstance(self.model, PPLR):
+            current_params = self.get_optimization_parameters()
+            
+
+            optimizable_params = [
+                p for p in current_params 
+                if isinstance(p['params'][0], torch.Tensor) and p['params'][0].is_leaf
+            ]
+            
+
+            if not optimizable_params:
+                raise ValueError(f"Shouldn't be getting here! No optimizable parameters found for {self.__class__.__name__}.")
+            
+            for p in optimizable_params:
+                print(f"Setting requires_grad for parameter: {p}")
+                p['params'][0].requires_grad_(True)
+            
+            assert self._optimizer is not None
+            # Preserve optimizer states and param_group settings
+            old_state = self._optimizer.state.copy()
+            old_param_groups = self._optimizer.param_groups.copy()
+
+            # Reconnect to new parameters
+            self._optimizer.param_groups.clear()
+            for param_group in optimizable_params:
+                self._optimizer.add_param_group(param_group)
+
+            # Restore per-group hyperparameters (lr, betas, weight_decay, etc.) by index,
+            # excluding 'params' which comes from the new groups
+            for new_pg, old_pg in zip(self._optimizer.param_groups, old_param_groups):
+                new_pg.update({k: v for k, v in old_pg.items() if k != "params"})
+
+            # Remap optimizer state: for any new param that IS the same tensor as an old param,
+            # carry its state over (moved to the right device just in case).
+            new_state = {}
+            for new_pg in self._optimizer.param_groups:
+                for new_param in new_pg["params"]:
+                    if new_param in old_state:
+                        device = new_param.device
+                        new_state[new_param] = {
+                            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                            for k, v in old_state[new_param].items()
+                        }
+
+            self._optimizer.state.clear()
+            self._optimizer.state.update(new_state)
+
+            if self._scheduler is not None and self._optimizer is not None:
+                self._scheduler.optimizer = self._optimizer
+        else:
+            super().reconnect_optimizer_to_parameters()
 
     # Pretraining
     @property
@@ -893,34 +969,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 return pred_full.detach().cpu()
 
             self._obj = pred_full.detach().cpu()
-
-    def get_tv_loss(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        coords: torch.Tensor,
-    ) -> torch.Tensor:
-        tv_loss = torch.tensor(0.0, device=coords.device)
-
-        num_tv_samples = min(10000, coords.shape[0])
-        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
-
-        tv_coords = coords[tv_indices].detach().requires_grad_(True)
-
-        tv_densities_recomputed = self.forward(tv_coords)
-
-        if tv_densities_recomputed.dim() > 1:
-            tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
-
-        grad_outputs = torch.autograd.grad(
-            outputs=tv_densities_recomputed,
-            inputs=tv_coords,
-            grad_outputs=torch.ones_like(tv_densities_recomputed),
-            create_graph=True,
-        )[0]
-
-        grad_norm = torch.norm(grad_outputs, dim=1)
-
-        tv_loss += self.constraints.tv_vol * grad_norm.mean()
-        return tv_loss
 
     def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
         if isinstance(device, str):
