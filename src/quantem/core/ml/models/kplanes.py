@@ -3,7 +3,8 @@ Tensor Decomposition Methods for INR-based reconstructions
 """
 
 import itertools
-from typing import Any, Callable, Optional, Sequence
+import math
+from typing import Callable, Optional, Sequence
 
 import tinycudann as tcnn
 import torch
@@ -131,28 +132,27 @@ def query_planes(
 
 def interpolate_ms_features(
     pts: torch.Tensor,
-    ms_grids: nn.ModuleList,
+    ms_grids: nn.ParameterList,
 ) -> torch.Tensor:
-    coo_combs = list(itertools.combinations(range(3), 2))  # [(0,1), (0,2), (1,2)]
-    multi_scale_interp = []
+    mat_mode = [[0, 1], [0, 2], [1, 2]]
+    coord_plane = torch.stack([
+        pts[:, mat_mode[0]],
+        pts[:, mat_mode[1]],
+        pts[:, mat_mode[2]],
+    ]).view(3, -1, 1, 2)
 
-    for grid in ms_grids:
-        interp_space = 1.
-        for ci, coo_comb in enumerate(coo_combs):
-            feature_dim = grid[ci].shape[1]
-            interp_out_plane = (
-                grid_sample_wrapper(grid[ci], pts[..., coo_comb])
-                .view(-1, feature_dim)
-            )
-            interp_space = interp_space * interp_out_plane
-        multi_scale_interp.append(interp_space)
+    per_scale = []
+    for plane_coef in ms_grids:
+        C = plane_coef.shape[1]
+        feats = F.grid_sample(
+            plane_coef, coord_plane, align_corners=True, mode="bilinear", padding_mode="border"
+        ).reshape(3, C, -1)
+        fused = feats[0] * feats[1] * feats[2]
+        per_scale.append(fused.T)
 
-    return torch.cat(multi_scale_interp, dim=-1)
+    return torch.cat(per_scale, dim=-1)
 
 
-"""
-K-planes Model
-"""
 class KPlanes(nn.Module, PPLR):
 
     def __init__(
@@ -165,6 +165,10 @@ class KPlanes(nn.Module, PPLR):
         multiscale_res_multipliers: Optional[Sequence[int]] = None,
         concat_features: bool = True,
         density_activation: Callable = lambda x: F.softplus(x - 1),
+        # Hybrid MLP parameters
+        use_hybrid_mlp: bool = False,
+        hybrid_hidden_dim: int = 64,
+        hybrid_num_layers: int = 2,
     ):
         """
         Assume coords are [-1, 1] in each dimension.
@@ -179,40 +183,55 @@ class KPlanes(nn.Module, PPLR):
         self.concat_features = concat_features
         self.density_activation = density_activation
 
-        
-        # Initialize planes
         self.grids = nn.ParameterList()
         self.feature_dim = 0
-
-        # Resolution pyramid
         for res_mult in self.multiscale_res_multipliers:
-            scaled_res = [r * res_mult for r in self.resolution]
-            gp = init_planes(
-                in_dim=self.input_coords_dims,
-                out_dim=self.M_features,
-                resolution=scaled_res,
+            scaled_res = [int(r * res_mult) for r in self.resolution]
+            plane = nn.Parameter(torch.empty(3, self.M_features, scaled_res[1], scaled_res[0]))
+            nn.init.uniform_(plane, 0.1, 0.5)
+            self.grids.append(plane)
+            self.feature_dim += self.M_features
+
+        # Network head
+        if use_hybrid_mlp:
+            hybrid_hidden_dim = int(hybrid_hidden_dim)
+            hybrid_num_layers = int(hybrid_num_layers)
+            if hybrid_hidden_dim <= 0:
+                raise ValueError(f"hybrid_hidden_dim must be >= 1, got {hybrid_hidden_dim}")
+            if hybrid_num_layers <= 0:
+                raise ValueError(f"hybrid_num_layers must be >= 1, got {hybrid_num_layers}")
+
+            factory = {}  # add dtype/device kwargs here if needed
+            layers = []
+            in_dim = self.feature_dim
+            for _ in range(hybrid_num_layers):
+                lin = nn.Linear(in_dim, hybrid_hidden_dim, **factory)
+                nn.init.kaiming_uniform_(lin.weight, a=0.0, nonlinearity="relu")
+                nn.init.zeros_(lin.bias)
+                layers.append(lin)
+                layers.append(nn.ReLU(inplace=True))
+                in_dim = hybrid_hidden_dim
+
+            out = nn.Linear(in_dim, 1, bias=True, **factory)
+            nn.init.normal_(out.weight, std=0.01)
+            nn.init.zeros_(out.bias)
+            layers.append(out)
+            self.sigma_net = nn.Sequential(*layers)
+        else:
+            self.sigma_net = tcnn.Network(
+                n_input_dims=self.feature_dim,
+                n_output_dims=1,
+                network_config={
+                    "otype": "CutlassMLP",
+                    "activation": "None",
+                    "output_activation": "None",
+                    "n_neurons": 128,
+                    "n_hidden_layers": 0,
+                },
             )
-            
-            self.feature_dim += gp[-1].shape[1]
-            self.grids.append(gp)
-
-
-        # Linear net
-        self.sigma_net = tcnn.Network(
-            n_input_dims=self.feature_dim,
-            n_output_dims=1,
-            network_config={
-                "otype": "CutlassMLP",
-                "activation": "None",
-                "output_activation": "None",
-                "n_neurons": 128,
-                "n_hidden_layers": 0,
-            },
-        )
 
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
-
         pts = coords.reshape(-1, 3)
         features = interpolate_ms_features(
             pts=pts,
@@ -222,15 +241,12 @@ class KPlanes(nn.Module, PPLR):
         density = self.density_activation(density_before_activation)
         return density
 
-    def forward(
-        self,
-        pts: torch.Tensor,
-    ):
+    def forward(self, pts: torch.Tensor):
         return self.get_densities(pts)
-    
+
     def get_params(self) -> dict[str, list[torch.nn.Parameter]]:
         return {
-            "grids": [p for grid in self.grids for p in grid],  # flatten ParameterLists
+            "grids": list(self.grids.parameters()),
             "sigma_net": list(self.sigma_net.parameters()),
         }
 
@@ -238,4 +254,417 @@ class KPlanes(nn.Module, PPLR):
     def param_keys(self) -> list[str]:
         return ["grids", "sigma_net"]
 
-    
+
+# --- Tilted KPlanes ---
+
+# ---------------------------------------------------------------------------
+# SO(3) quaternion parameter module
+# ---------------------------------------------------------------------------
+ 
+class SO3Param(nn.Module):
+    """
+    Stores T unit quaternions as learnable parameters in R^4 and normalises
+    them on every call to `as_matrix()`.
+ 
+    Quaternion convention: [x, y, z, w]  (scalar-last, same as scipy).
+ 
+    Initialisation
+    --------------
+    "random"  – uniform sampling over SO(3) via Shoemake's method.
+    "identity" – all rotations start as the identity (good for fine-tuning).
+    """
+ 
+    def __init__(self, T: int, init: str = "random"):
+        super().__init__()
+        if T < 1:
+            raise ValueError(f"T must be >= 1, got {T}")
+        quats = self._init_quaternions(T, init)   # (T, 4)
+        self.quats = nn.Parameter(quats)
+ 
+    # ------------------------------------------------------------------
+    # Initialisers
+    # ------------------------------------------------------------------
+ 
+    @staticmethod
+    def _shoemake_sample(T: int) -> torch.Tensor:
+        """Uniform SO(3) sampling via Shoemake (1992). Returns (T, 4) [x,y,z,w]."""
+        u = torch.rand(T, 3)
+        sqrt1_u0 = torch.sqrt(1.0 - u[:, 0])
+        sqrt_u0  = torch.sqrt(u[:, 0])
+        two_pi   = 2.0 * math.pi
+        x = sqrt1_u0 * torch.sin(two_pi * u[:, 1])
+        y = sqrt1_u0 * torch.cos(two_pi * u[:, 1])
+        z = sqrt_u0  * torch.sin(two_pi * u[:, 2])
+        w = sqrt_u0  * torch.cos(two_pi * u[:, 2])
+        return torch.stack([x, y, z, w], dim=-1)   # (T, 4)
+ 
+    @staticmethod
+    def _identity(T: int) -> torch.Tensor:
+        """All-identity rotations: [0,0,0,1] * T."""
+        q = torch.zeros(T, 4)
+        q[:, 3] = 1.0
+        return q
+ 
+    @classmethod
+    def _init_quaternions(cls, T: int, init: str) -> torch.Tensor:
+        if init == "random":
+            return cls._shoemake_sample(T)
+        elif init == "identity":
+            return cls._identity(T)
+        else:
+            raise ValueError(f"Unknown init '{init}'; choose 'random' or 'identity'.")
+ 
+    # ------------------------------------------------------------------
+    # Forward helpers
+    # ------------------------------------------------------------------
+ 
+    def normalized(self) -> torch.Tensor:
+        """Returns (T, 4) unit quaternions."""
+        return F.normalize(self.quats, p=2, dim=-1)
+ 
+    def as_matrix(self) -> torch.Tensor:
+        """
+        Converts the T stored quaternions to (T, 3, 3) rotation matrices.
+ 
+        Uses the standard formula; no trig, just multiplications.
+        """
+        q = self.normalized()          # (T, 4)  [x, y, z, w]
+        x, y, z, w = q.unbind(dim=-1)  # each (T,)
+ 
+        # Precompute products
+        xx, yy, zz = x*x, y*y, z*z
+        xy, xz, yz = x*y, x*z, y*z
+        wx, wy, wz = w*x, w*y, w*z
+ 
+        # Row-major: R[i,j]
+        R = torch.stack([
+            1 - 2*(yy + zz),   2*(xy - wz),       2*(xz + wy),
+              2*(xy + wz),    1 - 2*(xx + zz),     2*(yz - wx),
+              2*(xz - wy),      2*(yz + wx),      1 - 2*(xx + yy),
+        ], dim=-1).reshape(-1, 3, 3)   # (T, 3, 3)
+ 
+        return R
+ 
+    def extra_repr(self) -> str:
+        return f"T={self.quats.shape[0]}"
+def interpolate_ms_features_tilted(
+    pts: torch.Tensor,             # (B, 3)
+    ms_grids: nn.ParameterList,    # each grid: (3*T, C, H, W)
+    rotation_matrices: torch.Tensor,  # (T, 3, 3)
+) -> torch.Tensor:
+    """
+    Multi-scale, multi-rotation K-Planes feature interpolation.
+ 
+    For each of the T rotations:
+      1. Rotate pts  ->  (B, 3)
+      2. Project to XY / XZ / YZ planes  ->  3 × (B, 2) grids of coords
+      3. Bilinear interpolation on the corresponding planes
+      4. Hadamard product across the 3 planes  ->  (B, C)
+ 
+    Across T transforms, outputs are *concatenated* (not summed), so each
+    rotation owns a disjoint slice of the feature dimension.  Across scales,
+    outputs are also concatenated, matching the base KPlanes behaviour.
+ 
+    Returns
+    -------
+    features : (B, C * T * num_scales)
+    """
+    T = rotation_matrices.shape[0]
+    B = pts.shape[0]
+ 
+    # Rotate all points by all T rotation matrices at once.
+    # pts: (B, 3), R: (T, 3, 3)  ->  rotated: (T, B, 3)
+    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+ 
+    per_scale_features = []
+ 
+    for plane_coef in ms_grids:
+        # plane_coef shape: (3*T, C, H, W)
+        C = plane_coef.shape[1]
+ 
+        # Build the (3*T, B, 1, 2) coordinate tensor for grid_sample.
+        # For transform t, we need coords for planes XY, XZ, YZ.
+        # grid_sample expects coords in [-1, 1] with shape (N, Hout, Wout, 2).
+        all_plane_coords = []
+        for t in range(T):
+            rp = rotated[t]                            # (B, 3)
+            all_plane_coords.append(rp[:, [0, 1]])    # XY  (B, 2)
+            all_plane_coords.append(rp[:, [2, 0]])    # ZX  (B, 2)  matches ki
+            all_plane_coords.append(rp[:, [1, 2]])    # YZ  (B, 2)  matches jk
+ 
+        # Stack -> (3*T, B, 2) -> (3*T, B, 1, 2) for grid_sample
+        coord_tensor = torch.stack(all_plane_coords, dim=0).unsqueeze(2)
+        # coord_tensor: (3*T, B, 1, 2)
+ 
+        # grid_sample: input (N, C, H, W), grid (N, Hout, Wout, 2)
+        sampled = F.grid_sample(
+            plane_coef,          # (3*T, C, H, W)
+            coord_tensor,        # (3*T, B, 1, 2)
+            align_corners=True,
+            mode="bilinear",
+            padding_mode="border",
+        )  # -> (3*T, C, B, 1)
+        sampled = sampled.squeeze(-1)  # (3*T, C, B)
+ 
+        # Hadamard product within each transform group (3 planes per transform).
+        transform_features = []
+        for t in range(T):
+            p_xy = sampled[3*t + 0]   # (C, B)
+            p_zx = sampled[3*t + 1]
+            p_yz = sampled[3*t + 2]
+            fused = (p_xy * p_zx * p_yz).T   # (B, C)
+            transform_features.append(fused)
+ 
+        # Concatenate across transforms -> (B, C*T)
+        per_scale_features.append(torch.cat(transform_features, dim=-1))
+ 
+    # Concatenate across scales -> (B, C*T*num_scales)
+    return torch.cat(per_scale_features, dim=-1)
+
+# ---------------------------------------------------------------------------
+# KPlanesTILTED
+# ---------------------------------------------------------------------------
+ 
+class KPlanesTILTED(KPlanes):
+    """
+    K-Planes with T learned SO(3) rotations (TILTED).
+ 
+    Inherits KPlanes for the sigma_net, density_activation, and get_params
+    interface.  Overrides:
+      * __init__  – replaces the axis-aligned grids with (3*T)-plane grids
+                    and adds SO3Param.
+      * get_densities  – calls the TILTED interpolation instead.
+      * get_params     – adds "so3" key so callers can set a separate lr.
+      * param_keys     – updated list.
+ 
+    Parameters
+    ----------
+    M_features : int
+        Feature channels *per transform per scale*.  Total feature_dim will
+        be M_features * T * len(multiscale_res_multipliers).
+    T : int
+        Number of learned rotations (TILTED-T in the paper; 4 or 8 recommended).
+    tau_init : str
+        "random" (paper default) or "identity".
+    tau_warmup_steps : int
+        If > 0, grids and sigma_net are frozen for this many steps so the
+        rotations can find good basins first (two-phase warm-up).
+        Call model.training_step() once per optimiser step.
+    All other args are forwarded to KPlanes.
+    """
+ 
+    def __init__(
+        self,
+        # Grid parameters
+        input_coords_dims: int = 3,
+        M_features: int = 32,
+        resolution: Sequence[int] = (200, 200, 200),
+        multiscale_res_multipliers: Optional[Sequence[int]] = None,
+        density_activation: Callable = lambda x: F.softplus(x - 1),
+        # TILTED parameters
+        T: int = 4,
+        tau_init: str = "random",
+        tau_warmup_steps: int = 0,
+        # Hybrid MLP parameters
+        use_hybrid_mlp: bool = False,
+        hybrid_hidden_dim: int = 64,
+        hybrid_num_layers: int = 2,
+    ):
+        if input_coords_dims != 3:
+            raise NotImplementedError("KPlanesTILTED is implemented for 3D only.")
+        if T < 1:
+            raise ValueError(f"T must be >= 1, got {T}")
+ 
+        multiscale_res_multipliers = list(multiscale_res_multipliers or [1])
+        num_scales = len(multiscale_res_multipliers)
+ 
+        # Total feature dim seen by the MLP head.
+        # Each scale contributes M_features * T channels.
+        feature_dim = M_features * T * num_scales
+ 
+        # Call KPlanes.__init__ with grid_dimensions=2 so it builds sigma_net
+        # correctly; we immediately replace self.grids below.
+        super().__init__(
+            grid_dimensions=2,
+            input_coords_dims=3,
+            M_features=M_features,         # base class stores this
+            resolution=resolution,
+            multiscale_res_multipliers=multiscale_res_multipliers,
+            concat_features=True,
+            density_activation=density_activation,
+            use_hybrid_mlp=use_hybrid_mlp,
+            hybrid_hidden_dim=hybrid_hidden_dim,
+            hybrid_num_layers=hybrid_num_layers,
+        )
+        # KPlanes.__init__ built grids with shape (3, M, H, W) and feature_dim
+        # = M * num_scales.  We rebuild them for the TILTED shape.
+ 
+        self.T = T
+        self.tau_warmup_steps = tau_warmup_steps
+        self._global_step: int = 0
+ 
+        # ---- Rebuild grids: (3*T, M_features, H, W) per scale ----
+        self.grids = nn.ParameterList()
+        for res_mult in multiscale_res_multipliers:
+            scaled_res = [int(r * res_mult) for r in resolution]
+            plane = nn.Parameter(
+                torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0])
+            )
+            nn.init.uniform_(plane, 0.1, 0.5)
+            self.grids.append(plane)
+ 
+        # ---- Rebuild sigma_net with the correct feature_dim ----
+        # KPlanes built sigma_net with self.feature_dim (= M * num_scales),
+        # which is wrong for T > 1.  Rebuild here.
+        self.feature_dim = feature_dim
+        self._build_sigma_net(use_hybrid_mlp, hybrid_hidden_dim, hybrid_num_layers)
+ 
+        # ---- Learnable rotations ----
+        self.so3 = SO3Param(T, init=tau_init)
+ 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+ 
+    def _build_sigma_net(
+        self,
+        use_hybrid_mlp: bool,
+        hybrid_hidden_dim: int,
+        hybrid_num_layers: int,
+    ) -> None:
+        """Rebuild sigma_net for self.feature_dim (called after grids are set)."""
+        if use_hybrid_mlp:
+            layers = []
+            in_dim = self.feature_dim
+            for _ in range(hybrid_num_layers):
+                lin = nn.Linear(in_dim, hybrid_hidden_dim)
+                nn.init.kaiming_uniform_(lin.weight, a=0.0, nonlinearity="relu")
+                nn.init.zeros_(lin.bias)
+                layers.append(lin)
+                layers.append(nn.ReLU(inplace=True))
+                in_dim = hybrid_hidden_dim
+            out = nn.Linear(in_dim, 1, bias=True)
+            nn.init.normal_(out.weight, std=0.01)
+            nn.init.zeros_(out.bias)
+            layers.append(out)
+            self.sigma_net = nn.Sequential(*layers)
+        else:
+            self.sigma_net = tcnn.Network(
+                n_input_dims=self.feature_dim,
+                n_output_dims=1,
+                network_config={
+                    "otype": "CutlassMLP",
+                    "activation": "None",
+                    "output_activation": "None",
+                    "n_neurons": 128,
+                    "n_hidden_layers": 0,
+                },
+            )
+ 
+    # ------------------------------------------------------------------
+    # Warm-up bookkeeping
+    # ------------------------------------------------------------------
+ 
+    def training_step(self) -> None:
+        """
+        Call once per optimiser step to advance the internal counter.
+ 
+        During the first `tau_warmup_steps` iterations, grids and sigma_net
+        have their gradients zeroed after the backward pass so only the SO(3)
+        parameters update.  This is the lightweight version of two-phase
+        optimisation from the paper.
+        """
+        self._global_step += 1
+ 
+    def _in_warmup(self) -> bool:
+        return self.tau_warmup_steps > 0 and self._global_step < self.tau_warmup_steps
+ 
+    def zero_non_tau_grads(self) -> None:
+        """
+        Call after loss.backward() and before optimizer.step() when you want
+        to implement the rotation warm-up manually.  Alternatively just check
+        model.in_warmup and configure your optimizer accordingly.
+        """
+        if self._in_warmup():
+            for p in self.grids.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+            for p in self.sigma_net.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+ 
+    @property
+    def in_warmup(self) -> bool:
+        return self._in_warmup()
+ 
+    # ------------------------------------------------------------------
+    # Core forward
+    # ------------------------------------------------------------------
+ 
+    def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
+        pts = coords.reshape(-1, 3)
+        R = self.so3.as_matrix()                       # (T, 3, 3)
+        features = interpolate_ms_features_tilted(
+            pts=pts,
+            ms_grids=self.grids,
+            rotation_matrices=R,
+        )
+        density_before_activation = self.sigma_net(features)
+        return self.density_activation(density_before_activation)
+ 
+    def forward(self, pts: torch.Tensor) -> torch.Tensor:
+        return self.get_densities(pts)
+ 
+    # ------------------------------------------------------------------
+    # Parameter groups
+    # ------------------------------------------------------------------
+ 
+    def get_params(self) -> dict[str, list[nn.Parameter]]:
+        return {
+            "grids":     list(self.grids.parameters()),
+            "sigma_net": list(self.sigma_net.parameters()),
+            "so3":       list(self.so3.parameters()),
+        }
+ 
+    @property
+    def param_keys(self) -> list[str]:
+        return ["grids", "sigma_net", "so3"]
+ 
+
+    # ------------------------------------------------------------------
+    # Two-phase helper: extract tau for phase-2 initialisation
+    # ------------------------------------------------------------------
+ 
+    def extract_tau_state(self) -> torch.Tensor:
+        """
+        Returns the current quaternion tensor (detached copy) so it can be
+        used to initialise a larger phase-2 model via `load_tau_state`.
+        """
+        return self.so3.quats.detach().clone()
+ 
+    def load_tau_state(self, quats: torch.Tensor) -> None:
+        """
+        Load pre-trained quaternions (e.g. from a bottleneck phase-1 model).
+ 
+        quats : (T, 4) tensor, will be normalised internally.
+        """
+        if quats.shape != self.so3.quats.shape:
+            raise ValueError(
+                f"Shape mismatch: got {quats.shape}, "
+                f"expected {self.so3.quats.shape}"
+            )
+        with torch.no_grad():
+            self.so3.quats.copy_(F.normalize(quats, p=2, dim=-1))
+ 
+    # ------------------------------------------------------------------
+    # Pretty print
+    # ------------------------------------------------------------------
+ 
+    def extra_repr(self) -> str:
+        return (
+            f"T={self.T}, "
+            f"M_features={self.M_features}, "
+            f"feature_dim={self.feature_dim}, "
+            f"num_scales={len(self.multiscale_res_multipliers)}, "
+            f"tau_warmup_steps={self.tau_warmup_steps}"
+        )
