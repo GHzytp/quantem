@@ -981,7 +981,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
                     self.num_gpts,
                     *padded_diffraction_intensities_shape,
                 ),
-                in_place=True,
+                modify_in_place=True,
             )
             self.intensities_4d = self.dset.array.reshape(
                 (*self.gpts, *padded_diffraction_intensities_shape)

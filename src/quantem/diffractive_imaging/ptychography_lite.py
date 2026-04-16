@@ -180,23 +180,23 @@ class PtychoLite(Ptychography):
         if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
-                    "type": "adamw",
+                    "name": "adamw",
                     "lr": lr_obj,
                 },
             }
             scheduler_params = {
                 "object": {
-                    "type": scheduler_type,
+                    "name": scheduler_type,
                     "factor": scheduler_factor,
                 }
             }
             if learn_probe:
                 opt_params["probe"] = {
-                    "type": "adamw",
+                    "name": "adamw",
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {
-                    "type": scheduler_type,
+                    "name": scheduler_type,
                     "factor": scheduler_factor,
                 }
         else:
@@ -314,11 +314,11 @@ class PtychoLiteDIP(Ptychography):
                     reset=True,
                     num_iters=pretrain_iters,
                     optimizer_params={
-                        "type": "adamw",
+                        "name": "adamw",
                         "lr": pretrain_lr,
                     },
                     scheduler_params={
-                        "type": "plateau",
+                        "name": "plateau",
                         "factor": 0.5,
                     },
                     apply_constraints=False,
@@ -329,11 +329,11 @@ class PtychoLiteDIP(Ptychography):
                     reset=True,
                     num_iters=pretrain_iters,
                     optimizer_params={
-                        "type": "adamw",
+                        "name": "adamw",
                         "lr": 1e-3,
                     },
                     scheduler_params={
-                        "type": "plateau",
+                        "name": "plateau",
                         "factor": 0.5,
                     },
                     apply_constraints=False,
@@ -390,23 +390,23 @@ class PtychoLiteDIP(Ptychography):
         if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
-                    "type": "adamw",
+                    "name": "adamw",
                     "lr": lr_obj,
                 },
             }
             scheduler_params = {
                 "object": {
-                    "type": scheduler_type,
+                    "name": scheduler_type,
                     "factor": scheduler_factor,
                 }
             }
             if learn_probe:
                 opt_params["probe"] = {
-                    "type": "adamw",
+                    "name": "adamw",
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {
-                    "type": scheduler_type,
+                    "name": scheduler_type,
                     "factor": scheduler_factor,
                 }
         else:
