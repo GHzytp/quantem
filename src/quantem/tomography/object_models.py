@@ -564,9 +564,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         
         if isinstance(self.model, PPLR):
 
-            # DEBUG
-            for key, value in self.optimizer_params.items():
-                print(key, value)
             return [
                 {
                     "params": self.model.get_params()[key], 
@@ -612,6 +609,26 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         else:
             raise TypeError(f"optimizer parameters must be a dict for non-PPLR, got {type(params)}")
 
+    def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
+        """
+        Set the optimizer for this model.
+        Currently supports single LR for all parameters, TODO allow for per parameter LRs by
+        updating get_optimization_parameters to return a list of parameters and their LRs.
+        """
+        if not isinstance(self.model, PPLR):
+            super().set_optimizer(opt_params)
+            return
+
+        if opt_params is not None:
+            self.optimizer_params = opt_params
+
+        if not self._optimizer_params:
+            self._optimizer = None
+            return
+
+        params = self.get_optimization_parameters()
+        
+        self._optimizer = torch.optim.Adam(params)
 
     # Pretraining
     @property
