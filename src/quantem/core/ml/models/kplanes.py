@@ -574,6 +574,7 @@ class KPlanesTILTED(KPlanes):
         parameters update.  This is the lightweight version of two-phase
         optimisation from the paper.
         """
+        print("Global Stepped")
         self._global_step += 1
  
     def _in_warmup(self) -> bool:

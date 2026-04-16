@@ -506,29 +506,42 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     ) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=pred.device)
         if self.constraints.tv_vol > 0:
-            num_tv_samples = min(10_000, coords.shape[0])
-            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
 
-            tv_coords = coords[tv_indices].detach().requires_grad_(True)
-            tv_densities_recomputed = self.model(tv_coords)
-            if isinstance(tv_densities_recomputed, tuple):
-                tv_densities_recomputed = tv_densities_recomputed[0]
+            if isinstance(self.model, PPLR): # TODO: Temporary
+                for plane in self.model.grids:
+                    # plane: (3*T, C, H, W)
+                    # Differences along H (axis -2) and W (axis -1)
+                    diff_h = plane[..., 1:, :] - plane[..., :-1, :]  # (3*T, C, H-1, W)
+                    diff_w = plane[..., :, 1:] - plane[..., :, :-1]  # (3*T, C, H, W-1)
 
-            # Ensure shape is [num_samples, num_channels]
-            if tv_densities_recomputed.dim() == 1:
-                tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
 
-            # Compute gradients for each channel
-            grad_outputs = torch.autograd.grad(
-                outputs=tv_densities_recomputed,
-                inputs=tv_coords,
-                grad_outputs=torch.ones_like(tv_densities_recomputed),
-                create_graph=True,
-            )[0]  # Shape: [num_samples, coord_dim]
+                    soft_loss += diff_h.pow(2).mean() + diff_w.pow(2).mean()
 
-            # Compute TV loss - gradient magnitude per sample
-            grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
-            soft_loss += self.constraints.tv_vol * grad_norm.mean()
+                soft_loss /= len(self.model.grids)
+            else:
+                num_tv_samples = min(10_000, coords.shape[0])
+                tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+
+                tv_coords = coords[tv_indices].detach().requires_grad_(True)
+                tv_densities_recomputed = self.model(tv_coords)
+                if isinstance(tv_densities_recomputed, tuple):
+                    tv_densities_recomputed = tv_densities_recomputed[0]
+
+                # Ensure shape is [num_samples, num_channels]
+                if tv_densities_recomputed.dim() == 1:
+                    tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
+
+                # Compute gradients for each channel
+                grad_outputs = torch.autograd.grad(
+                    outputs=tv_densities_recomputed,
+                    inputs=tv_coords,
+                    grad_outputs=torch.ones_like(tv_densities_recomputed),
+                    create_graph=True,
+                )[0]  # Shape: [num_samples, coord_dim]
+
+                # Compute TV loss - gradient magnitude per sample
+                grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
+                soft_loss += self.constraints.tv_vol * grad_norm.mean()
 
         if (
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
