@@ -358,7 +358,6 @@ class SO3Param(nn.Module):
 
     def __init__(self, T: int, init: str = "random"):
         super().__init__()
-        print("SVD Module")
         if init == "random":
             # Initialize near identity with small noise
             M = torch.eye(3).unsqueeze(0).repeat(T, 1, 1)
