@@ -201,7 +201,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.bfloat16,
-                    enabled=True,
+                    enabled=False,
                 ):
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
@@ -214,9 +214,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 pred = integrated_densities.float()
-                soft_constraints_loss = 0.0
-                if self.num_epochs > 0:
-                    soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred)
+                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred, batch_idx, len(self.dataloader))
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 

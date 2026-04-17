@@ -261,164 +261,175 @@ class KPlanes(nn.Module, PPLR):
 # SO(3) quaternion parameter module
 # ---------------------------------------------------------------------------
  
+# class SO3Param(nn.Module):
+#     """
+#     Stores T unit quaternions as learnable parameters in R^4 and normalises
+#     them on every call to `as_matrix()`.
+ 
+#     Quaternion convention: [x, y, z, w]  (scalar-last, same as scipy).
+ 
+#     Initialisation
+#     --------------
+#     "random"  – uniform sampling over SO(3) via Shoemake's method.
+#     "identity" – all rotations start as the identity (good for fine-tuning).
+#     """
+ 
+#     def __init__(self, T: int, init: str = "random"):
+#         super().__init__()
+#         if T < 1:
+#             raise ValueError(f"T must be >= 1, got {T}")
+#         quats = self._init_quaternions(T, init)   # (T, 4)
+#         self.quats = nn.Parameter(quats)
+ 
+#     # ------------------------------------------------------------------
+#     # Initialisers
+#     # ------------------------------------------------------------------
+ 
+#     @staticmethod
+#     def _shoemake_sample(T: int) -> torch.Tensor:
+#         """Uniform SO(3) sampling via Shoemake (1992). Returns (T, 4) [x,y,z,w]."""
+#         u = torch.rand(T, 3)
+#         sqrt1_u0 = torch.sqrt(1.0 - u[:, 0])
+#         sqrt_u0  = torch.sqrt(u[:, 0])
+#         two_pi   = 2.0 * math.pi
+#         x = sqrt1_u0 * torch.sin(two_pi * u[:, 1])
+#         y = sqrt1_u0 * torch.cos(two_pi * u[:, 1])
+#         z = sqrt_u0  * torch.sin(two_pi * u[:, 2])
+#         w = sqrt_u0  * torch.cos(two_pi * u[:, 2])
+#         return torch.stack([x, y, z, w], dim=-1)   # (T, 4)
+ 
+#     @staticmethod
+#     def _identity(T: int) -> torch.Tensor:
+#         """All-identity rotations: [0,0,0,1] * T."""
+#         q = torch.zeros(T, 4)
+#         q[:, 3] = 1.0
+#         return q
+ 
+#     @classmethod
+#     def _init_quaternions(cls, T: int, init: str) -> torch.Tensor:
+#         if init == "random":
+#             return cls._shoemake_sample(T)
+#         elif init == "identity":
+#             return cls._identity(T)
+#         else:
+#             raise ValueError(f"Unknown init '{init}'; choose 'random' or 'identity'.")
+ 
+#     # ------------------------------------------------------------------
+#     # Forward helpers
+#     # ------------------------------------------------------------------
+ 
+#     def normalized(self) -> torch.Tensor:
+#         """Returns (T, 4) unit quaternions."""
+#         return F.normalize(self.quats, p=2, dim=-1)
+ 
+#     def as_matrix(self) -> torch.Tensor:
+#         """
+#         Converts the T stored quaternions to (T, 3, 3) rotation matrices.
+ 
+#         Uses the standard formula; no trig, just multiplications.
+#         """
+#         q = self.normalized()          # (T, 4)  [x, y, z, w]
+#         x, y, z, w = q.unbind(dim=-1)  # each (T,)
+ 
+#         # Precompute products
+#         xx, yy, zz = x*x, y*y, z*z
+#         xy, xz, yz = x*y, x*z, y*z
+#         wx, wy, wz = w*x, w*y, w*z
+ 
+#         # Row-major: R[i,j]
+#         R = torch.stack([
+#             1 - 2*(yy + zz),   2*(xy - wz),       2*(xz + wy),
+#               2*(xy + wz),    1 - 2*(xx + zz),     2*(yz - wx),
+#               2*(xz - wy),      2*(yz + wx),      1 - 2*(xx + yy),
+#         ], dim=-1).reshape(-1, 3, 3)   # (T, 3, 3)
+ 
+#         return R
+ 
+#     def extra_repr(self) -> str:
+#         return f"T={self.quats.shape[0]}"
+
+
 class SO3Param(nn.Module):
     """
-    Stores T unit quaternions as learnable parameters in R^4 and normalises
-    them on every call to `as_matrix()`.
- 
-    Quaternion convention: [x, y, z, w]  (scalar-last, same as scipy).
- 
-    Initialisation
-    --------------
-    "random"  – uniform sampling over SO(3) via Shoemake's method.
-    "identity" – all rotations start as the identity (good for fine-tuning).
+    SO(3) rotation bank using R9+SVD parameterization.
+    Each rotation is stored as an unconstrained 3x3 matrix M,
+    projected to SO(3) via SVD+(M) = U diag(1,1,det(UVt)) Vt.
     """
- 
+
     def __init__(self, T: int, init: str = "random"):
         super().__init__()
-        if T < 1:
-            raise ValueError(f"T must be >= 1, got {T}")
-        quats = self._init_quaternions(T, init)   # (T, 4)
-        self.quats = nn.Parameter(quats)
- 
-    # ------------------------------------------------------------------
-    # Initialisers
-    # ------------------------------------------------------------------
- 
-    @staticmethod
-    def _shoemake_sample(T: int) -> torch.Tensor:
-        """Uniform SO(3) sampling via Shoemake (1992). Returns (T, 4) [x,y,z,w]."""
-        u = torch.rand(T, 3)
-        sqrt1_u0 = torch.sqrt(1.0 - u[:, 0])
-        sqrt_u0  = torch.sqrt(u[:, 0])
-        two_pi   = 2.0 * math.pi
-        x = sqrt1_u0 * torch.sin(two_pi * u[:, 1])
-        y = sqrt1_u0 * torch.cos(two_pi * u[:, 1])
-        z = sqrt_u0  * torch.sin(two_pi * u[:, 2])
-        w = sqrt_u0  * torch.cos(two_pi * u[:, 2])
-        return torch.stack([x, y, z, w], dim=-1)   # (T, 4)
- 
-    @staticmethod
-    def _identity(T: int) -> torch.Tensor:
-        """All-identity rotations: [0,0,0,1] * T."""
-        q = torch.zeros(T, 4)
-        q[:, 3] = 1.0
-        return q
- 
-    @classmethod
-    def _init_quaternions(cls, T: int, init: str) -> torch.Tensor:
+        print("SVD Module")
         if init == "random":
-            return cls._shoemake_sample(T)
+            # Initialize near identity with small noise
+            M = torch.eye(3).unsqueeze(0).repeat(T, 1, 1)
+            M = M + 0.1 * torch.randn(T, 3, 3)
         elif init == "identity":
-            return cls._identity(T)
+            M = torch.eye(3).unsqueeze(0).repeat(T, 1, 1)
         else:
-            raise ValueError(f"Unknown init '{init}'; choose 'random' or 'identity'.")
- 
-    # ------------------------------------------------------------------
-    # Forward helpers
-    # ------------------------------------------------------------------
- 
-    def normalized(self) -> torch.Tensor:
-        """Returns (T, 4) unit quaternions."""
-        return F.normalize(self.quats, p=2, dim=-1)
- 
+            raise ValueError(f"Unknown init '{init}'")
+        self.M = nn.Parameter(M)   # (T, 3, 3)
+
     def as_matrix(self) -> torch.Tensor:
-        """
-        Converts the T stored quaternions to (T, 3, 3) rotation matrices.
- 
-        Uses the standard formula; no trig, just multiplications.
-        """
-        q = self.normalized()          # (T, 4)  [x, y, z, w]
-        x, y, z, w = q.unbind(dim=-1)  # each (T,)
- 
-        # Precompute products
-        xx, yy, zz = x*x, y*y, z*z
-        xy, xz, yz = x*y, x*z, y*z
-        wx, wy, wz = w*x, w*y, w*z
- 
-        # Row-major: R[i,j]
-        R = torch.stack([
-            1 - 2*(yy + zz),   2*(xy - wz),       2*(xz + wy),
-              2*(xy + wz),    1 - 2*(xx + zz),     2*(yz - wx),
-              2*(xz - wy),      2*(yz + wx),      1 - 2*(xx + yy),
-        ], dim=-1).reshape(-1, 3, 3)   # (T, 3, 3)
- 
-        return R
- 
-    def extra_repr(self) -> str:
-        return f"T={self.quats.shape[0]}"
+        """Projects each M to SO(3) via SVD. Returns (T, 3, 3)."""
+        U, _, Vh = torch.linalg.svd(self.M)   # U: (T,3,3), Vh: (T,3,3)
+        # Fix reflections: det(U Vh) must be +1
+        d = torch.det(U @ Vh)                  # (T,)
+        diag = torch.ones(self.M.shape[0], 3, device=self.M.device)
+        diag[:, 2] = d                          # multiply last singular vector by sign
+        return U @ (diag.unsqueeze(-1) * Vh)   # (T, 3, 3)
+
 def interpolate_ms_features_tilted(
     pts: torch.Tensor,             # (B, 3)
     ms_grids: nn.ParameterList,    # each grid: (3*T, C, H, W)
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
 ) -> torch.Tensor:
     """
-    Multi-scale, multi-rotation K-Planes feature interpolation.
- 
-    For each of the T rotations:
-      1. Rotate pts  ->  (B, 3)
-      2. Project to XY / XZ / YZ planes  ->  3 × (B, 2) grids of coords
-      3. Bilinear interpolation on the corresponding planes
-      4. Hadamard product across the 3 planes  ->  (B, C)
- 
-    Across T transforms, outputs are *concatenated* (not summed), so each
-    rotation owns a disjoint slice of the feature dimension.  Across scales,
-    outputs are also concatenated, matching the base KPlanes behaviour.
- 
-    Returns
-    -------
-    features : (B, C * T * num_scales)
+    Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
+    Returns features of shape (B, C * T * num_scales).
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
- 
-    # Rotate all points by all T rotation matrices at once.
-    # pts: (B, 3), R: (T, 3, 3)  ->  rotated: (T, B, 3)
+
+    # (T, B, 3)  — rotate all points by all rotations at once
     rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
- 
+
+    # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
+    # index_select is faster and cleaner than advanced indexing with python lists.
+    # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2)
+    idx = torch.tensor([[0, 1],
+                        [2, 0],
+                        [1, 2]], device=pts.device)                  # (3, 2)
+    # rotated: (T, B, 3) -> gather along last dim with idx (3, 2)
+    # Result: (T, 3, B, 2)
+    coords = rotated.unsqueeze(1).expand(T, 3, B, 3).gather(
+        -1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2)
+    )
+
+    # Flatten (T, 3) -> 3*T so it matches grid's first dim, and add the H_out=1 axis
+    coord_tensor = coords.reshape(3 * T, B, 1, 2)                    # (3T, B, 1, 2)
+
     per_scale_features = []
- 
     for plane_coef in ms_grids:
-        # plane_coef shape: (3*T, C, H, W)
+        # plane_coef: (3T, C, H, W)
         C = plane_coef.shape[1]
- 
-        # Build the (3*T, B, 1, 2) coordinate tensor for grid_sample.
-        # For transform t, we need coords for planes XY, XZ, YZ.
-        # grid_sample expects coords in [-1, 1] with shape (N, Hout, Wout, 2).
-        all_plane_coords = []
-        for t in range(T):
-            rp = rotated[t]                            # (B, 3)
-            all_plane_coords.append(rp[:, [0, 1]])    # XY  (B, 2)
-            all_plane_coords.append(rp[:, [2, 0]])    # ZX  (B, 2)  matches ki
-            all_plane_coords.append(rp[:, [1, 2]])    # YZ  (B, 2)  matches jk
- 
-        # Stack -> (3*T, B, 2) -> (3*T, B, 1, 2) for grid_sample
-        coord_tensor = torch.stack(all_plane_coords, dim=0).unsqueeze(2)
-        # coord_tensor: (3*T, B, 1, 2)
- 
-        # grid_sample: input (N, C, H, W), grid (N, Hout, Wout, 2)
+
         sampled = F.grid_sample(
-            plane_coef,          # (3*T, C, H, W)
-            coord_tensor,        # (3*T, B, 1, 2)
+            plane_coef,
+            coord_tensor,
             align_corners=True,
             mode="bilinear",
             padding_mode="border",
-        )  # -> (3*T, C, B, 1)
-        sampled = sampled.squeeze(-1)  # (3*T, C, B)
- 
-        # Hadamard product within each transform group (3 planes per transform).
-        transform_features = []
-        for t in range(T):
-            p_xy = sampled[3*t + 0]   # (C, B)
-            p_zx = sampled[3*t + 1]
-            p_yz = sampled[3*t + 2]
-            fused = (p_xy * p_zx * p_yz).T   # (B, C)
-            transform_features.append(fused)
- 
-        # Concatenate across transforms -> (B, C*T)
-        per_scale_features.append(torch.cat(transform_features, dim=-1))
- 
-    # Concatenate across scales -> (B, C*T*num_scales)
+        )  # (3T, C, B, 1)
+
+        # (3T, C, B) -> (T, 3, C, B) -> Hadamard across the "3" dim -> (T, C, B)
+        sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
+
+        # (T, C, B) -> (B, T, C) -> (B, T*C) to concatenate rotations along feature dim
+        per_scale_features.append(
+            sampled.permute(2, 0, 1).reshape(B, T * C)
+        )
+
+    # Concatenate across scales -> (B, T * C * num_scales)
     return torch.cat(per_scale_features, dim=-1)
 
 # ---------------------------------------------------------------------------
@@ -549,17 +560,11 @@ class KPlanesTILTED(KPlanes):
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
         else:
-            self.sigma_net = tcnn.Network(
-                n_input_dims=self.feature_dim,
-                n_output_dims=1,
-                network_config={
-                    "otype": "CutlassMLP",
-                    "activation": "None",
-                    "output_activation": "None",
-                    "n_neurons": 128,
-                    "n_hidden_layers": 0,
-                },
-            )
+            # Match mentor's "explicit" decoder: a single linear layer.
+            # Small init so density stays near 0 initially.
+            self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
+            nn.init.normal_(self.sigma_net.weight, std=0.01)
+            nn.init.zeros_(self.sigma_net.bias)
  
     # ------------------------------------------------------------------
     # Warm-up bookkeeping
