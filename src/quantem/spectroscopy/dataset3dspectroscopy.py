@@ -16,6 +16,10 @@ from quantem.spectroscopy.utils import load_xray_lines_database
 
 class Dataset3dspectroscopy(Dataset3d):
     # stores the element line info so you don't need to reload each time
+    element_info = None
+    element_info_path = None
+    atomic_weights = None
+
     def __init__(
         self,
         array: NDArray | Any,
@@ -38,21 +42,19 @@ class Dataset3dspectroscopy(Dataset3d):
 
         self.model_elements = None
         self.attached_spectra = None
-        self.element_info = None
 
     # loads elemental information
     @classmethod
     def load_element_info(cls):
         """Load element database for EDS (X-ray lines) or EELS (binding energies)."""
-        if hasattr(cls, "element_info"):
-            return
+        if cls.element_info is not None:
+            return cls.element_info
 
-        class_type = str(getattr(cls, "dataset_type", "")).strip().lower()
-        path = (
-            "eels_binding_energies.json"
-            if class_type == "eels"
-            else getattr(cls, "x_ray_lines.csv", "x_ray_lines.csv")
-        )
+        path = getattr(cls, "element_info_path", None)
+        if path is None:
+            raise NotImplementedError(
+                f"{cls.__name__} must define `element_info_path` to load element metadata."
+            )
         full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
 
         if path.lower().endswith(".csv"):
@@ -60,12 +62,18 @@ class Dataset3dspectroscopy(Dataset3d):
         else:
             with open(full_path, "r", encoding="utf-8") as f:
                 cls.element_info = json.load(f)["elements"]
+        return cls.element_info
+
+    @classmethod
+    def _ensure_element_info(cls):
+        """Load and return the cached element metadata."""
+        return cls.load_element_info() or {}
 
     @classmethod
     def load_atomic_weights(cls):
         """Load atomic weights table from CSV once per class."""
         if cls.atomic_weights is not None:
-            return
+            return cls.atomic_weights
 
         atomic_weights_path = "atomic_weights.csv"
         full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), atomic_weights_path)
@@ -95,6 +103,7 @@ class Dataset3dspectroscopy(Dataset3d):
             raise ValueError(f"{atomic_weights_path} did not contain any atomic weights")
 
         cls.atomic_weights = data
+        return cls.atomic_weights
 
     @staticmethod
     def _normalize_element_specs(specs):
@@ -145,11 +154,7 @@ class Dataset3dspectroscopy(Dataset3d):
             - 'Te La' (only Te La line)
             - ['Au Ma', 'Te La', 'Si']
         """
-        # Load element info if not already loaded
-        if type(self).element_info is None:
-            type(self).load_element_info()
-
-        all_info = type(self).element_info
+        all_info = type(self)._ensure_element_info()
         if all_info is None:
             return
 
@@ -885,9 +890,7 @@ class Dataset3dspectroscopy(Dataset3d):
         if energy is not None and energy_range is not None:
             raise ValueError("Specify either energy or energy_range, not both")
 
-        if type(self).element_info is None:
-            type(self).load_element_info()
-        all_info = type(self).element_info or {}
+        all_info = type(self)._ensure_element_info()
 
         specs = type(self)._normalize_element_specs(elements)
         if len(specs) == 0:

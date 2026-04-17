@@ -33,6 +33,9 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     """
 
+    element_info = None
+    element_info_path = "x_ray_lines.csv"
+
     def __init__(
         self,
         array: NDArray | Any,
