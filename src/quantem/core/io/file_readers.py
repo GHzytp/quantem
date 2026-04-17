@@ -122,7 +122,9 @@ def read_4dstem(
     return dataset
 
 
-def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset_index: int | None = None) -> Dataset3dspectroscopy:
+def read_3d_spectroscopy(
+    file_path: str, file_type: str, data_type: str, dataset_index: int | None = None
+) -> Dataset3dspectroscopy:
     """
     File reader for 3D spectroscopy data
 
@@ -141,7 +143,7 @@ def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset
     """
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
     data_list = file_reader(file_path)
-    
+
     # If specific index provided, use it
     if dataset_index is not None:
         imported_data = data_list[dataset_index]
@@ -161,11 +163,10 @@ def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset
             raise ValueError("No 3D dataset found in file")
 
         dataset_index, imported_data = three_d_datasets[0]
-        
+
         dataset_indices = []
         for entry in three_d_datasets:
             dataset_indices.append(entry[0])
-
 
         if len(data_list) > 1:
             print(
@@ -173,67 +174,33 @@ def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset
             )
 
     imported_axes = imported_data["axes"]
-    # imported_data[0], 
+    axis_order = (0, 1, 2) if file_type == "digitalmicrograph" else (2, 0, 1)
+    array = (
+        imported_data["data"]
+        if file_type == "digitalmicrograph"
+        else imported_data["data"].transpose(axis_order)
+    )
+    ordered_axes = [imported_axes[idx] for idx in axis_order]
+    sampling = [ax.get("scale", 1) for ax in ordered_axes]
+    origin = [ax.get("offset", 0) for ax in ordered_axes]
+    units = [
+        "pixels" if ax.get("units", "1") == "1" else ax.get("units", "pixels")
+        for ax in ordered_axes
+    ]
+
     if data_type == "EELS":
-        if file_type == "digitalmicrograph":
-            dataset = Dataset3deels.from_array(
-                array=imported_data["data"],
-                sampling=[
-                    imported_data["axes"][0]["scale"],
-                    imported_data["axes"][1]["scale"],
-                    imported_data["axes"][2]["scale"],
-                ],
-                origin=[
-                    imported_data["axes"][0]["offset"],
-                    imported_data["axes"][1]["offset"],
-                    imported_data["axes"][2]["offset"],
-                ],
-                units=[
-                    imported_data["axes"][0]["units"],
-                    imported_data["axes"][1]["units"],
-                    imported_data["axes"][2]["units"],
-                ],
-            )
-        else:
-            dataset = Dataset3deels.from_array(
-                array=imported_data["data"].transpose((2, 0, 1)),
-                sampling=[
-                    imported_data["axes"][2]["scale"],
-                    imported_data["axes"][0]["scale"],
-                    imported_data["axes"][1]["scale"],
-                ],
-                origin=[
-                    imported_data["axes"][2]["offset"],
-                    imported_data["axes"][0]["offset"],
-                    imported_data["axes"][1]["offset"],
-                ],
-                units=[
-                    imported_data["axes"][2]["units"],
-                    imported_data["axes"][0]["units"],
-                    imported_data["axes"][1]["units"],
-                ],
-            )
+        dataset_cls = Dataset3deels
     elif data_type == "EDS":
-        dataset = Dataset3deds.from_array(
-            array=imported_data["data"].transpose((2, 0, 1)),
-            sampling=[
-                imported_data["axes"][2]["scale"],
-                imported_data["axes"][0]["scale"],
-                imported_data["axes"][1]["scale"],
-            ],
-            origin=[
-                imported_data["axes"][2]["offset"],
-                imported_data["axes"][0]["offset"],
-                imported_data["axes"][1]["offset"],
-            ],
-            units=[
-                imported_data["axes"][2]["units"],
-                imported_data["axes"][0]["units"],
-                imported_data["axes"][1]["units"],
-            ],
-        )
+        dataset_cls = Dataset3deds
     else:
         raise ValueError(f"`data_type` must be `EDS` or `EELS` not `{data_type}`")
+
+    dataset = dataset_cls.from_array(
+        array=array,
+        sampling=sampling,
+        origin=origin,
+        units=units,
+    )
 
     return dataset
 
