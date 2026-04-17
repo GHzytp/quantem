@@ -214,7 +214,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 pred = integrated_densities.float()
-                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred, batch_idx, len(self.dataloader))
+                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, all_densities, pred)
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 

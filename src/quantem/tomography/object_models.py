@@ -505,24 +505,24 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def apply_soft_constraints(
         self,
         coords: torch.Tensor,
+        all_densities: torch.Tensor,
         pred: torch.Tensor,
-        curr_batch_idx: int,
-        max_batch_size: int
     ) -> torch.Tensor:
+
         soft_loss = torch.tensor(0.0, device=pred.device)
         if self.constraints.tv_vol > 0:
-            soft_loss += self.get_tv_loss(coords, pred, curr_batch_idx, max_batch_size)
+            soft_loss += self.get_tv_loss(coords, pred)
 
         if (
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
             and self.constraints.sparsity > 0
         ):  # NOTE: For the linter, I must make this :)
-            sparsity_loss = self.constraints.sparsity * torch.norm(pred, p=1)
+            sparsity_loss = self.constraints.sparsity * torch.norm(all_densities, p=1)
             soft_loss += sparsity_loss
 
         return soft_loss
 
-    def get_tv_loss(self, coords: torch.Tensor, pred: torch.Tensor, curr_batch_idx: int, max_batch_size: int) -> torch.Tensor:
+    def get_tv_loss(self, coords: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
         """
         Calculate the TV loss for the given coordinates and predictions.
 
@@ -530,19 +530,24 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """
         
         if isinstance(self.model, (KPlanes, KPlanesTILTED)):
-            if curr_batch_idx == max_batch_size - 1:
-                per_level = []
-                for p in self.model.grids:
-                    dh = p[:, :, 1:, :] - p[:, :, :-1, :]
-                    dw = p[:, :, :, 1:] - p[:, :, :, :-1]
-                    tv = 0.0
-                    if self.constraints.tv_vol > 0:
-                        tv = tv + self.constraints.tv_vol * (dh.pow(2).mean() + dw.pow(2).mean())
-                    per_level.append(tv)
-                
-                return torch.stack(per_level).sum() * max_batch_size
-            else:
-                return 0.0
+            is_tilted = isinstance(self.model, KPlanesTILTED)
+            per_level = []
+            for p in self.model.grids:
+                # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
+                dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
+                dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
+                per_plane = dh + dw                          # (3*T,) or (3,)
+
+                if is_tilted:
+                    T = self.model.T
+                    per_rotation = per_plane.view(T, 3).sum(dim=1)   # sum 3 planes per rotation
+                    level_tv = per_rotation.mean()                   # average across rotations
+                else:
+                    level_tv = per_plane.sum()                       # standard K-planes behavior
+
+                per_level.append(level_tv)
+
+            return self.constraints.tv_vol * torch.stack(per_level).sum()
         else:
             num_tv_samples = min(10_000, coords.shape[0])
             tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
