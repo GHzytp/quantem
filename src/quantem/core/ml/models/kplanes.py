@@ -438,15 +438,23 @@ def interpolate_ms_features_tilted(
 class KPlanesTILTED(KPlanes):
     """
     K-Planes with T learned SO(3) rotations (TILTED).
- 
+
     Inherits KPlanes for the sigma_net, density_activation, and get_params
     interface.  Overrides:
-      * __init__  – replaces the axis-aligned grids with (3*T)-plane grids
-                    and adds SO3Param.
+      * __init__       – replaces the axis-aligned grids with (3*T)-plane
+                         grids and adds SO3Param.
       * get_densities  – calls the TILTED interpolation instead.
       * get_params     – adds "so3" key so callers can set a separate lr.
       * param_keys     – updated list.
- 
+
+    Two-phase optimization
+    ----------------------
+    Phase 1: instantiate with small `M_features` (and optionally smaller
+             `resolution` / fewer scales) — the bottleneck model. Train it
+             until τ converges, then call `extract_tau_state()`.
+    Phase 2: instantiate at full capacity, call `load_tau_state(M_bneck)`
+             to seed the rotations, then train normally.
+
     Parameters
     ----------
     M_features : int
@@ -454,15 +462,13 @@ class KPlanesTILTED(KPlanes):
         be M_features * T * len(multiscale_res_multipliers).
     T : int
         Number of learned rotations (TILTED-T in the paper; 4 or 8 recommended).
+        Must match between phase 1 and phase 2 when doing two-phase transfer.
     tau_init : str
         "random" (paper default) or "identity".
-    tau_warmup_steps : int
-        If > 0, grids and sigma_net are frozen for this many steps so the
-        rotations can find good basins first (two-phase warm-up).
-        Call model.training_step() once per optimiser step.
+        Irrelevant if you're calling load_tau_state() right after __init__.
     All other args are forwarded to KPlanes.
     """
- 
+
     def __init__(
         self,
         # Grid parameters
@@ -474,7 +480,6 @@ class KPlanesTILTED(KPlanes):
         # TILTED parameters
         T: int = 4,
         tau_init: str = "random",
-        tau_warmup_steps: int = 0,
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -484,20 +489,20 @@ class KPlanesTILTED(KPlanes):
             raise NotImplementedError("KPlanesTILTED is implemented for 3D only.")
         if T < 1:
             raise ValueError(f"T must be >= 1, got {T}")
- 
+
         multiscale_res_multipliers = list(multiscale_res_multipliers or [1])
         num_scales = len(multiscale_res_multipliers)
- 
+
         # Total feature dim seen by the MLP head.
         # Each scale contributes M_features * T channels.
         feature_dim = M_features * T * num_scales
- 
+
         # Call KPlanes.__init__ with grid_dimensions=2 so it builds sigma_net
         # correctly; we immediately replace self.grids below.
         super().__init__(
             grid_dimensions=2,
             input_coords_dims=3,
-            M_features=M_features,         # base class stores this
+            M_features=M_features,
             resolution=resolution,
             multiscale_res_multipliers=multiscale_res_multipliers,
             concat_features=True,
@@ -506,13 +511,9 @@ class KPlanesTILTED(KPlanes):
             hybrid_hidden_dim=hybrid_hidden_dim,
             hybrid_num_layers=hybrid_num_layers,
         )
-        # KPlanes.__init__ built grids with shape (3, M, H, W) and feature_dim
-        # = M * num_scales.  We rebuild them for the TILTED shape.
- 
+
         self.T = T
-        self.tau_warmup_steps = tau_warmup_steps
-        self._global_step: int = 0
- 
+
         # ---- Rebuild grids: (3*T, M_features, H, W) per scale ----
         self.grids = nn.ParameterList()
         for res_mult in multiscale_res_multipliers:
@@ -522,20 +523,20 @@ class KPlanesTILTED(KPlanes):
             )
             nn.init.uniform_(plane, 0.1, 0.5)
             self.grids.append(plane)
- 
+
         # ---- Rebuild sigma_net with the correct feature_dim ----
         # KPlanes built sigma_net with self.feature_dim (= M * num_scales),
         # which is wrong for T > 1.  Rebuild here.
         self.feature_dim = feature_dim
         self._build_sigma_net(use_hybrid_mlp, hybrid_hidden_dim, hybrid_num_layers)
- 
+
         # ---- Learnable rotations ----
         self.so3 = SO3Param(T, init=tau_init)
- 
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
- 
+
     def _build_sigma_net(
         self,
         use_hybrid_mlp: bool,
@@ -559,53 +560,15 @@ class KPlanesTILTED(KPlanes):
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
         else:
-            # Match mentor's "explicit" decoder: a single linear layer.
-            # Small init so density stays near 0 initially.
+            # Single-linear "explicit" decoder. Small init -> density ~ 0 initially.
             self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
             nn.init.normal_(self.sigma_net.weight, std=0.01)
             nn.init.zeros_(self.sigma_net.bias)
- 
-    # ------------------------------------------------------------------
-    # Warm-up bookkeeping
-    # ------------------------------------------------------------------
- 
-    def training_step(self) -> None:
-        """
-        Call once per optimiser step to advance the internal counter.
- 
-        During the first `tau_warmup_steps` iterations, grids and sigma_net
-        have their gradients zeroed after the backward pass so only the SO(3)
-        parameters update.  This is the lightweight version of two-phase
-        optimisation from the paper.
-        """
-        print("Global Stepped")
-        self._global_step += 1
- 
-    def _in_warmup(self) -> bool:
-        return self.tau_warmup_steps > 0 and self._global_step < self.tau_warmup_steps
- 
-    def zero_non_tau_grads(self) -> None:
-        """
-        Call after loss.backward() and before optimizer.step() when you want
-        to implement the rotation warm-up manually.  Alternatively just check
-        model.in_warmup and configure your optimizer accordingly.
-        """
-        if self._in_warmup():
-            for p in self.grids.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
-            for p in self.sigma_net.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
- 
-    @property
-    def in_warmup(self) -> bool:
-        return self._in_warmup()
- 
+
     # ------------------------------------------------------------------
     # Core forward
     # ------------------------------------------------------------------
- 
+
     def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
         pts = coords.reshape(-1, 3)
         R = self.so3.as_matrix()                       # (T, 3, 3)
@@ -616,60 +579,192 @@ class KPlanesTILTED(KPlanes):
         )
         density_before_activation = self.sigma_net(features)
         return self.density_activation(density_before_activation)
- 
+
     def forward(self, pts: torch.Tensor) -> torch.Tensor:
         return self.get_densities(pts)
- 
+
     # ------------------------------------------------------------------
     # Parameter groups
     # ------------------------------------------------------------------
- 
+
     def get_params(self) -> dict[str, list[nn.Parameter]]:
         return {
             "grids":     list(self.grids.parameters()),
             "sigma_net": list(self.sigma_net.parameters()),
             "so3":       list(self.so3.parameters()),
         }
- 
+
     @property
     def param_keys(self) -> list[str]:
         return ["grids", "sigma_net", "so3"]
- 
 
     # ------------------------------------------------------------------
-    # Two-phase helper: extract tau for phase-2 initialisation
+    # Two-phase transfer: extract / load learned rotations
     # ------------------------------------------------------------------
- 
+
     def extract_tau_state(self) -> torch.Tensor:
         """
-        Returns the current quaternion tensor (detached copy) so it can be
-        used to initialise a larger phase-2 model via `load_tau_state`.
+        Returns the current raw R^9 matrices (detached copy) so they can be
+        used to initialise a phase-2 model via `load_tau_state`.
+
+        Returns
+        -------
+        torch.Tensor of shape (T, 3, 3)
         """
-        return self.so3.quats.detach().clone()
- 
-    def load_tau_state(self, quats: torch.Tensor) -> None:
+        return self.so3.M.detach().cpu().clone()
+
+    def load_tau_state(self, M: torch.Tensor) -> None:
         """
-        Load pre-trained quaternions (e.g. from a bottleneck phase-1 model).
- 
-        quats : (T, 4) tensor, will be normalised internally.
+        Load pre-trained rotation matrices (e.g. from a bottleneck phase-1 model).
+
+        No orthogonalization is needed — SO3Param.as_matrix() projects to SO(3)
+        via SVD on every forward pass.
+
+        Parameters
+        ----------
+        M : torch.Tensor of shape (T, 3, 3)
+            Raw unconstrained matrices from `extract_tau_state()`.
         """
-        if quats.shape != self.so3.quats.shape:
+        if M.shape != self.so3.M.shape:
             raise ValueError(
-                f"Shape mismatch: got {quats.shape}, "
-                f"expected {self.so3.quats.shape}"
+                f"Shape mismatch: got {M.shape}, expected {self.so3.M.shape}. "
+                f"Make sure T matches between phase 1 and phase 2."
             )
         with torch.no_grad():
-            self.so3.quats.copy_(F.normalize(quats, p=2, dim=-1))
- 
+            self.so3.M.copy_(M.to(self.so3.M.device))
+
     # ------------------------------------------------------------------
     # Pretty print
     # ------------------------------------------------------------------
- 
+
     def extra_repr(self) -> str:
         return (
             f"T={self.T}, "
             f"M_features={self.M_features}, "
             f"feature_dim={self.feature_dim}, "
-            f"num_scales={len(self.multiscale_res_multipliers)}, "
-            f"tau_warmup_steps={self.tau_warmup_steps}"
+            f"num_scales={len(self.multiscale_res_multipliers)}"
         )
+
+
+
+
+
+# CP Decomp for Warmup SO3 rotations
+
+def interpolate_ms_features_cp_tilted(
+    pts: torch.Tensor,             # (B, 3)
+    ms_grids: nn.ParameterList,    # each grid: (3*T, C, L) — 1D lines
+    rotation_matrices: torch.Tensor,  # (T, 3, 3)
+) -> torch.Tensor:
+    """
+    CP (vector outer product) version of TILTED interpolation.
+    Returns features of shape (B, C * T * num_scales).
+    """
+    T = rotation_matrices.shape[0]
+    B = pts.shape[0]
+
+    # Rotate all points by all rotations: (T, B, 3)
+    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+
+    per_scale_features = []
+    for line_coef in ms_grids:
+        # line_coef: (3T, C, L)  — three 1D feature lines per transform (x, y, z)
+        C, L = line_coef.shape[1], line_coef.shape[2]
+
+        # For each transform t, we need three 1D samples: at x_t, y_t, z_t.
+        # Lay them out as (3T, B) coords, matching line_coef's first dim.
+        # Axis order per transform: x, y, z.
+        coords_1d = rotated.reshape(T, B, 3).permute(0, 2, 1).reshape(3 * T, B)
+        # coords_1d: (3T, B), each row is samples along one axis for one transform
+
+        # grid_sample wants 4D input for 2D sampling, or we can use 1D via a
+        # (3T, C, 1, L) reshape and pass 2D coords with y fixed at 0.
+        # Simpler: use F.grid_sample with a 4D trick, or just do manual linear interp.
+        # Here's the grid_sample way:
+        line_coef_4d = line_coef.unsqueeze(2)                         # (3T, C, 1, L)
+        # grid: need (3T, Hout=1, Wout=B, 2), with x = coord, y = 0
+        grid = torch.stack([
+            coords_1d,                                                # x
+            torch.zeros_like(coords_1d),                              # y
+        ], dim=-1).unsqueeze(1)                                       # (3T, 1, B, 2)
+
+        sampled = F.grid_sample(
+            line_coef_4d, grid,
+            align_corners=True, mode="bilinear", padding_mode="border",
+        ).squeeze(2)                                                   # (3T, C, B)
+
+        # Hadamard across the 3 axes per transform: (T, 3, C, B) -> (T, C, B)
+        sampled = sampled.view(T, 3, C, B).prod(dim=1)
+
+        # (T, C, B) -> (B, T*C)
+        per_scale_features.append(sampled.permute(2, 0, 1).reshape(B, T * C))
+
+    return torch.cat(per_scale_features, dim=-1)
+
+
+class CPTilted(nn.Module, PPLR):
+    """
+    CP decomposition with TILTED rotations — the true bottleneck model for
+    phase 1. Rank-1-per-channel feature representation.
+
+    Shares the SO3Param and sigma_net design with KPlanesTILTED so you can
+    lift τ directly across: cp_model.extract_tau_state() ->
+    kplanes_model.load_tau_state().
+    """
+
+    def __init__(
+        self,
+        C: int = 4,                           # channels per transform per scale
+        resolution: Sequence[int] = (128, 128, 128),
+        multiscale_res_multipliers: Optional[Sequence[int]] = None,
+        T: int = 4,
+        tau_init: str = "random",
+        density_activation: Callable = lambda x: F.softplus(x - 1),
+    ):
+        super().__init__()
+        self.T = T
+        self.C = C
+        self.multiscale_res_multipliers = list(multiscale_res_multipliers or [1])
+        self.density_activation = density_activation
+
+        # 1D feature lines, one per axis per transform per scale.
+        # Shape per scale: (3*T, C, L).  We use max(resolution) for L; if your
+        # scene is strongly anisotropic use 3 separate lines per axis.
+        self.grids = nn.ParameterList()
+        for mult in self.multiscale_res_multipliers:
+            L = int(max(resolution) * mult)
+            line = nn.Parameter(torch.empty(3 * T, C, L))
+            nn.init.uniform_(line, 0.1, 0.5)
+            self.grids.append(line)
+
+        self.feature_dim = C * T * len(self.multiscale_res_multipliers)
+
+        # Same minimal single-linear decoder as your KPlanesTILTED default.
+        self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
+        nn.init.normal_(self.sigma_net.weight, std=0.01)
+        nn.init.zeros_(self.sigma_net.bias)
+
+        self.so3 = SO3Param(T, init=tau_init)
+
+    def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
+        pts = coords.reshape(-1, 3)
+        R = self.so3.as_matrix()
+        features = interpolate_ms_features_cp_tilted(pts, self.grids, R)
+        return self.density_activation(self.sigma_net(features))
+
+    def forward(self, pts):
+        return self.get_densities(pts)
+
+    def get_params(self):
+        return {
+            "grids":     list(self.grids.parameters()),
+            "sigma_net": list(self.sigma_net.parameters()),
+            "so3":       list(self.so3.parameters()),
+        }
+
+    @property
+    def param_keys(self):
+        return ["grids", "sigma_net", "so3"]
+
+    def extract_tau_state(self) -> torch.Tensor:
+        return self.so3.M.detach().clone()

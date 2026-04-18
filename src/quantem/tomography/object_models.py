@@ -99,10 +99,11 @@ class ObjConstraintParams:
         positivity: bool = True
         shrinkage: float = 0.0
         tv_vol: float = 0.0
+        tv_plane: float = 0.0
         sparsity: float = 0.0
         _name: str = "obj_inr"
 
-        soft_constraint_keys = ["tv_vol", "sparsity"]
+        soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity"]
         hard_constraint_keys = ["positivity", "shrinkage"]
 
     @classmethod
@@ -521,59 +522,131 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             soft_loss += sparsity_loss
 
         return soft_loss
+    # TV Losses
 
     def get_tv_loss(self, coords: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
         """
-        Calculate the TV loss for the given coordinates and predictions.
+        Dispatch to the appropriate TV loss based on model architecture.
 
-        Current supported architectures are KPlanes and INRs
+        - KPlanes / KPlanesTILTED: per-plane TV (regularizes the stored feature
+        planes directly). Cheap; regularizes the representation.
+        - CPTilted: per-line TV (same idea, applied to 1D feature lines).
+        - SIREN / other INRs: volume TV via autograd (exact gradient).
+        - Fallback: volume TV via finite differences (works anywhere).
+
+        If you want *volume* smoothness regardless of architecture, call
+        `get_volume_tv_loss(coords)` directly.
         """
-        
+        tv_loss = torch.tensor(0.0, device=pred.device)
         if isinstance(self.model, (KPlanes, KPlanesTILTED)):
-            is_tilted = isinstance(self.model, KPlanesTILTED)
-            per_level = []
-            for p in self.model.grids:
-                # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
-                dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
-                dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
-                per_plane = dh + dw                          # (3*T,) or (3,)
+            tv_loss += self._get_plane_tv_loss()
 
-                if is_tilted:
-                    T = self.model.T
-                    per_rotation = per_plane.view(T, 3).sum(dim=1)   # sum 3 planes per rotation
-                    level_tv = per_rotation.mean()                   # average across rotations
-                else:
-                    level_tv = per_plane.sum()                       # standard K-planes behavior
+        # SIREN and other INRs support double-backward → use exact autograd.
+        # Everything else falls through to finite-difference volume TV.
+        if not isinstance(self.model, PPLR):        # adjust to your actual INR class
+            tv_loss += self._get_volume_tv_loss_autograd(coords)
 
-                per_level.append(level_tv)
+        if isinstance(self.model, (KPlanes, KPlanesTILTED)):
+            tv_loss += self.get_volume_tv_loss(coords)
+        return tv_loss
 
-            return self.constraints.tv_vol * torch.stack(per_level).sum()
+
+    # ----------------------------------------------------------------------
+    # Plane TV (K-Planes family) — regularizes the stored feature planes.
+    # ----------------------------------------------------------------------
+
+    def _get_plane_tv_loss(self) -> torch.Tensor:
+        is_tilted = isinstance(self.model, KPlanesTILTED)
+        per_level = []
+
+        for p in self.model.grids:
+            # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
+            dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
+            dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
+            per_plane = dh + dw                                     # (3*T,) or (3,)
+
+            if is_tilted:
+                T = self.model.T
+                per_rotation = per_plane.view(T, 3).sum(dim=1)      # sum 3 planes per rotation
+                level_tv = per_rotation.mean()                      # avg across rotations
+            else:
+                level_tv = per_plane.sum()
+
+            per_level.append(level_tv)
+
+        return self.constraints.tv_plane * torch.stack(per_level).sum()
+
+
+    # ----------------------------------------------------------------------
+    # Volume TV (autograd) — exact gradient, needs double-backward support.
+    # ----------------------------------------------------------------------
+
+    def _get_volume_tv_loss_autograd(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Isotropic volume TV using autograd. Exact gradient, but requires the
+        model to support double-backward (SIREN yes, grid_sample-based models no).
+        """
+        num_tv_samples = min(10_000, coords.shape[0])
+        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+
+        tv_coords = coords[tv_indices].detach().requires_grad_(True)
+        pred = self.model(tv_coords)
+        if isinstance(pred, tuple):
+            pred = pred[0]
+        if pred.dim() == 1:
+            pred = pred.unsqueeze(-1)
+
+        grad_outputs = torch.autograd.grad(
+            outputs=pred,
+            inputs=tv_coords,
+            grad_outputs=torch.ones_like(pred),
+            create_graph=True,
+        )[0]                                                         # (N, 3)
+
+        grad_norm = torch.norm(grad_outputs, dim=1)                  # (N,)
+        return self.constraints.tv_vol * grad_norm.mean()
+
+
+    # ----------------------------------------------------------------------
+    # Volume TV (finite differences) — works for any model.
+    # ----------------------------------------------------------------------
+
+    def get_volume_tv_loss(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Isotropic volume TV via finite differences. Same form as the autograd
+        version (L1 of gradient L2-norm) but avoids double-backward, so it
+        works for KPlanesTILTED, CPTilted, and anything else.
+        """
+        num_tv_samples = min(10_000, coords.shape[0])
+        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+        tv_coords = coords[tv_indices]                               # (N, 3)
+
+        if hasattr(self.model, "resolution"):
+            h = 2.0 / min(self.model.resolution)
         else:
-            num_tv_samples = min(10_000, coords.shape[0])
-            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+            h = 1e-2
 
-            tv_coords = coords[tv_indices].detach().requires_grad_(True)
-            tv_densities_recomputed = self.model(tv_coords)
-            if isinstance(tv_densities_recomputed, tuple):
-                tv_densities_recomputed = tv_densities_recomputed[0]
+        pred = self.model(tv_coords)
+        if isinstance(pred, tuple):
+            pred = pred[0]
+        if pred.dim() == 1:
+            pred = pred.unsqueeze(-1)                                # (N, 1)
 
-            # Ensure shape is [num_samples, num_channels]
-            if tv_densities_recomputed.dim() == 1:
-                tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
+        grads = []
+        for axis in range(3):
+            offset = torch.zeros(3, device=tv_coords.device)
+            offset[axis] = h
+            shifted_pred = self.model(tv_coords + offset)
+            if isinstance(shifted_pred, tuple):
+                shifted_pred = shifted_pred[0]
+            if shifted_pred.dim() == 1:
+                shifted_pred = shifted_pred.unsqueeze(-1)
+            grads.append((shifted_pred - pred) / h)                  # (N, 1)
 
-            # Compute gradients for each channel
-            grad_outputs = torch.autograd.grad(
-                outputs=tv_densities_recomputed,
-                inputs=tv_coords,
-                grad_outputs=torch.ones_like(tv_densities_recomputed),
-                create_graph=True,
-            )[0]  # Shape: [num_samples, coord_dim]
+        grad_stack = torch.stack(grads, dim=-1)                      # (N, C, 3)
+        grad_norm = torch.norm(grad_stack, dim=-1)                   # (N, C)
 
-            # Compute TV loss - gradient magnitude per sample
-            grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
-            return self.constraints.tv_vol * grad_norm.mean()
-
-
+        return self.constraints.tv_vol * grad_norm.mean()
 
     def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
         """

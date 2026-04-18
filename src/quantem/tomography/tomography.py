@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.models.kplanes import CPTilted
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
 from quantem.tomography.dataset_models import (
@@ -232,6 +233,25 @@ class Tomography(TomographyOpt, TomographyBase):
                 self.step_optimizers()
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
+
+            if isinstance(self.obj_model.model, CPTilted):
+                if a0 == 0:
+                    prev_R = self.obj_model.model.so3.as_matrix().detach().clone()
+                elif (a0 + 1) % 20 == 0:
+                    R_now = self.obj_model.model.so3.as_matrix().detach()
+                    # Cumulative angular change per rotation over the last 20 iters.
+                    # trace(R_prev^T R_now) = 1 + 2*cos(theta), so theta = acos((trace - 1) / 2).
+                    rel_trace = torch.einsum('tij,tij->t', prev_R, R_now)
+                    angle = torch.acos(((rel_trace - 1) / 2).clamp(-1, 1))  # (T,) radians
+                    angle_deg = torch.rad2deg(angle)
+                    per_tau_str = ", ".join(f"{a:.2f}°" for a in angle_deg.tolist())
+                    print(
+                        f"iter {a0}: 20-iter τ change "
+                        f"max={angle_deg.max().item():.2f}°, "
+                        f"mean={angle_deg.mean().item():.2f}°, "
+                        f"per-τ=[{per_tau_str}]"
+                    )
+                    prev_R = R_now.clone()
 
             if self.world_size > 1:
                 dist.all_reduce(total_loss, dist.ReduceOp.AVG)

@@ -643,6 +643,29 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         self.device = device
         self.reconnect_optimizer_to_parameters()
 
+    # --- Save learned parameters ---
+
+    def save_parameters(self, path: str):
+        """
+        Saves the learned parameters to a file.
+        """
+        torch.save({
+            "z1": self._z1_params.detach().cpu(),
+            "z3": self._z3_params.detach().cpu(),
+            "shifts": self._shifts_params.detach().cpu(),
+        }, path)
+
+    def load_parameters(self, path: str):
+        """
+        Loads the learned parameters from a file.
+        """
+        data = torch.load(path)
+        self._z1_params = nn.Parameter(data["z1"])
+        self._z3_params = nn.Parameter(data["z3"])
+        self._shifts_params = nn.Parameter(data["shifts"])
+        if self.optimizer is not None:
+            self.reconnect_optimizer_to_parameters()
+
 
 class TomographyINRPretrainDataset(Dataset):
     """
