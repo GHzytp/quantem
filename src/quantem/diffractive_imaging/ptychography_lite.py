@@ -268,6 +268,7 @@ class PtychoLiteDIP(Ptychography):
         pretrain_lr: float = 1e-3,
         pretrain_probe: bool = True,
         pretrain_object: bool = True,
+        normalize_object_plotting: bool = True,
         # model settings
         cnn_num_layers: int = 3,
         # logging/device
@@ -323,6 +324,7 @@ class PtychoLiteDIP(Ptychography):
                     },
                     apply_constraints=False,
                     device=config.get("device"),
+                    normalize_object_plotting=normalize_object_plotting,
                 )
             if pretrain_probe:
                 probe_model.pretrain(

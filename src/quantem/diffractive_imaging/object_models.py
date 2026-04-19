@@ -22,6 +22,7 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
+from quantem.core.visualization.custom_normalizations import CustomNormalization
 from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import sum_patches
 
@@ -1056,6 +1057,7 @@ class ObjectDIP(ObjectConstraints):
         apply_constraints: bool = False,
         show: bool = True,
         device: str | None = None,  # allow overwriting of device
+        normalize_object_plotting: bool = True,
     ):
         if device is not None:
             self.to(device)
@@ -1091,6 +1093,7 @@ class ObjectDIP(ObjectConstraints):
             loss_fn=loss_fn,
             apply_constraints=apply_constraints,
             show=show,
+            normalize_object_plotting=normalize_object_plotting,
         )
         self._set_pretrained_weights(self.model)
 
@@ -1100,6 +1103,7 @@ class ObjectDIP(ObjectConstraints):
         loss_fn: Callable,
         apply_constraints: bool = False,
         show: bool = False,
+        normalize_object_plotting: bool = True,
     ):
         """Pretrain the DIP model."""
         if self.pretrain_target is None:
@@ -1151,9 +1155,16 @@ class ObjectDIP(ObjectConstraints):
             pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
 
         if show:
-            self.visualize_pretrain(output)
+            self.visualize_pretrain(
+                output,
+                normalize_object_plotting=normalize_object_plotting,
+            )
 
-    def visualize_pretrain(self, pred_obj: torch.Tensor):
+    def visualize_pretrain(
+        self,
+        pred_obj: torch.Tensor,
+        normalize_object_plotting: bool = True,
+    ):
         import matplotlib.gridspec as gridspec
 
         fig = plt.figure(figsize=(12, 6))
@@ -1190,6 +1201,31 @@ class ObjectDIP(ObjectConstraints):
         if target is None:
             raise ValueError("Model has not been pre-trained")
         if n_bot == 4:
+            norm_angle = None
+            norm_abs = None
+            if normalize_object_plotting:
+                target_mean_angle = target.mean(0).angle().cpu().detach().numpy()
+                target_mean_abs = target.mean(0).abs().cpu().detach().numpy()
+
+                target_norm_angle = CustomNormalization(
+                    interval_type="quantile",
+                    data=target_mean_angle,
+                )
+                norm_angle = {
+                    "interval_type": "manual",
+                    "vmin": target_norm_angle.vmin,
+                    "vmax": target_norm_angle.vmax,
+                }
+
+                target_norm_abs = CustomNormalization(
+                    interval_type="quantile",
+                    data=target_mean_abs,
+                )
+                norm_abs = {
+                    "interval_type": "manual",
+                    "vmin": target_norm_abs.vmin,
+                    "vmax": target_norm_abs.vmax,
+                }
             show_2d(
                 [
                     pred_obj.mean(0).angle().cpu().detach().numpy(),
@@ -1206,8 +1242,22 @@ class ObjectDIP(ObjectConstraints):
                 ],
                 cmap="magma",
                 cbar=True,
+                norm=[norm_angle, norm_angle, norm_abs, norm_abs],
             )
         else:
+            norm = None
+            if normalize_object_plotting:
+                target_mean = target.mean(0).cpu().detach().numpy()
+                target_norm = CustomNormalization(
+                    interval_type="quantile",
+                    data=target_mean,
+                )
+                norm = {
+                    "interval_type": "manual",
+                    "vmin": target_norm.vmin,
+                    "vmax": target_norm.vmax,
+                }
+
             show_2d(
                 [
                     pred_obj.mean(0).cpu().detach().numpy(),
@@ -1217,6 +1267,7 @@ class ObjectDIP(ObjectConstraints):
                 title=[f"Pred obj ({self.obj_type})", f"Target obj ({self.obj_type})"],
                 cmap="magma",
                 cbar=True,
+                norm=norm,
             )
         plt.suptitle(
             f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
