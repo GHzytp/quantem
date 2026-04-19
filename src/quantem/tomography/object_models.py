@@ -20,6 +20,11 @@ from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 
+def _unwrap(model):
+    """Unwrap DDP/FSDP/any wrapper that exposes `.module`."""
+    while hasattr(model, "module") and isinstance(model.module, torch.nn.Module):
+        model = model.module
+    return model
 
 class ObjConstraintParams:
     """
@@ -538,15 +543,16 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         `get_volume_tv_loss(coords)` directly.
         """
         tv_loss = torch.tensor(0.0, device=pred.device)
-        if isinstance(self.model, (KPlanes, KPlanesTILTED)):
+        inner = _unwrap(self.model)
+        if isinstance(inner, (KPlanes, KPlanesTILTED)):
             tv_loss += self._get_plane_tv_loss()
 
         # SIREN and other INRs support double-backward → use exact autograd.
         # Everything else falls through to finite-difference volume TV.
-        if not isinstance(self.model, PPLR):        # adjust to your actual INR class
+        if not isinstance(inner, PPLR):        # adjust to your actual INR class
             tv_loss += self._get_volume_tv_loss_autograd(coords)
 
-        if isinstance(self.model, (KPlanes, KPlanesTILTED)):
+        if isinstance(inner, (KPlanes, KPlanesTILTED)):
             tv_loss += self.get_volume_tv_loss(coords)
         return tv_loss
 
@@ -556,17 +562,18 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     # ----------------------------------------------------------------------
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
-        is_tilted = isinstance(self.model, KPlanesTILTED)
+        inner = _unwrap(self.model)
+        is_tilted = isinstance(inner, KPlanesTILTED)
         per_level = []
-
-        for p in self.model.grids:
+        
+        for p in inner.grids:
             # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
             dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
             dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
             per_plane = dh + dw                                     # (3*T,) or (3,)
 
             if is_tilted:
-                T = self.model.T
+                T = inner.T
                 per_rotation = per_plane.view(T, 3).sum(dim=1)      # sum 3 planes per rotation
                 level_tv = per_rotation.mean()                      # avg across rotations
             else:
@@ -621,12 +628,13 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
         tv_coords = coords[tv_indices]                               # (N, 3)
 
-        if hasattr(self.model, "resolution"):
-            h = 2.0 / min(self.model.resolution)
+        inner = _unwrap(self.model)
+        if hasattr(inner, "resolution"):
+            h = 2.0 / min(inner.resolution)
         else:
             h = 1e-2
 
-        pred = self.model(tv_coords)
+        pred = inner(tv_coords)
         if isinstance(pred, tuple):
             pred = pred[0]
         if pred.dim() == 1:
@@ -636,7 +644,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         for axis in range(3):
             offset = torch.zeros(3, device=tv_coords.device)
             offset[axis] = h
-            shifted_pred = self.model(tv_coords + offset)
+            shifted_pred = inner(tv_coords + offset)
             if isinstance(shifted_pred, tuple):
                 shifted_pred = shifted_pred[0]
             if shifted_pred.dim() == 1:
@@ -696,14 +704,16 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if isinstance(params, OptimizerType):
             self._optimizer_params = params
             return
-        if isinstance(self.model, PPLR):
+
+        inner = _unwrap(self.model)
+        if isinstance(inner, PPLR):
             if not isinstance(params, dict):
                 raise TypeError(f"optimizer parameters must be a dict for PPLR, got {type(params)}")
                 
             object_params = params
             
-            if set(object_params.keys()) != set(self.model.param_keys):
-                raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}")
+            if set(object_params.keys()) != set(inner.param_keys):
+                raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {inner.param_keys}")
 
             params = {}
             for key, value in object_params.items():
@@ -725,7 +735,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         Currently supports single LR for all parameters, TODO allow for per parameter LRs by
         updating get_optimization_parameters to return a list of parameters and their LRs.
         """
-        if not isinstance(self.model, PPLR):
+
+        inner = _unwrap(self.model)
+        if not isinstance(inner, PPLR):
             super().set_optimizer(opt_params)
             return
 

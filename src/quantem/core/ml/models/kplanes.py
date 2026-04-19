@@ -6,7 +6,7 @@ import itertools
 import math
 from typing import Callable, Optional, Sequence
 
-import tinycudann as tcnn
+# import tinycudann as tcnn
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -217,18 +217,7 @@ class KPlanes(nn.Module, PPLR):
             nn.init.zeros_(out.bias)
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
-        else:
-            self.sigma_net = tcnn.Network(
-                n_input_dims=self.feature_dim,
-                n_output_dims=1,
-                network_config={
-                    "otype": "CutlassMLP",
-                    "activation": "None",
-                    "output_activation": "None",
-                    "n_neurons": 128,
-                    "n_hidden_layers": 0,
-                },
-            )
+
 
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
@@ -370,10 +359,12 @@ class SO3Param(nn.Module):
 
     def as_matrix(self) -> torch.Tensor:
         """Projects each M to SO(3) via SVD. Returns (T, 3, 3)."""
+
+        
         U, _, Vh = torch.linalg.svd(self.M)   # U: (T,3,3), Vh: (T,3,3)
         # Fix reflections: det(U Vh) must be +1
         d = torch.det(U @ Vh)                  # (T,)
-        diag = torch.ones(self.M.shape[0], 3, device=self.M.device)
+        diag = torch.ones(self.M.shape[0], 3, device=self.M.device, dtype=self.M.dtype)
         diag[:, 2] = d                          # multiply last singular vector by sign
         return U @ (diag.unsqueeze(-1) * Vh)   # (T, 3, 3)
 
