@@ -43,28 +43,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         origin: NDArray | tuple | list | float | int,
         sampling: NDArray | tuple | list | float | int,
         units: list[str] | tuple | list,
-        signal_units: str = "arb. units",
+        signal_units: str = 'arb. units',
         _token: object | None = None,
     ):
-        """Initialize a 3D EDS dataset.
-
-        Parameters
-        ----------
-        array : NDArray | Any
-            The underlying 3D array data
-        name : str
-            A descriptive name for the dataset
-        origin : NDArray | tuple | list | float | int
-            The origin coordinates for each dimension
-        sampling : NDArray | tuple | list | float | int
-            The sampling rate/spacing for each dimension
-        units : list[str] | tuple | list
-            Units for each dimension
-        signal_units : str, optional
-            Units for the array values, by default "arb. units"
-        _token : object | None, optional
-            Token to prevent direct instantiation, by default None
-        """
         super().__init__(
             array=array,
             name=name,
@@ -74,118 +55,93 @@ class Dataset3deds(Dataset3dspectroscopy):
             signal_units=signal_units,
             _token=_token,
         )
-
-        self.dataset_type = "eds"
+        self.dataset_type = 'eds'
 
     @staticmethod
-    def _normalize_specs(specs, param_name="spec", allow_none=False):
-        if specs is None and allow_none:
-            return None
+    def _normalize_specs(specs, param_name='spec', allow_none=False):
+        if specs is None:
+            if allow_none:
+                return None
+            raise TypeError(f'{param_name} must be a string or sequence of strings')
         if isinstance(specs, str):
-            return [s.strip() for s in specs.split(",") if s.strip()]
+            return [s.strip() for s in specs.split(',') if s.strip()]
         if isinstance(specs, (list, tuple, set)):
-            out = []
-            for item in specs:
-                out.extend([s.strip() for s in str(item).split(",") if s.strip()])
-            return out
-        raise TypeError(
-            f"{param_name} must be {'None, ' if allow_none else ''}a string or a sequence of strings"
-        )
+            return [s.strip() for item in specs for s in str(item).split(',') if s.strip()]
+        raise TypeError(f'{param_name} must be a string or sequence of strings')
 
     @staticmethod
     def _normalize_token(text):
-        return re.sub(r"[^a-z0-9]", "", str(text).lower())
+        return re.sub(r'[^a-z0-9]', '', str(text).lower())
 
     @staticmethod
     def _ordered_element_keys(all_info):
-        return sorted([str(key) for key in all_info], key=lambda k: (-len(k), k))
+        return sorted(map(str, all_info), key=lambda k: (-len(k), k))
 
     @classmethod
     def _resolve_element_from_label(cls, label, ordered_elements):
-        label_str = str(label)
-        for element_name in ordered_elements:
-            if label_str.startswith(element_name):
-                return element_name
-        m = re.match(r"^[A-Z][a-z]?", label_str)
+        label = str(label)
+        for element in ordered_elements:
+            if label.startswith(element):
+                return element
+        m = re.match(r'^[A-Z][a-z]?', label)
         return m.group(0) if m else None
 
     @classmethod
     def _ensure_element_info(cls):
-        """Load and return the element->lines info dict."""
         if cls.element_info is None:
             cls.load_element_info()
         return cls.element_info or {}
 
     @classmethod
-    def _parse_element_selectors(cls, specs, *, allow_none=False, param_name="spec"):
-        """Parse selectors like 'Fe', 'FeK', 'FeKa1' into {element: None|set[tokens]}."""
+    def _parse_element_selectors(cls, specs, *, allow_none=False, param_name='spec'):
         tokens = cls._normalize_specs(specs, param_name=param_name, allow_none=allow_none)
         if tokens is None:
             return None
 
-        info = cls._ensure_element_info()
-        ordered = cls._ordered_element_keys(info)
+        ordered = cls._ordered_element_keys(cls._ensure_element_info())
         out: dict[str, set[str] | None] = {}
-
         for raw in tokens:
-            compact = re.sub(r"[\s_-]+", "", str(raw).strip())
+            compact = re.sub(r'[\s_-]+', '', str(raw).strip())
             if not compact:
                 continue
-
             element = next((k for k in ordered if compact.lower().startswith(k.lower())), None)
             if element is None:
                 raise ValueError(f"Could not resolve element from specifier '{raw}'")
-
-            suffix = compact[len(element) :]
-            if not suffix:
-                out[element] = None
-            else:
-                out.setdefault(element, set())
-                if out[element] is not None:
-                    out[element].add(str(suffix))
-
+            suffix = compact[len(element):]
+            out.setdefault(element, None if not suffix else set())
+            if suffix and out[element] is not None:
+                out[element].add(suffix)
         return out or None
 
     @staticmethod
     def _canonical_line_name(line_name: str) -> str:
-        return str(line_name).split("__", 1)[0]
+        return str(line_name).split('__', 1)[0]
 
     @classmethod
     def _iter_selected_lines(cls, element: str, suffix: str, *, raw_spec: str):
-        """Yield (line_name, line_info) for an element based on suffix matching."""
-        info = cls._ensure_element_info()
-        lines = info.get(element) or {}
-        if not isinstance(lines, dict) or not lines:
+        lines = cls._ensure_element_info().get(element) or {}
+        if not lines:
             raise ValueError(f"No X-ray lines found for element '{element}'")
-
         if not suffix:
             yield from lines.items()
             return
 
-        suffix_norm = cls._normalize_token(suffix)
-        if not suffix_norm:
-            raise ValueError(f"Could not parse line/edge token from '{raw_spec}'")
-
+        suffix = cls._normalize_token(suffix)
         exact, prefix = [], []
-        for ln, li in lines.items():
-            base = cls._canonical_line_name(str(ln))
-            ln_norm = cls._normalize_token(base)
-            if ln_norm == suffix_norm:
-                exact.append((ln, li))
-            if ln_norm.startswith(suffix_norm):
-                prefix.append((ln, li))
-
-        chosen = exact or prefix
-        if not chosen:
-            raise ValueError(
-                f"No X-ray lines matched specifier '{raw_spec}' for element '{element}'"
-            )
-        yield from chosen
+        for line_name, line_info in lines.items():
+            token = cls._normalize_token(cls._canonical_line_name(line_name))
+            if token == suffix:
+                exact.append((line_name, line_info))
+            if token.startswith(suffix):
+                prefix.append((line_name, line_info))
+        matches = exact or prefix
+        if not matches:
+            raise ValueError(f"No X-ray lines matched specifier '{raw_spec}' for element '{element}'")
+        yield from matches
 
     @classmethod
     def _group_labels_by_element(cls, labels: list[str]):
-        info = cls._ensure_element_info()
-        ordered = cls._ordered_element_keys(info)
+        ordered = cls._ordered_element_keys(cls._ensure_element_info())
         grouped: dict[str, list[str]] = {}
         for lbl in sorted(map(str, labels)):
             element = cls._resolve_element_from_label(lbl, ordered)
@@ -194,560 +150,373 @@ class Dataset3deds(Dataset3dspectroscopy):
         return grouped
 
     @classmethod
-    def _select_labels(
-        cls, selector: str, *, labels: list[str], labels_by_element: dict[str, list[str]]
-    ):
-        """Select labels from available spectrum-image labels using selector semantics."""
-        sel = str(selector).strip()
-        if not sel:
+    def _select_labels(cls, selector: str, *, labels: list[str], labels_by_element: dict[str, list[str]]):
+        selector = str(selector).strip()
+        if not selector:
             return []
 
         lower_map = {lbl.lower(): lbl for lbl in labels}
-        if sel.lower() in lower_map:
-            return [lower_map[sel.lower()]]
+        if selector.lower() in lower_map:
+            return [lower_map[selector.lower()]]
 
         elem_map = {elem.lower(): elem for elem in labels_by_element}
-        if sel.lower() in elem_map:
-            return list(labels_by_element[elem_map[sel.lower()]])
+        if selector.lower() in elem_map:
+            return list(labels_by_element[elem_map[selector.lower()]])
 
-        compact = cls._normalize_token(sel)
-        return [lbl for lbl in labels if cls._normalize_token(lbl).startswith(compact)]
+        token = cls._normalize_token(selector)
+        return [lbl for lbl in labels if cls._normalize_token(lbl).startswith(token)]
 
     @staticmethod
     def _line_shell(line_name: str) -> str:
-        line_upper = str(line_name).upper()
-        if line_upper.startswith("K"):
-            return "K"
-        if line_upper.startswith("L"):
-            return "L"
-        if line_upper.startswith("M"):
-            return "M"
-        return "?"
+        line_name = str(line_name).upper()
+        return 'K' if line_name.startswith('K') else 'L' if line_name.startswith('L') else 'M' if line_name.startswith('M') else '?'
 
     @staticmethod
-    def _peak_confidence(
-        snr_value: float, line_weight: float, distance_value: float, tolerance: float
-    ) -> float:
-        # Use a Gaussian distance likelihood: exp(-0.5 * (d/sigma)^2).
-        # sigma = tolerance / 3 so the hard cutoff sits at ~3sigma,
-        # giving a steep penalty for distance while tolerance stays as a
-        # generous search window.  This prevents heavy-element Ma1 lines
-        # (weight 1.0) from overshadowing lighter-element K-lines at much
-        # closer distances (e.g. Os Ma1 vs P Ka1 near 2 keV).
+    def _peak_confidence(snr_value: float, line_weight: float, distance_value: float, tolerance: float) -> float:
         sigma = max(float(tolerance) / 3.0, 1e-9)
-        snr_term = np.log1p(max(float(snr_value), 0.0))
-        weight_term = max(float(line_weight), 0.0)
-        distance_term = np.exp(-0.5 * (float(distance_value) / sigma) ** 2)
-        return snr_term * weight_term * distance_term
+        return np.log1p(max(float(snr_value), 0.0)) * max(float(line_weight), 0.0) * np.exp(
+            -0.5 * (float(distance_value) / sigma) ** 2
+        )
 
     @staticmethod
     def _line_matches_selector(line_name: str, selector: str) -> bool:
         line = str(line_name).strip().lower()
-        token = str(selector).strip().lower()
-        if token in {"k", "l", "m"}:
-            return line.startswith(token)
-        return token in line
+        selector = str(selector).strip().lower()
+        return line.startswith(selector) if selector in {'k', 'l', 'm'} else selector in line
 
     @classmethod
-    def _line_allowed_for_element(
-        cls, element_name: str, line_name: str, edge_filters=None
-    ) -> bool:
-        if edge_filters is None:
-            return True
-        selectors = edge_filters.get(str(element_name))
-        if selectors is None:
-            return True
-        return any(cls._line_matches_selector(line_name, token) for token in selectors)
+    def _line_allowed_for_element(cls, element_name: str, line_name: str, edge_filters=None) -> bool:
+        selectors = None if edge_filters is None else edge_filters.get(str(element_name))
+        return selectors is None or any(cls._line_matches_selector(line_name, token) for token in selectors)
 
-    def x_ray_lookup(
-        self, spec: str | list[str] | tuple[str, ...] | set[str]
-    ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-        """Lookup EDS X-ray lines for element, shell, or specific line specifiers."""
+    def _get_spectrum_images(self, method='integration'):
+        return {
+            'integration': getattr(self, '_spectrum_images', None),
+            'fit': getattr(self, '_spectrum_images_pytorch', None),
+        }.get(method)
+
+    @staticmethod
+    def _shell_preference_factor(shell_name: str) -> float:
+        return 0.72 if shell_name == 'M' else 1.0
+
+    @staticmethod
+    def _merge_edge_filters(requested, saved):
+        if requested and saved:
+            merged = dict(saved)
+            for element, selectors in requested.items():
+                current = merged.get(element)
+                merged[element] = None if current is None or selectors is None else set(current).union(selectors)
+            return merged
+        return requested or saved
+
+    @staticmethod
+    def _estimate_snr_thresholds(snr_values, peaks, snr_min=None, snr_threshold=None):
+        snr_values = np.asarray(snr_values, dtype=float)
+        snr_values = snr_values[np.isfinite(snr_values)]
+
+        if snr_min is None:
+            if snr_values.size:
+                sorted_snrs = np.sort(snr_values)
+                target_rank = min(sorted_snrs.size, int(np.clip(2 * int(peaks), 12, 64)))
+                rank_cutoff = float(sorted_snrs[-target_rank])
+                q30, q40, q50 = np.percentile(sorted_snrs, [30, 40, 50])
+                snr_min = float(np.clip(min(q50, max(q30, 0.35 * rank_cutoff, 0.9 * q40)), 7.0, 14.0))
+            else:
+                snr_min = 8.0
+        else:
+            snr_min = float(snr_min)
+
+        if snr_threshold is None:
+            if snr_values.size:
+                high = snr_values[snr_values >= snr_min]
+                high = high if high.size else snr_values
+                high = np.sort(high)[::-1]
+                anchor = high[: min(high.size, int(np.clip(int(peaks), 10, 40)))]
+                med, q75, q90 = np.percentile(anchor, [50, 75, 90])
+                snr_threshold = float(np.clip(max(med, 0.7 * q75, 2.5 * snr_min), max(2.5 * snr_min, snr_min), q90))
+            else:
+                snr_threshold = max(4.0 * snr_min, 30.0)
+        else:
+            snr_threshold = float(snr_threshold)
+
+        return snr_min, snr_threshold
+
+    def x_ray_lookup(self, spec: str | list[str] | tuple[str, ...] | set[str]) -> tuple[np.ndarray, np.ndarray, list[str]]:
         info = type(self)._ensure_element_info()
         ordered = type(self)._ordered_element_keys(info)
-        specs = type(self)._normalize_specs(spec, param_name="spec")
+        specs = type(self)._normalize_specs(spec, param_name='spec')
 
         rows: list[tuple[str, float, float]] = []
         for raw in specs:
-            compact = re.sub(r"[\s_-]+", "", str(raw).strip())
+            compact = re.sub(r'[\s_-]+', '', str(raw).strip())
             if not compact:
                 continue
-
             element = next((k for k in ordered if compact.lower().startswith(k.lower())), None)
             if element is None:
                 raise ValueError(f"Could not resolve element from specifier '{raw}'")
-
-            suffix = compact[len(element) :]
-            for line_name, line_info in type(self)._iter_selected_lines(
-                element, suffix, raw_spec=str(raw)
-            ):
+            suffix = compact[len(element):]
+            for line_name, line_info in type(self)._iter_selected_lines(element, suffix, raw_spec=str(raw)):
                 if not isinstance(line_info, dict):
                     continue
-
-                energy_raw = line_info.get("energy (keV)", line_info.get("energy"))
                 try:
-                    energy = float(energy_raw)
+                    energy = float(line_info.get('energy (keV)', line_info.get('energy')))
                 except (TypeError, ValueError):
                     continue
-
                 try:
-                    weight = float(line_info.get("weight", 0.0))
+                    weight = float(line_info.get('weight', 0.0))
                 except (TypeError, ValueError):
                     weight = 0.0
-
-                canonical = type(self)._canonical_line_name(str(line_name))
-                rows.append((f"{element}{canonical}", energy, weight))
+                rows.append((f'{element}{type(self)._canonical_line_name(line_name)}', energy, weight))
 
         if not rows:
-            raise ValueError(f"No X-ray lines matched specifier(s): {specs}")
+            raise ValueError(f'No X-ray lines matched specifier(s): {specs}')
 
-        rows.sort(key=lambda t: (t[1], -t[2], t[0]))
-        seen = set()
-        unique = []
-        for lbl, e, w in rows:
-            k = (lbl, round(float(e), 12), round(float(w), 12))
-            if k in seen:
-                continue
-            seen.add(k)
-            unique.append((lbl, e, w))
-
-        energies = np.asarray([e for _, e, _ in unique], dtype=float)
-        weights = np.asarray([w for _, _, w in unique], dtype=float)
-        labels = [lbl for lbl, _, _ in unique]
-        return energies, weights, labels
+        unique = sorted(
+            {(lbl, round(float(e), 12), round(float(w), 12)) for lbl, e, w in rows},
+            key=lambda t: (t[1], -t[2], t[0]),
+        )
+        return (
+            np.asarray([e for _, e, _ in unique], dtype=float),
+            np.asarray([w for _, _, w in unique], dtype=float),
+            [lbl for lbl, _, _ in unique],
+        )
 
     def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False, show=True):
         if elements is None:
             if self.model_elements is None:
-                raise ValueError("elements must be specified")
-            elements = list(self.model_elements.keys())
-            print(f"using model_elements {elements}")
+                raise ValueError('elements must be specified')
+            elements = list(self.model_elements)
 
         energies, _, labels = self.x_ray_lookup(elements)
-        energy_max = self.energy_axis.max()
-        energy_min = self.energy_axis.min()
-        ind = np.logical_and(energies > energy_min, energies < energy_max)
-        energies = energies[ind]
-        labels = [label for label, keep in zip(labels, ind) if keep]
+        keep = (energies > self.energy_axis.min()) & (energies < self.energy_axis.max())
+        energies = energies[keep]
+        labels = [label for label, ok in zip(labels, keep) if ok]
 
-        energy_axis = self.energy_axis.copy()
-        energy_axis_2d = energy_axis[:, None]
-        energies_2d = (energies)[None, :]
+        mask = (self.energy_axis[:, None] > energies[None, :] - width) & (self.energy_axis[:, None] < energies[None, :] + width)
+        n, h, w = self.array.shape
+        maps = (mask.astype(self.array.dtype).T @ self.array.reshape(n, -1)).reshape(mask.shape[1], h, w)
 
-        mask = (energy_axis_2d > energies_2d - width) & (energy_axis_2d < energies_2d + width)
-
-        N, H, W = self.array.shape
-        K = mask.shape[1]
-        eds2 = self.array.reshape(N, -1)
-        w = mask.astype(self.array.dtype)
-
-        maps = (w.T @ eds2).reshape(K, H, W)
-
-        existing = getattr(self, "_spectrum_images", {})
-        self._spectrum_images = {**existing, **dict(zip(labels, maps))}
-
+        self._spectrum_images = {**getattr(self, '_spectrum_images', {}), **dict(zip(labels, maps))}
         if show:
             self.show_spectrum_images(x_ray_lines=elements)
-
         if return_maps:
             return maps, labels
 
     def Integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
-        """Integrate selected X-ray lines and return combined map(s).
-
-        This method builds per-selector energy masks (union of line windows)
-        and integrates the dataset over those masks. For single-selector
-        plotting it reuses ``show_energy_window_map`` with the computed mask.
-
-        Parameters
-        ----------
-        spec : str | list[str] | tuple[str, ...] | set[str]
-            Selector(s) like ``"Au"``, ``"AuK"``, ``"AuKa1"``.
-            Element selectors (e.g. ``"Au"``) integrate all available lines.
-        width : float, optional
-            Half-width in keV for line-window integration, by default 0.15.
-        return_maps : bool, optional
-            If True, always return ``dict[selector, map]``.
-            If False and a single selector is provided, return only that 2D map.
-        show : bool, optional
-            If True, display the integrated map(s).
-        """
-        try:
-            width = float(width)
-        except (TypeError, ValueError):
-            raise ValueError("width must be a positive finite number")
-        if not np.isfinite(width) or width <= 0:
-            raise ValueError("width must be a positive finite number")
-
-        specs = type(self)._normalize_specs(spec, param_name="spec")
+        width = float(width)
+        specs = type(self)._normalize_specs(spec, param_name='spec')
         arr = np.asarray(self.array, dtype=float)
         energy_axis = np.asarray(self.energy_axis, dtype=float)
-        energy_min = float(np.min(energy_axis))
-        energy_max = float(np.max(energy_axis))
+        energy_min, energy_max = float(energy_axis.min()), float(energy_axis.max())
 
-        integrated_maps = {}
-        selector_masks = {}
-        for raw in specs:
-            selector = str(raw).strip()
-            line_energies, _, _ = self.x_ray_lookup(selector)
-            in_range = np.logical_and(line_energies >= energy_min, line_energies <= energy_max)
-            line_energies = np.asarray(line_energies[in_range], dtype=float)
-            if line_energies.size == 0:
-                raise ValueError(
-                    f"No X-ray lines for selector '{selector}' are within the dataset energy range"
-                )
+        selector_masks, integrated_maps = {}, {}
+        for selector in map(str, specs):
+            line_energies, _, _ = self.x_ray_lookup(selector.strip())
+            line_energies = line_energies[(line_energies >= energy_min) & (line_energies <= energy_max)]
+            if not len(line_energies):
+                raise ValueError(f"No X-ray lines for selector '{selector}' are within the dataset energy range")
 
-            selector_mask = np.zeros(energy_axis.shape, dtype=bool)
-            for line_energy in line_energies:
-                selector_mask |= np.logical_and(
-                    energy_axis >= (float(line_energy) - width),
-                    energy_axis <= (float(line_energy) + width),
-                )
-
-            if not np.any(selector_mask):
-                raise ValueError(
-                    f"No energy channels selected for selector '{selector}'. Try increasing width."
-                )
-
-            selector_masks[selector] = selector_mask
-            integrated_maps[selector] = arr[selector_mask, :, :].sum(axis=0)
+            mask = np.any(
+                (energy_axis[:, None] >= line_energies[None, :] - width)
+                & (energy_axis[:, None] <= line_energies[None, :] + width),
+                axis=1,
+            )
+            selector_masks[selector] = mask
+            integrated_maps[selector] = arr[mask].sum(axis=0)
 
         if show:
-            if "roi_px" in kwargs or "roi_cal" in kwargs:
-                raise ValueError(
-                    "Use roi (pixel) or roi_units (calibrated). roi_px/roi_cal are not supported"
-                )
+            cmap = kwargs.pop('cmap', 'magma')
             if len(integrated_maps) == 1:
-                selector = next(iter(integrated_maps.keys()))
+                selector = next(iter(integrated_maps))
                 self.show_energy_window_map(
                     energy_window=[energy_min, energy_max],
-                    roi=kwargs.pop("roi", None),
-                    roi_units=kwargs.pop("roi_units", None),
+                    roi=kwargs.pop('roi', None),
+                    roi_cal=kwargs.pop('roi_cal', None),
                     mask=selector_masks[selector],
-                    data_type=kwargs.pop("data_type", "eds"),
-                    cmap=kwargs.pop("cmap", "magma"),
+                    data_type=kwargs.pop('data_type', 'eds'),
+                    cmap=cmap,
                     show=True,
                 )
             else:
                 show_2d(
                     list(integrated_maps.values()),
-                    title=list(integrated_maps.keys()),
-                    cmap=kwargs.pop("cmap", "magma"),
-                    scalebar={"sampling": self.sampling[1], "units": self.units[1]},
+                    title=list(integrated_maps),
+                    cmap=cmap,
+                    scalebar={'sampling': self.sampling[1], 'units': self.units[1]},
                     **kwargs,
                 )
 
-        if return_maps or len(integrated_maps) != 1:
-            return integrated_maps
-        return next(iter(integrated_maps.values()))
+        return integrated_maps if return_maps or len(integrated_maps) != 1 else next(iter(integrated_maps.values()))
 
     def integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
-        """Lowercase alias for :meth:`Integrate`."""
-        return self.Integrate(
-            spec=spec,
-            width=width,
-            return_maps=return_maps,
-            show=show,
-            **kwargs,
-        )
+        return self.Integrate(spec=spec, width=width, return_maps=return_maps, show=show, **kwargs)
 
-    def show_spectrum_images(
-        self, x_ray_lines=None, return_fig=False, method="integration", **kwargs
-    ):
-        """Plot cached spectrum-image maps."""
-        spectrum_images = (
-            getattr(self, "_spectrum_images", None)
-            if method == "integration"
-            else getattr(self, "_spectrum_images_pytorch", None)
-            if method == "fit"
-            else None
-        )
-        if spectrum_images is None:
-            raise ValueError(
-                f"Method {method!r} is not supported, please choose 'integration' or 'fit'"
-            )
-        if not isinstance(spectrum_images, dict) or not spectrum_images:
-            raise ValueError("No spectrum images found. Run generage_spectrum_images(...) first.")
+    def show_spectrum_images(self, x_ray_lines=None, return_fig=False, method='integration', **kwargs):
+        spectrum_images = self._get_spectrum_images(method)
+        if not spectrum_images:
+            raise ValueError('No spectrum images found. Run generage_spectrum_images(...) first.')
 
         line_map = {str(k): np.asarray(v) for k, v in spectrum_images.items()}
         labels = list(line_map)
         labels_by_element = type(self)._group_labels_by_element(labels)
 
-        def _sum_maps(lbls):
-            return np.sum(np.stack([line_map[lbl] for lbl in lbls], axis=0), axis=0)
+        def sum_maps(lbls):
+            return np.sum([line_map[lbl] for lbl in lbls], axis=0)
 
-        specs = type(self)._normalize_specs(x_ray_lines, param_name="x_ray_lines", allow_none=True)
-        images, titles = [], []
-
+        specs = type(self)._normalize_specs(x_ray_lines, param_name='x_ray_lines', allow_none=True)
         if not specs:
-            for element in sorted(labels_by_element):
-                lbls = labels_by_element[element]
-                if lbls:
-                    images.append(_sum_maps(lbls))
-                    titles.append(element)
+            titles = sorted(labels_by_element)
+            images = [sum_maps(labels_by_element[t]) for t in titles]
         else:
-            for raw in specs:
-                selected = type(self)._select_labels(
-                    str(raw), labels=labels, labels_by_element=labels_by_element
-                )
-                if not selected:
-                    raise ValueError(
-                        f"No spectrum images matched selector '{raw}'. "
-                        f"Available examples: {', '.join(sorted(labels)[:10])}"
-                    )
-                images.append(line_map[selected[0]] if len(selected) == 1 else _sum_maps(selected))
-                titles.append(selected[0] if len(selected) == 1 else str(raw).strip())
+            selected = [type(self)._select_labels(str(raw), labels=labels, labels_by_element=labels_by_element) for raw in specs]
+            if any(not s for s in selected):
+                bad = next(raw for raw, s in zip(specs, selected) if not s)
+                raise ValueError(f"No spectrum images matched selector '{bad}'")
+            images = [line_map[s[0]] if len(s) == 1 else sum_maps(s) for s in selected]
+            titles = [s[0] if len(s) == 1 else str(raw).strip() for raw, s in zip(specs, selected)]
 
-        if not images:
-            raise ValueError("No spectrum images selected for plotting")
-
-        cmap = kwargs.pop("cmap", "magma")
         fig, ax = show_2d(
             images,
             title=titles,
-            cmap=cmap,
-            scalebar={"sampling": self.sampling[1], "units": self.units[1]},
+            cmap=kwargs.pop('cmap', 'magma'),
+            scalebar={'sampling': self.sampling[1], 'units': self.units[1]},
             returnfig=True,
             **kwargs,
         )
         if return_fig:
             return fig, ax
 
-    def _build_pytorch_spectrum_images(
-        self, abundance_maps: np.ndarray, element_names: list[str] | tuple[str, ...]
-    ) -> dict[str, np.ndarray]:
-        """Build per-line maps from fitted per-element abundance maps."""
+    def _build_pytorch_spectrum_images(self, abundance_maps: np.ndarray, element_names: list[str] | tuple[str, ...]) -> dict[str, np.ndarray]:
         maps = np.asarray(abundance_maps)
         if maps.ndim != 3:
             return {}
 
         line_maps = {}
-        for element_index, element_name in enumerate(element_names):
-            if element_index >= maps.shape[0]:
+        for i, element_name in enumerate(element_names):
+            if i >= maps.shape[0]:
                 break
-
-            element_map = np.asarray(maps[element_index], dtype=float)
             try:
                 _, line_weights, line_labels = self.x_ray_lookup(str(element_name))
             except ValueError:
                 continue
-
+            element_map = np.asarray(maps[i], dtype=float)
             for weight, label in zip(line_weights, line_labels):
-                try:
-                    weight_value = float(weight)
-                except (TypeError, ValueError):
-                    continue
-                line_maps[str(label)] = element_map * weight_value
-
+                line_maps[str(label)] = element_map * float(weight)
         return line_maps
 
-    def quantify_composition_cliff_lorimer(
-        self,
-        k_factors,
-        method="integration",
-        return_maps=False,
-        verbose=True,
-    ):
-        """Quantify composition from cached spectrum maps using Cliff-Lorimer.
+    def quantify_composition_cliff_lorimer(self, k_factors, method='integration', return_maps=False, verbose=True):
+        if not k_factors:
+            raise ValueError('k_factors must be a non-empty dict')
+        spectrum_images = self._get_spectrum_images(method)
+        if not spectrum_images:
+            raise ValueError('No spectrum images available for quantification')
 
-        Parameters
-        ----------
-        k_factors : dict
-            Mapping of selector -> k-factor.
-        method : {"integration", "fit"}, optional
-            Source map set to use.
-        return_maps : bool, optional
-            If True, include per-element/per-selector map outputs.
-        verbose : bool, optional
-            If True, print a small scalar text table (no maps).
-        """
-        if not isinstance(k_factors, dict) or not k_factors:
-            raise ValueError("k_factors must be a non-empty dict")
-
-        spectrum_images = (
-            getattr(self, "_spectrum_images", None)
-            if method == "integration"
-            else getattr(self, "_spectrum_images_pytorch", None)
-            if method == "fit"
-            else None
-        )
-        if spectrum_images is None:
-            raise ValueError(
-                f"Method {method!r} is not supported, please choose 'integration' or 'fit'"
-            )
-        if not isinstance(spectrum_images, dict) or not spectrum_images:
-            raise ValueError("No spectrum images available for quantification")
-
-        type(self)._ensure_element_info()
-        ordered_elements = type(self)._ordered_element_keys(type(self).element_info or {})
-
+        ordered_elements = type(self)._ordered_element_keys(type(self)._ensure_element_info())
         line_map = {str(k): np.asarray(v, dtype=float) for k, v in spectrum_images.items()}
         labels = list(line_map)
         labels_by_element = type(self)._group_labels_by_element(labels)
 
-        def _match(selector: str) -> list[str]:
-            return type(self)._select_labels(
-                selector, labels=labels, labels_by_element=labels_by_element
-            )
+        def match(selector: str) -> list[str]:
+            return type(self)._select_labels(selector, labels=labels, labels_by_element=labels_by_element)
 
-        intensities: dict[str, float] = {}
-        weighted_intensities: dict[str, float] = {}
+        intensities, weighted_intensities = {}, {}
         selector_maps = {} if return_maps else None
         intensity_maps = {} if return_maps else None
         weighted_intensity_maps = {} if return_maps else None
 
         for selector, k_raw in k_factors.items():
-            try:
-                k_val = float(k_raw)
-            except (TypeError, ValueError):
-                raise ValueError(f"k_factors[{selector!r}] must be numeric")
-            if not np.isfinite(k_val) or k_val <= 0:
-                raise ValueError(f"k_factors[{selector!r}] must be a positive finite number")
-
-            sel_labels = _match(str(selector).strip())
+            k_val = float(k_raw)
+            sel_labels = match(str(selector).strip())
             if not sel_labels:
-                raise ValueError(
-                    f"No spectrum images matched selector {selector!r}. "
-                    f"Available examples: {', '.join(sorted(labels)[:10])}"
-                )
+                raise ValueError(f'No spectrum images matched selector {selector!r}')
 
-            matched_elements = {
-                type(self)._resolve_element_from_label(lbl, ordered_elements) for lbl in sel_labels
-            }
-            matched_elements = {e for e in matched_elements if e is not None}
+            matched_elements = {type(self)._resolve_element_from_label(lbl, ordered_elements) for lbl in sel_labels} - {None}
             if len(matched_elements) != 1:
-                raise ValueError(
-                    f"Selector {selector!r} matched multiple elements: {sorted(matched_elements)}. "
-                    "Use selectors like 'AuK' or 'AuKa1'."
-                )
+                raise ValueError(f'Selector {selector!r} matched multiple elements: {sorted(matched_elements)}')
             element = next(iter(matched_elements))
 
-            grouped_map = np.sum(np.stack([line_map[lbl] for lbl in sel_labels], axis=0), axis=0)
-            intensity = float(np.sum(grouped_map))
+            grouped_map = np.sum([line_map[lbl] for lbl in sel_labels], axis=0)
+            intensity = float(grouped_map.sum())
             weighted = float(k_val * intensity)
-
-            intensities[element] = float(intensities.get(element, 0.0)) + intensity
-            weighted_intensities[element] = (
-                float(weighted_intensities.get(element, 0.0)) + weighted
-            )
+            intensities[element] = intensities.get(element, 0.0) + intensity
+            weighted_intensities[element] = weighted_intensities.get(element, 0.0) + weighted
 
             if return_maps:
                 weighted_map = grouped_map * k_val
                 selector_maps[str(selector)] = grouped_map
-                if element in intensity_maps:
-                    intensity_maps[element] = intensity_maps[element] + grouped_map
-                    weighted_intensity_maps[element] = (
-                        weighted_intensity_maps[element] + weighted_map
-                    )
-                else:
-                    intensity_maps[element] = grouped_map.copy()
-                    weighted_intensity_maps[element] = weighted_map.copy()
+                intensity_maps[element] = intensity_maps.get(element, 0) + grouped_map
+                weighted_intensity_maps[element] = weighted_intensity_maps.get(element, 0) + weighted_map
 
         if len(weighted_intensities) < 2:
-            raise ValueError("At least two elements are required for Cliff-Lorimer quantification")
+            raise ValueError('At least two elements are required for Cliff-Lorimer quantification')
 
-        weighted_sum = float(sum(weighted_intensities.values()))
-        atomic_percent = {
-            el: (100.0 * val / weighted_sum if weighted_sum > 0 else 0.0)
-            for el, val in weighted_intensities.items()
-        }
+        weighted_sum = sum(weighted_intensities.values())
+        atomic_percent = {el: 100.0 * val / weighted_sum if weighted_sum > 0 else 0.0 for el, val in weighted_intensities.items()}
 
         if type(self).atomic_weights is None:
             type(self).load_atomic_weights()
         atomic_weights = type(self).atomic_weights or {}
         missing = [el for el in atomic_percent if el not in atomic_weights]
         if missing:
-            raise ValueError(f"Atomic weights not found for elements: {missing}")
+            raise ValueError(f'Atomic weights not found for elements: {missing}')
 
-        weight_sum = sum(
-            (atomic_percent[el] / 100.0) * float(atomic_weights[el]) for el in atomic_percent
-        )
+        weight_sum = sum((atomic_percent[el] / 100.0) * float(atomic_weights[el]) for el in atomic_percent)
         weight_percent = {
-            el: (((atomic_percent[el] / 100.0) * float(atomic_weights[el]) / weight_sum) * 100.0)
-            if weight_sum > 0
-            else 0.0
+            el: (atomic_percent[el] / 100.0) * float(atomic_weights[el]) / weight_sum * 100.0 if weight_sum > 0 else 0.0
             for el in atomic_percent
         }
 
+        ordered = sorted(weighted_intensities, key=weighted_intensities.get, reverse=True)
+        table_text = '\n'.join([
+            'Element  Intensity      Weighted Intensity    Atomic %    Weight %',
+            '-------  -------------  --------------------  ----------  ----------',
+            *[
+                f'{el:<7}  {intensities[el]:>13.3f}  {weighted_intensities[el]:>20.3f}  {atomic_percent[el]:>10.3f}  {weight_percent[el]:>10.3f}'
+                for el in ordered
+            ],
+        ])
         result = {
-            "intensities": intensities,
-            "weighted_intensities": weighted_intensities,
-            "atomic_percent": atomic_percent,
-            "weight_percent": weight_percent,
+            'intensities': intensities,
+            'weighted_intensities': weighted_intensities,
+            'atomic_percent': atomic_percent,
+            'weight_percent': weight_percent,
+            'summary_table': table_text,
         }
-
-        ordered_elements = sorted(
-            weighted_intensities.keys(),
-            key=lambda element_name: weighted_intensities[element_name],
-            reverse=True,
-        )
-        table_lines = [
-            "Element  Intensity      Weighted Intensity    Atomic %    Weight %",
-            "-------  -------------  --------------------  ----------  ----------",
-        ]
-        for element_name in ordered_elements:
-            table_lines.append(
-                f"{element_name:<7}  "
-                f"{intensities[element_name]:>13.3f}  "
-                f"{weighted_intensities[element_name]:>20.3f}  "
-                f"{atomic_percent[element_name]:>10.3f}  "
-                f"{weight_percent[element_name]:>10.3f}"
-            )
-        table_text = "\n".join(table_lines)
-        result["summary_table"] = table_text
         if verbose:
             print(table_text)
 
         if return_maps:
             weighted_stack = np.stack(list(weighted_intensity_maps.values()), axis=0)
-            weighted_sum_map = np.sum(weighted_stack, axis=0)
+            weighted_sum_map = weighted_stack.sum(axis=0)
             atomic_percent_maps = {
-                el: np.divide(
-                    wmap * 100.0,
-                    weighted_sum_map,
-                    out=np.zeros_like(weighted_sum_map, dtype=float),
-                    where=weighted_sum_map > 0,
-                )
+                el: np.divide(wmap * 100.0, weighted_sum_map, out=np.zeros_like(weighted_sum_map, dtype=float), where=weighted_sum_map > 0)
                 for el, wmap in weighted_intensity_maps.items()
             }
-            mass_maps = {
-                el: (atomic_percent_maps[el] / 100.0) * float(atomic_weights[el])
-                for el in atomic_percent_maps
-            }
+            mass_maps = {el: atomic_percent_maps[el] / 100.0 * float(atomic_weights[el]) for el in atomic_percent_maps}
             mass_sum_map = np.sum(np.stack(list(mass_maps.values()), axis=0), axis=0)
             weight_percent_maps = {
-                el: np.divide(
-                    mmap * 100.0,
-                    mass_sum_map,
-                    out=np.zeros_like(mass_sum_map, dtype=float),
-                    where=mass_sum_map > 0,
-                )
+                el: np.divide(mmap * 100.0, mass_sum_map, out=np.zeros_like(mass_sum_map, dtype=float), where=mass_sum_map > 0)
                 for el, mmap in mass_maps.items()
             }
-            result.update(
-                {
-                    "selector_maps": selector_maps,
-                    "intensity_maps": intensity_maps,
-                    "weighted_intensity_maps": weighted_intensity_maps,
-                    "atomic_percent_maps": atomic_percent_maps,
-                    "weight_percent_maps": weight_percent_maps,
-                }
-            )
-
+            result.update({
+                'selector_maps': selector_maps,
+                'intensity_maps': intensity_maps,
+                'weighted_intensity_maps': weighted_intensity_maps,
+                'atomic_percent_maps': atomic_percent_maps,
+                'weight_percent_maps': weight_percent_maps,
+            })
         return result
 
     def clear_spectrum_images(self):
-        if self._spectrum_images is not None:
-            self._spectrum_images = {}
+        self._spectrum_images = {}
 
     def clear_spectrum_images_pytorch(self):
-        if self._spectrum_images_pytorch is not None:
-            self._spectrum_images = {}
+        self._spectrum_images_pytorch = {}
 
     def peak_autoid(
         self,
         roi=None,
-        roi_units=None,
+        roi_cal=None,
         energy_range=None,
         elements=None,
         refline=None,
@@ -766,1552 +535,664 @@ class Dataset3deds(Dataset3dspectroscopy):
         mode=None,
         return_details=False,
     ):
-        """Auto-detect and label EDS peaks from the mean ROI spectrum.
-
-        This method calls ``show_mean_spectrum`` to generate the baseline plot, then
-        overlays peak markers and element labels from X-ray line matching.
-
-        Parameters
-        ----------
-        min_line_weight : float, optional
-            Minimum X-ray line weight required for a line to be eligible during
-            matching and ranking. Set to 0 to allow all lines.
-                mode : str | None, optional
-                        Controls how element constraints are applied:
-                        - "autofill": auto-ID over all elements while optionally overlaying
-                            requested/saved-model element references.
-                        - "elements_preferred": keep autofill enabled, but bias final
-                            matching toward requested/saved-model elements.
-                        - "elements_only": if elements are provided explicitly or via saved
-                            model, only those elements are considered during matching.
-                        - None: choose context-aware default. If no requested/saved-model
-                            elements are present, defaults to "autofill". If requested or
-                            saved-model elements exist, defaults to "elements_only".
-        return_details : bool, optional
-            If True, return full internal results (matches/confidence/peaks).
-            If False (default), return only figure and axes.
-        """
         type(self)._ensure_element_info()
+        all_info = type(self).element_info or {}
+        grid_peaks = grid_peaks or {}
+        ignore_range = [0, 0.25] if ignore_range is None else ignore_range
+        ignored_elements = set(map(str, type(self)._normalize_specs(ignore_elements, allow_none=True) or []))
+        min_line_weight = max(float(min_line_weight), 0.0)
 
-        if grid_peaks is None:
-            grid_peaks = {}
-
-        requested_edge_filters = type(self)._parse_element_selectors(
-            elements, allow_none=True, param_name="elements"
-        )
-        saved_model_edge_filters = {
+        requested = type(self)._parse_element_selectors(elements, allow_none=True, param_name='elements')
+        saved = {
             str(k): (set(map(str, v.keys())) if isinstance(v, dict) and v else None)
-            for k, v in (getattr(self, "model_elements", {}) or {}).items()
+            for k, v in (getattr(self, 'model_elements', {}) or {}).items()
         } or None
+        edge_filters = type(self)._merge_edge_filters(requested, saved)
+        requested_elements = set(edge_filters) if edge_filters else None
 
-        if saved_model_edge_filters is not None and requested_edge_filters is not None:
-            merged_edge_filters = dict(saved_model_edge_filters)
-            for element_name, selectors in requested_edge_filters.items():
-                if element_name not in merged_edge_filters:
-                    merged_edge_filters[element_name] = selectors
-                    continue
-
-                existing = merged_edge_filters[element_name]
-                if existing is None or selectors is None:
-                    merged_edge_filters[element_name] = None
-                else:
-                    merged_edge_filters[element_name] = set(existing).union(set(selectors))
-            requested_edge_filters = merged_edge_filters
-        elif requested_edge_filters is None and saved_model_edge_filters is not None:
-            requested_edge_filters = saved_model_edge_filters
-
-        if requested_edge_filters is not None:
-            elements = list(requested_edge_filters.keys())
-
-        requested_elements = set(elements) if elements is not None else None
-
-        mode_normalized = None if mode is None else str(mode).strip().lower()
-        valid_modes = {"autofill", "elements_only", "elements_preferred"}
-        if mode_normalized is not None and mode_normalized not in valid_modes:
-            raise ValueError("mode must be one of: autofill, elements_only, elements_preferred")
-
-        if mode_normalized is None:
-            mode_normalized = "elements_only" if requested_elements is not None else "autofill"
-
-        if mode_normalized == "elements_only" and requested_elements is None:
-            raise ValueError("mode='elements_only' requires elements to be specified or saved")
-        if mode_normalized == "elements_preferred" and requested_elements is None:
-            raise ValueError(
-                "mode='elements_preferred' requires elements to be specified or saved"
-            )
-
-        match_elements = requested_elements if mode_normalized == "elements_only" else None
-        preferred_elements_set = (
-            set(str(element_name) for element_name in requested_elements)
-            if mode_normalized == "elements_preferred" and requested_elements is not None
-            else set()
-        )
-        reference_elements = (
-            requested_elements
-            if mode_normalized in {"elements_only", "autofill", "elements_preferred"}
-            and requested_elements is not None
-            else None
-        )
-
-        if isinstance(ignore_elements, str):
-            ignore_elements = [ignore_elements]
-        if ignore_elements is not None and not isinstance(ignore_elements, (list, tuple, set)):
-            raise TypeError("ignore_elements must be None, a string, or a sequence of strings")
-        try:
-            min_line_weight = float(min_line_weight)
-        except (TypeError, ValueError) as exc:
-            raise TypeError("min_line_weight must be a number") from exc
-        if min_line_weight < 0:
-            raise ValueError("min_line_weight must be >= 0")
-        ignored_elements = (
-            {str(element_name) for element_name in ignore_elements}
-            if ignore_elements is not None
-            else set()
-        )
+        mode = (str(mode).strip().lower() if mode is not None else None) or ('elements_only' if requested_elements else 'autofill')
+        search_elements = requested_elements if mode == 'elements_only' else None
+        preferred_elements = set(map(str, requested_elements or [])) if mode == 'elements_preferred' else set()
+        reference_elements = requested_elements
 
         fig, (ax_img, ax_spec) = self.show_mean_spectrum(
             roi=roi,
-            roi_units=roi_units,
+            roi_cal=roi_cal,
             energy_range=energy_range,
             mask=mask,
-            data_type="eds",
+            data_type='eds',
             show=False,
         )
-
         spec = self.calculate_mean_spectrum(
             roi=roi,
-            roi_units=roi_units,
+            roi_cal=roi_cal,
             energy_range=energy_range,
             ignore_range=ignore_range,
             mask=mask,
         )
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
-        E = E0 + dE * np.arange(self.shape[0])
-
+        E = float(self.origin[0]) + float(self.sampling[0]) * np.arange(self.shape[0])
         if energy_range is not None:
-            indices = np.where((energy_range[0] <= E) & (energy_range[1] >= E))[0]
-            E = E[indices]
+            keep = (energy_range[0] <= E) & (E <= energy_range[1])
+            E = E[keep]
+            spec = spec[keep]
 
-        if ignore_range is None:
-            ignore_range = [0, 0.25]
+        def in_ignore(energy):
+            return len(ignore_range) == 2 and ignore_range[0] <= float(energy) <= ignore_range[1]
 
-        def _is_in_ignored_range(energy_value: float) -> bool:
-            if ignore_range is None or len(ignore_range) != 2:
-                return False
-            min_ignore, max_ignore = ignore_range
-            return float(min_ignore) <= float(energy_value) <= float(max_ignore)
-
-        peak_indices, peak_properties = find_peaks(spec, height=0, distance=5)
-        peak_heights = peak_properties["peak_heights"]
-
+        peak_indices, props = find_peaks(spec, height=0, distance=5)
+        peak_heights = props['peak_heights']
         background_std = np.nanstd(spec[spec <= np.nanpercentile(spec, 50)])
         if not np.isfinite(background_std) or background_std <= 0:
             background_std = np.nanstd(spec)
         if not np.isfinite(background_std) or background_std <= 0:
             background_std = 1.0
 
-        initial_snrs = []
-        for _, height in zip(peak_indices, peak_heights):
-            initial_snrs.append(height / background_std)
+        snr_values = np.asarray([height / background_std for height in peak_heights], dtype=float)
+        snr_min, snr_threshold = type(self)._estimate_snr_thresholds(snr_values, peaks, snr_min, snr_threshold)
 
-        if len(initial_snrs) > 0:
-            snr_values = np.asarray(initial_snrs, dtype=float)
-            snr_values = snr_values[np.isfinite(snr_values)]
-        else:
-            snr_values = np.asarray([], dtype=float)
+        display_peaks = [
+            (int(i), float(h), float(E[i]), float(h / background_std))
+            for i, h in zip(peak_indices, peak_heights)
+            if not in_ignore(E[i]) and h / background_std >= snr_min
+        ]
+        display_peaks.sort(key=lambda item: item[3], reverse=True)
+        significant_peaks = list(display_peaks)
+        display_peaks = display_peaks[:peaks]
 
-        if snr_min is None:
-            if snr_values.size > 0:
-                sorted_snrs = np.sort(snr_values)
-                target_rank = int(np.clip(2 * int(peaks), 12, 64))
-                target_rank = min(target_rank, int(sorted_snrs.size))
-                rank_cutoff = float(sorted_snrs[-target_rank])
-                q30 = float(np.percentile(sorted_snrs, 30))
-                q40 = float(np.percentile(sorted_snrs, 40))
-                q50 = float(np.percentile(sorted_snrs, 50))
-                adaptive_cutoff = min(q50, max(q30, 0.35 * rank_cutoff, 0.9 * q40))
-                # Keep the display threshold permissive so moderate-SNR peaks remain visible.
-                min_snr = float(np.clip(adaptive_cutoff, 7.0, 14.0))
-            else:
-                min_snr = 8.0
-        else:
-            min_snr = float(snr_min)
-
-        if snr_threshold is None:
-            if snr_values.size > 0:
-                high_snr_pool = snr_values[snr_values >= min_snr]
-                if high_snr_pool.size == 0:
-                    high_snr_pool = snr_values
-                sorted_high = np.sort(high_snr_pool)[::-1]
-                anchor_count = int(np.clip(int(peaks), 10, 40))
-                anchor_count = min(anchor_count, int(sorted_high.size))
-                anchor_pool = sorted_high[:anchor_count]
-                anchor_median = float(np.percentile(anchor_pool, 50))
-                anchor_q75 = float(np.percentile(anchor_pool, 75))
-                anchor_q90 = float(np.percentile(anchor_pool, 90))
-                adaptive_threshold = max(anchor_median, 0.7 * anchor_q75, 2.5 * min_snr)
-                # Anchor to the strongest displayed-peak regime so defaults do not
-                # collapse toward the low-SNR bulk when peak counts are large.
-                snr_threshold_for_sample = float(
-                    np.clip(adaptive_threshold, max(2.5 * min_snr, min_snr), anchor_q90)
-                )
-            else:
-                snr_threshold_for_sample = max(4.0 * min_snr, 30.0)
-        else:
-            snr_threshold_for_sample = float(snr_threshold)
-
-        all_candidate_peaks = []
-        significant_peaks = []
-        for peak_idx, height in zip(peak_indices, peak_heights):
-            peak_energy = E[peak_idx]
-
-            if _is_in_ignored_range(peak_energy):
-                continue
-
-            snr = height / background_std
-            all_candidate_peaks.append((peak_idx, height, peak_energy, snr))
-            if snr >= min_snr:
-                significant_peaks.append((peak_idx, height, peak_energy, snr))
-
-        significant_peaks.sort(key=lambda item: item[3], reverse=True)
-
-        display_peaks = significant_peaks[:peaks]
-
-        all_info = type(self).element_info
-        peak_matches = []
-
-        def _line_shell(line_name):
-            line_upper = str(line_name).upper()
-            if line_upper.startswith("K"):
-                return "K"
-            if line_upper.startswith("L"):
-                return "L"
-            if line_upper.startswith("M"):
-                return "M"
-            return "?"
-
-        def _shell_preference_factor(shell_name):
-            # Keep K and L comparable; only downweight M lines because they
-            # are more prone to overlap-driven false assignments.
-            if shell_name in {"K", "L"}:
-                return 1.0
-            if shell_name == "M":
-                return 0.72
-            return 1.0
-
-        def _peak_confidence(snr_value, line_weight, distance_value):
-            return type(self)._peak_confidence(
-                snr_value=snr_value,
-                line_weight=line_weight,
-                distance_value=distance_value,
-                tolerance=tolerance,
-            )
-
-        def _line_matches_selector(line_name: str, selector: str) -> bool:
-            line = str(line_name).strip().lower()
-            token = str(selector).strip().lower()
-            if token in {"k", "l", "m"}:
-                return line.startswith(token)
-            return token in line
-
-        def _line_allowed_for_element(element_name, line_name, edge_filters=None):
-            if edge_filters is None:
-                return True
-
-            selectors = edge_filters.get(str(element_name))
-            if selectors is None:
-                return True
-
-            return any(_line_matches_selector(line_name, token) for token in selectors)
-
-        def _best_line_match(peak_energy, peak_snr, allowed_elements=None, edge_filters=None):
-            best_score = -float("inf")
-            best_element = None
-            best_line_name = None
-            best_line_weight = 0.0
-            best_distance = float("inf")
-
-            if not all_info:
-                return None
-
+        def candidate_matches(peak_energy, snr, allowed_elements=None):
+            matches = []
             for element_name, lines in all_info.items():
                 if allowed_elements is not None and element_name not in allowed_elements:
                     continue
-
                 for line_name, line_info in lines.items():
-                    if not _line_allowed_for_element(element_name, line_name, edge_filters):
+                    if not type(self)._line_allowed_for_element(element_name, line_name, edge_filters):
                         continue
-                    line_energy = line_info["energy (keV)"]
-                    line_weight = line_info.get("weight", 0.5)
+                    line_weight = float(line_info.get('weight', 0.5))
+                    line_energy = float(line_info['energy (keV)'])
+                    shell = type(self)._line_shell(line_name)
+                    tol = tolerance * 0.5 if shell == 'M' and ('Ma' not in line_name and 'Mb' not in line_name) else tolerance
                     distance = abs(peak_energy - line_energy)
-                    shell = _line_shell(line_name)
+                    if line_weight < min_line_weight or distance > tol:
+                        continue
+                    score = type(self)._peak_confidence(snr, line_weight, distance, tolerance) * type(self)._shell_preference_factor(shell)
+                    matches.append({
+                        'element': str(element_name),
+                        'line': str(line_name),
+                        'weight': line_weight,
+                        'distance': distance,
+                        'score': float(score),
+                        'shell': shell,
+                    })
+            matches.sort(key=lambda m: m['score'], reverse=True)
+            return matches
 
-                    is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
-                    effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
-
-                    if line_weight >= min_line_weight and distance <= effective_tolerance:
-                        # Use score-based ranking: confidence with weight and distance
-                        # This matches rematcher logic and avoids distance-driven artifacts
-                        score = _peak_confidence(peak_snr, line_weight, distance)
-                        score *= _shell_preference_factor(shell)
-                        if score > best_score:
-                            best_score = score
-                            best_element = element_name
-                            best_line_name = line_name
-                            best_line_weight = line_weight
-                            best_distance = distance
-
-            if best_element is None:
-                return None
-
-            return best_element, best_line_name, best_line_weight, best_distance
-
-        search_elements = match_elements
-
+        peak_matches = []
         for peak_idx, height, peak_energy, snr in display_peaks:
-            best_match_info = _best_line_match(
-                peak_energy, snr, search_elements, requested_edge_filters
-            )
-            if best_match_info is not None:
-                best_element, best_line_name, best_line_weight, best_distance = best_match_info
-                best_element = str(best_element)
-                best_line_name = str(best_line_name)
-                best_match = f"{best_element} {best_line_name}"
-                match_confidence = _peak_confidence(snr, best_line_weight, best_distance)
-                peak_matches.append(
-                    (
-                        peak_idx,
-                        height,
-                        peak_energy,
-                        snr,
-                        best_element,
-                        best_match,
-                        best_distance,
-                        best_line_name,
-                        best_line_weight,
-                        match_confidence,
-                    )
-                )
+            matches = candidate_matches(peak_energy, snr, search_elements)
+            if not matches:
+                continue
+            best = matches[0]
+            peak_matches.append((
+                peak_idx,
+                height,
+                peak_energy,
+                snr,
+                best['element'],
+                f"{best['element']} {best['line']}",
+                best['distance'],
+                best['line'],
+                best['weight'],
+                best['score'],
+            ))
+
+        element_stats, line_evidence = {}, {}
+        for _, _, peak_energy, snr, element, _, distance, line_name, line_weight, conf in peak_matches:
+            if search_elements is not None and element not in search_elements:
+                continue
+            shell = type(self)._line_shell(line_name)
+            stats = element_stats.setdefault(element, {
+                'raw_conf': 0.0,
+                'shells': set(),
+                'lines': set(),
+                'strong_matches': 0,
+                'match_count': 0,
+                'best_match_conf': 0.0,
+                'best_match_snr': 0.0,
+                'best_match_energy': 0.0,
+                'best_match_distance': float('inf'),
+                'best_match_weight': 0.0,
+                'best_match_shell': '?',
+            })
+            label = f'{element} {line_name}'
+            evidence = line_evidence.setdefault(label, {'match_count': 0, 'strong_matches': 0, 'best_conf': 0.0, 'best_snr': 0.0, 'energies': []})
+
+            stats['raw_conf'] += float(conf)
+            stats['shells'].add(shell)
+            stats['lines'].add(line_name)
+            stats['match_count'] += 1
+            stats['strong_matches'] += int(snr > snr_threshold and distance < distance_threshold_for_sample)
+            if conf > stats['best_match_conf']:
+                stats.update({
+                    'best_match_conf': float(conf),
+                    'best_match_snr': float(snr),
+                    'best_match_energy': float(peak_energy),
+                    'best_match_distance': float(distance),
+                    'best_match_weight': float(line_weight),
+                    'best_match_shell': shell,
+                })
+
+            evidence['match_count'] += 1
+            evidence['energies'].append(float(peak_energy))
+            evidence['strong_matches'] += int(snr > snr_threshold and distance < distance_threshold_for_sample)
+            if conf > evidence['best_conf']:
+                evidence['best_conf'] = float(conf)
+                evidence['best_snr'] = float(snr)
+
+        element_confidence = {}
+        # --- Intensity ratio check and multi-peak pattern boost ---
+        for element, stats in element_stats.items():
+            valid_shells = {shell for shell in stats['shells'] if shell in {'K', 'L', 'M'}}
+            shell_bonus = float(np.sqrt(max(1, len(valid_shells))))
+            line_bonus = 1.0 + 0.30 * float(np.log1p(max(0, len(stats['lines']) - 1)))
+            strong_bonus = 1.0 + 0.40 * float(np.log1p(stats['strong_matches']))
+            major_bonus = 1.20 if {'K', 'L'} & valid_shells else 1.0
+
+            # Intensity ratio logic
+            element_peak_intensities = {}
+            for _, height, peak_energy, snr, el, _, distance, line_name, line_weight, conf in peak_matches:
+                if el == element:
+                    element_peak_intensities.setdefault(line_name, []).append(float(height))
+            # Only consider if at least 2 lines detected
+            if len(element_peak_intensities) >= 2:
+                observed = []
+                expected = []
+                for line_name, intensities in element_peak_intensities.items():
+                    observed.append(max(intensities))
+                    weight = all_info.get(element, {}).get(line_name, {}).get('weight', None)
+                    try:
+                        expected.append(float(weight) if weight is not None else 0.0)
+                    except Exception:
+                        expected.append(0.0)
+                obs_sum = sum(observed)
+                exp_sum = sum(expected)
+                if obs_sum > 0 and exp_sum > 0:
+                    observed_norm = [x / obs_sum for x in observed]
+                    expected_norm = [x / exp_sum for x in expected]
+                    ratio_score = 1.0 - (sum(abs(o - e) for o, e in zip(observed_norm, expected_norm)) / 2.0)
+                    ratio_factor = 1.0
+                    if ratio_score > 0.7:
+                        ratio_factor = 1.15 + 0.25 * (ratio_score - 0.7)
+                    elif ratio_score < 0.4:
+                        ratio_factor = 0.7 + 0.5 * ratio_score
+                else:
+                    ratio_factor = 1.0
+            else:
+                ratio_factor = 1.0
+
+            # --- Strong pattern boost: if both main lines for K, L, or M are matched, multiply confidence by 3 (dominates score) ---
+            matched_lines = set(element_peak_intensities.keys())
+            k_lines = {'Ka1', 'Kb1'}
+            l_lines = {'La1', 'Lb1'}
+            m_lines = {'Ma1', 'Mb1'}
+            pattern_factor = 1.0
+            if k_lines.issubset(matched_lines):
+                pattern_factor = 3.0
+            elif l_lines.issubset(matched_lines):
+                pattern_factor = 2.5
+            elif m_lines.issubset(matched_lines):
+                pattern_factor = 2.0
+
+            element_confidence[element] = stats['raw_conf'] * shell_bonus * line_bonus * strong_bonus * major_bonus * ratio_factor * pattern_factor
 
         detected_elements = set()
-        detected_sample_peaks = {}
-        element_confidence = {}
-        element_stats = {}
-        line_evidence = {}
-        for (
-            peak_idx,
-            height,
-            peak_energy,
-            snr,
-            element_name,
-            match_str,
-            distance,
-            line_name,
-            line_weight,
-            match_confidence,
-        ) in peak_matches:
-            element_name = str(element_name)
-            line_name = str(line_name)
-            if search_elements is not None and element_name not in search_elements:
-                continue
-
-            shell = _line_shell(line_name)
-            line_label = f"{element_name} {line_name}"
-            if element_name not in element_stats:
-                element_stats[element_name] = {
-                    "raw_conf": 0.0,
-                    "shells": set(),
-                    "lines": set(),
-                    "strong_matches": 0,
-                    "match_count": 0,
-                    "best_match_conf": 0.0,
-                    "best_match_snr": 0.0,
-                    "best_match_energy": 0.0,
-                    "best_match_distance": float("inf"),
-                    "best_match_weight": 0.0,
-                    "best_match_shell": "?",
-                }
-
-            if line_label not in line_evidence:
-                line_evidence[line_label] = {
-                    "match_count": 0,
-                    "strong_matches": 0,
-                    "best_conf": 0.0,
-                    "best_snr": 0.0,
-                    "energies": [],
-                }
-
-            element_stats[element_name]["raw_conf"] += float(match_confidence)
-            element_stats[element_name]["shells"].add(shell)
-            element_stats[element_name]["lines"].add(str(line_name))
-            element_stats[element_name]["match_count"] += 1
-            if snr > snr_threshold_for_sample and distance < distance_threshold_for_sample:
-                element_stats[element_name]["strong_matches"] += 1
-
-            if float(match_confidence) > float(element_stats[element_name]["best_match_conf"]):
-                element_stats[element_name]["best_match_conf"] = float(match_confidence)
-                element_stats[element_name]["best_match_snr"] = float(snr)
-                element_stats[element_name]["best_match_energy"] = float(peak_energy)
-                element_stats[element_name]["best_match_distance"] = float(distance)
-                element_stats[element_name]["best_match_weight"] = float(line_weight)
-                element_stats[element_name]["best_match_shell"] = shell
-
-            line_evidence[line_label]["match_count"] += 1
-            line_evidence[line_label]["energies"].append(float(peak_energy))
-            if snr > snr_threshold_for_sample and distance < distance_threshold_for_sample:
-                line_evidence[line_label]["strong_matches"] += 1
-            if float(match_confidence) > float(line_evidence[line_label]["best_conf"]):
-                line_evidence[line_label]["best_conf"] = float(match_confidence)
-                line_evidence[line_label]["best_snr"] = float(snr)
-
-        for element_name, stats in element_stats.items():
-            valid_shells = {shell for shell in stats["shells"] if shell in {"K", "L", "M"}}
-            num_shells = len(valid_shells)
-            num_lines = len(stats["lines"])
-            has_major_shell = len(valid_shells.intersection({"K", "L"})) > 0
-
-            # Shell bonus: each additional confirmed shell is independent evidence.
-            # Two independent shells give P(element|K∧L) ∝ P_K · P_L, so the
-            # log-likelihood adds linearly and the likelihood ratio scales as
-            # sqrt(n_shells) in the geometric-mean sense (Jaynes, Prob. Theory).
-            shell_bonus = float(np.sqrt(max(1, num_shells)))
-
-            # Line bonus: each additional distinct matched line reduces the
-            # probability of a chance coincidence. Diminishing returns are
-            # captured by log1p (each doubling of evidence adds a fixed increment).
-            line_bonus = 1.0 + 0.30 * float(np.log1p(max(0, num_lines - 1)))
-
-            # Strong-match bonus: the Poisson false-peak rate at SNR > T scales
-            # as erfc(T/√2); n independent strong peaks compound multiplicatively
-            # so log1p(n) correctly models the diminishing-returns likelihood ratio.
-            strong_bonus = 1.0 + 0.40 * float(np.log1p(stats["strong_matches"]))
-
-            # K/L shell presence is strong physical prior: these are the primary
-            # transitions expected in any sample above Z≈10.
-            major_bonus = 1.20 if has_major_shell else 1.0
-
-            confidence = stats["raw_conf"] * shell_bonus * line_bonus * strong_bonus * major_bonus
-            element_confidence[element_name] = float(confidence)
-
         if element_confidence:
-            conf_values = np.array(list(element_confidence.values()), dtype=float)
-            # Absolute Poisson MDL floor (Currie 1968, Anal. Chem. 40:586):
-            # a peak is physically detectable only when SNR >= 3σ of background.
-            # The minimum confidence a single real peak can produce is:
-            #   log1p(3.0) * 0.5 * exp(-0.5*(1σ distance)²) ≈ 0.334
-            # (half-weight line, 1-sigma spatial offset, SNR=3).
-            # No element below this floor can have a statistically detectable peak.
+            conf_values = np.asarray(list(element_confidence.values()), dtype=float)
             poisson_mdl_snr = 3.0
-            _mdl_conf_floor = float(np.log1p(poisson_mdl_snr)) * 0.5 * float(np.exp(-0.5))
-            confidence_cutoff = max(
-                float(np.percentile(conf_values, 45)),
-                0.30 * float(conf_values.max()),
-                _mdl_conf_floor,
-            )
+            cutoff = max(float(np.percentile(conf_values, 45)), 0.30 * float(conf_values.max()))
+            for element, confidence in element_confidence.items():
+                stats = element_stats[element]
+                lines = set(stats['lines'])
+                # Criterion 1: Both main lines matched (pattern match) → always autodetect
+                strong_pattern = (
+                    {'Ka1', 'Kb1'}.issubset(lines)
+                    or {'La1', 'Lb1'}.issubset(lines)
+                    or {'Ma1', 'Mb1'}.issubset(lines)
+                ) and confidence > 0
+                # Criterion 2: High confidence above cutoff and sufficient SNR
+                high_confidence = confidence >= cutoff and stats['best_match_snr'] >= poisson_mdl_snr
+                if strong_pattern or high_confidence:
+                    detected_elements.add(element)
 
-            for element_name, confidence in element_confidence.items():
-                stats = element_stats[element_name]
-                valid_shells = {shell for shell in stats["shells"] if shell in {"K", "L", "M"}}
-                has_major_shell = len(valid_shells.intersection({"K", "L"})) > 0
-                # is_supported: best peak must clear the 3σ Poisson MDL
-                # (Currie 1968) — any peak below SNR=3 cannot be distinguished
-                # from background noise regardless of fit quality.
-                is_supported = (
-                    confidence >= confidence_cutoff
-                    and stats["best_match_snr"] >= poisson_mdl_snr
-                    and (
-                        stats["strong_matches"] >= 1
-                        or stats["best_match_snr"] >= max(min_snr, 0.6 * snr_threshold_for_sample)
-                    )
-                )
-                # is_near_cutoff_but_consistent: two independent peaks above the
-                # 3σ MDL have a joint false-positive probability ≈ p₁·p₂ ≈ negligible
-                # (akin to requiring both the critical level Lc and detection limit Ld
-                # to be satisfied on independent lines — Currie 1968, §IV).
-                is_near_cutoff_but_consistent = (
-                    confidence >= 0.75 * confidence_cutoff
-                    and stats["best_match_snr"] >= poisson_mdl_snr
-                    and stats["match_count"] >= 2
-                    and has_major_shell
-                    and stats["best_match_snr"] >= max(min_snr, 0.5 * snr_threshold_for_sample)
-                )
-                is_high_energy_singleton_anchor = (
-                    stats["match_count"] == 1
-                    and stats["best_match_energy"] >= 6.0
-                    and stats["best_match_weight"] >= 0.8
-                    and stats["best_match_distance"] <= 0.35 * tolerance
-                    and confidence >= 0.45 * confidence_cutoff
-                )
-                is_high_quality_singleton = (
-                    stats["match_count"] == 1
-                    and has_major_shell
-                    and stats["best_match_snr"] >= max(min_snr, 0.6 * snr_threshold_for_sample)
-                    and stats["best_match_weight"] >= 0.5
-                    and stats["best_match_distance"] <= 0.30 * tolerance
-                    and confidence >= 0.35 * confidence_cutoff
-                )
+        dominant_elements = set()
+        if element_confidence:
+            conf_values = np.asarray(list(element_confidence.values()), dtype=float)
+            conf_floor = max(float(np.median(conf_values)) if conf_values.size else 0.0, 1e-9)
+            conf_p80 = float(np.percentile(conf_values, 80)) if conf_values.size > 1 else 0.0
+            for element, confidence in element_confidence.items():
+                stats = element_stats.get(element, {})
+                repeat_support = int(stats.get('match_count', 0)) >= 2 or int(stats.get('strong_matches', 0)) >= 1
+                if confidence >= conf_p80 and confidence >= 1.8 * conf_floor and repeat_support:
+                    dominant_elements.add(element)
 
-                if (
-                    is_supported
-                    or is_near_cutoff_but_consistent
-                    or is_high_energy_singleton_anchor
-                    or is_high_quality_singleton
-                ):
-                    detected_elements.add(element_name)
+        anchor_elements = {
+            element for element in detected_elements
+            if element in element_stats and element_stats[element].get('best_match_energy', 0.0) >= 6.0 and element_stats[element].get('best_match_weight', 0.0) >= 0.8
+        }
+        max_detected_conf = max([element_confidence.get(el, 0.0) for el in detected_elements], default=0.0)
+
+        def prior_boost(element):
+            prior = float(element_confidence.get(element, 0.0)) / max(float(max_detected_conf), 1e-9)
+            factor = 1.0 + 0.5 * prior
+            if prior >= 0.90:
+                factor *= 1.9
+            elif prior >= 0.75:
+                factor *= 1.5
+            elif prior >= 0.55:
+                factor *= 1.2
+            return prior, factor
+
+        def consistency_boost(element, line_name, peak_energy):
+            if element not in dominant_elements:
+                return 1.0
+            evidence = line_evidence.get(f'{element} {line_name}')
+            if not evidence or not any(abs(float(peak_energy) - float(prev)) >= 0.04 for prev in evidence.get('energies', [])):
+                return 1.0
+            best_conf = float(evidence.get('best_conf', 0.0))
+            best_snr = float(evidence.get('best_snr', 0.0))
+            strong = int(evidence.get('strong_matches', 0))
+            line_weight = float((all_info.get(element, {}).get(line_name, {}) or {}).get('weight', 0.5))
+            tier = 1.0 + 0.7 * max(0.0, line_weight - 0.35)
+            if strong >= 1 and best_conf >= 1.4:
+                return min(3.2, 2.4 * tier)
+            if best_conf >= 1.1 and best_snr >= max(snr_min, 0.75 * snr_threshold):
+                return min(2.6, 1.9 * tier)
+            if best_conf >= 0.8:
+                return min(2.0, 1.5 * tier)
+            return min(1.5, 1.2 * tier)
+
+        def dominant_boost(element):
+            if element not in dominant_elements:
+                return 1.0
+            prior, _ = prior_boost(element)
+            stats = element_stats.get(element, {})
+            repeat_support = max(int(stats.get('strong_matches', 0)), max(0, int(stats.get('match_count', 0)) - 1))
+            base = 2.30 if prior >= 0.90 else 1.85 if prior >= 0.75 else 1.45
+            if repeat_support >= 2:
+                base *= 1.10
+            return min(base, 2.60)
+
+        def reranked_matches(peak_energy, snr, allowed_elements=None, top_k=None):
+            # Compute which elements have both main lines matched (pattern boost)
+            element_to_lines = {}
+            for _, _, _, _, el, _, _, ln, _, _ in peak_matches:
+                element_to_lines.setdefault(el, set()).add(ln)
+            scored = []
+            for match in candidate_matches(peak_energy, snr, allowed_elements):
+                element, line_name, shell = match['element'], match['line'], match['shell']
+                prior, prior_factor = prior_boost(element)
+                pref = 1.35 if element in preferred_elements else 1.0
+                anchor = 1.15 if element in anchor_elements and shell in {'K', 'L'} else 1.0
+                consistency = consistency_boost(element, line_name, peak_energy)
+                dom = dominant_boost(element)
+                # Pattern boost: if both main lines for K, L, or M are matched by detected peaks, boost candidate score
+                lines_matched = element_to_lines.get(element, set())
+                k_lines = {'Ka1', 'Kb1'}
+                l_lines = {'La1', 'Lb1'}
+                m_lines = {'Ma1', 'Mb1'}
+                pattern_factor = 1.0
+                if k_lines.issubset(lines_matched):
+                    pattern_factor = 3.0
+                elif l_lines.issubset(lines_matched):
+                    pattern_factor = 2.5
+                elif m_lines.issubset(lines_matched):
+                    pattern_factor = 2.0
+                if shell == 'M':
+                    prior_factor = 1.0 + 0.3 * prior
+                    consistency = 1.0
+                    dom = min(dom, 1.30)
+                score = match['score'] * prior_factor * pref * anchor * consistency * dom * pattern_factor
+                scored.append({**match, 'score': float(score)})
+
+            scored.sort(key=lambda m: m['score'], reverse=True)
+            if mode == 'elements_preferred' and preferred_elements:
+                preferred = [m for m in scored if m['element'] in preferred_elements]
+                scored = preferred + [m for m in scored if m['element'] not in preferred_elements] if preferred else scored
+
+            unique, seen = [], set()
+            for match in scored:
+                label = f"{match['element']} {match['line']}"
+                if label in seen:
+                    continue
+                seen.add(label)
+                unique.append(match)
+
+            if top_k is None or len(unique) <= 1:
+                return unique
+            selected = [unique[0]]
+            used_elements = {unique[0]['element']}
+            for match in unique[1:]:
+                if match['element'] in used_elements:
+                    continue
+                selected.append(match)
+                used_elements.add(match['element'])
+                if len(selected) >= int(top_k):
+                    return selected
+            for match in unique[1:]:
+                if match not in selected:
+                    selected.append(match)
+                if len(selected) >= int(top_k):
+                    break
+            return selected
+
+        rematch_allowed = {str(match[4]) for match in peak_matches if str(match[4]) not in ignored_elements}
+        rematch_allowed.update(map(str, detected_elements))
+        rematch_allowed.update(preferred_elements)
 
         refined_peak_matches = []
         raw_match_by_idx = {int(match[0]): match for match in peak_matches}
-        anchor_elements = {
-            element_name
-            for element_name in detected_elements
-            if element_name in element_stats
-            and element_stats[element_name].get("best_match_energy", 0.0) >= 6.0
-            and element_stats[element_name].get("best_match_weight", 0.0) >= 0.8
-        }
-        max_detected_conf = (
-            max([element_confidence.get(el, 0.0) for el in detected_elements])
-            if len(detected_elements) > 0
-            else 0.0
-        )
-        dominant_elements = set()
-        if element_confidence:
-            conf_values = np.array(list(element_confidence.values()), dtype=float)
-            conf_median = float(np.median(conf_values)) if len(conf_values) > 0 else 0.0
-            conf_p80 = float(np.percentile(conf_values, 80)) if len(conf_values) > 1 else 0.0
-            conf_floor = max(conf_median, 1e-9)
-
-            for element_name, confidence in element_confidence.items():
-                stats = element_stats.get(str(element_name), {})
-                has_repeat_support = (
-                    int(stats.get("match_count", 0)) >= 2
-                    or int(stats.get("strong_matches", 0)) >= 1
-                )
-                if (
-                    float(confidence) >= conf_p80
-                    and float(confidence) >= 1.8 * conf_floor
-                    and has_repeat_support
-                ):
-                    dominant_elements.add(str(element_name))
-
-        def _element_prior_factor(element_name, denom):
-            prior = float(element_confidence.get(element_name, 0.0)) / denom
-            prior_factor = 1.0 + 0.5 * prior
-
-            # When an element is already strongly supported by the spectrum,
-            # bias nearby ambiguous peaks toward that same element.
-            if prior >= 0.90:
-                prior_factor *= 1.9
-            elif prior >= 0.75:
-                prior_factor *= 1.5
-            elif prior >= 0.55:
-                prior_factor *= 1.2
-
-            return prior, prior_factor
-
-        def _line_consistency_boost(element_name, line_name, peak_energy, denom):
-            # Use dominant_elements membership rather than a normalized-prior
-            # threshold.  The normalized prior can be suppressed when one or
-            # two elements have very large confidence (e.g. Au driving the
-            # denominator high), causing legitimate dominant elements like Cu
-            # to silently fail the old `prior >= 0.75` gate even though they
-            # clearly belong in the sample.
-            if str(element_name) not in dominant_elements:
-                return 1.0
-
-            line_label = f"{element_name} {line_name}"
-            evidence = line_evidence.get(line_label)
-            if evidence is None:
-                return 1.0
-
-            # Require support from another peak for this exact line so we
-            # don't self-reinforce a single spurious match.
-            has_other_peak_support = any(
-                abs(float(peak_energy) - float(prev_energy)) >= 0.04
-                for prev_energy in evidence.get("energies", [])
-            )
-            if not has_other_peak_support:
-                return 1.0
-
-            best_line_conf = float(evidence.get("best_conf", 0.0))
-            best_line_snr = float(evidence.get("best_snr", 0.0))
-            strong_line_matches = int(evidence.get("strong_matches", 0))
-
-            # Scale by line weight: high-weight primary lines (K/L α, weight
-            # ≈ 0.7–1.0) get proportionally stronger boosts than low-weight
-            # secondary lines (weight < 0.4).  This prevents a low-weight
-            # line from an equally-dominant element from outscoring a
-            # confirmed primary line purely via prior amplification.
-            line_info_entry = (all_info or {}).get(str(element_name), {}).get(str(line_name), {})
-            line_weight = (
-                float(line_info_entry.get("weight", 0.5))
-                if isinstance(line_info_entry, dict)
-                else 0.5
-            )
-            weight_tier = 1.0 + 0.7 * max(0.0, line_weight - 0.35)
-
-            if strong_line_matches >= 1 and best_line_conf >= 1.4:
-                return min(3.2, 2.4 * weight_tier)
-            if best_line_conf >= 1.1 and best_line_snr >= max(
-                min_snr, 0.75 * snr_threshold_for_sample
-            ):
-                return min(2.6, 1.9 * weight_tier)
-            if best_line_conf >= 0.8:
-                return min(2.0, 1.5 * weight_tier)
-            return min(1.5, 1.2 * weight_tier)
-
-        def _dominant_element_boost(element_name, denom):
-            element_key = str(element_name)
-            if element_key not in dominant_elements:
-                return 1.0
-
-            prior, _ = _element_prior_factor(element_key, denom)
-            stats = element_stats.get(element_key, {})
-            repeat_support = max(
-                int(stats.get("strong_matches", 0)),
-                max(0, int(stats.get("match_count", 0)) - 1),
-            )
-
-            if prior >= 0.90:
-                base_boost = 2.30
-            elif prior >= 0.75:
-                base_boost = 1.85
-            else:
-                base_boost = 1.45
-
-            if repeat_support >= 2:
-                base_boost *= 1.10
-
-            return min(base_boost, 2.60)
-
-        def _best_supported_line_match_with_prior(
-            peak_energy, snr, allowed_elements, edge_filters=None
-        ):
-            if not all_info or not allowed_elements:
-                return None
-
-            best_tuple = None
-            best_score = -float("inf")
-            best_preferred_tuple = None
-            best_preferred_score = -float("inf")
-            denom = max(float(max_detected_conf), 1e-9)
-
-            for element_name, lines in all_info.items():
-                if element_name not in allowed_elements:
-                    continue
-
-                prior, prior_factor = _element_prior_factor(element_name, denom)
-                preferred_factor = 1.35 if str(element_name) in preferred_elements_set else 1.0
-
-                for line_name, line_info in lines.items():
-                    if not _line_allowed_for_element(element_name, line_name, edge_filters):
-                        continue
-                    line_energy = line_info["energy (keV)"]
-                    line_weight = line_info.get("weight", 0.5)
-                    distance = abs(peak_energy - line_energy)
-                    shell = _line_shell(line_name)
-
-                    is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
-                    effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
-
-                    if line_weight < min_line_weight or distance > effective_tolerance:
-                        continue
-
-                    local_conf = _peak_confidence(snr, line_weight, distance)
-                    anchor_boost = 1.0
-                    if element_name in anchor_elements and shell in {"K", "L"}:
-                        anchor_boost = 1.15
-
-                    consistency_boost = _line_consistency_boost(
-                        element_name, line_name, peak_energy, denom
-                    )
-                    dominant_boost = _dominant_element_boost(element_name, denom)
-
-                    # M-lines are secondary transitions confirmed by K/L lines
-                    # from the same element.  The large cascade boosts designed
-                    # for K/L cross-peak propagation must not override a
-                    # better-fitting primary K/L line from another element
-                    # (e.g. P Ka1 vs Pt Ma1 near 2.03 keV: P Ka1 has higher
-                    # local_conf but Pt is dominant via La1 at 9.47 keV).
-                    if shell == "M":
-                        eff_prior_factor = 1.0 + 0.3 * prior
-                        eff_consistency = 1.0
-                        eff_dominant = min(dominant_boost, 1.30)
-                    else:
-                        eff_prior_factor = prior_factor
-                        eff_consistency = consistency_boost
-                        eff_dominant = dominant_boost
-
-                    score = (
-                        local_conf
-                        * eff_prior_factor
-                        * anchor_boost
-                        * preferred_factor
-                        * eff_consistency
-                        * eff_dominant
-                    )
-                    score *= _shell_preference_factor(shell)
-
-                    if (
-                        str(element_name) in preferred_elements_set
-                        and score > best_preferred_score
-                    ):
-                        best_preferred_score = score
-                        best_preferred_tuple = (element_name, line_name, line_weight, distance)
-
-                    if score > best_score:
-                        best_score = score
-                        best_tuple = (element_name, line_name, line_weight, distance)
-
-            if mode_normalized == "elements_preferred" and best_preferred_tuple is not None:
-                return best_preferred_tuple
-
-            return best_tuple
-
-        def _top_supported_line_matches_with_prior(
-            peak_energy, snr, allowed_elements, edge_filters=None, top_k=3
-        ):
-            if not all_info or top_k <= 0:
-                return []
-
-            scored_matches = []
-            denom = max(float(max_detected_conf), 1e-9)
-
-            for element_name, lines in all_info.items():
-                if allowed_elements is not None and element_name not in allowed_elements:
-                    continue
-
-                prior, prior_factor = _element_prior_factor(element_name, denom)
-                preferred_factor = 1.35 if str(element_name) in preferred_elements_set else 1.0
-
-                for line_name, line_info in lines.items():
-                    if not _line_allowed_for_element(element_name, line_name, edge_filters):
-                        continue
-                    line_energy = line_info["energy (keV)"]
-                    line_weight = line_info.get("weight", 0.5)
-                    distance = abs(peak_energy - line_energy)
-                    shell = _line_shell(line_name)
-
-                    is_m_line = "M" in line_name and not ("Ma" in line_name or "Mb" in line_name)
-                    effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
-
-                    if line_weight < min_line_weight or distance > effective_tolerance:
-                        continue
-
-                    local_conf = _peak_confidence(snr, line_weight, distance)
-                    anchor_boost = 1.0
-                    if element_name in anchor_elements and shell in {"K", "L"}:
-                        anchor_boost = 1.15
-
-                    consistency_boost = _line_consistency_boost(
-                        element_name, line_name, peak_energy, denom
-                    )
-                    dominant_boost = _dominant_element_boost(element_name, denom)
-
-                    if shell == "M":
-                        eff_prior_factor = 1.0 + 0.3 * prior
-                        eff_consistency = 1.0
-                        eff_dominant = min(dominant_boost, 1.30)
-                    else:
-                        eff_prior_factor = prior_factor
-                        eff_consistency = consistency_boost
-                        eff_dominant = dominant_boost
-
-                    score = (
-                        local_conf
-                        * eff_prior_factor
-                        * anchor_boost
-                        * preferred_factor
-                        * eff_consistency
-                        * eff_dominant
-                    )
-                    score *= _shell_preference_factor(shell)
-                    scored_matches.append(
-                        (
-                            float(score),
-                            str(element_name),
-                            str(line_name),
-                            float(line_weight),
-                            float(distance),
-                        )
-                    )
-
-            scored_matches.sort(key=lambda item: item[0], reverse=True)
-
-            if mode_normalized == "elements_preferred" and preferred_elements_set:
-                preferred_scored_matches = [
-                    item for item in scored_matches if str(item[1]) in preferred_elements_set
-                ]
-                if len(preferred_scored_matches) > 0:
-                    non_preferred_scored_matches = [
-                        item
-                        for item in scored_matches
-                        if str(item[1]) not in preferred_elements_set
-                    ]
-                    scored_matches = preferred_scored_matches + non_preferred_scored_matches
-
-            unique = []
-            seen_labels = set()
-            for score, element_name, line_name, line_weight, distance in scored_matches:
-                label = f"{element_name} {line_name}"
-                if label in seen_labels:
-                    continue
-                seen_labels.add(label)
-                unique.append((element_name, line_name, line_weight, distance, score))
-
-            if len(unique) == 0:
-                return []
-
-            # Keep the top-scoring best match first, then prefer alternatives
-            # from different elements before falling back to same-element lines.
-            best_match = unique[0]
-            selected = [best_match]
-            selected_labels = {f"{best_match[0]} {best_match[1]}"}
-            used_elements = {str(best_match[0])}
-
-            for candidate in unique[1:]:
-                element_name, line_name, _, _, _ = candidate
-                label = f"{element_name} {line_name}"
-                if label in selected_labels or str(element_name) in used_elements:
-                    continue
-                selected.append(candidate)
-                selected_labels.add(label)
-                used_elements.add(str(element_name))
-                if len(selected) >= int(top_k):
-                    return selected
-
-            for candidate in unique[1:]:
-                element_name, line_name, _, _, _ = candidate
-                label = f"{element_name} {line_name}"
-                if label in selected_labels:
-                    continue
-                selected.append(candidate)
-                selected_labels.add(label)
-                if len(selected) >= int(top_k):
-                    break
-
-            return selected
-
-        first_pass_elements = {
-            str(match[4])
-            for match in peak_matches
-            if len(match) > 4 and str(match[4]) not in ignored_elements
-        }
-        rematch_allowed_elements = set(str(element_name) for element_name in detected_elements)
-        rematch_allowed_elements.update(first_pass_elements)
-        if preferred_elements_set:
-            rematch_allowed_elements.update(preferred_elements_set)
-
         for peak_idx, height, peak_energy, snr in display_peaks:
-            match = raw_match_by_idx.get(int(peak_idx))
-
-            if rematch_allowed_elements:
-                alt_match_info = _best_supported_line_match_with_prior(
-                    peak_energy, snr, rematch_allowed_elements, requested_edge_filters
-                )
-                if alt_match_info is not None:
-                    alt_element, alt_line_name, alt_line_weight, alt_distance = alt_match_info
-                    alt_element = str(alt_element)
-                    alt_line_name = str(alt_line_name)
-                    alt_match_str = f"{alt_element} {alt_line_name}"
-                    alt_conf = _peak_confidence(snr, alt_line_weight, alt_distance)
-                    match = (
-                        peak_idx,
-                        height,
-                        peak_energy,
-                        snr,
-                        alt_element,
-                        alt_match_str,
-                        alt_distance,
-                        alt_line_name,
-                        alt_line_weight,
-                        alt_conf,
-                    )
-
-            if match is not None:
-                refined_peak_matches.append(match)
-
+            best = reranked_matches(peak_energy, snr, rematch_allowed or None, top_k=1)
+            best = best[0] if best else None
+            if best is None:
+                continue
+            refined_peak_matches.append((
+                peak_idx,
+                height,
+                peak_energy,
+                snr,
+                best['element'],
+                f"{best['element']} {best['line']}",
+                best['distance'],
+                best['line'],
+                best['weight'],
+                best['score'],
+            ))
         peak_matches = refined_peak_matches
 
-        # Keep confidence-based detected elements, but ensure they still have
-        # at least one matched peak after rematching.
         matched_elements = {str(match[4]) for match in peak_matches}
-        detected_elements = {
-            str(element_name)
-            for element_name in detected_elements
-            if str(element_name) in matched_elements
-        }
-        if mode_normalized == "elements_preferred" and preferred_elements_set:
-            detected_elements.update(
-                str(element_name)
-                for element_name in preferred_elements_set
-                if str(element_name) in matched_elements
-            )
-        if ignored_elements:
-            detected_elements = {
-                str(element_name)
-                for element_name in detected_elements
-                if str(element_name) not in ignored_elements
-            }
-
+        detected_elements = {str(el) for el in detected_elements if str(el) in matched_elements and str(el) not in ignored_elements}
+        if mode == 'elements_preferred':
+            detected_elements.update(str(el) for el in preferred_elements if str(el) in matched_elements)
         refined_match_by_idx = {int(match[0]): match for match in peak_matches}
 
         final_matches_by_element: dict[str, set[str]] = {}
-        for (
-            _peak_idx,
-            _height,
-            _peak_energy,
-            _snr,
-            element_name,
-            _match_str,
-            _distance,
-            line_name,
-            _line_weight,
-            _match_confidence,
-        ) in peak_matches:
-            element_key = str(element_name)
-            if element_key in ignored_elements:
-                continue
-            final_matches_by_element.setdefault(element_key, set()).add(str(line_name))
+        for _, _, _, _, element, _, _, line_name, _, _ in peak_matches:
+            if element not in ignored_elements:
+                final_matches_by_element.setdefault(element, set()).add(str(line_name))
 
-        displayed_peak_count = len(display_peaks)
-        total_over_snr_peak_count = len(significant_peaks)
+        candidate_elements = sorted(str(el) for el in final_matches_by_element if str(el) not in detected_elements)
+        possible_elements = set(candidate_elements)
+        possible_line_labels = {f'{element} {line}' for _, _, _, _, element, _, _, line, _, _ in peak_matches if element in possible_elements}
 
-        candidate_elements = sorted(
-            str(element_name)
-            for element_name in final_matches_by_element
-            if str(element_name) not in detected_elements
-        )
-        possible_elements_set = set(candidate_elements)
-        possible_line_labels = {
-            f"{str(element_name)} {str(line_name)}"
-            for (
-                _,
-                _,
-                _,
-                _,
-                element_name,
-                _,
-                _,
-                line_name,
-                _,
-                _,
-            ) in peak_matches
-            if str(element_name) in possible_elements_set
-        }
+        def format_elements_with_lines(names):
+            items = []
+            for element in sorted(map(str, names)):
+                lines = sorted(map(str, final_matches_by_element.get(element, set())))
+                line_strs = [str(line) for line in lines]
+                items.append(f"{element} [{', '.join(line_strs)}]" if lines else f'{element}')
+            return ', '.join(items)
 
-        def _format_saved_model_elements(edge_filters):
+        def format_saved(edge_filters):
             if edge_filters is None:
-                return "None"
+                return 'None'
+            out = []
+            for element in sorted(map(str, edge_filters)):
+                selectors = edge_filters.get(element)
+                out.append(f'{element} [all]' if not selectors else f"{element} [{', '.join(sorted(map(str, selectors)))}]")
+            return '\n'.join(out) if out else 'None'
 
-            formatted = []
-            for element_name in sorted(str(name) for name in edge_filters):
-                selectors = edge_filters.get(element_name)
-                if selectors is None or len(selectors) == 0:
-                    formatted.append(f"{element_name} [all]")
-                    continue
-
-                selector_names = sorted(str(token) for token in selectors)
-                formatted.append(f"{element_name} [{', '.join(selector_names)}]")
-
-            return "\n".join(formatted) if len(formatted) > 0 else "None"
-
-        def _format_elements_with_lines(element_names):
-            formatted = []
-            for element_name in sorted(str(name) for name in element_names):
-                line_names = sorted(
-                    str(line_name)
-                    for line_name in final_matches_by_element.get(str(element_name), set())
-                )
-                confidence_value = float(element_confidence.get(str(element_name), 0.0))
-                confidence_suffix = f" conf={confidence_value:.2f}"
-                if len(line_names) > 0:
-                    formatted.append(
-                        f"{element_name} [{', '.join(line_names)}]{confidence_suffix}"
-                    )
-                else:
-                    formatted.append(f"{str(element_name)}{confidence_suffix}")
-            return ", ".join(formatted)
-
-        model_elements_header = "Saved Model Elements (Plotted):\n"
-        print(
-            f"\n{model_elements_header} {_format_saved_model_elements(saved_model_edge_filters)}"
-        )
-
-        if detected_elements:
-            print(f"\nAutodetected: {_format_elements_with_lines(detected_elements)}")
-        else:
-            print("\nAutodetected: None")
+        print(f"\nAutodetected: {format_elements_with_lines(detected_elements) if detected_elements else 'None'}")
         if dominant_elements:
-            dominant_sorted = sorted(
-                dominant_elements,
-                key=lambda el: element_confidence.get(str(el), 0.0),
-                reverse=True,
-            )
-            dominant_str = ", ".join(
-                f"{el} (conf={element_confidence.get(str(el), 0.0):.2f})" for el in dominant_sorted
-            )
-            print(f"Dominant (strong prior): {dominant_str}")
-        if candidate_elements:
-            print(f"Possible: {_format_elements_with_lines(candidate_elements)}")
-        else:
-            print("Possible: None")
+            dominant_str = ', '.join(f"{el} (conf={element_confidence.get(str(el), 0.0):.2f})" for el in sorted(dominant_elements, key=lambda el: element_confidence.get(str(el), 0.0), reverse=True))
+            print(f'Dominant (strong prior): {dominant_str}')
+        print(f"Possible: {format_elements_with_lines(candidate_elements) if candidate_elements else 'None'}")
 
-        # Stable per-element colors (same element color across K/L/M lines)
-        elements_for_color = set(detected_elements)
+        elements_for_color = set(detected_elements) | {str(match[4]) for match in peak_matches}
         if search_elements is not None:
-            elements_for_color.update(str(el) for el in search_elements)
-        elements_for_color.update(str(match[4]) for match in peak_matches)
+            elements_for_color.update(map(str, search_elements))
+        palette = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f', '#003f5c', '#7a5195', '#ef5675', '#ffa600', '#2f4b7c']
+        element_color_map = {el: palette[i % len(palette)] for i, el in enumerate(sorted(elements_for_color))}
 
-        sorted_elements_for_colors = sorted(elements_for_color)
-        high_contrast_palette = [
-            "#1f77b4",  # blue
-            "#d62728",  # red
-            "#2ca02c",  # green
-            "#9467bd",  # purple
-            "#ff7f0e",  # orange
-            "#8c564b",  # brown
-            "#e377c2",  # pink
-            "#17becf",  # cyan
-            "#bcbd22",  # olive
-            "#7f7f7f",  # gray
-            "#003f5c",  # dark blue
-            "#7a5195",  # deep violet
-            "#ef5675",  # strong rose
-            "#ffa600",  # amber
-            "#2f4b7c",  # slate blue
-        ]
-        color_palette = [
-            high_contrast_palette[i % len(high_contrast_palette)]
-            for i in range(max(1, len(sorted_elements_for_colors)))
-        ]
-        element_color_map = {
-            element: color_palette[i] for i, element in enumerate(sorted_elements_for_colors)
+        detected_sample_peaks = {
+            float(peak_energy)
+            for _, _, peak_energy, _, element, _, _, _, _, _ in peak_matches
+            if element in detected_elements
         }
-
-        table_rows = []
-        matched_row_count = 0
-
-        def _mark_autodetected_label(label_text):
-            if not label_text or label_text == "-":
-                return label_text
-            element_token = str(label_text).split()[0]
-            if element_token in detected_elements:
-                return f"{label_text}*"
-            return label_text
-
-        def _format_label_with_score(label_text, score_value):
-            if score_value is None:
-                return str(label_text)
-            return f"{label_text} ({float(score_value):.3f})"
-
-        for peak_idx, height, peak_energy, snr in display_peaks:
-            match = refined_match_by_idx.get(int(peak_idx))
-            if match is not None:
-                if search_elements is not None:
-                    allowed_for_table = set(str(element_name) for element_name in search_elements)
-                else:
-                    allowed_for_table = {
-                        str(element_name)
-                        for element_name in (all_info or {}).keys()
-                        if str(element_name) not in ignored_elements
-                    }
-                    if len(allowed_for_table) == 0:
-                        allowed_for_table = None
-
-                top_matches = _top_supported_line_matches_with_prior(
-                    peak_energy,
-                    snr,
-                    allowed_for_table,
-                    requested_edge_filters,
-                    top_k=3,
-                )
-                best_label = f"{str(match[4])} {str(match[7])}"
-                score_by_label = {
-                    f"{element_name} {line_name}".lower(): float(score)
-                    for element_name, line_name, _, _, score in top_matches
-                }
-                best_score = score_by_label.get(str(best_label).lower())
-                best_match = _mark_autodetected_label(
-                    _format_label_with_score(best_label, best_score)
-                )
-                alt_2 = "-"
-                alt_3 = "-"
-
-                if len(top_matches) > 0:
-                    ranked_entries = [
-                        (f"{element_name} {line_name}", float(score))
-                        for element_name, line_name, _, _, score in top_matches
-                    ]
-                    ranked_entries = [
-                        (label, score)
-                        for label, score in ranked_entries
-                        if str(label).lower() != str(best_label).lower()
-                    ]
-                    if len(ranked_entries) > 0:
-                        alt_2 = _mark_autodetected_label(
-                            _format_label_with_score(ranked_entries[0][0], ranked_entries[0][1])
-                        )
-                    if len(ranked_entries) > 1:
-                        alt_3 = _mark_autodetected_label(
-                            _format_label_with_score(ranked_entries[1][0], ranked_entries[1][1])
-                        )
-
-                table_rows.append((peak_energy, height, snr, best_match, alt_2, alt_3))
-                matched_row_count += 1
-            else:
-                row_label = "Unmatched" if search_elements is not None else "Unknown"
-                table_rows.append((peak_energy, height, snr, row_label, "-", "-"))
-
-        sorted_table_rows = sorted(table_rows, key=lambda item: item[0])
-
-        for (
-            peak_idx,
-            height,
-            peak_energy,
-            snr,
-            element_name,
-            match_str,
-            distance,
-            line_name,
-            line_weight,
-            match_confidence,
-        ) in peak_matches:
-            if element_name in detected_elements:
-                detected_sample_peaks[peak_energy] = True
-
-        filtered_sample_peaks = {}
-        for peak_energy in detected_sample_peaks:
-            for (
-                peak_idx,
-                height,
-                matched_energy,
-                snr,
-                element_name,
-                match_str,
-                distance,
-                line_name,
-                line_weight,
-                match_confidence,
-            ) in peak_matches:
-                if abs(matched_energy - peak_energy) < 0.001 and element_name in detected_elements:
-                    filtered_sample_peaks[peak_energy] = True
-                    break
-        detected_sample_peaks = filtered_sample_peaks
-
-        y_min = float(np.nanmin(spec)) if len(spec) > 0 else 0.0
-        y_max = float(np.nanmax(spec)) if len(spec) > 0 else 1.0
-        y_span = max(1e-9, y_max - y_min)
-        y_scale = max(y_span, abs(y_max), 1.0)
+        y_min = float(np.nanmin(spec)) if len(spec) else 0.0
+        y_max = float(np.nanmax(spec)) if len(spec) else 1.0
+        y_scale = max(max(1e-9, y_max - y_min), abs(y_max), 1.0)
         y_dot = -0.04 * y_scale
 
-        def _infer_requested_element_for_color(peak_energy):
-            if reference_elements is None or not all_info:
+        def infer_requested_color(peak_energy):
+            if reference_elements is None:
                 return None
-
-            best_element = None
-            best_distance = float("inf")
-            for element_name in reference_elements:
-                element_key = str(element_name)
-                lines_info = all_info.get(element_key, {})
-                if not isinstance(lines_info, dict):
-                    continue
-                for line_name, line_info in lines_info.items():
-                    if not _line_allowed_for_element(
-                        element_key, line_name, requested_edge_filters
-                    ):
-                        continue
-                    if not isinstance(line_info, dict):
-                        continue
-                    line_energy = line_info.get("energy (keV)")
-                    if line_energy is None:
+            best_element, best_distance = None, float('inf')
+            for element in reference_elements:
+                for line_name, line_info in (all_info.get(str(element), {}) or {}).items():
+                    if not type(self)._line_allowed_for_element(str(element), line_name, edge_filters):
                         continue
                     try:
-                        distance = abs(float(peak_energy) - float(line_energy))
+                        distance = abs(float(peak_energy) - float(line_info.get('energy (keV)')))
                     except (TypeError, ValueError):
                         continue
                     if distance < best_distance:
-                        best_distance = distance
-                        best_element = element_key
-
+                        best_distance, best_element = distance, str(element)
             return best_element
 
+        table_rows = []
         for peak_idx, height, peak_energy, snr in display_peaks:
-            if _is_in_ignored_range(peak_energy):
-                continue
-            is_sample = detected_sample_peaks.get(peak_energy, False)
             match = refined_match_by_idx.get(int(peak_idx))
-            is_possible = match is not None and str(match[4]) in possible_elements_set
-            if match is not None:
-                peak_element = match[4]
-                line_color = element_color_map.get(peak_element, "red")
-            else:
-                inferred_element = _infer_requested_element_for_color(peak_energy)
-                if inferred_element is not None:
-                    line_color = element_color_map.get(str(inferred_element), "red")
+            is_sample = float(peak_energy) in detected_sample_peaks
+            is_possible = match is not None and str(match[4]) in possible_elements
+            color = element_color_map.get(match[4], 'red') if match is not None else element_color_map.get(str(infer_requested_color(peak_energy)), 'red')
+
+            if not in_ignore(peak_energy):
+                # Only plot solid lines for matched peaks (autodetected or requested elements)
+                if match is not None:
+                    ax_spec.axvline(peak_energy, color=color, linestyle='-', alpha=0.7, linewidth=1.5)
                 else:
-                    line_color = "red"
+                    ax_spec.plot([peak_energy], [y_dot], marker='|', markersize=4, color='gray', alpha=0.8, linestyle='None')
 
-            if is_sample:
-                ax_spec.axvline(
-                    peak_energy,
-                    color=line_color,
-                    linestyle="-",
-                    alpha=0.5,
-                    linewidth=1.5,
-                )
-            elif is_possible:
-                ax_spec.axvline(
-                    peak_energy,
-                    color=line_color,
-                    linestyle="--",
-                    alpha=0.45,
-                    linewidth=1.25,
-                )
-            else:
-                ax_spec.plot(
-                    [peak_energy],
-                    [y_dot],
-                    marker="|",
-                    markersize=4,
-                    color="gray",
-                    alpha=0.8,
-                    linestyle="None",
-                )
+                if show_text and match is not None:
+                    for grid_element, grid_energy in grid_peaks.items():
+                        if abs(peak_energy - grid_energy) < 0.1:
+                            ax_spec.text(peak_energy, height * 0.7, f'{grid_element}\n(grid)', ha='center', va='bottom', fontsize=8, color='gray', style='italic')
+                            print(f'Peak at {peak_energy} keV may come from the grid.')
+                            break
 
-            if show_text and is_sample:
-                y_pos = height * 0.7
-                is_grid_peak = False
-                for grid_element, grid_energy in grid_peaks.items():
-                    if abs(peak_energy - grid_energy) < 0.1:
-                        ax_spec.text(
-                            peak_energy,
-                            y_pos,
-                            f"{grid_element}\n(grid)",
-                            ha="center",
-                            va="bottom",
-                            fontsize=8,
-                            color="gray",
-                            style="italic",
-                        )
-                        is_grid_peak = True
-                        break
-                if is_grid_peak:
-                    print(f"Peak at {peak_energy} keV may come from the grid.")
+            def label_with_energy_and_ratio(label, detected_peak_intensity=None):
+                # label is like 'Fe Ka', want to append (energy, ratio) from all_info and observed/expected
+                if not label or label == '-' or label == 'Unmatched' or label == 'Unknown':
+                    return label
+                parts = label.split()
+                if len(parts) < 2:
+                    return label
+                element, line = parts[0], parts[1].replace('*','')
+                line_info = all_info.get(element, {}).get(line, {})
+                ref_energy = None
+                if isinstance(line_info, dict):
+                    ref_energy = line_info.get('energy (keV)', line_info.get('energy'))
+                try:
+                    ref_energy = float(ref_energy)
+                except (TypeError, ValueError):
+                    ref_energy = None
+                # Compute observed/expected ratio: use detected peak intensity / expected weight
+                ratio_str = ''
+                weight = line_info.get('weight', None)
+                try:
+                    weight = float(weight) if weight is not None else 0.0
+                except Exception:
+                    weight = 0.0
+                if detected_peak_intensity is not None and weight:
+                    try:
+                        ratio = float(detected_peak_intensity) / float(weight)
+                        ratio_str = f", {ratio:.2f}"
+                    except Exception:
+                        ratio_str = ''
+                label_core = label.rstrip('*')
+                star = '*' if label.endswith('*') else ''
+                if ref_energy is not None:
+                    return f"{label_core} ({ref_energy:.3f}{ratio_str}){star}"
+                else:
+                    return label
+
+            if match is None:
+                table_rows.append((peak_energy, height, snr, 'Unmatched' if search_elements is not None else 'Unknown', '-', '-'))
+                continue
+
+            allowed_for_table = set(map(str, search_elements)) if search_elements is not None else ({str(el) for el in all_info if str(el) not in ignored_elements} or None)
+            ranked = reranked_matches(peak_energy, snr, allowed_for_table, top_k=3)
+            labels = [(f"{m['element']} {m['line']}", float(m['score']), m['element'], m['line']) for m in ranked]
+            best_label = f'{match[4]} {match[7]}'
+
+            def fmt(label, score=None):
+                label = f'{label}*' if str(label).split()[0] in detected_elements else label
+                return label
+
+            # Gather all intensities for this element for ratio calculation
+            all_element_intensities = {}
+            for l in all_info.get(match[4], {}):
+                # Find the highest observed intensity for each line
+                obs = 0.0
+                for _, h, _, _, el, _, _, ln, _, _ in peak_matches:
+                    if el == match[4] and ln == l:
+                        obs = max(obs, float(h))
+                weight = all_info.get(match[4], {}).get(l, {}).get('weight', None)
+                try:
+                    weight = float(weight) if weight is not None else 0.0
+                except Exception:
+                    weight = 0.0
+                all_element_intensities[l] = (obs, weight)
+
+            remaining = [(label, score, elem, line) for label, score, elem, line in labels if label.lower() != best_label.lower()]
+            # For each label, show ratio for that line
+            def get_peak_intensity(elem, line):
+                obs = 0.0
+                for _, h, _, _, el, _, _, ln, _, _ in peak_matches:
+                    if el == elem and ln == line:
+                        obs = max(obs, float(h))
+                return obs
+
+            table_rows.append((
+                peak_energy,
+                height,
+                snr,
+                label_with_energy_and_ratio(fmt(best_label), detected_peak_intensity=height),
+                label_with_energy_and_ratio(fmt(remaining[0][0]), detected_peak_intensity=height) if len(remaining) > 0 else '-',
+                label_with_energy_and_ratio(fmt(remaining[1][0]), detected_peak_intensity=height) if len(remaining) > 1 else '-',
+            ))
 
         current_bottom, current_top = ax_spec.get_ylim()
-        dot_padding = 0.02 * y_scale
-        target_bottom = min(current_bottom, y_dot - dot_padding, -dot_padding)
-        ax_spec.set_ylim(bottom=target_bottom, top=current_top)
+        ax_spec.set_ylim(bottom=min(current_bottom, y_dot - 0.02 * y_scale, -0.02 * y_scale), top=current_top)
 
-        # If elements were explicitly requested, overlay reference X-ray lines from the
-        # database even when they are not peak-matched by auto-id.
-        all_label_candidates = []
-        unified_axes_top_label_y = 0.92
-        if reference_elements is not None:
-            energy_min = float(np.min(E))
-            energy_max = float(np.max(E))
-            displayed_peak_energies = [
-                float(peak_energy) for _, _, peak_energy, _ in display_peaks
-            ]
-            display_peak_tolerance = max(0.05, 0.5 * tolerance)
-            existing_matches_by_element = {}
-            for (
-                peak_idx,
-                height,
-                peak_energy,
-                snr,
-                element_name,
-                match_str,
-                distance,
-                line_name,
-                line_weight,
-                match_confidence,
-            ) in peak_matches:
-                element_key = str(element_name)
-                if element_key not in existing_matches_by_element:
-                    existing_matches_by_element[element_key] = []
-                existing_matches_by_element[element_key].append(float(peak_energy))
+        label_candidates = []
+        top_label_y = 0.92
+        # Plot reference lines (dotted) ONLY for explicitly requested elements, not for autodetected/possible
+        if requested_elements:
+            energy_min, energy_max = float(np.min(E)), float(np.max(E))
+            matched_by_element = {}
+            for _, _, peak_energy, _, element, _, _, _, _, _ in peak_matches:
+                matched_by_element.setdefault(str(element), []).append(float(peak_energy))
 
-            for element_name in sorted(reference_elements):
-                element_key = str(element_name)
-                lines_info = all_info.get(element_key, {}) if all_info is not None else {}
-                if not isinstance(lines_info, dict) or len(lines_info) == 0:
-                    continue
-
-                candidate_lines = []
-                for line_name, line_info in lines_info.items():
-                    if not _line_allowed_for_element(
-                        element_key, line_name, requested_edge_filters
-                    ):
-                        continue
-                    if not isinstance(line_info, dict):
-                        continue
-                    energy_val = line_info.get("energy (keV)")
-                    if energy_val is None:
+            for element in sorted(requested_elements):
+                candidates = []
+                for line_name, line_info in (all_info.get(str(element), {}) or {}).items():
+                    if not type(self)._line_allowed_for_element(str(element), line_name, edge_filters):
                         continue
                     try:
-                        line_energy = float(energy_val)
+                        line_energy = float(line_info.get('energy (keV)'))
+                        line_weight = float(line_info.get('weight', 0.0))
                     except (TypeError, ValueError):
                         continue
-                    if not (energy_min <= line_energy <= energy_max):
+                    if energy_min <= line_energy <= energy_max:
+                        candidates.append((str(line_name), line_energy, line_weight))
+                candidates = sorted([c for c in candidates if c[2] >= 0.05] or candidates, key=lambda item: item[2], reverse=True)[:6]
+                for line_name, line_energy, _ in candidates:
+                    if in_ignore(line_energy):
                         continue
-
-                    line_weight = float(line_info.get("weight", 0.0))
-                    candidate_lines.append((line_name, line_energy, line_weight))
-
-                if len(candidate_lines) == 0:
-                    continue
-
-                # Keep meaningful requested-element lines while avoiding excessive clutter.
-                filtered_lines = [line for line in candidate_lines if line[2] >= 0.05]
-                if len(filtered_lines) == 0:
-                    filtered_lines = sorted(
-                        candidate_lines, key=lambda item: item[2], reverse=True
-                    )[:1]
-                else:
-                    filtered_lines = sorted(
-                        filtered_lines, key=lambda item: item[2], reverse=True
-                    )[:6]
-
-                for line_name, line_energy, line_weight in filtered_lines:
-                    if _is_in_ignored_range(line_energy):
+                    # Skip if already matched by a detected peak
+                    if any(abs(line_energy - matched_energy) <= max(0.05, 0.5 * tolerance) for matched_energy in matched_by_element.get(str(element), [])):
                         continue
-
-                    line_label = f"{element_key} {line_name}"
-                    is_possible_line = line_label in possible_line_labels
-
-                    # For possible elements, draw guides only near peaks that already
-                    # passed snr_min. For reference-only requested elements, keep
-                    # explicit refline guides even without nearby peaks.
-                    if is_possible_line:
-                        if not any(
-                            abs(line_energy - peak_energy) <= display_peak_tolerance
-                            for peak_energy in displayed_peak_energies
-                        ):
-                            continue
-
-                    matched_energies = existing_matches_by_element.get(element_key, [])
-                    if any(
-                        abs(line_energy - matched_energy) <= max(0.05, 0.5 * tolerance)
-                        for matched_energy in matched_energies
-                    ):
-                        continue
-
-                    line_color = element_color_map.get(element_key, "black")
-                    line_style = "--" if is_possible_line else ":"
-                    line_alpha = 0.3 if is_possible_line else 0.35
-                    ax_spec.axvline(
-                        line_energy,
-                        color=line_color,
-                        linestyle=line_style,
-                        alpha=line_alpha,
-                        linewidth=1.2,
-                    )
-                    all_label_candidates.append(
-                        (
-                            float(line_energy),
-                            f"{element_key} {line_name}",
-                            line_color,
-                            line_style,
-                            float(unified_axes_top_label_y),
-                            "axes_top",
-                            8,
-                            "normal",
-                            0.8,
-                        )
-                    )
-
-        legend_handles = []
-        legend_labels = set()
+                    color = element_color_map.get(str(element), 'black')
+                    style = '--'
+                    alpha = 0.45
+                    ax_spec.axvline(line_energy, color=color, linestyle=style, alpha=alpha, linewidth=1.2)
+                    label_candidates.append((float(line_energy), f'{element} {line_name}', color, style, float(top_label_y), 'axes_top', 8, 'normal', 0.8))
 
         if show_text and peak_matches:
-            labels_to_plot = []
-            for (
-                peak_idx,
-                height,
-                peak_energy,
-                snr,
-                element_name,
-                match_str,
-                distance,
-                line_name,
-                line_weight,
-                match_confidence,
-            ) in peak_matches:
-                is_detected_peak = element_name in detected_elements and detected_sample_peaks.get(
-                    peak_energy, False
-                )
-                is_possible_peak = str(element_name) in possible_elements_set
-                if not (is_detected_peak or is_possible_peak):
+            label_offset = max(0.03 * y_scale, 0.08)
+            # Only label autodetected elements and explicitly requested elements
+            label_allowed = set(detected_elements)
+            if requested_elements:
+                label_allowed.update(str(el) for el in requested_elements)
+            for _, height, peak_energy, _, element, match_str, _, _, _, _ in peak_matches:
+                is_detected = element in detected_elements and float(peak_energy) in detected_sample_peaks
+                if element not in label_allowed or in_ignore(peak_energy):
                     continue
-
-                line_name = match_str.split()[-1] if match_str else ""
-                label_text = f"{element_name} {line_name}" if line_name else element_name
-                if is_detected_peak:
-                    label_text = f"{label_text}*"
-                color = element_color_map.get(element_name, "black")
-                linestyle = "-" if is_detected_peak else "--"
-                labels_to_plot.append((peak_energy, label_text, color, height, linestyle))
-
-            label_vertical_offset = max(0.03 * y_scale, 0.08)
-            for peak_energy, label_text, color, height, linestyle in labels_to_plot:
-                if _is_in_ignored_range(peak_energy):
+                if not is_detected and element not in (requested_elements or set()):
                     continue
-                if linestyle == "--":
-                    all_label_candidates.append(
-                        (
-                            float(peak_energy),
-                            label_text,
-                            color,
-                            linestyle,
-                            float(unified_axes_top_label_y),
-                            "axes_top",
-                            9,
-                            "normal",
-                            0.9,
-                        )
-                    )
+                label = f"{element} {match_str.split()[-1]}" + ('*' if is_detected else '')
+                style = '-' if is_detected else '--'
+                y_value = float(height + label_offset) if is_detected else float(top_label_y)
+                y_mode = 'data' if is_detected else 'axes_top'
+                label_candidates.append((float(peak_energy), label, element_color_map.get(element, 'black'), style, y_value, y_mode, 10 if is_detected else 9, 'bold' if is_detected else 'normal', 1.0 if is_detected else 0.9))
+
+        legend_handles, legend_labels = [], set()
+        if show_text and label_candidates:
+            label_candidates.sort(key=lambda item: item[0])
+            groups, current = [], []
+            overlap_threshold = max(0.16, 1.1 * float(tolerance))
+            for label in label_candidates:
+                if not current or abs(label[0] - current[-1][0]) <= overlap_threshold:
+                    current.append(label)
                 else:
-                    all_label_candidates.append(
-                        (
-                            float(peak_energy),
-                            label_text,
-                            color,
-                            linestyle,
-                            float(height + label_vertical_offset),
-                            "data",
-                            10,
-                            "bold",
-                            1.0,
-                        )
-                    )
+                    groups.append(current)
+                    current = [label]
+            if current:
+                groups.append(current)
 
-        if show_text and all_label_candidates:
-            all_label_candidates.sort(key=lambda item: item[0])
-
-            overlap_threshold = max(0.16, 1.10 * float(tolerance))
-            grouped_labels = []
-            current_group = []
-
-            for label in all_label_candidates:
-                if not current_group:
-                    current_group.append(label)
-                    continue
-
-                prev_energy = current_group[-1][0]
-                energy_delta = abs(label[0] - prev_energy)
-                should_group = energy_delta <= overlap_threshold
-
-                if should_group:
-                    current_group.append(label)
-                else:
-                    grouped_labels.append(current_group)
-                    current_group = [label]
-
-            if current_group:
-                grouped_labels.append(current_group)
-
-            for group in grouped_labels:
+            for group in groups:
                 if len(group) == 1:
-                    (
-                        peak_energy,
-                        label_text,
-                        color,
-                        linestyle,
-                        y_value,
-                        y_mode,
-                        font_size,
-                        font_weight,
-                        alpha_value,
-                    ) = group[0]
-                    if y_mode == "axes_top":
-                        ax_spec.text(
-                            peak_energy,
-                            y_value,
-                            label_text,
-                            ha="center",
-                            va="top",
-                            fontsize=font_size,
-                            color=color,
-                            weight=font_weight,
-                            rotation=90,
-                            alpha=alpha_value,
-                            transform=ax_spec.get_xaxis_transform(),
-                            clip_on=True,
-                        )
+                    peak_energy, label_text, color, _, y_value, y_mode, font_size, font_weight, alpha_value = group[0]
+                    common = dict(ha='center', fontsize=font_size, color=color, weight=font_weight, rotation=90, alpha=alpha_value)
+                    if y_mode == 'axes_top':
+                        ax_spec.text(peak_energy, y_value, label_text, va='top', transform=ax_spec.get_xaxis_transform(), clip_on=True, **common)
                     else:
-                        ax_spec.text(
-                            peak_energy,
-                            y_value,
-                            label_text,
-                            ha="center",
-                            va="bottom",
-                            fontsize=font_size,
-                            color=color,
-                            weight=font_weight,
-                            rotation=90,
-                            alpha=alpha_value,
-                        )
+                        ax_spec.text(peak_energy, y_value, label_text, va='bottom', **common)
                 else:
-                    for _, label_text, color, linestyle, _, _, _, _, _ in group:
-                        legend_key = (label_text, str(color), linestyle)
-                        if legend_key in legend_labels:
+                    for _, label_text, color, linestyle, *_ in group:
+                        key = (label_text, str(color), linestyle)
+                        if key in legend_labels:
                             continue
-                        legend_labels.add(legend_key)
-                        legend_handles.append(
-                            Line2D(
-                                [0],
-                                [0],
-                                color=color,
-                                linestyle=linestyle,
-                                linewidth=1.5,
-                                label=label_text,
-                            )
-                        )
+                        legend_labels.add(key)
+                        legend_handles.append(Line2D([0], [0], color=color, linestyle=linestyle, linewidth=1.5, label=label_text))
 
-        overlap_legend = None
         if legend_handles:
-            overlap_legend = ax_spec.legend(
-                handles=legend_handles,
-                loc="upper right",
-                fontsize=8,
-                title="Overlapping Labels",
-            )
-        if overlap_legend is not None:
+            overlap_legend = ax_spec.legend(handles=legend_handles, loc='upper right', fontsize=8, title='Overlapping Labels')
             ax_spec.add_artist(overlap_legend)
 
         fig.tight_layout()
         plt.show()
 
-        print(
-            f"{'Energy (keV)':<12} {'Intensity':<12} {'SNR':<8} "
-            f"{'Best Match':<22} {'Alt 2':<22} {'Alt 3':<22}"
-        )
-        print("-" * 105)
+        sorted_table_rows = sorted(table_rows, key=lambda item: item[0])
+        print(f"{'Energy (keV)':<12} {'Intensity':<12} {'SNR':<8} {'Best Match':<22} {'Alt 2':<22} {'Alt 3':<22}")
+        print('-' * 105)
         for peak_energy, height, snr, best_match, alt_2, alt_3 in sorted_table_rows:
-            print(
-                f"{peak_energy:<12.3f} {height:<12.1f} {snr:<8.1f} "
-                f"{best_match:<22} {alt_2:<22} {alt_3:<22}"
-            )
-        print("-" * 105)
-        print(
-            f"{displayed_peak_count} of {total_over_snr_peak_count} peaks above "
-            f"snr_min={min_snr:.1f}, snr_threshold={snr_threshold_for_sample:.1f} displayed.\n"
-        )
+            print(f'{peak_energy:<12.3f} {height:<12.2f} {snr:<8.1f} {best_match:<22} {alt_2:<22} {alt_3:<22}')
+        print('-' * 105)
+        print(f'{len(display_peaks)} of {len(significant_peaks)} peaks above snr_min={snr_min:.1f}, snr_threshold={snr_threshold:.1f} displayed.\n')
 
         if return_details:
             return {
-                "figure": fig,
-                "axes": (ax_img, ax_spec),
-                "detected_elements": sorted(detected_elements),
-                "element_confidence": element_confidence,
-                "display_peaks": display_peaks,
-                "peak_matches": peak_matches,
-                "snr_min": min_snr,
-                "snr_threshold": snr_threshold_for_sample,
+                'figure': fig,
+                'axes': (ax_img, ax_spec),
+                'detected_elements': sorted(detected_elements),
+                'element_confidence': element_confidence,
+                'display_peaks': display_peaks,
+                'peak_matches': peak_matches,
+                'snr_min': snr_min,
+                'snr_threshold': snr_threshold,
             }
-
         return fig, (ax_img, ax_spec)
 
     def _fit_mean_model_pytorch(
