@@ -46,6 +46,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         signal_units: str = 'arb. units',
         _token: object | None = None,
     ):
+        """Initialize a 3D EDS dataset."""
         super().__init__(
             array=array,
             name=name,
@@ -59,6 +60,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _normalize_specs(specs, param_name='spec', allow_none=False):
+        """Parse specs into a flat list of stripped strings."""
         if specs is None:
             if allow_none:
                 return None
@@ -71,14 +73,17 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _normalize_token(text):
+        """Return a lowercase alphanumeric-only token for fuzzy matching."""
         return re.sub(r'[^a-z0-9]', '', str(text).lower())
 
     @staticmethod
     def _ordered_element_keys(all_info):
+        """Return element keys sorted longest-first for greedy prefix matching."""
         return sorted(map(str, all_info), key=lambda k: (-len(k), k))
 
     @classmethod
     def _resolve_element_from_label(cls, label, ordered_elements):
+        """Extract the element name from a line label like 'FeKa1'."""
         label = str(label)
         for element in ordered_elements:
             if label.startswith(element):
@@ -88,12 +93,14 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @classmethod
     def _ensure_element_info(cls):
+        """Load element X-ray line data if not already cached."""
         if cls.element_info is None:
             cls.load_element_info()
         return cls.element_info or {}
 
     @classmethod
     def _parse_element_selectors(cls, specs, *, allow_none=False, param_name='spec'):
+        """Parse element/line specifiers into a dict of {element: set_of_suffixes | None}."""
         tokens = cls._normalize_specs(specs, param_name=param_name, allow_none=allow_none)
         if tokens is None:
             return None
@@ -115,10 +122,12 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _canonical_line_name(line_name: str) -> str:
+        """Strip any suffix after '__' from a line name."""
         return str(line_name).split('__', 1)[0]
 
     @classmethod
     def _iter_selected_lines(cls, element: str, suffix: str, *, raw_spec: str):
+        """Yield (line_name, line_info) pairs matching an element and optional suffix."""
         lines = cls._ensure_element_info().get(element) or {}
         if not lines:
             raise ValueError(f"No X-ray lines found for element '{element}'")
@@ -141,6 +150,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @classmethod
     def _group_labels_by_element(cls, labels: list[str]):
+        """Group line labels by their parent element."""
         ordered = cls._ordered_element_keys(cls._ensure_element_info())
         grouped: dict[str, list[str]] = {}
         for lbl in sorted(map(str, labels)):
@@ -151,6 +161,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @classmethod
     def _select_labels(cls, selector: str, *, labels: list[str], labels_by_element: dict[str, list[str]]):
+        """Return labels matching a selector string (exact, element, or prefix)."""
         selector = str(selector).strip()
         if not selector:
             return []
@@ -168,11 +179,13 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _line_shell(line_name: str) -> str:
+        """Return the shell letter ('K', 'L', 'M', or '?') for a line name."""
         line_name = str(line_name).upper()
         return 'K' if line_name.startswith('K') else 'L' if line_name.startswith('L') else 'M' if line_name.startswith('M') else '?'
 
     @staticmethod
     def _peak_confidence(snr_value: float, line_weight: float, distance_value: float, tolerance: float) -> float:
+        """Compute a confidence score for a peak-to-line match."""
         sigma = max(float(tolerance) / 3.0, 1e-9)
         return np.log1p(max(float(snr_value), 0.0)) * max(float(line_weight), 0.0) * np.exp(
             -0.5 * (float(distance_value) / sigma) ** 2
@@ -180,16 +193,19 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _line_matches_selector(line_name: str, selector: str) -> bool:
+        """Check whether a line name matches a shell or substring selector."""
         line = str(line_name).strip().lower()
         selector = str(selector).strip().lower()
         return line.startswith(selector) if selector in {'k', 'l', 'm'} else selector in line
 
     @classmethod
     def _line_allowed_for_element(cls, element_name: str, line_name: str, edge_filters=None) -> bool:
+        """Return True if the line passes the edge filter for its element."""
         selectors = None if edge_filters is None else edge_filters.get(str(element_name))
         return selectors is None or any(cls._line_matches_selector(line_name, token) for token in selectors)
 
     def _get_spectrum_images(self, method='integration'):
+        """Retrieve cached spectrum images for the given method."""
         return {
             'integration': getattr(self, '_spectrum_images', None),
             'fit': getattr(self, '_spectrum_images_pytorch', None),
@@ -197,10 +213,12 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _shell_preference_factor(shell_name: str) -> float:
+        """Return a down-weighting factor for M-shell lines."""
         return 0.72 if shell_name == 'M' else 1.0
 
     @staticmethod
     def _merge_edge_filters(requested, saved):
+        """Merge requested and saved edge filters, unioning selectors per element."""
         if requested and saved:
             merged = dict(saved)
             for element, selectors in requested.items():
@@ -211,6 +229,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @staticmethod
     def _estimate_snr_thresholds(snr_values, peaks, snr_min=None, snr_threshold=None):
+        """Auto-estimate snr_min and snr_threshold from peak SNR distribution."""
         snr_values = np.asarray(snr_values, dtype=float)
         snr_values = snr_values[np.isfinite(snr_values)]
 
@@ -242,6 +261,30 @@ class Dataset3deds(Dataset3dspectroscopy):
         return snr_min, snr_threshold
 
     def x_ray_lookup(self, spec: str | list[str] | tuple[str, ...] | set[str]) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Look up X-ray line energies, weights, and labels.
+
+        Parameters
+        ----------
+        spec : str | sequence[str]
+            One or more element/line specifiers.  Accepted formats include
+            element names (``'Fe'``), element + shell (``'Fe K'``), and
+            element + line (``'Fe Ka1'``).  Comma-separated strings are
+            split automatically.
+
+        Returns
+        -------
+        energies : ndarray
+            1-D array of line energies in keV, sorted by energy.
+        weights : ndarray
+            Corresponding tabulated line weights (0--1).
+        labels : list[str]
+            Human-readable labels such as ``'FeKa1'``.
+
+        Raises
+        ------
+        ValueError
+            If no lines match the specifier(s).
+        """
         info = type(self)._ensure_element_info()
         ordered = type(self)._ordered_element_keys(info)
         specs = type(self)._normalize_specs(spec, param_name='spec')
@@ -282,6 +325,30 @@ class Dataset3deds(Dataset3dspectroscopy):
         )
 
     def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False, show=True):
+        """Generate spectrum images by integrating around X-ray line energies.
+
+        For each matched X-ray line, sums the spectral intensity within an
+        energy window of ``line_energy +/- width`` at every spatial pixel.
+        Results are cached in ``self._spectrum_images`` for later use by
+        :meth:`show_spectrum_images` and :meth:`quantify_composition_cliff_lorimer`.
+
+        Parameters
+        ----------
+        elements : str | sequence[str] | None, optional
+            Element/line specifiers (see :meth:`x_ray_lookup`).  If ``None``,
+            uses ``self.model_elements``.
+        width : float, optional
+            Half-width of the integration window in keV.
+        return_maps : bool, optional
+            If ``True``, return ``(maps, labels)``.
+        show : bool, optional
+            If ``True``, display the generated maps.
+
+        Returns
+        -------
+        tuple[ndarray, list[str]] | None
+            Only returned when *return_maps* is ``True``.
+        """
         if elements is None:
             if self.model_elements is None:
                 raise ValueError('elements must be specified')
@@ -303,6 +370,31 @@ class Dataset3deds(Dataset3dspectroscopy):
             return maps, labels
 
     def Integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
+        """Integrate the spectrum around specified X-ray lines.
+
+        Sums spectral intensity within ``line_energy +/- width`` for each
+        selector.  By default, displays the resulting map(s).
+
+        Parameters
+        ----------
+        spec : str | sequence[str]
+            Element/line specifiers (see :meth:`x_ray_lookup`), e.g.
+            ``'Fe Ka'`` or ``['Cu', 'Zn']``.
+        width : float, optional
+            Half-width of the integration window in keV.
+        return_maps : bool, optional
+            If ``True``, return the integrated maps.
+        show : bool, optional
+            If ``True``, display the maps.
+        **kwargs
+            Forwarded to the plotting function (e.g. ``cmap``, ``roi``).
+
+        Returns
+        -------
+        ndarray | dict[str, ndarray]
+            Single map when one selector is given, otherwise a dict keyed by
+            selector string.
+        """
         width = float(width)
         specs = type(self)._normalize_specs(spec, param_name='spec')
         arr = np.asarray(self.array, dtype=float)
@@ -349,9 +441,35 @@ class Dataset3deds(Dataset3dspectroscopy):
         return integrated_maps if return_maps or len(integrated_maps) != 1 else next(iter(integrated_maps.values()))
 
     def integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
+        """Convenience wrapper for Integrate."""
         return self.Integrate(spec=spec, width=width, return_maps=return_maps, show=show, **kwargs)
 
     def show_spectrum_images(self, x_ray_lines=None, return_fig=False, method='integration', **kwargs):
+        """Display cached spectrum images.
+
+        Parameters
+        ----------
+        x_ray_lines : str | sequence[str] | None, optional
+            Selectors to filter which images are shown.  If ``None``, one
+            panel per element is displayed.
+        return_fig : bool, optional
+            If ``True``, return ``(fig, ax)``.
+        method : {"integration", "fit"}, optional
+            Which cache to read from: integration-based maps or PyTorch
+            fit-based maps.
+        **kwargs
+            Forwarded to :func:`show_2d` (e.g. ``cmap``).
+
+        Returns
+        -------
+        tuple[Figure, Axes] | None
+            Only returned when *return_fig* is ``True``.
+
+        Raises
+        ------
+        ValueError
+            If no cached spectrum images exist for the chosen *method*.
+        """
         spectrum_images = self._get_spectrum_images(method)
         if not spectrum_images:
             raise ValueError('No spectrum images found. Run generage_spectrum_images(...) first.')
@@ -387,6 +505,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             return fig, ax
 
     def _build_pytorch_spectrum_images(self, abundance_maps: np.ndarray, element_names: list[str] | tuple[str, ...]) -> dict[str, np.ndarray]:
+        """Convert per-element abundance maps into per-line spectrum images using weights."""
         maps = np.asarray(abundance_maps)
         if maps.ndim != 3:
             return {}
@@ -405,6 +524,36 @@ class Dataset3deds(Dataset3dspectroscopy):
         return line_maps
 
     def quantify_composition_cliff_lorimer(self, k_factors, method='integration', return_maps=False, verbose=True):
+        """Quantify elemental composition using the Cliff-Lorimer thin-film method.
+
+        Parameters
+        ----------
+        k_factors : dict[str, float]
+            Mapping of element/line selectors to their k-factors, e.g.
+            ``{'Fe K': 1.0, 'Cu K': 1.45}``.  At least two elements are
+            required.
+        method : {"integration", "fit"}, optional
+            Which cached spectrum images to use for intensity extraction.
+        return_maps : bool, optional
+            If ``True``, include per-pixel atomic-percent and weight-percent
+            maps in the returned dict.
+        verbose : bool, optional
+            If ``True``, print the quantification summary table.
+
+        Returns
+        -------
+        dict
+            Keys include ``atomic_percent``, ``weight_percent``,
+            ``intensities``, ``weighted_intensities``, and
+            ``summary_table``.  When *return_maps* is ``True``, also
+            includes ``atomic_percent_maps`` and ``weight_percent_maps``.
+
+        Raises
+        ------
+        ValueError
+            If *k_factors* is empty, fewer than two elements are matched, or
+            spectrum images are missing.
+        """
         if not k_factors:
             raise ValueError('k_factors must be a non-empty dict')
         spectrum_images = self._get_spectrum_images(method)
@@ -508,9 +657,11 @@ class Dataset3deds(Dataset3dspectroscopy):
         return result
 
     def clear_spectrum_images(self):
+        """Clear cached integration-based spectrum images."""
         self._spectrum_images = {}
 
     def clear_spectrum_images_pytorch(self):
+        """Clear cached PyTorch fit-based spectrum images."""
         self._spectrum_images_pytorch = {}
 
     def peak_autoid(
@@ -535,6 +686,80 @@ class Dataset3deds(Dataset3dspectroscopy):
         mode=None,
         return_details=False,
     ):
+        """Automatically identify elements from EDS peaks in the mean spectrum.
+
+        Finds peaks in the spatially-averaged spectrum, matches them against a
+        database of known X-ray line energies, and classifies elements as
+        *detected* (high confidence) or *possible* (lower confidence).  Results
+        are printed and overlaid on an interactive spectrum plot.
+
+        Parameters
+        ----------
+        roi : sequence[int] | None, optional
+            Pixel-coordinate ROI ``[y0, y1, x0, x1]`` used when computing the
+            mean spectrum.  If ``None``, the full spatial extent is used.
+        roi_cal : sequence[float] | None, optional
+            Calibrated-coordinate ROI (same layout as *roi* but in physical
+            units).
+        energy_range : sequence[float] | None, optional
+            Two-element energy window ``[emin, emax]`` in keV.  Peaks outside
+            this range are ignored.
+        elements : str | sequence[str] | None, optional
+            Element or element-line specifiers to search for, e.g.
+            ``'Fe'``, ``'Fe Ka'``, or ``['Cu', 'Zn K']``.  When provided,
+            behaviour depends on *mode*.
+        refline : str | None, optional
+            Reserved for future use.
+        ignore_elements : str | sequence[str] | None, optional
+            Elements to exclude from autodetection.
+        ignore_range : sequence[float] | None, optional
+            Energy range ``[emin, emax]`` whose peaks are ignored.  Defaults to
+            ``[0, 0.25]`` keV to skip the noise floor.
+        threshold : float, optional
+            Legacy parameter (currently unused).  SNR filtering is controlled
+            by *snr_min* and *snr_threshold*.
+        tolerance : float, optional
+            Maximum energy difference in keV between a detected peak and a
+            tabulated X-ray line for them to be considered a match.
+            M-shell minor lines use ``tolerance * 0.5``.
+        min_line_weight : float, optional
+            Minimum tabulated line weight (0--1) for a line to be considered.
+        mask : ndarray | None, optional
+            Boolean spatial mask; only pixels where ``mask`` is ``True``
+            contribute to the mean spectrum.
+        show_text : bool, optional
+            If ``True``, annotate matched peaks on the plot.
+        snr_min : float | None, optional
+            Minimum signal-to-noise ratio for a peak to be displayed.  If
+            ``None``, estimated automatically from the SNR distribution.
+        snr_threshold : float | None, optional
+            SNR above which a peak match counts as "strong" evidence for an
+            element.  If ``None``, estimated automatically.
+        distance_threshold_for_sample : float, optional
+            Maximum energy distance (keV) for a match to qualify as a strong
+            match (used together with *snr_threshold*).
+        grid_peaks : dict | None, optional
+            Mapping of ``{label: energy}`` for known grid/artifact peaks that
+            should be flagged in the output.
+        peaks : int, optional
+            Maximum number of peaks to display.
+        mode : {"elements_only", "elements_preferred", "autofill"} | None, optional
+            Search strategy.  ``"elements_only"`` restricts matching to
+            *elements*; ``"elements_preferred"`` boosts them but allows others;
+            ``"autofill"`` (default when *elements* is ``None``) searches all
+            elements.
+        return_details : bool, optional
+            If ``True``, return a dict with detection details instead of the
+            figure.
+
+        Returns
+        -------
+        tuple[Figure, tuple[Axes, Axes]] | dict
+            By default returns ``(fig, (ax_img, ax_spec))``.  When
+            *return_details* is ``True``, returns a dict containing
+            ``detected_elements``, ``element_confidence``, ``display_peaks``,
+            ``peak_matches``, ``snr_min``, ``snr_threshold``, and the figure.
+        """
         type(self)._ensure_element_info()
         all_info = type(self).element_info or {}
         grid_peaks = grid_peaks or {}
@@ -1211,6 +1436,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         default_lr_lbfgs,
         verbose=False,
     ):
+        """Fit a single mean spectrum using the PyTorch EDS model."""
         target = spectrum_raw
         spectrum_offset = torch.tensor(0.0, dtype=spectrum_raw.dtype, device=spectrum_raw.device)
         spectrum_scale = torch.tensor(1.0, dtype=spectrum_raw.dtype, device=spectrum_raw.device)
@@ -1301,6 +1527,40 @@ class Dataset3deds(Dataset3dspectroscopy):
         optimizer="lbfgs",
         device=None,
     ):
+        """Fit the spatially-summed mean EDS spectrum and display results.
+
+        A convenience wrapper around :meth:`_fit_mean_model_pytorch` that
+        handles device selection, energy windowing, and result visualization.
+
+        Parameters
+        ----------
+        energy_range : sequence[float] | None, optional
+            Two-element energy interval ``[emin, emax]`` in keV.  If ``None``,
+            the full energy axis is used.
+        elements_to_fit : sequence[str] | None, optional
+            Element symbols to include in the fit.  If ``None``, uses keys
+            from ``self.model_elements``.
+        peak_width : float, optional
+            Initial FWHM-like peak width in keV.
+        num_iters : int, optional
+            Number of optimization iterations.
+        lr : float | None, optional
+            Learning rate.  If ``None``, an optimizer-specific default is used.
+        polynomial_background_degree : int, optional
+            Degree of the polynomial background basis.
+        optimizer : {"adam", "lbfgs"}, optional
+            Optimizer to use.
+        device : str | torch.device | None, optional
+            Torch device.  If ``None``, uses CUDA when available.
+
+        Returns
+        -------
+        dict
+            Keys include ``loss_history``, ``fitted_spectrum``,
+            ``input_spectrum``, ``background_spectrum``, ``concentrations``,
+            ``element_names``, ``peak_widths``, ``energy_axis``, and
+            ``fit_range``.
+        """
         optimizer_name = str(optimizer).lower()
         if optimizer_name not in {"adam", "lbfgs"}:
             raise ValueError("optimizer must be 'lbfgs' or 'adam'")
@@ -2021,24 +2281,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         }
 
     def calculate_background_powerlaw(self, spectrum):
+        """Estimate a power-law Bremsstrahlung background from the spectrum."""
         import numpy as np
-
-        """
-            From input spectrum, calculate power-law background typical for EDS Bremsstrahlung.
-            Uses a conservative approach with heavy smoothing to avoid creating artifacts.
-            
-            Parameters
-            ----------
-            spectrum : ndarray
-                1D spectrum
-            energy_axis : ndarray
-                Energy axis corresponding to spectrum
-                
-            Returns
-            -------
-            ndarray
-                1D array representing the calculated background
-            """
         from scipy.ndimage import gaussian_filter
 
         # Use a larger window for more conservative background estimation
