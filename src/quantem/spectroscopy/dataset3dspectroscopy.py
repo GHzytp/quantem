@@ -984,7 +984,7 @@ class Dataset3dspectroscopy(Dataset3d):
         self,
         energy_window=None,
         roi=None,
-        roi_units=None,
+        roi_cal=None,
         mask=None,
         data_type="eds",
         cmap="viridis",
@@ -1019,8 +1019,8 @@ class Dataset3dspectroscopy(Dataset3d):
         tuple
             ``(fig, (ax_map, ax_spec), energy_map)`` where ``energy_map`` is the integrated 2D array.
         """
-        y, x, dy, dx = self._resolve_roi(roi=roi, roi_units=roi_units)
-        has_roi_overlay = any(val is not None for val in (roi, roi_units))
+        y, x, dy, dx = self._resolve_roi(roi=roi, roi_cal=roi_cal)
+        has_roi_overlay = any(val is not None for val in (roi, roi_cal))
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
@@ -1057,7 +1057,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         spec = self.calculate_mean_spectrum(
             roi=roi,
-            roi_units=roi_units,
+            roi_cal=roi_cal,
             mask=mask,
             attach_mean_spectrum=False,
         )
