@@ -1166,11 +1166,12 @@ class Dataset3deds(Dataset3dspectroscopy):
                 out.append(f'{element} [all]' if not selectors else f"{element} [{', '.join(sorted(map(str, selectors)))}]")
             return '\n'.join(out) if out else 'None'
 
-        print(f"\nAutodetected: {format_elements_with_lines(detected_elements) if detected_elements else 'None'}")
-        if dominant_elements:
-            dominant_str = ', '.join(f"{el} (conf={element_confidence.get(str(el), 0.0):.2f})" for el in sorted(dominant_elements, key=lambda el: element_confidence.get(str(el), 0.0), reverse=True))
-            print(f'Dominant (strong prior): {dominant_str}')
-        print(f"Possible: {format_elements_with_lines(candidate_elements) if candidate_elements else 'None'}")
+        all_identified = set(detected_elements) | set(candidate_elements)
+        print(f"\nDetected: {format_elements_with_lines(all_identified) if all_identified else 'None'}")
+        visible_dominant = dominant_elements & all_identified
+        if visible_dominant:
+            dominant_str = ', '.join(f"{el} (conf={element_confidence.get(str(el), 0.0):.2f})" for el in sorted(visible_dominant, key=lambda el: element_confidence.get(str(el), 0.0), reverse=True))
+            print(f'High confidence: {dominant_str}')
 
         elements_for_color = set(detected_elements) | {str(match[4]) for match in peak_matches}
         if search_elements is not None:
@@ -1241,23 +1242,10 @@ class Dataset3deds(Dataset3dspectroscopy):
                     ref_energy = float(ref_energy)
                 except (TypeError, ValueError):
                     ref_energy = None
-                # Compute observed/expected ratio: use detected peak intensity / expected weight
-                ratio_str = ''
-                weight = line_info.get('weight', None)
-                try:
-                    weight = float(weight) if weight is not None else 0.0
-                except Exception:
-                    weight = 0.0
-                if detected_peak_intensity is not None and weight:
-                    try:
-                        ratio = float(detected_peak_intensity) / float(weight)
-                        ratio_str = f", {ratio:.2f}"
-                    except Exception:
-                        ratio_str = ''
                 label_core = label.rstrip('*')
                 star = '*' if label.endswith('*') else ''
                 if ref_energy is not None:
-                    return f"{label_core} ({ref_energy:.3f}{ratio_str}){star}"
+                    return f"{label_core} ({ref_energy:.3f}){star}"
                 else:
                     return label
 
@@ -1271,7 +1259,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             best_label = f'{match[4]} {match[7]}'
 
             def fmt(label, score=None):
-                label = f'{label}*' if str(label).split()[0] in detected_elements else label
+                label = f'{label}*' if requested_elements and str(label).split()[0] in requested_elements else label
                 return label
 
             # Gather all intensities for this element for ratio calculation
@@ -1346,21 +1334,15 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         if show_text and peak_matches:
             label_offset = max(0.03 * y_scale, 0.08)
-            # Only label autodetected elements and explicitly requested elements
-            label_allowed = set(detected_elements)
+            label_allowed = set(detected_elements) | possible_elements
             if requested_elements:
                 label_allowed.update(str(el) for el in requested_elements)
             for _, height, peak_energy, _, element, match_str, _, _, _, _ in peak_matches:
-                is_detected = element in detected_elements and float(peak_energy) in detected_sample_peaks
+                is_requested = requested_elements is not None and element in requested_elements
                 if element not in label_allowed or in_ignore(peak_energy):
                     continue
-                if not is_detected and element not in (requested_elements or set()):
-                    continue
-                label = f"{element} {match_str.split()[-1]}" + ('*' if is_detected else '')
-                style = '-' if is_detected else '--'
-                y_value = float(height + label_offset) if is_detected else float(top_label_y)
-                y_mode = 'data' if is_detected else 'axes_top'
-                label_candidates.append((float(peak_energy), label, element_color_map.get(element, 'black'), style, y_value, y_mode, 10 if is_detected else 9, 'bold' if is_detected else 'normal', 1.0 if is_detected else 0.9))
+                label = f"{element} {match_str.split()[-1]}" + ('*' if is_requested else '')
+                label_candidates.append((float(peak_energy), label, element_color_map.get(element, 'black'), '-', float(height + label_offset), 'data', 10, 'bold', 1.0))
 
         legend_handles, legend_labels = [], set()
         if show_text and label_candidates:

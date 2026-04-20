@@ -959,6 +959,7 @@ class Dataset3dspectroscopy(Dataset3d):
                     linestyle=linestyle,
                     linewidth=linewidth,
                     alpha=alpha,
+                    label=label,
                 )
                 artists.append(line_artist)
                 labels.append(label)
