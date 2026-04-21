@@ -43,6 +43,14 @@ def plot_lattice_vectors(
         None clips lines to image edges.
     **kwargs forwarded to show_2d (e.g. cmap, title).
     """
+    # Check if lattice vectors have been defined
+    if not hasattr(lattice, "_lat"):
+        raise ValueError(
+            "Must define lattice vectors first. Call `Lattice.define_lattice_vectors()`"
+        )
+    # Adding a defualt figsize
+    if "figsize" not in kwargs:
+        kwargs["figsize"] = (10, 10)
     fig, ax = show_2d(lattice._image.array, returnfig=True, **kwargs)
     if ax.images:
         ax.images[-1].set_zorder(0)
@@ -50,10 +58,10 @@ def plot_lattice_vectors(
     r0, u, v = (np.asarray(x, dtype=float) for x in lattice._lat)
 
     ax.scatter(
-        r0[1], r0[0], s=60, edgecolor=(0, 0, 0), facecolor=(0, 0.5, 0), marker="s", zorder=30
+        r0[1], r0[0], s=60, edgecolor=(0, 0, 0), facecolor=(0, 0.5, 0), marker="s", zorder=5
     )
 
-    n_vec = int(bound_num_vectors) if bound_num_vectors is not None else 1
+    n_vec = int(np.ceil(bound_num_vectors)) if bound_num_vectors is not None else 1
     for k in range(1, n_vec + 1):
         tip = r0 + k * u
         ax.arrow(
@@ -66,7 +74,7 @@ def plot_lattice_vectors(
             head_length=6.0,
             linewidth=2.0,
             color="red",
-            zorder=20,
+            zorder=4,
         )
     for k in range(1, n_vec + 1):
         tip = r0 + k * v
@@ -80,7 +88,7 @@ def plot_lattice_vectors(
             head_length=6.0,
             linewidth=2.0,
             color=(0.0, 0.7, 1.0),
-            zorder=20,
+            zorder=4,
         )
 
     if bound_num_vectors is None:
