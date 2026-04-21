@@ -1929,7 +1929,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
 
         if elements_to_fit is None:
-            if self.model_elements is None:
+            if not self.model_elements:
                 raise ValueError("elements_to_fit must be specified")
             elements_to_fit = list(self.model_elements.keys())
             print(f"using model_elements {elements_to_fit}")
@@ -2205,7 +2205,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             raise ValueError("constrain_background must be >= 0")
 
         if elements_to_fit is None:
-            if self.model_elements is None:
+            if not self.model_elements:
                 raise ValueError("elements_to_fit must be specified")
             elements_to_fit = list(self.model_elements.keys())
             if verbose:

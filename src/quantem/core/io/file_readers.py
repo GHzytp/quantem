@@ -188,6 +188,12 @@ def read_3d_spectroscopy(
         for ax in ordered_axes
     ]
 
+    for i, unit in enumerate(units):
+        if unit == "eV":
+            sampling[i] = sampling[i] / 1000
+            origin[i] = origin[i] / 1000
+            units[i] = "keV"
+
     if data_type == "EELS":
         dataset_cls = Dataset3deels
     elif data_type == "EDS":

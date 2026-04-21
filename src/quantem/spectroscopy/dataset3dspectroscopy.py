@@ -14,6 +14,31 @@ from quantem.core.visualization import show_2d
 from quantem.spectroscopy.utils import load_xray_lines_database
 
 
+class _ModelElementsDict(dict):
+    """dict subclass for model_elements with a readable repr."""
+
+    def __repr__(self):
+        if not self:
+            return "Model Elements:\n  None"
+        lines = ["Model Elements:"]
+        for element, line_info in self.items():
+            if isinstance(line_info, dict) and line_info:
+                line_names = ', '.join(sorted(line_info.keys()))
+                lines.append(f"  {element}: {line_names}")
+            else:
+                lines.append(f"  {element}")
+        return '\n'.join(lines)
+
+    def _repr_html_(self):
+        if not self:
+            return "<b>Model Elements:</b><br>&nbsp;&nbsp;None"
+        rows = "".join(
+            f"<tr><td><b>{el}</b></td><td>{', '.join(sorted(info.keys())) if isinstance(info, dict) and info else ''}</td></tr>"
+            for el, info in self.items()
+        )
+        return f"<b>Model Elements:</b><table>{rows}</table>"
+
+
 class Dataset3dspectroscopy(Dataset3d):
     # stores the element line info so you don't need to reload each time
     element_info = None
@@ -40,7 +65,7 @@ class Dataset3dspectroscopy(Dataset3d):
             _token=type(self)._token if _token is None else _token,
         )
 
-        self.model_elements = None
+        self.model_elements = _ModelElementsDict()
         self.attached_spectra = None
 
     # loads elemental information
@@ -159,9 +184,6 @@ class Dataset3dspectroscopy(Dataset3d):
             return
 
         specs = type(self)._normalize_element_specs(elements)
-        if self.model_elements is None:
-            self.model_elements = {}
-
         added_this_call = {}
 
         for spec in specs:
@@ -201,7 +223,7 @@ class Dataset3dspectroscopy(Dataset3d):
                     added_this_call[element_key] = []
                 added_this_call[element_key].extend(added_keys)
         if not self.model_elements:
-            self.model_elements = None
+            self.model_elements = _ModelElementsDict()
 
         if added_this_call:
             print("Added to model:")
@@ -225,7 +247,7 @@ class Dataset3dspectroscopy(Dataset3d):
             - 'Te La' (remove only Te La line)
             - ['Au Ma', 'Te La']
         """
-        if self.model_elements is None:
+        if not self.model_elements:
             return
 
         specs = type(self)._normalize_element_specs(elements)
@@ -257,11 +279,11 @@ class Dataset3dspectroscopy(Dataset3d):
                 self.model_elements.pop(element_key, None)
 
         if not self.model_elements:
-            self.model_elements = None
+            self.model_elements = _ModelElementsDict()
 
     def clear_model_elements(self):
         """Clear all elements from the model."""
-        self.model_elements = None
+        self.model_elements = _ModelElementsDict()
 
     # Storage of spectra alongside dataset
 
