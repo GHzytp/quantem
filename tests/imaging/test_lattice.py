@@ -18,14 +18,17 @@ class TestLatticeInit:
         with pytest.raises(RuntimeError, match="Use Lattice.from_data"):
             Lattice(ds2d)
 
-        lattice = Lattice.from_data(image)
-        assert isinstance(lattice, Lattice)
-        assert lattice.image is not None
+        lattice_img = Lattice.from_data(image)
+        lattice_dset = Lattice.from_data(ds2d)
+        assert isinstance(lattice_img, Lattice)
+        assert lattice_img.image is not None
+        assert isinstance(lattice_dset, Lattice)
+        assert lattice_dset.image is not None
 
     def test_normalization(self):
         """Test min/max normalization."""
         image = np.random.randn(100, 100) * 1000.0
-        image[0, 0] = 0.0
+        image[0, 0] = -10.0
         image[99, 99] = 1000.0
 
         # Both normalizations
@@ -36,6 +39,14 @@ class TestLatticeInit:
         # No normalization
         lattice = Lattice.from_data(image, normalize_min=False, normalize_max=False)
         assert_array_almost_equal(lattice.image.array, image)
+
+        # Min normalization
+        lattice = Lattice.from_data(image, normalize_min=True, normalize_max=False)
+        assert lattice.image.array.min() == 0
+
+        # Max normalization
+        lattice = Lattice.from_data(image, normalize_min=False, normalize_max=True)
+        assert lattice.image.array.max() == 1
 
     def test_edge_cases(self):
         """Test NaN handling."""
@@ -130,6 +141,14 @@ class TestDefineLatticeVectors:
         # Negative block_size
         with pytest.raises(ValueError):
             lattice.define_lattice_vectors(origin=[50, 50], u=[5, 0], v=[0, 5], block_size=-1)
+
+        # Origin out of bounds
+        with pytest.raises(ValueError):
+            lattice.define_lattice_vectors(origin=[10, 105], u=[5, 0], v=[0, 5])
+
+        # Non-ivertible lattice vectors
+        with pytest.raises(ValueError):
+            lattice.define_lattice_vectors(origin=[50, 50], u=[5, 0], v=[10, 0])
 
 
 class TestLatticeSerialize:

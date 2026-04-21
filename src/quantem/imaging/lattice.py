@@ -179,6 +179,16 @@ class Lattice(AutoSerialize):
         )
         if not self._lat.shape == (3, 2):
             raise ValueError("origin, u, v must be in (row, col) format only.")
+        if not (
+            0 <= origin[0] < self.image.array.shape[0]
+            and 0 <= origin[1] < self.image.array.shape[1]
+        ):
+            raise ValueError("origin must be within the image bounds.")
+        try:
+            L = self._lat[1:]
+            _ = np.linalg.inv(L)
+        except np.linalg.LinAlgError:
+            raise ValueError("u, v must be invertible.")
 
         # Refine lattice coordinates
         # Note that we currently assume corners are local maxima
