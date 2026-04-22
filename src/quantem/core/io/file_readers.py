@@ -189,7 +189,7 @@ def read_3d_spectroscopy(
     ]
 
     for i, unit in enumerate(units):
-        if unit == "eV":
+        if unit == "eV" and data_type == "EDS":
             sampling[i] = sampling[i] / 1000
             origin[i] = origin[i] / 1000
             units[i] = "keV"
