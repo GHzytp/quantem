@@ -113,7 +113,7 @@ class PtychoLite(Ptychography):
             probe_params.update(polar_parameters)
 
         if middle_focus:
-            if num_slices > 1:
+            if num_slices > 1 and obj_model.slice_thicknesses is not None:
                 half_thickness = obj_model.slice_thicknesses.sum() / 2
                 if "C10" in probe_params and probe_params["C10"] is not None:
                     probe_params["C10"] -= half_thickness

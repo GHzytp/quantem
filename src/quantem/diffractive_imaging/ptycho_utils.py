@@ -136,7 +136,7 @@ def fourier_shift_expand(
     if af.is_complex(array):
         return shifted_array
     else:
-        return shifted_array.real
+        return shifted_array.real # type:ignore ## will be numeric so this should be safe 
 
 
 @overload
@@ -144,20 +144,20 @@ def fourier_translation_operator(
     positions: np.ndarray,
     shape: tuple,
     expand_dim: bool = True,
-    dtype: "str|torch.dtype|None" = None,
+    dtype: "str|torch.dtype|np.dtype|None" = None,
 ) -> np.ndarray: ...
 @overload
 def fourier_translation_operator(
     positions: "torch.Tensor",
     shape: tuple,
     expand_dim: bool = True,
-    dtype: "str|torch.dtype|None" = None,
+    dtype: "str|torch.dtype|np.dtype|None" = None,
 ) -> "torch.Tensor": ...
 def fourier_translation_operator(
     positions: ArrayLike,
     shape: tuple,
     expand_dim: bool = True,
-    dtype: "str|torch.dtype|None" = None,
+    dtype: "str|torch.dtype|np.dtype|None" = None,
 ) -> ArrayLike:
     """Returns phase ramp for fourier-shifting array of shape `shape`."""
     nr, nc = shape[-2:]
