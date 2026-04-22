@@ -164,7 +164,7 @@ class KPlanes(nn.Module, PPLR):
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Optional[Sequence[int]] = None,
         concat_features: bool = True,
-        density_activation: Callable = lambda x: F.softplus(x - 1),
+        density_activation: Callable = lambda x: F.softplus(x - 1), # Keep playing around with this and trunc_exp
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
