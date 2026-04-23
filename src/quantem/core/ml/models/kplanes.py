@@ -130,7 +130,6 @@ def query_planes(
         result = result * sampled
     return result  # pyright: ignore[reportReturnType]
  
-
 def interpolate_ms_features(
     pts: torch.Tensor,
     ms_grids: nn.ParameterList,
@@ -283,7 +282,6 @@ class KPlanes(PPLR, TensorDecompositionModel):
         if not isinstance(resolution, Sequence):
             raise TypeError("Resolution must be a sequence")
         self._resolution = list(resolution)
-
 
 # ---------------------------------------------------------------------------
 # KPlanesTILTED
@@ -576,7 +574,6 @@ class KPlanesTILTED(KPlanes):
     def tilted(self) -> bool:
         return True
         
-
 # CP Decomp for Warmup SO3 rotations
 
 def interpolate_ms_features_cp_tilted(
