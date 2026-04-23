@@ -14,11 +14,11 @@ from quantem.core.ml import OptimizerParams
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
-from quantem.core.ml.models.kplanes import KPlanes, KPlanesTILTED
-from quantem.core.ml.models.model_base import PPLR
+from quantem.core.ml.models.model_base import PPLR, PlanarDecompositionModel
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
+
 
 class ObjConstraintParams:
     """
@@ -197,6 +197,12 @@ ObjConstraintsType = (
 )
 
 
+def _unwrap(model: nn.Module | nn.parallel.DistributedDataParallel) -> PlanarDecompositionModel:
+    """Unwrap a DistributedDataParallel model to get the underlying module ONLY for tensor decomposition models."""
+    if isinstance(model, nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
+
 class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
     DEFAULT_LRS = {
         "object": 8e-6,
@@ -205,7 +211,6 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
     """
     Base class for all ObjectModels to inherit from.
     """
-
     def __init__(
         self,
         shape: tuple[int, int, int],  # pyright: ignore[reportRedeclaration]
@@ -297,7 +302,6 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
 
             raise NotImplementedError
 
-
 class ObjectConstraints(BaseConstraints, ObjectBase):  # TODO: Ask Arthur why we still need this
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -308,7 +312,6 @@ class ObjectConstraints(BaseConstraints, ObjectBase):  # TODO: Ask Arthur why we
         Get the TV loss for the object model. Must be implemented in each subclass.
         """
         raise NotImplementedError
-
 
 class ObjectPixelated(ObjectConstraints):
 
@@ -453,7 +456,6 @@ class ObjectPixelated(ObjectConstraints):
 
 class ObjectINR(ObjectConstraints, DDPMixin):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjINRConstraints()
-
     def __init__(
         self,
         shape: tuple[int, int, int],
@@ -470,7 +472,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
-        self.constraints: ObjConstraintsType = self.DEFAULT_CONSTRAINTS.copy()
+        self.constraints: ObjConstraintParams.ObjINRConstraints = self.DEFAULT_CONSTRAINTS.copy()
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
             self.setup_distributed(device=device)
@@ -881,10 +883,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             self.distribute_model(self._model)
         self.reconnect_optimizer_to_parameters()
 
-
 class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjTensorDecompConstraints()
-
     def __init__(
         self,
         shape: tuple[int, int, int],
@@ -901,7 +901,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
-        self.constraints: ObjConstraintsType = self.DEFAULT_CONSTRAINTS.copy()
+        self.constraints: ObjConstraintParams.ObjTensorDecompConstraints = self.DEFAULT_CONSTRAINTS.copy()
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
             self.setup_distributed(device=device)
@@ -929,7 +929,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
     # --- Properties ---
 
     @property
-    def model(self) -> nn.Module | nn.parallel.DistributedDataParallel:
+    def model(self) -> nn.Module | nn.parallel.DistributedDataParallel | PlanarDecompositionModel:
         """
         Returns the INR model.
         """
@@ -970,7 +970,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
             and self.constraints.sparsity > 0
         ):  # NOTE: For the linter, I must make this :)
-            sparsity_loss = self.constraints.sparsity * torch.norm(all_densities, p=1)
+            sparsity_loss = self.constraints.sparsity * all_densities.abs().mean()
             soft_loss += sparsity_loss
 
         return soft_loss
@@ -986,10 +986,11 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
 
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
-        is_tilted = isinstance(self.model, KPlanesTILTED)
+        is_tilted = self.model.tilted
         per_level = []
         
-        for p in self.model.grids:
+        model = _unwrap(self.model)
+        for p in model.grids:
             # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
             dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
             dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
@@ -1017,12 +1018,10 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
         tv_coords = coords[tv_indices]                               # (N, 3)
 
-        if hasattr(self.model, "resolution"):
-            h = 2.0 / min(self.model.resolution)
-        else:
-            h = 1e-2
+        model = _unwrap(self.model)
+        h = 2.0 / min(model.resolution)
 
-        pred = self.model(tv_coords)
+        pred = model(tv_coords)
         if isinstance(pred, tuple):
             pred = pred[0]
         if pred.dim() == 1:
@@ -1269,99 +1268,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
 
         return all_densities
 
-    # Pretrain Loop
-
-    def pretrain(
-        self,
-        pretrain_dataset: TomographyINRPretrainDataset,
-        batch_size: int,
-        reset: bool = False,
-        num_iters: int = 10,
-        num_workers: int = 0,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
-        loss_fn: Callable | str = "l1",
-        verbose: bool = True,
-    ):
-        """
-        Pretrain the INR model to fit target volume.
-        """
-
-        if (
-            pretrain_dataset is not None
-        ):  # Need to make a check if there's already a pretrain dataset to not go through with the setup again.
-            self.pretrain_dataset = pretrain_dataset
-            (
-                self.pretraining_dataloader,
-                self.pretraining_sampler,
-                self.pretraining_val_dataloader,
-                self.pretraining_val_sampler,
-            ) = self.setup_dataloader(pretrain_dataset, batch_size, num_workers=num_workers)
-
-        if optimizer_params is not None:
-            self.set_optimizer(optimizer_params)
-        if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_iters)
-
-        if reset:
-            self.reset()
-
-        loss_fn = get_loss_module(loss_fn, self.dtype)
-
-        self._pretrain(
-            num_iters=num_iters,
-            loss_fn=loss_fn,
-            verbose=verbose,
-        )
-
-    def _pretrain(
-        self,
-        num_iters: int,
-        loss_fn: Callable,
-        verbose: bool,
-    ):
-        if self.optimizer is None:
-            raise RuntimeError("Optimizer not set. Call set_optimizer() first.")
-        if self.scheduler is None:
-            raise RuntimeError("Scheduler not set. Call set_scheduler() first.")
-
-        self.model.train()
-        optimizer = self.optimizer
-        scheduler = self.scheduler
-
-        pbar = tqdm(range(num_iters), desc="Pretraining", disable=not verbose)
-        for a0 in pbar:
-            epoch_loss = 0
-            for batch_idx, batch in enumerate[Any](self.pretraining_dataloader):
-                coords = batch["coords"].to(self.device, non_blocking=True)
-                target = batch["target"].to(self.device, non_blocking=True)
-
-                with torch.autocast(
-                    device_type=self.device.type, dtype=torch.bfloat16, enabled=True
-                ):
-                    outputs = self.forward(coords)
-                    loss = loss_fn(outputs, target)
-
-                loss.backward()
-                epoch_loss += loss.item()
-
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                optimizer.step()
-                optimizer.zero_grad()
-
-            if scheduler is not None:
-                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(epoch_loss)
-                else:
-                    scheduler.step()
-
-            self._pretrain_losses.append(epoch_loss / len(self.pretraining_dataloader))
-            print(
-                f"Epoch {a0 + 1}/{num_iters}, Pretrain Loss: {epoch_loss / len(self.pretraining_dataloader):.4f}"
-            )
-            self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
+    # NOTE: Pretraining is done in a two-phase fashion as shown in TILTED paper.
 
     def create_volume(self, return_vol: bool = False):
         N = max(self._shape)

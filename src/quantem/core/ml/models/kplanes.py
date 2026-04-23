@@ -154,7 +154,7 @@ def interpolate_ms_features(
     return torch.cat(per_scale, dim=-1)
 
 
-class KPlanes(nn.Module, PPLR, TensorDecompositionModel):
+class KPlanes(PPLR, TensorDecompositionModel):
 
     def __init__(
         self,
@@ -247,6 +247,42 @@ class KPlanes(nn.Module, PPLR, TensorDecompositionModel):
     @property
     def td_type(self) -> str:
         return self._td_type
+
+    @td_type.setter
+    def td_type(self, td_type: str):
+        if not isinstance(td_type, str):
+            raise TypeError("td_type must be a string")
+        self._td_type = td_type
+    
+    @property
+    def tilted(self) -> bool:
+        return False
+
+    @tilted.setter
+    def tilted(self, tilted: bool):
+        if not isinstance(tilted, bool):
+            raise TypeError("tilted must be a boolean")
+        self._tilted = tilted
+
+    @property
+    def grids(self) -> torch.nn.ParameterList:
+        return self._grids
+
+    @grids.setter
+    def grids(self, grids: torch.nn.ParameterList):
+        if not isinstance(grids, torch.nn.ParameterList):
+            raise TypeError("Grids must be a ParameterList")
+        self._grids = grids
+
+    @property
+    def resolution(self) -> list[int]:
+        return self._resolution
+
+    @resolution.setter
+    def resolution(self, resolution: Sequence[int]):
+        if not isinstance(resolution, Sequence):
+            raise TypeError("Resolution must be a sequence")
+        self._resolution = list(resolution)
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +571,10 @@ class KPlanesTILTED(KPlanes):
             self.so3 = SO3ParamQuat(self.T, init=init)
         else:
             raise ValueError(f"Invalid SO3 parameterization type: {so3_param_type}")
+
+    @property
+    def tilted(self) -> bool:
+        return True
         
 
 # CP Decomp for Warmup SO3 rotations
@@ -590,7 +630,7 @@ def interpolate_ms_features_cp_tilted(
     return torch.cat(per_scale_features, dim=-1)
 
 
-class CPTilted(nn.Module, PPLR, TensorDecompositionModel):
+class CPTilted(PPLR, TensorDecompositionModel):
     """
     CP decomposition with TILTED rotations — the true bottleneck model for
     phase 1. Rank-1-per-channel feature representation.
@@ -661,3 +701,12 @@ class CPTilted(nn.Module, PPLR, TensorDecompositionModel):
 
     def extract_tau_state(self) -> torch.Tensor:
         return self.so3.M.detach().clone()
+    
+    @property
+    def tilted(self) -> bool:
+        return True
+
+
+
+
+KPlanesType = KPlanes | KPlanesTILTED | CPTilted
