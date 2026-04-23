@@ -1,9 +1,10 @@
 import os
 from pathlib import Path
-from typing import Any, Literal, Self, Sequence
+from typing import Any, Callable, Literal, Self, Sequence
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset4dstem
@@ -271,6 +272,7 @@ class PtychoLiteDIP(Ptychography):
         normalize_object_plotting: bool = True,
         # model settings
         cnn_num_layers: int = 3,
+        final_activation: str | Callable = nn.Identity(),
         # logging/device
         log_dir: os.PathLike | str | None = None,
         log_prefix: str = "",
@@ -287,6 +289,7 @@ class PtychoLiteDIP(Ptychography):
             out_channels=ptycholite.obj_model.num_slices,
             num_layers=cnn_num_layers,
             dtype=torch.complex64 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
+            final_activation=final_activation,
         )
 
         obj_model = ObjectDIP.from_pixelated(
