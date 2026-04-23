@@ -1017,13 +1017,12 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
         tv_coords = coords[tv_indices]                               # (N, 3)
 
-        inner = _unwrap(self.model)
-        if hasattr(inner, "resolution"):
-            h = 2.0 / min(inner.resolution)
+        if hasattr(self.model, "resolution"):
+            h = 2.0 / min(self.model.resolution)
         else:
             h = 1e-2
 
-        pred = inner(tv_coords)
+        pred = self.model(tv_coords)
         if isinstance(pred, tuple):
             pred = pred[0]
         if pred.dim() == 1:
@@ -1033,7 +1032,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         for axis in range(3):
             offset = torch.zeros(3, device=tv_coords.device)
             offset[axis] = h
-            shifted_pred = inner(tv_coords + offset)
+            shifted_pred = self.model(tv_coords + offset)
             if isinstance(shifted_pred, tuple):
                 shifted_pred = shifted_pred[0]
             if shifted_pred.dim() == 1:
@@ -1094,15 +1093,14 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
             self._optimizer_params = params
             return
 
-        inner = _unwrap(self.model)
-        if isinstance(inner, PPLR):
+        if isinstance(self.model, PPLR):
             if not isinstance(params, dict):
                 raise TypeError(f"optimizer parameters must be a dict for PPLR, got {type(params)}")
                 
             object_params = params
             
-            if set(object_params.keys()) != set(inner.param_keys):
-                raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {inner.param_keys}")
+            if set(object_params.keys()) != set(self.model.param_keys):
+                raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}")
 
             params = {}
             for key, value in object_params.items():
@@ -1125,8 +1123,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         updating get_optimization_parameters to return a list of parameters and their LRs.
         """
 
-        inner = _unwrap(self.model)
-        if not isinstance(inner, PPLR):
+        if not isinstance(self.model, PPLR):
             super().set_optimizer(opt_params)
             return
 

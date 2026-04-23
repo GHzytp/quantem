@@ -26,6 +26,7 @@ from quantem.tomography.object_models import (
     ObjConstraintsType,
     ObjectINR,
     ObjectPixelated,
+    ObjectTensorDecomp,
 )
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
@@ -42,7 +43,7 @@ class Tomography(TomographyOpt, TomographyBase):
     def from_models(
         cls,
         dset: DatasetModelType,
-        obj_model: ObjectINR,
+        obj_model: ObjectINR | ObjectTensorDecomp,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         verbose: int | bool = True,
@@ -180,7 +181,7 @@ class Tomography(TomographyOpt, TomographyBase):
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
-            if isinstance(self.obj_model, ObjectINR):
+            if isinstance(self.obj_model, ObjectINR) or isinstance(self.obj_model, ObjectTensorDecomp):
                 self.obj_model.model.train()
             else:
                 raise NotImplementedError(

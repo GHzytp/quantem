@@ -253,6 +253,60 @@ class KPlanes(nn.Module, PPLR, TensorDecompositionModel):
 # KPlanesTILTED
 # ---------------------------------------------------------------------------
  
+def interpolate_ms_features_tilted(
+    pts: torch.Tensor,             # (B, 3)
+    ms_grids: nn.ParameterList,    # each grid: (3*T, C, H, W)
+    rotation_matrices: torch.Tensor,  # (T, 3, 3)
+) -> torch.Tensor:
+    """
+    Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
+    Returns features of shape (B, C * T * num_scales).
+    """
+    T = rotation_matrices.shape[0]
+    B = pts.shape[0]
+
+    # (T, B, 3)  — rotate all points by all rotations at once
+    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+
+    # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
+    # index_select is faster and cleaner than advanced indexing with python lists.
+    # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2)
+    idx = torch.tensor([[0, 1],
+                        [2, 0],
+                        [1, 2]], device=pts.device)                  # (3, 2)
+    # rotated: (T, B, 3) -> gather along last dim with idx (3, 2)
+    # Result: (T, 3, B, 2)
+    coords = rotated.unsqueeze(1).expand(T, 3, B, 3).gather(
+        -1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2)
+    )
+
+    # Flatten (T, 3) -> 3*T so it matches grid's first dim, and add the H_out=1 axis
+    coord_tensor = coords.reshape(3 * T, B, 1, 2)                    # (3T, B, 1, 2)
+
+    per_scale_features = []
+    for plane_coef in ms_grids:
+        # plane_coef: (3T, C, H, W)
+        C = plane_coef.shape[1]
+
+        sampled = F.grid_sample(
+            plane_coef,
+            coord_tensor,
+            align_corners=True,
+            mode="bilinear",
+            padding_mode="border",
+        )  # (3T, C, B, 1)
+
+        # (3T, C, B) -> (T, 3, C, B) -> Hadamard across the "3" dim -> (T, C, B)
+        sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
+
+        # (T, C, B) -> (B, T, C) -> (B, T*C) to concatenate rotations along feature dim
+        per_scale_features.append(
+            sampled.permute(2, 0, 1).reshape(B, T * C)
+        )
+
+    # Concatenate across scales -> (B, T * C * num_scales)
+    return torch.cat(per_scale_features, dim=-1)
+
 class KPlanesTILTED(KPlanes):
     """
     K-Planes with T learned SO(3) rotations (TILTED).
@@ -352,7 +406,7 @@ class KPlanesTILTED(KPlanes):
         self._build_sigma_net(use_hybrid_mlp, hybrid_hidden_dim, hybrid_num_layers)
 
         # ---- Learnable rotations ----
-        self.so3 = SO3Param(T, init=tau_init)
+        self.set_so3_param_type(so3_param_type, init=tau_init)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -466,7 +520,7 @@ class KPlanesTILTED(KPlanes):
             f"num_scales={len(self.multiscale_res_multipliers)}"
         )
 
-    def set_so3_param_type(self, so3_param_type: str) -> None:
+    def set_so3_param_type(self, so3_param_type: str, init: str = "rand") -> None:
         """
         Set the SO3 parameterization type.
         
@@ -476,16 +530,12 @@ class KPlanesTILTED(KPlanes):
             SO3 parameterization type ("quat" or "r9svd").
         """
         if so3_param_type == "r9svd":
-            self.so3 = SO3ParamR9SVD(self.T)
+            self.so3 = SO3ParamR9SVD(self.T, init=init)
         elif so3_param_type == "quat":
-            self.so3 = SO3ParamQuat(self.T)
+            self.so3 = SO3ParamQuat(self.T, init=init)
         else:
             raise ValueError(f"Invalid SO3 parameterization type: {so3_param_type}")
         
-
-
-
-
 
 # CP Decomp for Warmup SO3 rotations
 
