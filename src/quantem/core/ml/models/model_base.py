@@ -25,3 +25,13 @@ class PPLR(ABC):
         This abstract property should return a list of available parameter keys.
         """
         pass
+
+class TensorDecompositionModel(ABC):
+
+    @property
+    @abstractmethod
+    def td_type(self) -> str:
+        """
+        This abstract property should return the type of tensor decomposition used.
+        """
+        pass
