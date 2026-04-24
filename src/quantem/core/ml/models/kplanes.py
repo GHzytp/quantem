@@ -381,7 +381,7 @@ class KPlanesTILTED(KPlanes):
         input_coords_dims: int = 3,
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
-        multiscale_res_multipliers: Optional[Sequence[int]] = None,
+        multiscale_res_multipliers: Optional[Sequence[float]] = None,
         density_activation: Callable = lambda x: F.softplus(x - 1),
         # TILTED parameters
         T: int = 4,

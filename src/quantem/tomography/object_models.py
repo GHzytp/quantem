@@ -1066,16 +1066,14 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
 
     def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
         
-        if isinstance(self.model, PPLR):
-
-            return [
-                {
-                    "params": self.model.get_params()[key], 
-                    **self.optimizer_params[key].params(),
-                }
-                for key in self.model.param_keys
-            ]
-        return list(self.params)
+        model = _unwrap (self.model)
+        return [
+            {
+                "params": model.get_params()[key], 
+                **self.optimizer_params[key].params(),
+            }
+            for key in model.param_keys
+        ]
 
 
     # --- Optimizer Mixin Overloads in the case of PPLR ---
@@ -1088,54 +1086,25 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
     @optimizer_params.setter
     def optimizer_params(self, params: OptimizerType | dict[str, OptimizerType] | dict[str, Any]):
         """Set the optimizer parameters."""
-        if isinstance(params, OptimizerType):
-            self._optimizer_params = params
-            return
 
-        if isinstance(self.model, PPLR):
-            if not isinstance(params, dict):
-                raise TypeError(f"optimizer parameters must be a dict for PPLR, got {type(params)}")
-                
-            object_params = params
+        if not isinstance(params, dict):
+            raise TypeError(f"optimizer parameters must be a dict for PPLR, got {type(params)}")
             
-            if set(object_params.keys()) != set(self.model.param_keys):
-                raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}")
-
-            params = {}
-            for key, value in object_params.items():
-                if isinstance(value, dict):
-                    params[key] = OptimizerParams.parse_dict(d=value)
-                elif isinstance(value, OptimizerType):
-                    params[key] = value
-                else:
-                    raise TypeError(f"optimizer parameters must be a dict or OptimizerType, got {type(value)}")
-
-            self._optimizer_params = params
-        else:
-            raise TypeError(f"optimizer parameters must be a dict for non-PPLR, got {type(params)}")
-
-
-    def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
-        """
-        Set the optimizer for this model.
-        Currently supports single LR for all parameters, TODO allow for per parameter LRs by
-        updating get_optimization_parameters to return a list of parameters and their LRs.
-        """
-
-        if not isinstance(self.model, PPLR):
-            super().set_optimizer(opt_params)
-            return
-
-        if opt_params is not None:
-            self.optimizer_params = opt_params
-
-        if not self._optimizer_params:
-            self._optimizer = None
-            return
-
-        params = self.get_optimization_parameters()
+        object_params = params
         
-        self._optimizer = torch.optim.Adam(params)
+        if set(object_params.keys()) != set(self.model.param_keys):
+            raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}")
+
+        params = {}
+        for key, value in object_params.items():
+            if isinstance(value, dict):
+                params[key] = OptimizerParams.parse_dict(d=value)
+            elif isinstance(value, OptimizerType):
+                params[key] = value
+            else:
+                raise TypeError(f"optimizer parameters must be a dict or OptimizerType, got {type(value)}")
+
+        self._optimizer_params = params
 
     def reconnect_optimizer_to_parameters(self) -> None:
         """
@@ -1144,58 +1113,56 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
 
         if self.optimizer is None:
             return
-            
-        if isinstance(self.model, PPLR):
-            current_params = self.get_optimization_parameters()
-            
+        
+        current_params = self.get_optimization_parameters()
+        
 
-            optimizable_params = [
-                p for p in current_params 
-                if isinstance(p['params'][0], torch.Tensor) and p['params'][0].is_leaf
-            ]
-            
+        optimizable_params = [
+            p for p in current_params 
+            if isinstance(p['params'][0], torch.Tensor) and p['params'][0].is_leaf
+        ]
+        
 
-            if not optimizable_params:
-                raise ValueError(f"Shouldn't be getting here! No optimizable parameters found for {self.__class__.__name__}.")
-            
-            for p in optimizable_params:
-                print(f"Setting requires_grad for parameter: {p}")
-                p['params'][0].requires_grad_(True)
-            
-            assert self._optimizer is not None
-            # Preserve optimizer states and param_group settings
-            old_state = self._optimizer.state.copy()
-            old_param_groups = self._optimizer.param_groups.copy()
+        if not optimizable_params:
+            raise ValueError(f"Shouldn't be getting here! No optimizable parameters found for {self.__class__.__name__}.")
+        
+        for p in optimizable_params:
+            print(f"Setting requires_grad for parameter: {p}")
+            p['params'][0].requires_grad_(True)
+        
+        assert self._optimizer is not None
+        # Preserve optimizer states and param_group settings
+        old_state = self._optimizer.state.copy()
+        old_param_groups = self._optimizer.param_groups.copy()
 
-            # Reconnect to new parameters
-            self._optimizer.param_groups.clear()
-            for param_group in optimizable_params:
-                self._optimizer.add_param_group(param_group)
+        # Reconnect to new parameters
+        self._optimizer.param_groups.clear()
+        for param_group in optimizable_params:
+            self._optimizer.add_param_group(param_group)
 
-            # Restore per-group hyperparameters (lr, betas, weight_decay, etc.) by index,
-            # excluding 'params' which comes from the new groups
-            for new_pg, old_pg in zip(self._optimizer.param_groups, old_param_groups):
-                new_pg.update({k: v for k, v in old_pg.items() if k != "params"})
+        # Restore per-group hyperparameters (lr, betas, weight_decay, etc.) by index,
+        # excluding 'params' which comes from the new groups
+        for new_pg, old_pg in zip(self._optimizer.param_groups, old_param_groups):
+            new_pg.update({k: v for k, v in old_pg.items() if k != "params"})
 
-            # Remap optimizer state: for any new param that IS the same tensor as an old param,
-            # carry its state over (moved to the right device just in case).
-            new_state = {}
-            for new_pg in self._optimizer.param_groups:
-                for new_param in new_pg["params"]:
-                    if new_param in old_state:
-                        device = new_param.device
-                        new_state[new_param] = {
-                            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                            for k, v in old_state[new_param].items()
-                        }
+        # Remap optimizer state: for any new param that IS the same tensor as an old param,
+        # carry its state over (moved to the right device just in case).
+        new_state = {}
+        for new_pg in self._optimizer.param_groups:
+            for new_param in new_pg["params"]:
+                if new_param in old_state:
+                    device = new_param.device
+                    new_state[new_param] = {
+                        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in old_state[new_param].items()
+                    }
 
-            self._optimizer.state.clear()
-            self._optimizer.state.update(new_state)
+        self._optimizer.state.clear()
+        self._optimizer.state.update(new_state)
 
-            if self._scheduler is not None and self._optimizer is not None:
-                self._scheduler.optimizer = self._optimizer
-        else:
-            super().reconnect_optimizer_to_parameters()
+        if self._scheduler is not None and self._optimizer is not None:
+            self._scheduler.optimizer = self._optimizer
+
 
     # Pretraining
     @property
