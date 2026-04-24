@@ -883,7 +883,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             self.distribute_model(self._model)
         self.reconnect_optimizer_to_parameters()
 
-class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
+class ObjectTensorDecomp(ObjectINR):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjTensorDecompConstraints()
     def __init__(
         self,
@@ -926,33 +926,6 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         obj_model.to(device)
         return obj_model
 
-    # --- Properties ---
-
-    @property
-    def model(self) -> nn.Module | nn.parallel.DistributedDataParallel | PlanarDecompositionModel:
-        """
-        Returns the INR model.
-        """
-        return self._model
-
-    @property
-    def obj(self) -> torch.Tensor:
-        return self._obj
-
-    @obj.setter
-    def obj(self, obj: torch.Tensor):
-        self._obj = obj
-
-    @property
-    def obj_view(self) -> np.ndarray:
-        """
-        Returns the object as a view of the x, y, z axes.
-
-        Matches the axes of conventionally reconstructed objects, this is the object that will be saved.
-        """
-        self.create_volume()
-        return self._obj.cpu().numpy().transpose(0, 1, 3, 2)
-
     # --- Constraints ---
 
     def apply_soft_constraints(
@@ -966,10 +939,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         if self.constraints.tv_vol > 0:
             soft_loss += self.get_tv_loss(coords, pred)
 
-        if (
-            isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
-            and self.constraints.sparsity > 0
-        ):  # NOTE: For the linter, I must make this :)
+        if self.constraints.sparsity > 0:  # NOTE: For the linter, I must make this :)
             sparsity_loss = self.constraints.sparsity * all_densities.abs().mean()
             soft_loss += sparsity_loss
 
@@ -1107,9 +1077,6 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         self._optimizer_params = params
 
     def reconnect_optimizer_to_parameters(self) -> None:
-        """
-        Reconnect optimizer overload, defaults back to the standard implementation if no `PPLR` is detected.
-        """
 
         if self.optimizer is None:
             return
@@ -1163,174 +1130,8 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         if self._scheduler is not None and self._optimizer is not None:
             self._scheduler.optimizer = self._optimizer
 
-
-    # Pretraining
-    @property
-    def pretrained_weights(self) -> dict[str, torch.Tensor]:
-        """get the pretrained weights of the INR model"""
-        return self._pretrained_weights
-
-    def _set_pretrained_weights(self, model: "torch.nn.Module"):
-        """set the pretrained weights of the INR model"""
-        if not isinstance(model, torch.nn.Module):
-            raise TypeError(f"Pretrained model must be a torch.nn.Module, got {type(model)}")
-        self._pretrained_weights = deepcopy(model.state_dict())
-
-    @property
-    def pretrain_target(self) -> TomographyINRPretrainDataset:
-        """get the pretrain target"""
-        return self._pretrain_target
-
-    @pretrain_target.setter
-    def pretrain_target(self, target: TomographyINRPretrainDataset):
-        """set the pretrain target"""
-        self._pretrain_target = target
-
-    @property
-    def dtype(self) -> torch.dtype:
-        """
-        Returns the dtype of the object.
-        """
-        # TODO: This is a temporary solution to get the dtype of the object.
-        return torch.float32
-
-    @property
-    def shape(self) -> tuple[int, int, int]:
-        return self._shape
-
-    @shape.setter
-    def shape(self, shape: tuple[int, int, int]):
-        self._shape = shape
-
-    # --- Helper Functions ---
-    def rebuild_model(self):
-        self._model = self.distribute_model(self._model)
-
-    # Reset method that goes back to the pretrained weights.
-    def reset(self):
-        """reset the model to the pretrained weights"""
-        self.model.load_state_dict(self._pretrained_weights.copy())
-        self._model = self.distribute_model(
-            self.model
-        )  # Maybe add a check to see if distributed or not, but not very computationally expensive to do this.
-
-    # --- Forward Method ---
-
-    def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        """forward pass for the INR model"""
-        all_densities = self.model(coords)
-
-        if all_densities.dim() > 1:
-            all_densities = all_densities.squeeze(-1)
-        valid_mask = (
-            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
-        ).float()
-
-        if all_densities.dim() > 1:
-            valid_mask = valid_mask.unsqueeze(-1)
-        # Multi-dimensional mask
-        all_densities = all_densities * valid_mask
-
-        all_densities = self.apply_hard_constraints(all_densities)
-
-        return all_densities
-
-    # NOTE: Pretraining is done in a two-phase fashion as shown in TILTED paper.
-
-    def create_volume(self, return_vol: bool = False):
-        N = max(self._shape)
-        with torch.no_grad():
-            coords_1d = torch.linspace(-1, 1, N)
-            x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
-            inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-            model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-
-            inference_batch_size = 5 * N * N
-            total_samples = N**3
-            samples_per_gpu = total_samples // self.world_size
-            remainder = total_samples % self.world_size
-
-            if self.global_rank < remainder:
-                start_idx = self.global_rank * (samples_per_gpu + 1)
-                end_idx = start_idx + samples_per_gpu + 1
-            else:
-                start_idx = self.global_rank * samples_per_gpu + remainder
-                end_idx = start_idx + samples_per_gpu
-
-            inputs_subset = inputs[start_idx:end_idx]
-            num_samples = inputs_subset.shape[0]
-
-            outputs_list = []
-            for batch_start in range(0, num_samples, inference_batch_size):
-                batch_end = min(batch_start + inference_batch_size, num_samples)
-                batch_coords = inputs_subset[batch_start:batch_end].to(
-                    self.device, non_blocking=True
-                )
-
-                batch_outputs = model(batch_coords)  # (B, C) or (B,) etc.
-
-                if isinstance(batch_outputs, tuple):
-                    batch_outputs = batch_outputs[0]
-                batch_outputs = self.apply_hard_constraints(batch_outputs)
-
-                # Ensure shape is (B, C)
-                if batch_outputs.dim() == 1:
-                    batch_outputs = batch_outputs.unsqueeze(-1)  # (B, 1)
-
-                outputs_list.append(batch_outputs.cpu())
-
-            outputs = torch.cat(outputs_list, dim=0)  # (local_B, C)
-            C = outputs.shape[-1]  # e.g. 5
-
-            if self.world_size > 1:
-                # gather variable-sized first dimension (local_B) while keeping channels
-                local_B = outputs.shape[0]
-                output_size = torch.tensor(local_B, device=self.device, dtype=torch.long)
-                all_sizes = [
-                    torch.zeros(1, device=self.device, dtype=torch.long)
-                    for _ in range(self.world_size)
-                ]
-                dist.all_gather(all_sizes, output_size)
-                max_size = max(size.item() for size in all_sizes)
-
-                outputs_dev = outputs.to(self.device)  # (local_B, C)
-                if local_B < max_size:
-                    pad = torch.zeros(
-                        (max_size - local_B, C),  # type: ignore
-                        device=self.device,
-                        dtype=outputs_dev.dtype,
-                    )
-                    outputs_padded = torch.cat([outputs_dev, pad], dim=0)  # (max_size, C)
-                else:
-                    outputs_padded = outputs_dev
-
-                gathered_outputs = [
-                    torch.empty((max_size, C), device=self.device, dtype=outputs_dev.dtype)  # type: ignore
-                    for _ in range(self.world_size)
-                ]
-                dist.all_gather(gathered_outputs, outputs_padded.contiguous())
-
-                trimmed_outputs = []
-                for rank, size in enumerate(all_sizes):
-                    trimmed_outputs.append(gathered_outputs[rank][: size.item(), :])
-
-                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(C, N, N, N).float()
-            else:
-                pred_full = outputs.reshape(C, N, N, N).float()
-
-            if return_vol:
-                return pred_full.detach().cpu()
-
-            self._obj = pred_full.detach().cpu()
-
-    def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
-        if isinstance(device, str):
-            device = torch.device(device)
-        self._device = device
-        if self.world_size == 1:
-            self._model = self._model.to(device)
-        elif not isinstance(self._model, torch.nn.parallel.DistributedDataParallel):
-            self.distribute_model(self._model)
-        self.reconnect_optimizer_to_parameters()
+    def pretrain(self) -> None:
+        raise NotImplementedError("Tensor decomposition pretraining is not usually required, and for TILTED there is a two-phase warmup approach.")
+ 
 
 ObjectModelType = ObjectPixelated | ObjectINR
