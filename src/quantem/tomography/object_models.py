@@ -1078,7 +1078,7 @@ class ObjectTensorDecomp(ObjectConstraints, DDPMixin):
         return list(self.params)
 
 
-    # --- DDP Mixin Overloads in the case of PPLR ---
+    # --- Optimizer Mixin Overloads in the case of PPLR ---
 
     @property
     def optimizer_params(self) -> OptimizerType | dict[str, OptimizerType]:
