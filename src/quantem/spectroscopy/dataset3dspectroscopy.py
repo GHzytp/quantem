@@ -23,11 +23,11 @@ class _ModelElementsDict(dict):
         lines = ["Model Elements:"]
         for element, line_info in self.items():
             if isinstance(line_info, dict) and line_info:
-                line_names = ', '.join(sorted(line_info.keys()))
+                line_names = ", ".join(sorted(line_info.keys()))
                 lines.append(f"  {element}: {line_names}")
             else:
                 lines.append(f"  {element}")
-        return '\n'.join(lines)
+        return "\n".join(lines)
 
     def _repr_html_(self):
         if not self:
@@ -87,6 +87,10 @@ class Dataset3dspectroscopy(Dataset3d):
         else:
             with open(full_path, "r", encoding="utf-8") as f:
                 cls.element_info = json.load(f)["elements"]
+
+        if str(getattr(cls, "dataset_type", "")).lower() == "eds":
+            cls._normalize_element_info()
+
         return cls.element_info
 
     @classmethod

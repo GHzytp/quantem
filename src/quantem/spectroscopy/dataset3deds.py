@@ -35,6 +35,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     element_info = None
     element_info_path = "x_ray_lines.csv"
+    dataset_type = "eds"
 
     def __init__(
         self,
@@ -97,6 +98,111 @@ class Dataset3deds(Dataset3dspectroscopy):
         if cls.element_info is None:
             cls.load_element_info()
         return cls.element_info or {}
+
+    @classmethod
+    def _normalize_element_info(cls, combine_close_peaks=True, energy_threshold_ev=15):
+        """Normalize EDS X-ray lines and optionally merge unresolved line families."""
+        if not isinstance(cls.element_info, dict):
+            return cls.element_info
+
+        if combine_close_peaks is None:
+            combine_close_peaks = cls.combine_close_xray_lines
+        if energy_threshold_ev is None:
+            energy_threshold_ev = cls.close_xray_line_threshold_ev
+        threshold_kev = float(energy_threshold_ev) / 1000.0
+
+        def line_family(line_name):
+            canonical = cls._canonical_line_name(line_name).strip()
+            match = re.match(r"^([A-Za-z]+)", canonical)
+            return match.group(1) if match else canonical
+
+        def normalized_line_name(line_name):
+            canonical = cls._canonical_line_name(line_name).strip()
+            match = re.match(r"^([A-Za-z]+)\d+(?:,\d+)+$", canonical)
+            return match.group(1) if match else canonical
+
+        def unique_name(lines, name):
+            if name not in lines:
+                return name
+            idx = 2
+            while f"{name}__{idx}" in lines:
+                idx += 1
+            return f"{name}__{idx}"
+
+        def merged_info(entries):
+            weights = np.asarray([entry["weight"] for entry in entries], dtype=float)
+            energies = np.asarray([entry["energy"] for entry in entries], dtype=float)
+            weight_sum = float(np.sum(weights))
+            if weight_sum > 0.0:
+                energy = float(np.sum(energies * weights) / weight_sum)
+            else:
+                energy = float(np.mean(energies))
+            return {"energy (keV)": energy, "weight": weight_sum}
+
+        normalized_info = {}
+        for element, lines in cls.element_info.items():
+            if not isinstance(lines, dict):
+                normalized_info[element] = lines
+                continue
+
+            entries_by_family = {}
+            normalized_lines = {}
+            for line_name, line_info in lines.items():
+                if not isinstance(line_info, dict):
+                    continue
+                try:
+                    energy = float(line_info.get("energy (keV)", line_info.get("energy")))
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    weight = float(line_info.get("weight", 0.0))
+                except (TypeError, ValueError):
+                    weight = 0.0
+
+                entry = {
+                    "line": normalized_line_name(line_name),
+                    "family": line_family(line_name),
+                    "energy": energy,
+                    "weight": weight,
+                }
+                entries_by_family.setdefault(entry["family"], []).append(entry)
+
+            for family, entries in entries_by_family.items():
+                entries = sorted(entries, key=lambda entry: entry["energy"])
+                if not combine_close_peaks:
+                    for entry in entries:
+                        name = unique_name(normalized_lines, entry["line"])
+                        normalized_lines[name] = {
+                            "energy (keV)": entry["energy"],
+                            "weight": entry["weight"],
+                        }
+                    continue
+
+                clusters = []
+                current = []
+                for entry in entries:
+                    if not current or entry["energy"] - current[0]["energy"] <= threshold_kev:
+                        current.append(entry)
+                    else:
+                        clusters.append(current)
+                        current = [entry]
+                if current:
+                    clusters.append(current)
+
+                for cluster in clusters:
+                    name = family if len(cluster) > 1 else cluster[0]["line"]
+                    name = unique_name(normalized_lines, name)
+                    normalized_lines[name] = merged_info(cluster)
+
+            normalized_info[element] = dict(
+                sorted(
+                    normalized_lines.items(),
+                    key=lambda item: (item[1]["energy (keV)"], item[0]),
+                )
+            )
+
+        cls.element_info = normalized_info
+        return cls.element_info
 
     @classmethod
     def _parse_element_selectors(cls, specs, *, allow_none=False, param_name="spec"):
