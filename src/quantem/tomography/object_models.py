@@ -17,7 +17,7 @@ from quantem.core.ml.models.model_base import PlanarDecompositionModel
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
-from quantem.tomography.tomography import ReconstructionContext
+from quantem.tomography.tomography_context import ReconstructionContext
 
 
 class ObjConstraintParams:
@@ -915,7 +915,9 @@ class ObjectTensorDecomp(ObjectINR):
     # --- Constraints ---
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=ctx.pred.device)
+        soft_loss = torch.tensor(
+            0.0, device=ctx.pred.device if ctx.pred is not None else self.device
+        )
         if self.constraints.tv_vol > 0:
             assert ctx.coords is not None, "Coordinates must be provided for TV loss"
             assert ctx.pred is not None, "Prediction must be provided for TV loss"

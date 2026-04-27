@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from quantem.tomography.tomography import ReconstructionContext
+from quantem.tomography.tomography_context import ReconstructionContext
 
 
 @dataclass(slots=False)

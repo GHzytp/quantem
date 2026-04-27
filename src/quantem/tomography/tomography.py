@@ -1,7 +1,6 @@
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Self, Sequence
+from typing import Literal, Self, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,6 +30,7 @@ from quantem.tomography.object_models import (
 )
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
+from quantem.tomography.tomography_context import ReconstructionContext
 from quantem.tomography.tomography_opt import TomographyOpt
 
 
@@ -219,8 +219,13 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 pred = integrated_densities.float()
+
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(
-                    all_coords, all_densities, pred
+                    ctx=ReconstructionContext(
+                        coords=all_coords,
+                        pred=pred,
+                        all_densities=all_densities,
+                    )
                 )
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
@@ -630,20 +635,3 @@ class TomographyConventional(TomographyBase):
         ax.set_title("Reconstruction Loss")
         ax.set_yscale("log")
         plt.show()
-
-
-@dataclass
-class ReconstructionContext:
-    """
-    Handles all reconstruction parameters to be passed into object models.
-
-    Subclasses will pick whatever parameter they need
-        - Pixelated reads ".volume"
-        - INR reads ".coords" and recomputes via the model.
-        - TensorDecomp reads ".coords" and ".pred" (and ".all densities")
-    """
-
-    coords: Optional[torch.Tensor] = None
-    pred: Optional[torch.Tensor] = None
-    all_densities: Optional[torch.Tensor] = None
-    obj: Optional[torch.Tensor] = None

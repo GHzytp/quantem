@@ -232,11 +232,16 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     # --- Optimization Parameters ---
 
-    def get_optimization_parameters(self) -> list[nn.Parameter]:
+    def get_optimization_parameters(self) -> list[dict[str, Any]]:
         """
-        Get the parameters that should be optimized for this model.
+        Get the parameters that should be optimized for this model,
+        wrapped in a single param group.
         """
-        return list(self.parameters())
+        if isinstance(self._optimizer_params, dict):
+            opt = next(iter(self._optimizer_params.values()))
+        else:
+            opt = self._optimizer_params
+        return [{"params": list(self.parameters()), **opt.params()}]
 
     # --- Forward pass ---
     @abstractmethod
