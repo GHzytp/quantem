@@ -18,6 +18,7 @@ from quantem.core.ml.models.model_base import PPLR, PlanarDecompositionModel
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
+from quantem.tomography.tomography import ReconstructionContext as ctx
 
 
 class ObjConstraintParams:

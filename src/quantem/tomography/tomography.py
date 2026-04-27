@@ -1,6 +1,7 @@
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Self, Sequence
+from typing import Literal, Optional, Self, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -625,3 +626,20 @@ class TomographyConventional(TomographyBase):
         ax.set_title("Reconstruction Loss")
         ax.set_yscale("log")
         plt.show()
+
+
+@dataclass
+class ReconstructionContext:
+    """
+    Handles all reconstruction parameters to be passed into object models.
+
+    Subclasses will pick whatever parameter they need
+        - Pixelated reads ".volume"
+        - INR reads ".coords" and recomputes via the model.
+        - TEnsorDEcomp reads ".coords" and ".pred" (and ".all densities")
+    """
+
+    coords: Optional[torch.Tensor] = None
+    pred: Optional[torch.Tensor] = None
+    all_densities: Optional[torch.Tensor] = None
+    volume: Optional[torch.Tensor] = None
