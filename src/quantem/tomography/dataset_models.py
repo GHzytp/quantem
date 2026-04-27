@@ -649,11 +649,14 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         """
         Saves the learned parameters to a file.
         """
-        torch.save({
-            "z1": self._z1_params.detach().cpu(),
-            "z3": self._z3_params.detach().cpu(),
-            "shifts": self._shifts_params.detach().cpu(),
-        }, path)
+        torch.save(
+            {
+                "z1": self._z1_params.detach().cpu(),
+                "z3": self._z3_params.detach().cpu(),
+                "shifts": self._shifts_params.detach().cpu(),
+            },
+            path,
+        )
 
     def load_parameters(self, path: str):
         """

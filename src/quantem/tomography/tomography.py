@@ -182,7 +182,9 @@ class Tomography(TomographyOpt, TomographyBase):
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
-            if isinstance(self.obj_model, ObjectINR) or isinstance(self.obj_model, ObjectTensorDecomp):
+            if isinstance(self.obj_model, ObjectINR) or isinstance(
+                self.obj_model, ObjectTensorDecomp
+            ):
                 self.obj_model.model.train()
             else:
                 raise NotImplementedError(
@@ -217,7 +219,9 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 pred = integrated_densities.float()
-                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, all_densities, pred)
+                soft_constraints_loss = self.obj_model.apply_soft_constraints(
+                    all_coords, all_densities, pred
+                )
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 
@@ -243,7 +247,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     R_now = self.obj_model.model.so3.as_matrix().detach()
                     # Cumulative angular change per rotation over the last 20 iters.
                     # trace(R_prev^T R_now) = 1 + 2*cos(theta), so theta = acos((trace - 1) / 2).
-                    rel_trace = torch.einsum('tij,tij->t', prev_R, R_now)
+                    rel_trace = torch.einsum("tij,tij->t", prev_R, R_now)
                     angle = torch.acos(((rel_trace - 1) / 2).clamp(-1, 1))  # (T,) radians
                     angle_deg = torch.rad2deg(angle)
                     per_tau_str = ", ".join(f"{a:.2f}°" for a in angle_deg.tolist())
@@ -636,10 +640,10 @@ class ReconstructionContext:
     Subclasses will pick whatever parameter they need
         - Pixelated reads ".volume"
         - INR reads ".coords" and recomputes via the model.
-        - TEnsorDEcomp reads ".coords" and ".pred" (and ".all densities")
+        - TensorDecomp reads ".coords" and ".pred" (and ".all densities")
     """
 
     coords: Optional[torch.Tensor] = None
     pred: Optional[torch.Tensor] = None
     all_densities: Optional[torch.Tensor] = None
-    volume: Optional[torch.Tensor] = None
+    obj: Optional[torch.Tensor] = None

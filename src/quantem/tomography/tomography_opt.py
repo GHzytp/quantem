@@ -2,7 +2,7 @@ from collections.abc import Mapping
 
 import torch
 
-from quantem.core.ml.optimizer_mixin import OptimizerParams, OptimizerType, SchedulerType
+from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
 from quantem.tomography.tomography_base import TomographyBase
 
 

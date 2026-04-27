@@ -3,7 +3,6 @@ Tensor Decomposition Methods for INR-based reconstructions
 """
 
 import itertools
-import math
 from typing import Callable, Optional, Sequence
 
 # import tinycudann as tcnn
@@ -17,15 +16,19 @@ from .so3params import SO3ParamQuat, SO3ParamR9SVD
 """
 K-planes utility functions
 """
-def grid_sample_wrapper(grid: torch.Tensor, coords: torch.Tensor, align_corners: bool = True) -> torch.Tensor:
+
+
+def grid_sample_wrapper(
+    grid: torch.Tensor, coords: torch.Tensor, align_corners: bool = True
+) -> torch.Tensor:
     """
     Performs bilinear interpolation on a grid at given coordinates.
-    
+
     Args:
         grid: Grid tensor of shape [B, C, H, W] or [C, H, W]
         coords: Coordinate tensor of shape [B, N, 2] or [N, 2]
         align_corners: Whether to align corners
-        
+
     Returns:
         Interpolated values of shape [B, N, C] or [N, C]
     """
@@ -40,8 +43,10 @@ def grid_sample_wrapper(grid: torch.Tensor, coords: torch.Tensor, align_corners:
     if grid_dim == 2 or grid_dim == 3:
         grid_sampler = F.grid_sample
     else:
-        raise NotImplementedError(f"Grid-sample was called with {grid_dim}D data but is only "
-                                  f"implemented for 2 and 3D data.")
+        raise NotImplementedError(
+            f"Grid-sample was called with {grid_dim}D data but is only "
+            f"implemented for 2 and 3D data."
+        )
 
     coords = coords.view([coords.shape[0]] + [1] * (grid_dim - 1) + list(coords.shape[1:]))
     B, feature_dim = grid.shape[:2]
@@ -50,10 +55,13 @@ def grid_sample_wrapper(grid: torch.Tensor, coords: torch.Tensor, align_corners:
         grid,  # [B, feature_dim, reso, ...]
         coords,  # [B, 1, ..., n, grid_dim]
         align_corners=align_corners,
-        mode='bilinear', padding_mode='border')
+        mode="bilinear",
+        padding_mode="border",
+    )
     interp = interp.view(B, feature_dim, n).transpose(-1, -2)  # [B, n, feature_dim]
     interp = interp.squeeze()  # [B?, n, feature_dim?]
     return interp
+
 
 def init_planes(
     in_dim: int,
@@ -62,18 +70,18 @@ def init_planes(
     init_range: tuple = (0.1, 0.5),
 ) -> nn.ParameterList:
     """Create the set of 2D planes for a k-plane decomposition.
- 
+
     For in_dim=3 (spatial), this creates 3 planes: XY, XZ, YZ.
     For in_dim=4 (spatial + time), this creates 6 planes: XY, XZ, XT, YZ, YT, ZT.
     Time planes (those involving axis 3) are initialized to 1 so they start
     as identity multipliers.
- 
+
     Args:
         in_dim: Dimensionality of the input coordinates (3 or 4).
         out_dim: Number of feature channels per plane.
         resolution: Resolution along each axis, e.g. [128, 128, 128].
         init_range: (a, b) for uniform initialization of spatial planes.
- 
+
     Returns:
         nn.ParameterList of plane parameters, each of shape [1, out_dim, res_j, res_i].
     """
@@ -94,21 +102,22 @@ def init_planes(
         planes.append(param)
     return planes
 
+
 def query_planes(
     pts: torch.Tensor,
     planes: nn.ParameterList,
     in_dim: int,
 ) -> float:
     """Query the k-plane representation at a batch of points.
- 
+
     Projects each point onto every axis-pair plane, bilinearly interpolates,
     and returns the element-wise product across all planes.
- 
+
     Args:
         pts: (B, in_dim) coordinates in [-1, 1].
         planes: The ParameterList from init_planes.
         in_dim: 3 or 4.
- 
+
     Returns:
         (B, out_dim) features.
     """
@@ -116,30 +125,33 @@ def query_planes(
     result = 1.0
     for plane_param, pair in zip(planes, axis_pairs):
         # Extract the 2D coords for this plane
-        coords_2d = pts[..., list(pair)]                  # (B, 2)
-        coords_2d = coords_2d.view(1, -1, 1, 2)          # (1, B, 1, 2) for grid_sample
+        coords_2d = pts[..., list(pair)]  # (B, 2)
+        coords_2d = coords_2d.view(1, -1, 1, 2)  # (1, B, 1, 2) for grid_sample
         # grid_sample: input (N,C,H,W), grid (N, H_out, W_out, 2)
         sampled = F.grid_sample(
-            plane_param,          # (1, C, H, W)
-            coords_2d,            # (1, B, 1, 2)
+            plane_param,  # (1, C, H, W)
+            coords_2d,  # (1, B, 1, 2)
             align_corners=True,
             mode="bilinear",
             padding_mode="border",
         )  # -> (1, C, B, 1)
-        sampled = sampled.squeeze(0).squeeze(-1).T        # (B, C)
+        sampled = sampled.squeeze(0).squeeze(-1).T  # (B, C)
         result = result * sampled
     return result  # pyright: ignore[reportReturnType]
- 
+
+
 def interpolate_ms_features(
     pts: torch.Tensor,
     ms_grids: nn.ParameterList,
 ) -> torch.Tensor:
     mat_mode = [[0, 1], [0, 2], [1, 2]]
-    coord_plane = torch.stack([
-        pts[:, mat_mode[0]],
-        pts[:, mat_mode[1]],
-        pts[:, mat_mode[2]],
-    ]).view(3, -1, 1, 2)
+    coord_plane = torch.stack(
+        [
+            pts[:, mat_mode[0]],
+            pts[:, mat_mode[1]],
+            pts[:, mat_mode[2]],
+        ]
+    ).view(3, -1, 1, 2)
 
     per_scale = []
     for plane_coef in ms_grids:
@@ -154,7 +166,6 @@ def interpolate_ms_features(
 
 
 class KPlanes(PPLR, TensorDecompositionModel):
-
     def __init__(
         self,
         # Grid parameters
@@ -164,7 +175,9 @@ class KPlanes(PPLR, TensorDecompositionModel):
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Optional[Sequence[int]] = None,
         concat_features: bool = True,
-        density_activation: Callable = lambda x: F.softplus(x - 1), # Keep playing around with this and trunc_exp
+        density_activation: Callable = lambda x: F.softplus(
+            x - 1
+        ),  # Keep playing around with this and trunc_exp
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -218,7 +231,6 @@ class KPlanes(PPLR, TensorDecompositionModel):
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
 
-
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
         pts = coords.reshape(-1, 3)
@@ -252,7 +264,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         if not isinstance(td_type, str):
             raise TypeError("td_type must be a string")
         self._td_type = td_type
-    
+
     @property
     def tilted(self) -> bool:
         return False
@@ -283,13 +295,15 @@ class KPlanes(PPLR, TensorDecompositionModel):
             raise TypeError("Resolution must be a sequence")
         self._resolution = list(resolution)
 
+
 # ---------------------------------------------------------------------------
 # KPlanesTILTED
 # ---------------------------------------------------------------------------
- 
+
+
 def interpolate_ms_features_tilted(
-    pts: torch.Tensor,             # (B, 3)
-    ms_grids: nn.ParameterList,    # each grid: (3*T, C, H, W)
+    pts: torch.Tensor,  # (B, 3)
+    ms_grids: nn.ParameterList,  # each grid: (3*T, C, H, W)
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
 ) -> torch.Tensor:
     """
@@ -305,17 +319,15 @@ def interpolate_ms_features_tilted(
     # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
     # index_select is faster and cleaner than advanced indexing with python lists.
     # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2)
-    idx = torch.tensor([[0, 1],
-                        [2, 0],
-                        [1, 2]], device=pts.device)                  # (3, 2)
+    idx = torch.tensor([[0, 1], [2, 0], [1, 2]], device=pts.device)  # (3, 2)
     # rotated: (T, B, 3) -> gather along last dim with idx (3, 2)
     # Result: (T, 3, B, 2)
-    coords = rotated.unsqueeze(1).expand(T, 3, B, 3).gather(
-        -1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2)
+    coords = (
+        rotated.unsqueeze(1).expand(T, 3, B, 3).gather(-1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2))
     )
 
     # Flatten (T, 3) -> 3*T so it matches grid's first dim, and add the H_out=1 axis
-    coord_tensor = coords.reshape(3 * T, B, 1, 2)                    # (3T, B, 1, 2)
+    coord_tensor = coords.reshape(3 * T, B, 1, 2)  # (3T, B, 1, 2)
 
     per_scale_features = []
     for plane_coef in ms_grids:
@@ -334,12 +346,11 @@ def interpolate_ms_features_tilted(
         sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
 
         # (T, C, B) -> (B, T, C) -> (B, T*C) to concatenate rotations along feature dim
-        per_scale_features.append(
-            sampled.permute(2, 0, 1).reshape(B, T * C)
-        )
+        per_scale_features.append(sampled.permute(2, 0, 1).reshape(B, T * C))
 
     # Concatenate across scales -> (B, T * C * num_scales)
     return torch.cat(per_scale_features, dim=-1)
+
 
 class KPlanesTILTED(KPlanes):
     """
@@ -392,7 +403,6 @@ class KPlanesTILTED(KPlanes):
         hybrid_num_layers: int = 2,
         so3_param_type: str = "r9svd",
     ):
-
         self._td_type = "tilted"
         if input_coords_dims != 3:
             raise NotImplementedError("KPlanesTILTED is implemented for 3D only.")
@@ -427,9 +437,7 @@ class KPlanesTILTED(KPlanes):
         self.grids = nn.ParameterList()
         for res_mult in multiscale_res_multipliers:
             scaled_res = [int(r * res_mult) for r in resolution]
-            plane = nn.Parameter(
-                torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0])
-            )
+            plane = nn.Parameter(torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0]))
             nn.init.uniform_(plane, 0.1, 0.5)
             self.grids.append(plane)
 
@@ -480,7 +488,7 @@ class KPlanesTILTED(KPlanes):
 
     def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
         pts = coords.reshape(-1, 3)
-        R = self.so3.as_matrix()                       # (T, 3, 3)
+        R = self.so3.as_matrix()  # (T, 3, 3)
         features = interpolate_ms_features_tilted(
             pts=pts,
             ms_grids=self.grids,
@@ -498,9 +506,9 @@ class KPlanesTILTED(KPlanes):
 
     def get_params(self) -> dict[str, list[nn.Parameter]]:
         return {
-            "grids":     list(self.grids.parameters()),
+            "grids": list(self.grids.parameters()),
             "sigma_net": list(self.sigma_net.parameters()),
-            "so3":       list(self.so3.parameters()),
+            "so3": list(self.so3.parameters()),
         }
 
     @property
@@ -557,7 +565,7 @@ class KPlanesTILTED(KPlanes):
     def set_so3_param_type(self, so3_param_type: str, init: str = "rand") -> None:
         """
         Set the SO3 parameterization type.
-        
+
         Parameters
         ----------
         so3_param_type : str
@@ -573,12 +581,14 @@ class KPlanesTILTED(KPlanes):
     @property
     def tilted(self) -> bool:
         return True
-        
+
+
 # CP Decomp for Warmup SO3 rotations
 
+
 def interpolate_ms_features_cp_tilted(
-    pts: torch.Tensor,             # (B, 3)
-    ms_grids: nn.ParameterList,    # each grid: (3*T, C, L) — 1D lines
+    pts: torch.Tensor,  # (B, 3)
+    ms_grids: nn.ParameterList,  # each grid: (3*T, C, L) — 1D lines
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
 ) -> torch.Tensor:
     """
@@ -594,7 +604,7 @@ def interpolate_ms_features_cp_tilted(
     per_scale_features = []
     for line_coef in ms_grids:
         # line_coef: (3T, C, L)  — three 1D feature lines per transform (x, y, z)
-        C, L = line_coef.shape[1], line_coef.shape[2]
+        C, _ = line_coef.shape[1], line_coef.shape[2]
 
         # For each transform t, we need three 1D samples: at x_t, y_t, z_t.
         # Lay them out as (3T, B) coords, matching line_coef's first dim.
@@ -606,17 +616,23 @@ def interpolate_ms_features_cp_tilted(
         # (3T, C, 1, L) reshape and pass 2D coords with y fixed at 0.
         # Simpler: use F.grid_sample with a 4D trick, or just do manual linear interp.
         # Here's the grid_sample way:
-        line_coef_4d = line_coef.unsqueeze(2)                         # (3T, C, 1, L)
+        line_coef_4d = line_coef.unsqueeze(2)  # (3T, C, 1, L)
         # grid: need (3T, Hout=1, Wout=B, 2), with x = coord, y = 0
-        grid = torch.stack([
-            coords_1d,                                                # x
-            torch.zeros_like(coords_1d),                              # y
-        ], dim=-1).unsqueeze(1)                                       # (3T, 1, B, 2)
+        grid = torch.stack(
+            [
+                coords_1d,  # x
+                torch.zeros_like(coords_1d),  # y
+            ],
+            dim=-1,
+        ).unsqueeze(1)  # (3T, 1, B, 2)
 
         sampled = F.grid_sample(
-            line_coef_4d, grid,
-            align_corners=True, mode="bilinear", padding_mode="border",
-        ).squeeze(2)                                                   # (3T, C, B)
+            line_coef_4d,
+            grid,
+            align_corners=True,
+            mode="bilinear",
+            padding_mode="border",
+        ).squeeze(2)  # (3T, C, B)
 
         # Hadamard across the 3 axes per transform: (T, 3, C, B) -> (T, C, B)
         sampled = sampled.view(T, 3, C, B).prod(dim=1)
@@ -639,12 +655,13 @@ class CPTilted(PPLR, TensorDecompositionModel):
 
     def __init__(
         self,
-        C: int = 4,                           # channels per transform per scale
+        C: int = 4,  # channels per transform per scale
         resolution: Sequence[int] = (128, 128, 128),
         multiscale_res_multipliers: Optional[Sequence[int]] = None,
         T: int = 4,
         tau_init: str = "random",
         density_activation: Callable = lambda x: F.softplus(x - 1),
+        so3_param_type: str = "r9svd",
     ):
         super().__init__()
         self._td_type = "cp_tilted"
@@ -670,7 +687,12 @@ class CPTilted(PPLR, TensorDecompositionModel):
         nn.init.normal_(self.sigma_net.weight, std=0.01)
         nn.init.zeros_(self.sigma_net.bias)
 
-        self.so3 = SO3Param(T, init=tau_init)
+        if so3_param_type == "r9svd":
+            self.so3 = SO3ParamR9SVD(T, init=tau_init)
+        elif so3_param_type == "quat":
+            self.so3 = SO3ParamQuat(T, init=tau_init)
+        else:
+            raise ValueError(f"Unknown SO3 param type: {so3_param_type}")
 
     def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
         pts = coords.reshape(-1, 3)
@@ -683,9 +705,9 @@ class CPTilted(PPLR, TensorDecompositionModel):
 
     def get_params(self):
         return {
-            "grids":     list(self.grids.parameters()),
+            "grids": list(self.grids.parameters()),
             "sigma_net": list(self.sigma_net.parameters()),
-            "so3":       list(self.so3.parameters()),
+            "so3": list(self.so3.parameters()),
         }
 
     @property
@@ -698,12 +720,10 @@ class CPTilted(PPLR, TensorDecompositionModel):
 
     def extract_tau_state(self) -> torch.Tensor:
         return self.so3.M.detach().clone()
-    
+
     @property
     def tilted(self) -> bool:
         return True
-
-
 
 
 KPlanesType = KPlanes | KPlanesTILTED | CPTilted

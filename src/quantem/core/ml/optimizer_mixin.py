@@ -1,7 +1,7 @@
 import textwrap
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Generator, Iterable, Literal
 
 from quantem.core import config
 
@@ -581,11 +581,11 @@ class OptimizerMixin:
     @abstractmethod
     def get_optimization_parameters(
         self,
-    ) -> "torch.Tensor | Sequence[torch.Tensor] | Iterator[torch.Tensor]":
+    ) -> "Iterable[torch.Tensor] | Iterable[dict[str, Any]]":
         """
         Get the parameters that should be optimized for this model.
         This could be replaced with just module.parameters(), but this allows for flexibility
-        in the future to allow for per parameter LRs.
+        in the future to allow for per parameter LRs. # NOTE: Cl 4/27/26 updated to iterable type-hint.
         """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
@@ -639,15 +639,16 @@ class OptimizerMixin:
             optimizer_cls = self._optimizer_class_for(self._optimizer_params)
             self._optimizer = optimizer_cls(params, **self._optimizer_params.params())
 
-
     def _optimizer_class_for(self, opt_params) -> type[torch.optim.Optimizer]:
         match opt_params:
-            case OptimizerParams.Adam():  return torch.optim.Adam
-            case OptimizerParams.AdamW(): return torch.optim.AdamW
-            case OptimizerParams.SGD():   return torch.optim.SGD
+            case OptimizerParams.Adam():
+                return torch.optim.Adam
+            case OptimizerParams.AdamW():
+                return torch.optim.AdamW
+            case OptimizerParams.SGD():
+                return torch.optim.SGD
             case _:
                 raise NotImplementedError(f"Unknown optimizer type: {opt_params}")
-
 
     def set_scheduler(
         self, scheduler_params: SchedulerType | dict | None = None, num_iter: int | None = None

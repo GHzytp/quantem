@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, Optional
 
 import numpy as np
 import torch
@@ -14,11 +14,11 @@ from quantem.core.ml import OptimizerParams
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
-from quantem.core.ml.models.model_base import PPLR, PlanarDecompositionModel
+from quantem.core.ml.models.model_base import PlanarDecompositionModel
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
-from quantem.tomography.tomography import ReconstructionContext as ctx
+from quantem.tomography.tomography import ReconstructionContext
 
 
 class ObjConstraintParams:
@@ -128,7 +128,7 @@ class ObjConstraintParams:
         shrinkage: float = 0.0
         tv_vol: float = 0.0
         tv_plane: float = 0.0
-        sparsity:float = 0.0
+        sparsity: float = 0.0
         _name: str = "obj_tensor_decomp"
 
         soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity"]
@@ -192,7 +192,7 @@ class ObjConstraintParams:
 
 
 ObjConstraintsType = (
-    ObjConstraintParams.ObjPixelatedConstraints 
+    ObjConstraintParams.ObjPixelatedConstraints
     | ObjConstraintParams.ObjINRConstraints
     | ObjConstraintParams.ObjTensorDecompConstraints
 )
@@ -204,6 +204,7 @@ def _unwrap(model: nn.Module | nn.parallel.DistributedDataParallel) -> PlanarDec
         return model.module
     return model
 
+
 class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
     DEFAULT_LRS = {
         "object": 8e-6,
@@ -212,6 +213,7 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
     """
     Base class for all ObjectModels to inherit from.
     """
+
     def __init__(
         self,
         shape: tuple[int, int, int],  # pyright: ignore[reportRedeclaration]
@@ -231,91 +233,92 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
 
         # --- Instantiation ----
 
-        # --- Properties ---
-        @property
-        def shape(self) -> tuple[int, int, int]:
-            """
-            Shape of the object (x, y, z).
-            """
-            return self._shape
+    # --- Properties ---
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """
+        Shape of the object (x, y, z).
+        """
+        return self._shape
 
-        @shape.setter
-        def shape(self, new_shape: tuple[int, int, int]):
-            self._shape = new_shape
+    @shape.setter
+    def shape(self, new_shape: tuple[int, int, int]):
+        self._shape = new_shape
 
-        @property
-        def obj(self) -> torch.Tensor:
-            """
-            Returns the object, should be implemented in subclasses.
-            """
-            raise NotImplementedError
+    @property
+    def obj(self) -> torch.Tensor:
+        """
+        Returns the object, should be implemented in subclasses.
+        """
+        raise NotImplementedError
 
-        @property
-        def model(self) -> nn.Module:
-            """
-            Returns the model, should be implemented in subclasses.
-            """
-            raise NotImplementedError
+    @property
+    def model(self) -> nn.Module:
+        """
+        Returns the model, should be implemented in subclasses.
+        """
+        raise NotImplementedError
 
-        @abstractmethod
-        def dtype(self) -> torch.dtype:
-            """
-            Returns the dtype of the object.
-            """
-            raise NotImplementedError
+    @abstractmethod
+    def dtype(self) -> torch.dtype:
+        """
+        Returns the dtype of the object.
+        """
+        raise NotImplementedError
 
-        @abstractmethod
-        def forward(self, *args, **kwargs) -> torch.Tensor:
-            """
-            Forward pass, should be implemented in subclasses. Note for any nn.Module this is
-            a required method.
-            """
-            raise NotImplementedError
+    @abstractmethod
+    def forward(self, coords: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass, should be implemented in subclasses. Note for any nn.Module this is
+        a required method.
+        """
+        raise NotImplementedError
 
-        @abstractmethod
-        def reset(self) -> None:
-            """
-            Reset the object, should be implemented in subclasses.
-            """
-            raise NotImplementedError
+    @abstractmethod
+    def reset(self) -> None:
+        """
+        Reset the object, should be implemented in subclasses.
+        """
+        raise NotImplementedError
 
-        @property
-        def params(self) -> Generator[torch.nn.Parameter, None, None]:
-            """
-            Get the parameters that should be optimized for this model.
+    @property
+    def params(self) -> Generator[torch.nn.Parameter, None, None]:
+        """
+        Get the parameters that should be optimized for this model.
 
-            Should be implemented in subclasses.
-            """
-            raise NotImplementedError
+        Should be implemented in subclasses.
+        """
+        raise NotImplementedError
 
-        # --- Helper Functions ---
-        def get_optimization_parameters(self) -> list[nn.Parameter]:
-            """
-            Get the parameters that should be optimized for this model.
-            """
-            return list(self.params)
+    # --- Helper Functions ---
+    def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
+        """
+        Get the parameters that should be optimized for this model.
+        """
+        return list(self.params)
 
-        @abstractmethod  # Each subclass should implement this.
-        def to(self, *args, **kwargs):
-            """
-            Move the object to a device
-            """
+    @abstractmethod  # Each subclass should implement this.
+    def to(self, device: str | torch.device):
+        """
+        Move the object to a device
+        """
 
-            raise NotImplementedError
+        raise NotImplementedError
+
 
 class ObjectConstraints(BaseConstraints, ObjectBase):  # TODO: Ask Arthur why we still need this
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     @abstractmethod
-    def get_tv_loss(self, **kwargs) -> torch.Tensor:
+    def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
         """
         Get the TV loss for the object model. Must be implemented in each subclass.
         """
         raise NotImplementedError
 
-class ObjectPixelated(ObjectConstraints):
 
+class ObjectPixelated(ObjectConstraints):
     """
     Object model for pixelated objects.
 
@@ -383,14 +386,6 @@ class ObjectPixelated(ObjectConstraints):
         return self.obj.cpu().unsqueeze(0).numpy()
 
     @property
-    def shape(self) -> tuple[int, int, int]:
-        return self._shape
-
-    @shape.setter
-    def shape(self, shape: tuple[int, int, int]):
-        self._shape = shape
-
-    @property
     def soft_loss(self) -> torch.Tensor:
         return self.apply_soft_constraints(self._obj)
 
@@ -424,30 +419,32 @@ class ObjectPixelated(ObjectConstraints):
         # TODO: Need to implement the other hard constraints: Fourier Filter and Circular Mask.
         return obj2
 
-    def apply_soft_constraints(self, obj: torch.Tensor) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
+    def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
+        assert ctx.obj is not None, "ObjectPixelated requires ctx.obj to be set"
+        soft_loss = torch.tensor(0.0, device=ctx.obj.device, dtype=ctx.obj.dtype, requires_grad=True)
         if self.constraints.tv_vol > 0:
             tv_loss = self.get_tv_loss(
-                obj.unsqueeze(0).unsqueeze(0), tv_weight=self.constraints.tv_vol
+                ctx
             )
             soft_loss += tv_loss
         return soft_loss
 
     # --- Forward method ---
-    def forward(self, dummy_input=None) -> torch.Tensor:
+    def forward(self, coords=None) -> torch.Tensor:
         return self.obj
 
     # --- Defining the TV loss ---
-    def get_tv_loss(self, obj: torch.Tensor, tv_weight: float = 1e-3) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride] -> get_tv_loss has different arguments depending on the object.
-        tv_d = torch.pow(obj[:, :, 1:, :, :] - obj[:, :, :-1, :, :], 2).sum()
-        tv_h = torch.pow(obj[:, :, :, 1:, :] - obj[:, :, :, :-1, :], 2).sum()
-        tv_w = torch.pow(obj[:, :, :, :, 1:] - obj[:, :, :, :, :-1], 2).sum()
+    def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        assert ctx.obj is not None, "ObjectPixelated requires ctx.obj to be set"
+        tv_d = torch.pow(ctx.obj[:, :, 1:, :, :] - ctx.obj[:, :, :-1, :, :], 2).sum()
+        tv_h = torch.pow(ctx.obj[:, :, :, 1:, :] - ctx.obj[:, :, :, :-1, :], 2).sum()
+        tv_w = torch.pow(ctx.obj[:, :, :, :, 1:] - ctx.obj[:, :, :, :, :-1], 2).sum()
         tv_loss = tv_d + tv_h + tv_w
 
-        return tv_loss * tv_weight / (torch.prod(torch.tensor(obj.shape)))
+        return tv_loss * self.constraints.tv_vol / (torch.prod(torch.tensor(obj.shape)))
 
     # --- Helper Functions ---
-    def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
+    def to(self, device: str | torch.device):
         if isinstance(device, str):
             device = torch.device(device)
         self._device = device
@@ -455,8 +452,10 @@ class ObjectPixelated(ObjectConstraints):
         self.reconnect_optimizer_to_parameters()
         return self
 
+
 class ObjectINR(ObjectConstraints, DDPMixin):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjINRConstraints()
+
     def __init__(
         self,
         shape: tuple[int, int, int],
@@ -884,8 +883,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             self.distribute_model(self._model)
         self.reconnect_optimizer_to_parameters()
 
+
 class ObjectTensorDecomp(ObjectINR):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjTensorDecompConstraints()
+
     def __init__(
         self,
         shape: tuple[int, int, int],
@@ -902,7 +903,9 @@ class ObjectTensorDecomp(ObjectINR):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
-        self.constraints: ObjConstraintParams.ObjTensorDecompConstraints = self.DEFAULT_CONSTRAINTS.copy()
+        self.constraints: ObjConstraintParams.ObjTensorDecompConstraints = (
+            self.DEFAULT_CONSTRAINTS.copy()
+        )
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
             self.setup_distributed(device=device)
@@ -935,7 +938,6 @@ class ObjectTensorDecomp(ObjectINR):
         all_densities: torch.Tensor,
         pred: torch.Tensor,
     ) -> torch.Tensor:
-
         soft_loss = torch.tensor(0.0, device=pred.device)
         if self.constraints.tv_vol > 0:
             soft_loss += self.get_tv_loss(coords, pred)
@@ -949,35 +951,32 @@ class ObjectTensorDecomp(ObjectINR):
     # TV Losses
 
     def get_tv_loss(self, coords: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-
         tv_loss = torch.tensor(0.0, device=pred.device)
         tv_loss += self._get_plane_tv_loss()
         tv_loss += self.get_volume_tv_loss(coords)
         return tv_loss
 
-
     def _get_plane_tv_loss(self) -> torch.Tensor:
         is_tilted = self.model.tilted
         per_level = []
-        
+
         model = _unwrap(self.model)
         for p in model.grids:
             # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
             dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
             dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
-            per_plane = dh + dw                                     # (3*T,) or (3,)
+            per_plane = dh + dw  # (3*T,) or (3,)
 
             if is_tilted:
                 T = self.model.T
-                per_rotation = per_plane.view(T, 3).sum(dim=1)      # sum 3 planes per rotation
-                level_tv = per_rotation.mean()                      # avg across rotations
+                per_rotation = per_plane.view(T, 3).sum(dim=1)  # sum 3 planes per rotation
+                level_tv = per_rotation.mean()  # avg across rotations
             else:
                 level_tv = per_plane.sum()
 
             per_level.append(level_tv)
 
         return self.constraints.tv_plane * torch.stack(per_level).sum()
-
 
     def get_volume_tv_loss(self, coords: torch.Tensor) -> torch.Tensor:
         """
@@ -987,7 +986,7 @@ class ObjectTensorDecomp(ObjectINR):
         """
         num_tv_samples = min(10_000, coords.shape[0])
         tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
-        tv_coords = coords[tv_indices]                               # (N, 3)
+        tv_coords = coords[tv_indices]  # (N, 3)
 
         model = _unwrap(self.model)
         h = 2.0 / min(model.resolution)
@@ -996,7 +995,7 @@ class ObjectTensorDecomp(ObjectINR):
         if isinstance(pred, tuple):
             pred = pred[0]
         if pred.dim() == 1:
-            pred = pred.unsqueeze(-1)                                # (N, 1)
+            pred = pred.unsqueeze(-1)  # (N, 1)
 
         grads = []
         for axis in range(3):
@@ -1007,10 +1006,10 @@ class ObjectTensorDecomp(ObjectINR):
                 shifted_pred = shifted_pred[0]
             if shifted_pred.dim() == 1:
                 shifted_pred = shifted_pred.unsqueeze(-1)
-            grads.append((shifted_pred - pred) / h)                  # (N, 1)
+            grads.append((shifted_pred - pred) / h)  # (N, 1)
 
-        grad_stack = torch.stack(grads, dim=-1)                      # (N, C, 3)
-        grad_norm = torch.norm(grad_stack, dim=-1)                   # (N, C)
+        grad_stack = torch.stack(grads, dim=-1)  # (N, C, 3)
+        grad_norm = torch.norm(grad_stack, dim=-1)  # (N, C)
 
         return self.constraints.tv_vol * grad_norm.mean()
 
@@ -1032,20 +1031,18 @@ class ObjectTensorDecomp(ObjectINR):
         """
         Returns the optimization parameters, here we also check if PPLR is used and return the appropriate parameters.
         """
-   
+
         return self.model.parameters()  # type: ignore[attr-defined]
 
     def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
-        
-        model = _unwrap (self.model)
+        model = _unwrap(self.model)
         return [
             {
-                "params": model.get_params()[key], 
+                "params": model.get_params()[key],
                 **self.optimizer_params[key].params(),
             }
             for key in model.param_keys
         ]
-
 
     # --- Optimizer Mixin Overloads in the case of PPLR ---
 
@@ -1060,11 +1057,13 @@ class ObjectTensorDecomp(ObjectINR):
 
         if not isinstance(params, dict):
             raise TypeError(f"optimizer parameters must be a dict for PPLR, got {type(params)}")
-            
+
         object_params = params
-        
+
         if set(object_params.keys()) != set(self.model.param_keys):
-            raise ValueError(f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}")
+            raise ValueError(
+                f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}"
+            )
 
         params = {}
         for key, value in object_params.items():
@@ -1073,31 +1072,33 @@ class ObjectTensorDecomp(ObjectINR):
             elif isinstance(value, OptimizerType):
                 params[key] = value
             else:
-                raise TypeError(f"optimizer parameters must be a dict or OptimizerType, got {type(value)}")
+                raise TypeError(
+                    f"optimizer parameters must be a dict or OptimizerType, got {type(value)}"
+                )
 
         self._optimizer_params = params
 
     def reconnect_optimizer_to_parameters(self) -> None:
-
         if self.optimizer is None:
             return
-        
+
         current_params = self.get_optimization_parameters()
-        
 
         optimizable_params = [
-            p for p in current_params 
-            if isinstance(p['params'][0], torch.Tensor) and p['params'][0].is_leaf
+            p
+            for p in current_params
+            if isinstance(p["params"][0], torch.Tensor) and p["params"][0].is_leaf
         ]
-        
 
         if not optimizable_params:
-            raise ValueError(f"Shouldn't be getting here! No optimizable parameters found for {self.__class__.__name__}.")
-        
+            raise ValueError(
+                f"Shouldn't be getting here! No optimizable parameters found for {self.__class__.__name__}."
+            )
+
         for p in optimizable_params:
             print(f"Setting requires_grad for parameter: {p}")
-            p['params'][0].requires_grad_(True)
-        
+            p["params"][0].requires_grad_(True)
+
         assert self._optimizer is not None
         # Preserve optimizer states and param_group settings
         old_state = self._optimizer.state.copy()
@@ -1132,7 +1133,9 @@ class ObjectTensorDecomp(ObjectINR):
             self._scheduler.optimizer = self._optimizer
 
     def pretrain(self) -> None:
-        raise NotImplementedError("Tensor decomposition pretraining is not usually required, and for TILTED there is a two-phase warmup approach.")
- 
+        raise NotImplementedError(
+            "Tensor decomposition pretraining is not usually required, and for TILTED there is a two-phase warmup approach."
+        )
+
 
 ObjectModelType = ObjectPixelated | ObjectINR

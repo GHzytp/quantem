@@ -1,4 +1,3 @@
-
 import warnings
 from typing import Any, Literal
 
@@ -891,6 +890,7 @@ class PtychographyVisualizations(PtychographyBase):
 
         if conv_angle is not None and energy is not None:
             from quantem.core.utils.utils import electron_wavelength_angstrom
+
             wavelength = electron_wavelength_angstrom(energy)
             conv_angle_rad = conv_angle * 1e-3
             # For defocused probe: radius ≈ |defocus| * convergence_angle + diffraction_limit

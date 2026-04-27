@@ -318,8 +318,7 @@ class Dataset3d(Dataset):
         ncols = min(ncols, n_frames)  # Don't create more columns than frames
         images = [self.array[i] for i in frame_idx]
         labels = [
-            f"Frame {i}" if title_prefix is None else f"{title_prefix} {i}"
-            for i in frame_idx
+            f"Frame {i}" if title_prefix is None else f"{title_prefix} {i}" for i in frame_idx
         ]
         # Pad last row to complete the grid (show_2d requires rectangular input)
         remainder = n_frames % ncols
