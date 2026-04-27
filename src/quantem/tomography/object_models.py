@@ -259,7 +259,6 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
         """
         raise NotImplementedError
 
-    @abstractmethod
     @property
     def dtype(self) -> torch.dtype:
         """
@@ -537,40 +536,19 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
     def apply_soft_constraints(
         self,
-        coords: torch.Tensor,
-        pred: torch.Tensor,
+        ctx: ReconstructionContext,
     ) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=pred.device)
+        soft_loss = torch.tensor(0.0, device=ctx.coords.device)
         if self.constraints.tv_vol > 0:
-            num_tv_samples = min(10_000, coords.shape[0])
-            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
-
-            tv_coords = coords[tv_indices].detach().requires_grad_(True)
-            tv_densities_recomputed = self.model(tv_coords)
-            if isinstance(tv_densities_recomputed, tuple):
-                tv_densities_recomputed = tv_densities_recomputed[0]
-
-            # Ensure shape is [num_samples, num_channels]
-            if tv_densities_recomputed.dim() == 1:
-                tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
-
-            # Compute gradients for each channel
-            grad_outputs = torch.autograd.grad(
-                outputs=tv_densities_recomputed,
-                inputs=tv_coords,
-                grad_outputs=torch.ones_like(tv_densities_recomputed),
-                create_graph=True,
-            )[0]  # Shape: [num_samples, coord_dim]
-
-            # Compute TV loss - gradient magnitude per sample
-            grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
-            soft_loss += self.constraints.tv_vol * grad_norm.mean()
+            assert ctx.coords is not None, "coords must be provided for INR object model to compute the TV loss"
+            soft_loss += self.get_tv_loss(ctx)
 
         if (
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
             and self.constraints.sparsity > 0
         ):  # NOTE: For the linter, I must make this :)
-            sparsity_loss = self.constraints.sparsity * torch.norm(pred, p=1)
+            assert ctx.pred is not None, "pred must be provided for INR object model to compute the sparsity loss"
+            sparsity_loss = self.constraints.sparsity * torch.norm(ctx.pred, p=1)
             soft_loss += sparsity_loss
 
         return soft_loss
@@ -586,6 +564,37 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
 
         return pred
+
+    # --- Define get_tv_loss ---
+
+    def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        """
+        Compute the total variation loss for the INR model.
+        """
+        assert ctx.coords is not None, "coords must be provided for INR object model"
+        num_tv_samples = min(10_000, ctx.coords.shape[0])
+        tv_indices = torch.randperm(ctx.coords.shape[0], device=ctx.coords.device)[:num_tv_samples]
+
+        tv_coords = ctx.coords[tv_indices].detach().requires_grad_(True)
+        tv_densities_recomputed = self.model(tv_coords)
+        if isinstance(tv_densities_recomputed, tuple):
+            tv_densities_recomputed = tv_densities_recomputed[0]
+
+        # Ensure shape is [num_samples, num_channels]
+        if tv_densities_recomputed.dim() == 1:
+            tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
+
+        # Compute gradients for each channel
+        grad_outputs = torch.autograd.grad(
+            outputs=tv_densities_recomputed,
+            inputs=tv_coords,
+            grad_outputs=torch.ones_like(tv_densities_recomputed),
+            create_graph=True,
+        )[0]  # Shape: [num_samples, coord_dim]
+
+        # Compute TV loss - gradient magnitude per sample
+        grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
+        return self.constraints.tv_vol * grad_norm.mean()
 
     # --- Optimization Parameters ---
     @property
@@ -625,13 +634,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         # TODO: This is a temporary solution to get the dtype of the object.
         return torch.float32
 
-    @property
-    def shape(self) -> tuple[int, int, int]:
-        return self._shape
-
-    @shape.setter
-    def shape(self, shape: tuple[int, int, int]):
-        self._shape = shape
 
     # --- Helper Functions ---
     def rebuild_model(self):
@@ -647,8 +649,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
     # --- Forward Method ---
 
-    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+    def forward(self, coords: Optional[torch.Tensor] = None) -> torch.Tensor:
         """forward pass for the INR model"""
+        assert coords is not None, "ObjectINR.forward requires coords"
+        
         all_densities = self.model(coords)
 
         if all_densities.dim() > 1:
@@ -846,33 +850,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
             self._obj = pred_full.detach().cpu()
 
-    def get_tv_loss(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        coords: torch.Tensor,
-    ) -> torch.Tensor:
-        tv_loss = torch.tensor(0.0, device=coords.device)
-
-        num_tv_samples = min(10000, coords.shape[0])
-        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
-
-        tv_coords = coords[tv_indices].detach().requires_grad_(True)
-
-        tv_densities_recomputed = self.forward(tv_coords)
-
-        if tv_densities_recomputed.dim() > 1:
-            tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
-
-        grad_outputs = torch.autograd.grad(
-            outputs=tv_densities_recomputed,
-            inputs=tv_coords,
-            grad_outputs=torch.ones_like(tv_densities_recomputed),
-            create_graph=True,
-        )[0]
-
-        grad_norm = torch.norm(grad_outputs, dim=1)
-
-        tv_loss += self.constraints.tv_vol * grad_norm.mean()
-        return tv_loss
 
     def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
         if isinstance(device, str):
