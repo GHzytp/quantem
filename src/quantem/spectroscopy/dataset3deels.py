@@ -338,7 +338,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             units=self.units,
         )
 
-    def align_dual_eels_universal(ll, hl, approach="smooth", sigma=1.2):
+    def correct_zlp_shift(ll, hl, approach="smooth", sigma=1.2):
         """
         Aligns ZLP jitter across the spatial map and synchronizes Dual-EELS pairs.
         """
@@ -358,20 +358,6 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         print("QuantEM: Alignment and Dual-EELS sync complete.")
         return ll, hl, shifts
-
-    def calibrate_energy_axis(ll, hl):
-        """
-        Fine-tunes the origin so the absolute peak position is exactly 0.0 eV.
-        """
-        # Find the peak of the average spectrum
-        current_peak_idx = np.argmax(np.mean(ll.array, axis=(1, 2)))
-        peak_ev = ll.origin[0] + (current_peak_idx * ll.sampling[0])
-
-        # Apply global shift to both datasets
-        ll.origin[0] -= peak_ev
-        hl.origin[0] -= peak_ev
-
-        print(f"QuantEM: Final calibration shift of {peak_ev:.4f} eV applied.")
 
     def plot_absolute_zlp_shift(dataset, search_window=(-10, 10)):
         """
@@ -405,33 +391,6 @@ class Dataset3deels(Dataset3dspectroscopy):
         plt.show()
 
         return absolute_shift
-
-    def plot_alignment_verification(dataset, shift_map, coords=(9, 9)):
-        """
-        Plots the drift map and a specific spectrum to verify alignment quality.
-        """
-        y, x = coords
-        spec = dataset.array[:, y, x]
-        energies = dataset.origin[0] + np.arange(len(spec)) * dataset.sampling[0]
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-        # Drift Map
-        im = ax1.imshow(shift_map, cmap="RdBu_r", origin="lower")
-        ax1.plot(x, y, "yo", markeredgecolor="k")
-        ax1.set_title("Drift Map")
-        plt.colorbar(im, ax=ax1, label="Relative Shift")
-
-        # Spectrum Verification
-        ax2.plot(energies, spec, color="black", label="Aligned Spec")
-        ax2.axvline(0, color="red", linestyle="--", alpha=0.7, label="0.0 eV Target")
-        ax2.set_xlim(-5, 5)
-        ax2.set_title(f"ZLP Detail at Pixel ({x}, {y})")
-        ax2.set_xlabel("Energy Loss (eV)")
-        ax2.legend()
-
-        plt.tight_layout()
-        plt.show()
 
     def visualize_thickness_windows(dataset, zlp_window=(-3.0, 3.0), total_window=(-3.0, 75.0)):
         """
