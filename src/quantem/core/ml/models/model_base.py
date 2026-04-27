@@ -37,7 +37,7 @@ class TensorDecompositionModel(nn.Module, ABC):
     td_type: str
 
 
-class PlanarDecompositionModel(TensorDecompositionModel):
+class PlanarDecompositionModel(TensorDecompositionModel, PPLR):
     """
     Planar factored-grid models: K-Planes, K-Planes-TILTED, HexPlane, tri-planes.
 

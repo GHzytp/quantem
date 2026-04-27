@@ -10,12 +10,11 @@ import torch.nn as nn
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.ml import OptimizerParams
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.models.model_base import PlanarDecompositionModel
-from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType
+from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 from quantem.tomography.tomography import ReconstructionContext
@@ -291,11 +290,14 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
         raise NotImplementedError
 
     # --- Helper Functions ---
-    def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
-        """
-        Get the parameters that should be optimized for this model.
-        """
-        return list(self.params)
+    def get_optimization_parameters(self) -> list[dict[str, Any]]:
+        """Default: wrap self.params in a single param group."""
+        if isinstance(self._optimizer_params, dict):
+            # Shouldn't happen for single-group models, but be defensive
+            opt = next(iter(self._optimizer_params.values()))
+        else:
+            opt = self._optimizer_params
+        return [{"params": list(self.params), **opt.params()}]
 
     @abstractmethod  # Each subclass should implement this.
     def to(self, device: str | torch.device):
@@ -540,14 +542,18 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     ) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=ctx.coords.device)
         if self.constraints.tv_vol > 0:
-            assert ctx.coords is not None, "coords must be provided for INR object model to compute the TV loss"
+            assert ctx.coords is not None, (
+                "coords must be provided for INR object model to compute the TV loss"
+            )
             soft_loss += self.get_tv_loss(ctx)
 
         if (
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
             and self.constraints.sparsity > 0
         ):  # NOTE: For the linter, I must make this :)
-            assert ctx.pred is not None, "pred must be provided for INR object model to compute the sparsity loss"
+            assert ctx.pred is not None, (
+                "pred must be provided for INR object model to compute the sparsity loss"
+            )
             sparsity_loss = self.constraints.sparsity * torch.norm(ctx.pred, p=1)
             soft_loss += sparsity_loss
 
@@ -601,7 +607,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def params(self) -> Generator[torch.nn.Parameter, None, None]:
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self) -> list[nn.Parameter]:
+    def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
         return list(self.params)
 
     # Pretraining
@@ -634,7 +640,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         # TODO: This is a temporary solution to get the dtype of the object.
         return torch.float32
 
-
     # --- Helper Functions ---
     def rebuild_model(self):
         self._model = self.distribute_model(self._model)
@@ -652,7 +657,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def forward(self, coords: Optional[torch.Tensor] = None) -> torch.Tensor:
         """forward pass for the INR model"""
         assert coords is not None, "ObjectINR.forward requires coords"
-        
+
         all_densities = self.model(coords)
 
         if all_densities.dim() > 1:
@@ -850,7 +855,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
             self._obj = pred_full.detach().cpu()
 
-
     def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
         if isinstance(device, str):
             device = torch.device(device)
@@ -910,28 +914,30 @@ class ObjectTensorDecomp(ObjectINR):
 
     # --- Constraints ---
 
-    def apply_soft_constraints(
-        self,
-        coords: torch.Tensor,
-        all_densities: torch.Tensor,
-        pred: torch.Tensor,
-    ) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=pred.device)
+    def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
+        soft_loss = torch.tensor(0.0, device=ctx.pred.device)
         if self.constraints.tv_vol > 0:
-            soft_loss += self.get_tv_loss(coords, pred)
+            assert ctx.coords is not None, "Coordinates must be provided for TV loss"
+            assert ctx.pred is not None, "Prediction must be provided for TV loss"
+            soft_loss += self.get_tv_loss(ctx)
 
         if self.constraints.sparsity > 0:  # NOTE: For the linter, I must make this :)
-            sparsity_loss = self.constraints.sparsity * all_densities.abs().mean()
+            assert ctx.all_densities is not None, (
+                "All densities must be provided for sparsity loss"
+            )
+            sparsity_loss = self.constraints.sparsity * ctx.all_densities.abs().mean()
             soft_loss += sparsity_loss
 
         return soft_loss
 
     # TV Losses
 
-    def get_tv_loss(self, coords: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        tv_loss = torch.tensor(0.0, device=pred.device)
+    def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        assert ctx.coords is not None, "Coordinates must be provided for TV loss"
+        assert ctx.pred is not None, "Prediction must be provided for TV loss"
+        tv_loss = torch.tensor(0.0, device=ctx.pred.device)
         tv_loss += self._get_plane_tv_loss()
-        tv_loss += self.get_volume_tv_loss(coords)
+        tv_loss += self.get_volume_tv_loss(ctx.coords)
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
@@ -1012,103 +1018,33 @@ class ObjectTensorDecomp(ObjectINR):
 
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
+    def get_optimization_parameters(self) -> list[dict[str, Any]]:
+        """PPLR: per-key param groups."""
         model = _unwrap(self.model)
+        assert isinstance(self._optimizer_params, dict), (
+            "ObjectTensorDecomp requires dict-form optimizer_params"
+        )
         return [
-            {
-                "params": model.get_params()[key],
-                **self.optimizer_params[key].params(),
-            }
+            {"params": model.get_params()[key], **self._optimizer_params[key].params()}
             for key in model.param_keys
         ]
 
-    # --- Optimizer Mixin Overloads in the case of PPLR ---
-
-    @property
-    def optimizer_params(self) -> OptimizerType | dict[str, OptimizerType]:
-        """Get the optimizer parameters."""
-        return self._optimizer_params
-
-    @optimizer_params.setter
-    def optimizer_params(self, params: OptimizerType | dict[str, OptimizerType] | dict[str, Any]):
-        """Set the optimizer parameters."""
-
-        if not isinstance(params, dict):
-            raise TypeError(f"optimizer parameters must be a dict for PPLR, got {type(params)}")
-
-        object_params = params
-
-        if set(object_params.keys()) != set(self.model.param_keys):
-            raise ValueError(
-                f"optimizer parameters keys must match PPLR param_keys, got {object_params.keys()} != {self.model.param_keys}"
+    def _normalize_optimizer_params(self, params):
+        """ObjectTensorDecomp requires a dict matching model.param_keys."""
+        if not isinstance(params, dict) or self._is_single_optimizer_dict(params):
+            raise TypeError(
+                f"ObjectTensorDecomp requires dict[str, OptimizerType] keyed by "
+                f"param_keys; got {type(params)}"
             )
-
-        params = {}
-        for key, value in object_params.items():
-            if isinstance(value, dict):
-                params[key] = OptimizerParams.parse_dict(d=value)
-            elif isinstance(value, OptimizerType):
-                params[key] = value
-            else:
-                raise TypeError(
-                    f"optimizer parameters must be a dict or OptimizerType, got {type(value)}"
-                )
-
-        self._optimizer_params = params
-
-    def reconnect_optimizer_to_parameters(self) -> None:
-        if self.optimizer is None:
-            return
-
-        current_params = self.get_optimization_parameters()
-
-        optimizable_params = [
-            p
-            for p in current_params
-            if isinstance(p["params"][0], torch.Tensor) and p["params"][0].is_leaf
-        ]
-
-        if not optimizable_params:
+        model = _unwrap(self.model)
+        expected = set(model.param_keys)
+        got = set(params.keys())
+        if got != expected:
             raise ValueError(
-                f"Shouldn't be getting here! No optimizable parameters found for {self.__class__.__name__}."
+                f"optimizer_params keys must match model.param_keys: "
+                f"got {got}, expected {expected}"
             )
-
-        for p in optimizable_params:
-            print(f"Setting requires_grad for parameter: {p}")
-            p["params"][0].requires_grad_(True)
-
-        assert self._optimizer is not None
-        # Preserve optimizer states and param_group settings
-        old_state = self._optimizer.state.copy()
-        old_param_groups = self._optimizer.param_groups.copy()
-
-        # Reconnect to new parameters
-        self._optimizer.param_groups.clear()
-        for param_group in optimizable_params:
-            self._optimizer.add_param_group(param_group)
-
-        # Restore per-group hyperparameters (lr, betas, weight_decay, etc.) by index,
-        # excluding 'params' which comes from the new groups
-        for new_pg, old_pg in zip(self._optimizer.param_groups, old_param_groups):
-            new_pg.update({k: v for k, v in old_pg.items() if k != "params"})
-
-        # Remap optimizer state: for any new param that IS the same tensor as an old param,
-        # carry its state over (moved to the right device just in case).
-        new_state = {}
-        for new_pg in self._optimizer.param_groups:
-            for new_param in new_pg["params"]:
-                if new_param in old_state:
-                    device = new_param.device
-                    new_state[new_param] = {
-                        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                        for k, v in old_state[new_param].items()
-                    }
-
-        self._optimizer.state.clear()
-        self._optimizer.state.update(new_state)
-
-        if self._scheduler is not None and self._optimizer is not None:
-            self._scheduler.optimizer = self._optimizer
+        return super()._normalize_optimizer_params(params)
 
     def pretrain(self) -> None:
         raise NotImplementedError(
@@ -1116,4 +1052,4 @@ class ObjectTensorDecomp(ObjectINR):
         )
 
 
-ObjectModelType = ObjectPixelated | ObjectINR
+ObjectModelType = ObjectPixelated | ObjectINR | ObjectTensorDecomp
