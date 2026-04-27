@@ -236,6 +236,75 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return smoothed_data3d
 
+    def measure_zlp_offset(self, zlp_guess_x=None, fit_window=0.8):
+        """
+        Measure ZLP offset at each pixel position by fitting each spectrum to a Gaussian and returning a 2D plane fit of ZLP positions.
+        """
+
+        # Define Gaussian constraint to fit ZLP to
+        def gaussian_fit(x, A, mu, sigma):
+            return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+        n_energy, n_y, n_x = self.array.shape()
+
+        dE = float(self.sampling[0])
+        E0 = float(self.origin[0])
+        energy_axis = E0 + np.arange(n_energy) * dE
+
+        # For each pixel, measure the zlp position by fitting a Gaussian to the measured zero-loss signal and taking its center as the zlp position.
+
+        zlp_measured = np.zeros((n_y, n_x))
+
+        for iy in range(n_y):
+            for ix in range(n_x):
+                # Apply median filter to discount hot pixels that might spuriously produce the maximum intensity of the spectrum
+                spec_filt = median_filter(self.array[:, iy, ix], size=3)
+
+                # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
+                if zlp_guess_x is not None:
+                    zlp_crude_idx = int(np.argmin(np.abs(energy_axis - zlp_guess_x)))
+                else:
+                    zlp_crude_idx = int(np.argmax(spec_filt))
+
+                mu0 = float(energy_axis[zlp_crude_idx])
+
+                lo = mu0 - fit_window
+                hi = mu0 + fit_window
+
+                x_mask = (energy_axis >= lo) & (energy_axis <= hi)
+
+                xw = energy_axis[x_mask]
+                yw = spec_filt[x_mask]
+
+                A0 = float(spec_filt[zlp_crude_idx])
+                sigma0 = fit_window / 2
+
+                p0 = (A0, mu0, sigma0)
+
+                bounds = (
+                    (
+                        0.0,
+                        lo,
+                        1e-12,
+                    ),
+                    (
+                        np.inf,
+                        hi,
+                        np.inf,
+                    ),
+                )
+
+                popt, _ = curve_fit(gaussian_fit, xw, yw, p0=p0, bounds=bounds)
+
+                zlp_measured[n_y, n_x] = popt[1]
+
+        # Fit a 2D plane to the array of measured ZLPs
+
+        return
+
+    def apply_zlp_correction():
+        return
+
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
         Calibrate the energy axis by centering the zero loss peak at 0 eV.
