@@ -260,6 +260,7 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
         raise NotImplementedError
 
     @abstractmethod
+    @property
     def dtype(self) -> torch.dtype:
         """
         Returns the dtype of the object.
@@ -385,9 +386,9 @@ class ObjectPixelated(ObjectConstraints):
     def obj_view(self) -> np.ndarray:
         return self.obj.cpu().unsqueeze(0).numpy()
 
-    @property
-    def soft_loss(self) -> torch.Tensor:
-        return self.apply_soft_constraints(self._obj)
+    # @property
+    # def soft_loss(self) -> torch.Tensor:
+    #     return self.apply_soft_constraints(self._obj)
 
     @property
     def name(self) -> str:
@@ -421,11 +422,11 @@ class ObjectPixelated(ObjectConstraints):
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
         assert ctx.obj is not None, "ObjectPixelated requires ctx.obj to be set"
-        soft_loss = torch.tensor(0.0, device=ctx.obj.device, dtype=ctx.obj.dtype, requires_grad=True)
+        soft_loss = torch.tensor(
+            0.0, device=ctx.obj.device, dtype=ctx.obj.dtype, requires_grad=True
+        )
         if self.constraints.tv_vol > 0:
-            tv_loss = self.get_tv_loss(
-                ctx
-            )
+            tv_loss = self.get_tv_loss(ctx)
             soft_loss += tv_loss
         return soft_loss
 
@@ -441,7 +442,7 @@ class ObjectPixelated(ObjectConstraints):
         tv_w = torch.pow(ctx.obj[:, :, :, :, 1:] - ctx.obj[:, :, :, :, :-1], 2).sum()
         tv_loss = tv_d + tv_h + tv_w
 
-        return tv_loss * self.constraints.tv_vol / (torch.prod(torch.tensor(obj.shape)))
+        return tv_loss * self.constraints.tv_vol / (torch.prod(torch.tensor(ctx.obj.shape)))
 
     # --- Helper Functions ---
     def to(self, device: str | torch.device):
