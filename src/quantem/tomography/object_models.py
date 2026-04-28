@@ -607,9 +607,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def params(self) -> Generator[torch.nn.Parameter, None, None]:
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self) -> list[nn.Parameter] | list[dict[str, Any]]:
-        return list(self.params)
-
     # Pretraining
     @property
     def pretrained_weights(self) -> dict[str, torch.Tensor]:
