@@ -41,7 +41,7 @@ class Dataset3d(Dataset):
         name : str
             A descriptive name for the dataset
         origin : NDArray | tuple | list | float | int
-            The origin coordinates for each dimension
+            The origin coordinates for each dimension in calibrated units
         sampling : NDArray | tuple | list | float | int
             The sampling rate/spacing for each dimension
         units : list[str] | tuple | list
@@ -80,7 +80,7 @@ class Dataset3d(Dataset):
         name : str | None
             Dataset name. Default: "3D dataset"
         origin : NDArray | tuple | list | float | int | None
-            Origin for each dimension. Default: [0, 0, 0]
+            Origin for each dimension in calibrated units. Default: [0, 0, 0]
         sampling : NDArray | tuple | list | float | int | None
             Sampling for each dimension. Default: [1, 1, 1]
         units : list[str] | tuple | list | None
@@ -148,7 +148,7 @@ class Dataset3d(Dataset):
         fill_value : float
             Value to fill array with. Default: 0.0
         origin : NDArray | tuple | list | float | int | None
-            Origin for each dimension
+            Origin for each dimension in calibrated units.
         sampling : NDArray | tuple | list | float | int | None
             Sampling for each dimension
         units : list[str] | tuple | list | None

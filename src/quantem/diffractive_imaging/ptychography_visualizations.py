@@ -170,19 +170,26 @@ class PtychographyVisualizations(PtychographyBase):
                 obj_show = obj_pad
             else:  # complex or pure phase just show the phase
                 obj_show = np.angle(obj_pad)
-            show_2d(
+            fig, ax = show_2d(
                 [
                     obj_show,
                     np.abs(obj_fft),
                 ],
                 title=[t + "Object", t + "Fourier Transform"],
                 scalebar=[obj_scalebar, fft_scalebar],
+                return_fig=True,
                 **kwargs,
             )
+            ax[1].set_aspect(obj_np.shape[-1] / obj_np.shape[-2])
         else:
-            show_2d(
-                np.abs(obj_fft), scalebar=fft_scalebar, title=t + "Fourier Transform", **kwargs
+            fig, ax = show_2d(
+                np.abs(obj_fft),
+                scalebar=fft_scalebar,
+                title=t + "Fourier Transform",
+                return_fig=True,
+                **kwargs,
             )
+            ax.set_aspect(obj_np.shape[-1] / obj_np.shape[-2])
         if return_fft:
             return obj_fft
         else:
