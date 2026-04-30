@@ -236,6 +236,75 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return smoothed_data3d
 
+    def measure_zlp_offset(self, zlp_guess_x=None, fit_window=0.8):
+        """
+        Measure ZLP offset at each pixel position by fitting each spectrum to a Gaussian and returning a 2D plane fit of ZLP positions.
+        """
+
+        # Define Gaussian constraint to fit ZLP to
+        def gaussian_fit(x, A, mu, sigma):
+            return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+        n_energy, n_y, n_x = self.array.shape()
+
+        dE = float(self.sampling[0])
+        E0 = float(self.origin[0])
+        energy_axis = E0 + np.arange(n_energy) * dE
+
+        # For each pixel, measure the zlp position by fitting a Gaussian to the measured zero-loss signal and taking its center as the zlp position.
+
+        zlp_measured = np.zeros((n_y, n_x))
+
+        for iy in range(n_y):
+            for ix in range(n_x):
+                # Apply median filter to discount hot pixels that might spuriously produce the maximum intensity of the spectrum
+                spec_filt = median_filter(self.array[:, iy, ix], size=3)
+
+                # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
+                if zlp_guess_x is not None:
+                    zlp_crude_idx = int(np.argmin(np.abs(energy_axis - zlp_guess_x)))
+                else:
+                    zlp_crude_idx = int(np.argmax(spec_filt))
+
+                mu0 = float(energy_axis[zlp_crude_idx])
+
+                lo = mu0 - fit_window
+                hi = mu0 + fit_window
+
+                x_mask = (energy_axis >= lo) & (energy_axis <= hi)
+
+                xw = energy_axis[x_mask]
+                yw = spec_filt[x_mask]
+
+                A0 = float(spec_filt[zlp_crude_idx])
+                sigma0 = fit_window / 2
+
+                p0 = (A0, mu0, sigma0)
+
+                bounds = (
+                    (
+                        0.0,
+                        lo,
+                        1e-12,
+                    ),
+                    (
+                        np.inf,
+                        hi,
+                        np.inf,
+                    ),
+                )
+
+                popt, _ = curve_fit(gaussian_fit, xw, yw, p0=p0, bounds=bounds)
+
+                zlp_measured[n_y, n_x] = popt[1]
+
+        # Fit a 2D plane to the array of measured ZLPs
+
+        return
+
+    def apply_zlp_correction():
+        return
+
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
         Calibrate the energy axis by centering the zero loss peak at 0 eV.
@@ -338,7 +407,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             units=self.units,
         )
 
-    def align_dual_eels_universal(ll, hl, approach="smooth", sigma=1.2):
+    def correct_zlp_shift(ll, hl, approach="smooth", sigma=1.2):
         """
         Aligns ZLP jitter across the spatial map and synchronizes Dual-EELS pairs.
         """
@@ -358,20 +427,6 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         print("QuantEM: Alignment and Dual-EELS sync complete.")
         return ll, hl, shifts
-
-    def calibrate_energy_axis(ll, hl):
-        """
-        Fine-tunes the origin so the absolute peak position is exactly 0.0 eV.
-        """
-        # Find the peak of the average spectrum
-        current_peak_idx = np.argmax(np.mean(ll.array, axis=(1, 2)))
-        peak_ev = ll.origin[0] + (current_peak_idx * ll.sampling[0])
-
-        # Apply global shift to both datasets
-        ll.origin[0] -= peak_ev
-        hl.origin[0] -= peak_ev
-
-        print(f"QuantEM: Final calibration shift of {peak_ev:.4f} eV applied.")
 
     def plot_absolute_zlp_shift(dataset, search_window=(-10, 10)):
         """
@@ -405,33 +460,6 @@ class Dataset3deels(Dataset3dspectroscopy):
         plt.show()
 
         return absolute_shift
-
-    def plot_alignment_verification(dataset, shift_map, coords=(9, 9)):
-        """
-        Plots the drift map and a specific spectrum to verify alignment quality.
-        """
-        y, x = coords
-        spec = dataset.array[:, y, x]
-        energies = dataset.origin[0] + np.arange(len(spec)) * dataset.sampling[0]
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-        # Drift Map
-        im = ax1.imshow(shift_map, cmap="RdBu_r", origin="lower")
-        ax1.plot(x, y, "yo", markeredgecolor="k")
-        ax1.set_title("Drift Map")
-        plt.colorbar(im, ax=ax1, label="Relative Shift")
-
-        # Spectrum Verification
-        ax2.plot(energies, spec, color="black", label="Aligned Spec")
-        ax2.axvline(0, color="red", linestyle="--", alpha=0.7, label="0.0 eV Target")
-        ax2.set_xlim(-5, 5)
-        ax2.set_title(f"ZLP Detail at Pixel ({x}, {y})")
-        ax2.set_xlabel("Energy Loss (eV)")
-        ax2.legend()
-
-        plt.tight_layout()
-        plt.show()
 
     def visualize_thickness_windows(dataset, zlp_window=(-3.0, 3.0), total_window=(-3.0, 75.0)):
         """
