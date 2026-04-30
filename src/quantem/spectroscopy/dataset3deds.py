@@ -984,7 +984,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         requested_elements = set(edge_filters) if edge_filters else None
 
         mode = (str(mode).strip().lower() if mode is not None else None) or (
-            "elements_only" if requested_elements else "autofill"
+            "elements_preferred" if requested_elements else "autofill"
         )
         search_elements = requested_elements if mode == "elements_only" else None
         preferred_elements = (
@@ -1006,12 +1006,20 @@ class Dataset3deds(Dataset3dspectroscopy):
             energy_range=energy_range,
             ignore_range=ignore_range,
             mask=mask,
+            attach_mean_spectrum=False,
         )
-        E = float(self.origin[0]) + float(self.sampling[0]) * np.arange(self.shape[0])
+        spec = np.asarray(spec, dtype=float)
+        E = np.asarray(self.energy_axis, dtype=float)
+        if mask is not None:
+            E = E[np.asarray(mask, dtype=bool)]
         if energy_range is not None:
             keep = (energy_range[0] <= E) & (E <= energy_range[1])
             E = E[keep]
-            spec = spec[keep]
+        if E.shape[0] != spec.shape[0]:
+            raise RuntimeError(
+                "Energy axis and mean spectrum lengths do not match after applying "
+                "mask and energy_range."
+            )
 
         def in_ignore(energy):
             return len(ignore_range) == 2 and ignore_range[0] <= float(energy) <= ignore_range[1]

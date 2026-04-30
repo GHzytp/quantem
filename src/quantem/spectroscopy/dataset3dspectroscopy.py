@@ -872,9 +872,6 @@ class Dataset3dspectroscopy(Dataset3d):
             },
             **kwargs,
         )
-        ax_img.set_xlabel("X (pixels)")
-        ax_img.set_ylabel("Y (pixels)")
-
         # Highlight the ROI with a rectangle
         rect = Rectangle(
             (x - 0.5, y - 0.5), dx, dy, linewidth=2, edgecolor="red", facecolor="none", alpha=0.8
