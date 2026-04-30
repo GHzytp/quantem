@@ -449,39 +449,37 @@ class Dataset3dspectroscopy(Dataset3d):
             "reconstructed": reconstructed_data3d if mask is None else reconstructed_data3d,
         }
 
-        def _run_pca(self, data: NDArray | Any, n_components: int):
-            array = np.asarray(data, dtype=float)
-            n_samples, n_features = array.shape
-            max_components = min(n_samples, n_features)
-            if not 1 <= n_components <= max_components:
-                raise ValueError(
-                    f"n_components={n_components} must be between 1 and {max_components}"
-                )
+    def _run_pca(self, data: NDArray | Any, n_components: int):
+        array = np.asarray(data, dtype=float)
+        n_samples, n_features = array.shape
+        max_components = min(n_samples, n_features)
+        if not 1 <= n_components <= max_components:
+            raise ValueError(f"n_components={n_components} must be between 1 and {max_components}")
 
-            mean = np.mean(array, axis=0)
-            centered = torch.as_tensor(array - mean, dtype=torch.float64)
-            _, s, vh = torch.linalg.svd(centered, full_matrices=False)
+        mean = np.mean(array, axis=0)
+        centered = torch.as_tensor(array - mean, dtype=torch.float64)
+        _, s, vh = torch.linalg.svd(centered, full_matrices=False)
 
-            components = vh[:n_components].cpu().numpy()
-            loadings = (centered @ vh[:n_components].T).cpu().numpy()
+        components = vh[:n_components].cpu().numpy()
+        loadings = (centered @ vh[:n_components].T).cpu().numpy()
 
-            denom = max(n_samples - 1, 1)
-            explained_variance = ((s[:n_components] ** 2) / denom).cpu().numpy()
-            total_variance = torch.sum((s**2) / denom).item()
-            explained_variance_ratio = (
-                explained_variance / total_variance
-                if total_variance > 0
-                else np.zeros_like(explained_variance)
-            )
-            reconstructed = loadings @ components + mean
+        denom = max(n_samples - 1, 1)
+        explained_variance = ((s[:n_components] ** 2) / denom).cpu().numpy()
+        total_variance = torch.sum((s**2) / denom).item()
+        explained_variance_ratio = (
+            explained_variance / total_variance
+            if total_variance > 0
+            else np.zeros_like(explained_variance)
+        )
+        reconstructed = loadings @ components + mean
 
-            return (
-                components,
-                loadings,
-                explained_variance,
-                explained_variance_ratio,
-                reconstructed,
-            )
+        return (
+            components,
+            loadings,
+            explained_variance,
+            explained_variance_ratio,
+            reconstructed,
+        )
 
     def _plot_pca_results(
         self,
@@ -694,7 +692,16 @@ class Dataset3dspectroscopy(Dataset3d):
         mask=None,
         attach_mean_spectrum=True,
         roi_cal=None,
+        normalize=True,
     ):
+        """Calculate a spectrum from a spatial ROI.
+
+        Parameters
+        ----------
+        normalize : bool, optional
+            If ``True``, average over the ROI pixels.  If ``False``, sum counts
+            over the ROI pixels.
+        """
         y, x, dy, dx = self._resolve_roi(roi=roi, roi_cal=roi_cal)
 
         # SPECTRUM CALCULATION --------------------------------------------------------------
@@ -732,8 +739,11 @@ class Dataset3dspectroscopy(Dataset3d):
                     f"Mask shape {mask.shape} does not match energy axis shape ({arr.shape[0]},)"
                 )
 
-            arr = arr[mask, :, :]  # select only masked energy channels
-            spec = arr.sum(axis=(1, 2)) if arr.shape[0] > 0 else np.zeros(0)
+            arr = arr[mask, y : y + dy, x : x + dx]  # select masked energies and ROI
+            if arr.shape[0] > 0:
+                spec = arr.mean(axis=(1, 2)) if normalize else arr.sum(axis=(1, 2))
+            else:
+                spec = np.zeros(0)
             E = E[mask]  # Mask the energy axis as well
         else:
             spec = np.empty(self.shape[0], dtype=float)
@@ -742,7 +752,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 roi_data = img[y : y + dy, x : x + dx]
                 if roi_data.size == 0:
                     raise ValueError("ROI is empty; check y/x/dy/dx.")
-                spec[k] = roi_data.mean()
+                spec[k] = roi_data.mean() if normalize else roi_data.sum()
 
         # APPLY ENERGY RANGE ---------------------------------------------------------------
 
@@ -834,11 +844,15 @@ class Dataset3dspectroscopy(Dataset3d):
             roi_cal=roi_cal,
             energy_range=energy_range,
             mask=mask,
+            normalize=False,
         )
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
         E = E0 + dE * np.arange(self.shape[0])
+
+        if mask is not None:
+            E = E[np.asarray(mask, dtype=bool)]
 
         if energy_range is not None:
             indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
@@ -879,7 +893,7 @@ class Dataset3dspectroscopy(Dataset3d):
         ax_img.add_patch(rect)
 
         # RIGHT PLOT: Show spectrum
-        ax_spec.plot(E, spec, linewidth=1.5)
+        ax_spec.plot(E, spec, linewidth=1.5, color="k")
         if self.dataset_type == "eds":
             ax_spec.set_xlabel("Energy (keV)")
         else:
@@ -1104,9 +1118,6 @@ class Dataset3dspectroscopy(Dataset3d):
             },
         )
 
-        ax_map.set_xlabel("X (pixels)")
-        ax_map.set_ylabel("Y (pixels)")
-
         if has_roi_overlay:
             rect = Rectangle(
                 (x - 0.5, y - 0.5),
@@ -1119,7 +1130,7 @@ class Dataset3dspectroscopy(Dataset3d):
             )
             ax_map.add_patch(rect)
 
-        ax_spec.plot(E_spec, spec, linewidth=1.5)
+        ax_spec.plot(E_spec, spec, linewidth=1.5, color="k")
         ax_spec.axvspan(emin, emax, color="orange", alpha=0.2, label="Selected window")
         ax_spec.set_xlabel(f"Energy ({unit_label})")
         ax_spec.set_ylabel("Intensity")

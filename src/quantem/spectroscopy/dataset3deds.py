@@ -1020,27 +1020,38 @@ class Dataset3deds(Dataset3dspectroscopy):
                 "Energy axis and mean spectrum lengths do not match after applying "
                 "mask and energy_range."
             )
+        spec_for_peaks = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
+        if spec_for_peaks.size:
+            spec_for_peaks = spec_for_peaks - float(np.nanmin(spec_for_peaks))
+            peak_scale = float(np.nanmax(np.abs(spec_for_peaks)))
+            if np.isfinite(peak_scale) and peak_scale > 0:
+                spec_for_peaks = spec_for_peaks / peak_scale
 
         def in_ignore(energy):
             return len(ignore_range) == 2 and ignore_range[0] <= float(energy) <= ignore_range[1]
 
-        peak_indices, props = find_peaks(spec, height=0, distance=5)
-        peak_heights = props["peak_heights"]
-        background_std = np.nanstd(spec[spec <= np.nanpercentile(spec, 50)])
+        peak_indices, props = find_peaks(spec_for_peaks, height=0, distance=5)
+        peak_signal_heights = props["peak_heights"]
+        peak_heights = spec[peak_indices]
+        background_std = np.nanstd(
+            spec_for_peaks[spec_for_peaks <= np.nanpercentile(spec_for_peaks, 50)]
+        )
         if not np.isfinite(background_std) or background_std <= 0:
-            background_std = np.nanstd(spec)
+            background_std = np.nanstd(spec_for_peaks)
         if not np.isfinite(background_std) or background_std <= 0:
             background_std = 1.0
 
-        snr_values = np.asarray([height / background_std for height in peak_heights], dtype=float)
+        snr_values = np.asarray(
+            [height / background_std for height in peak_signal_heights], dtype=float
+        )
         snr_min, snr_threshold = type(self)._estimate_snr_thresholds(
             snr_values, peaks, snr_min, snr_threshold
         )
 
         display_peaks = [
-            (int(i), float(h), float(E[i]), float(h / background_std))
-            for i, h in zip(peak_indices, peak_heights)
-            if not in_ignore(E[i]) and h / background_std >= snr_min
+            (int(i), float(raw_h), float(E[i]), float(signal_h / background_std))
+            for i, raw_h, signal_h in zip(peak_indices, peak_heights, peak_signal_heights)
+            if not in_ignore(E[i]) and signal_h / background_std >= snr_min
         ]
         display_peaks.sort(key=lambda item: item[3], reverse=True)
         significant_peaks = list(display_peaks)
