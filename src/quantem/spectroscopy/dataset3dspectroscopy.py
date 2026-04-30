@@ -310,7 +310,7 @@ class Dataset3dspectroscopy(Dataset3d):
     def clear_attached_spectra(self):
         self.attached_spectra = None
 
-    def plot_attached_spectrum(self, data_type="eds", spectrum_index=0):
+    def plot_attached_spectrum(self, spectrum_index=0):
         fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
 
         ax_spec.plot(
@@ -318,9 +318,9 @@ class Dataset3dspectroscopy(Dataset3d):
             self.attached_spectra[spectrum_index][0],
             linewidth=1.5,
         )
-        if data_type == "eds":
+        if self.dataset_type == "eds":
             ax_spec.set_xlabel("Energy (keV)")
-        elif data_type == "eels":
+        elif self.dataset_type == "eels":
             ax_spec.set_xlabel("Energy (eV)")
         ax_spec.set_ylabel("Intensity")
         ax_spec.set_title(f"Spectrum in index {spectrum_index}")
@@ -1023,7 +1023,6 @@ class Dataset3dspectroscopy(Dataset3d):
         roi=None,
         roi_cal=None,
         mask=None,
-        data_type="eds",
         cmap="viridis",
         show=True,
     ):
@@ -1044,8 +1043,6 @@ class Dataset3dspectroscopy(Dataset3d):
         mask : array-like | None, optional
             Optional boolean mask over energy channels. If provided, it is
             combined with ``energy_window``.
-        data_type : str, optional
-            "eds" (keV) or "eels" (eV), used for title/unit text.
         cmap : str, optional
             Matplotlib colormap for the map.
         show : bool, optional
@@ -1103,7 +1100,7 @@ class Dataset3dspectroscopy(Dataset3d):
         else:
             E_spec = E
 
-        unit_label = "keV" if str(data_type).lower() == "eds" else "eV"
+        unit_label = "keV" if str(self.dataset_type).lower() == "eds" else "eV"
         fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(12, 4))
         show_2d(
             energy_map,
@@ -1155,7 +1152,6 @@ class Dataset3dspectroscopy(Dataset3d):
         mask=None,
         target_edge=None,
         window_size=10,
-        data_type="eds",
         method="powerlaw",
         return_dataset=True,
         attach_spectrum=True,
@@ -1178,9 +1174,9 @@ class Dataset3dspectroscopy(Dataset3d):
 
         spec = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
 
-        if data_type == "eds":
+        if self.dataset_type == "eds":
             background = self.calculate_background_powerlaw(spec)
-        elif data_type == "eels":
+        elif self.dataset_type == "eels":
             if method == "powerlaw":
                 background = self.powerlaw_backgroundfit_eels(
                     spec, energy_range, target_edge, window_size
@@ -1212,7 +1208,7 @@ class Dataset3dspectroscopy(Dataset3d):
         fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
 
         ax_specbacksub.plot(E, subtracted_mean_spectrum, linewidth=1.5)
-        if data_type == "eds":
+        if self.dataset_type == "eds":
             ax_specbacksub.set_xlabel("Energy (keV)")
         else:
             ax_specbacksub.set_xlabel("Energy (eV)")
@@ -1234,7 +1230,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 spec3D_subtracted[:, p, q] = np.maximum(self.array[indices, p, q] - background, 0)
 
         if return_dataset:
-            if data_type == "eds":
+            if self.dataset_type == "eds":
                 return Dataset3deds.from_array(
                     array=spec3D_subtracted,
                     sampling=self.sampling,
@@ -1242,7 +1238,7 @@ class Dataset3dspectroscopy(Dataset3d):
                     units=self.units,
                 )
 
-            elif data_type == "eels":
+            elif self.dataset_type == "eels":
                 return Dataset3deels.from_array(
                     array=spec3D_subtracted,
                     sampling=self.sampling,
