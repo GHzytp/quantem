@@ -1205,6 +1205,9 @@ class Dataset3dspectroscopy(Dataset3d):
             indices = np.arange(self.shape[0])
         ###
 
+        output_origin = np.array(self.origin, dtype=float, copy=True)
+        output_origin[0] = E[0]
+
         fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
 
         ax_specbacksub.plot(E, subtracted_mean_spectrum, linewidth=1.5)
@@ -1234,7 +1237,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 return Dataset3deds.from_array(
                     array=spec3D_subtracted,
                     sampling=self.sampling,
-                    origin=self.origin,
+                    origin=output_origin,
                     units=self.units,
                 )
 
@@ -1242,7 +1245,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 return Dataset3deels.from_array(
                     array=spec3D_subtracted,
                     sampling=self.sampling,
-                    origin=self.origin,
+                    origin=output_origin,
                     units=self.units,
                 )
         else:
