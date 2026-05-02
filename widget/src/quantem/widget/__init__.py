@@ -1,24 +1,7 @@
 from importlib.metadata import version
-import pathlib
-import anywidget
-import traitlets
+
+from quantem.widget.show2d import Show2D
+from quantem.widget.show4dstem import Show4DSTEM
 
 __version__ = version("quantem.widget")
-
-_static = pathlib.Path(__file__).parent / "static"
-
-
-class CounterWidget(anywidget.AnyWidget):
-    _esm = _static / "index.js"
-
-    count = traitlets.Int(0).tag(sync=True)
-
-
-def show4dstem():
-    # TODO: Implement 4D-STEM visualization widget
-    print("show4dstem: not yet implemented")
-
-
-def counter():
-    """Create a minimal counter widget for testing."""
-    return CounterWidget()
+__all__ = ["Show2D", "Show4DSTEM"]
