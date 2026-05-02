@@ -13,7 +13,7 @@ import base64
 import math
 import warnings
 from enum import StrEnum
-from typing import Optional, Union, List, Self
+from typing import Self
 
 import anywidget
 import matplotlib
@@ -253,7 +253,7 @@ class Show2D(anywidget.AnyWidget):
     image_rotations = traitlets.List(traitlets.Int(), []).tag(sync=True)
 
     @classmethod
-    def _normalize_tool_groups(cls, tool_groups) -> List[str]:
+    def _normalize_tool_groups(cls, tool_groups) -> list[str]:
         return normalize_tool_groups("Show2D", tool_groups)
 
     @classmethod
@@ -269,7 +269,7 @@ class Show2D(anywidget.AnyWidget):
         disable_roi: bool = False,
         disable_profile: bool = False,
         disable_all: bool = False,
-    ) -> List[str]:
+    ) -> list[str]:
         return build_tool_groups(
             "Show2D",
             tool_groups=disabled_tools,
@@ -299,7 +299,7 @@ class Show2D(anywidget.AnyWidget):
         hide_roi: bool = False,
         hide_profile: bool = False,
         hide_all: bool = False,
-    ) -> List[str]:
+    ) -> list[str]:
         return build_tool_groups(
             "Show2D",
             tool_groups=hidden_tools,
@@ -326,10 +326,10 @@ class Show2D(anywidget.AnyWidget):
 
     def __init__(
         self,
-        data: Union[np.ndarray, List[np.ndarray]],
-        labels: Optional[List[str]] = None,
+        data: np.ndarray | list[np.ndarray],
+        labels: list[str | None] = None,
         title: str = "",
-        cmap: Union[str, Colormap] = Colormap.INFERNO,
+        cmap: str | Colormap = Colormap.INFERNO,
         pixel_size: float = 0.0,
         scale_bar_visible: bool = True,
         show_fft: bool = False,
@@ -340,7 +340,7 @@ class Show2D(anywidget.AnyWidget):
         auto_contrast: bool = False,
         vmin: float | list | None = None,
         vmax: float | list | None = None,
-        disabled_tools: Optional[List[str]] = None,
+        disabled_tools: list[str | None] = None,
         disable_display: bool = False,
         disable_histogram: bool = False,
         disable_stats: bool = False,
@@ -350,7 +350,7 @@ class Show2D(anywidget.AnyWidget):
         disable_roi: bool = False,
         disable_profile: bool = False,
         disable_all: bool = False,
-        hidden_tools: Optional[List[str]] = None,
+        hidden_tools: list[str | None] = None,
         hide_display: bool = False,
         hide_histogram: bool = False,
         hide_stats: bool = False,
@@ -371,7 +371,7 @@ class Show2D(anywidget.AnyWidget):
         link_contrast: bool = True,
         diff_mode: bool = False,
         view_box: tuple | list | None = None,
-        display_bin: Union[int, str] = "auto",
+        display_bin: int | str = "auto",
         state=None,
         **kwargs,
     ):
