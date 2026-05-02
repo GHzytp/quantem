@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import traitlets
 
+from quantem.core.datastructures import Dataset2d, Dataset3d
 from quantem.widget.array_utils import to_numpy, _resize_image
 from quantem.widget.json_state import resolve_widget_version, save_state_file, unwrap_state_payload
 from quantem.widget.tool_parity import (
@@ -438,8 +439,12 @@ class Show2D(anywidget.AnyWidget):
         self._display_data = None  # initialized after data setup
         self._display_bin = 1
 
-        # Check if data is a Dataset2d and extract metadata
-        if hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling"):
+        # First-class support for quantem Dataset2d / Dataset3d:
+        # extract array + auto-populate title, pixel_size from sampling+units.
+        # (Duck-typing fallback below covers any other object exposing the same API.)
+        if isinstance(data, (Dataset2d, Dataset3d)) or (
+            hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling")
+        ):
             if not title and data.name:
                 title = data.name
             if pixel_size == 0.0 and hasattr(data, "units"):
@@ -451,7 +456,7 @@ class Show2D(anywidget.AnyWidget):
                     pixel_size = sampling_val
             data = data.array
 
-        # Convert input to NumPy (handles NumPy, CuPy, PyTorch)
+        # Convert NumPy / PyTorch / list inputs to a NumPy array.
         if isinstance(data, list):
             images = [to_numpy(d) for d in data]
 
@@ -532,7 +537,7 @@ class Show2D(anywidget.AnyWidget):
                 if v is None: return [None] * n
                 if isinstance(v, (list, tuple)):
                     if len(v) != n:
-                        raise ValueError(f"vmin/vmax list length {len(v)} != n_images {n}")
+                        raise ValueError(f"vmin/vmax list has length {len(v)} but n_images is {n}. Pass a list of length {n} or a scalar to apply uniformly.")
                     return [None if x is None else float(x) for x in v]
                 return [float(v)] * n
             self.vmins = _expand(vmin)
@@ -1125,7 +1130,7 @@ class Show2D(anywidget.AnyWidget):
         Self
         """
         if angle % 90 != 0:
-            raise ValueError(f"Rotation angle must be a multiple of 90°, got {angle}")
+            raise ValueError(f"Rotation angle must be a multiple of 90 (got {angle}). Use 0, 90, 180, 270, or -90, -180, -270.")
         if idx < 0 or idx >= self.n_images:
             raise IndexError(f"Image index {idx} out of range [0, {self.n_images})")
         k = (angle // 90) % 4

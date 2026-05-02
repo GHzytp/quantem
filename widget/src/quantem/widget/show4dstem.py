@@ -566,7 +566,7 @@ class Show4DSTEM(anywidget.AnyWidget):
                 self._device = torch.device("cpu")
             self._data = torch.from_numpy(data_np).to(self._device)
         else:
-            raise ValueError(f"Expected 3D, 4D, or 5D array, got {ndim}D")
+            raise ValueError(f"Show4DSTEM expects a 3D ((N, det_h, det_w) flat-scan), 4D ((scan_h, scan_w, det_h, det_w)), or 5D ((n_frames, scan_h, scan_w, det_h, det_w)) array. Got {ndim}D. Reshape with array.reshape((scan_h, scan_w, det_h, det_w)) or pass a Dataset4dstem.")
         if _verbose:
             if str(self._device) == "mps":
                 torch.mps.synchronize()
@@ -729,7 +729,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             self._det_shape = (data_np.shape[2], data_np.shape[3])
             self._data = torch.from_numpy(data_np).to(self._device)
         else:
-            raise ValueError(f"Expected 3D, 4D, or 5D array, got {data_np.ndim}D")
+            raise ValueError(f"Show4DSTEM expects a 3D, 4D, or 5D array. Got {data_np.ndim}D. See documentation for accepted shapes.")
         self.frame_idx = 0
         self.shape_rows = self._scan_shape[0]
         self.shape_cols = self._scan_shape[1]
@@ -1865,7 +1865,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         elif panel_key == "fft":
             rgb, render_meta = self._render_fft_rgb()
         else:
-            raise ValueError(f"Unsupported panel '{panel_key}'")
+            raise ValueError(f"Unsupported panel {panel_key!r}. Valid options: 'diffraction', 'virtual', 'fft', 'all'.")
 
         panel = Image.fromarray(rgb, mode="RGB")
         panel = self._decorate_panel(panel, panel_key, include_overlays, include_scalebar)
