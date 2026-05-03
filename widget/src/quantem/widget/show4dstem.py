@@ -1,22 +1,9 @@
 """
 show4dstem: Fast interactive 4D-STEM viewer widget.
 
-Apple MPS GPU limit: PyTorch's MPS backend (Apple Silicon) has a hard limit
-of ~2.1 billion elements (INT_MAX = 2^31 - 1) per tensor. Datasets exceeding
-this automatically fall back to CPU, which is still fast on Apple Silicon
-thanks to unified memory (CPU and GPU share the same RAM).
-
-CUDA GPUs do not have this limit.
-
-Common 4D-STEM sizes (float32):
-
-    Scan     Detector   Elements     Size    MPS?
-    128×128  128×128       268M    1.0 GB    yes
-    128×128  256×256     1,074M    4.0 GB    yes
-    256×256  128×128     1,074M    4.0 GB    yes
-    256×256  192×192     2,416M    9.0 GB    no (auto CPU, still fast)
-    256×256  256×256     4,295M   16.0 GB    no (auto CPU, still fast)
-    512×512  256×256    17,180M   64.0 GB    no (auto CPU)
+Single chunked-torch path on every device (CUDA / MPS / CPU). Reductions cast
+uint16 → float32 in scan-row chunks bounded by _CHUNK_BYTE_BUDGET, so transient
+memory stays the same regardless of total dataset size.
 
 To reduce data size, bin k-space at the dataset level before viewing:
 
@@ -38,18 +25,19 @@ import numpy as np
 import torch
 import traitlets
 
+# Cap transient chunk memory at ~600 MB regardless of detector size.
+# A 4096 × 192² × 4 byte float32 cast = 600 MB; a 4096 × 256² × 4 byte cast
+# would be 1.0 GB. _chunk_rows() picks an N-rows-per-chunk that keeps the
+# transient under this cap.
+_CHUNK_BYTE_BUDGET = 600 * 1024 * 1024
+
 from quantem.core.config import validate_device
 from quantem.widget.array_utils import to_numpy
-from quantem.widget.json_state import (
+from quantem.widget.state import (
     build_json_header,
     resolve_widget_version,
     save_state_file,
     unwrap_state_payload,
-)
-from quantem.widget.tool_parity import (
-    bind_tool_runtime_api,
-    build_tool_groups,
-    normalize_tool_groups,
 )
 
 
@@ -64,7 +52,6 @@ def _format_memory(nbytes: int) -> str:
 # Constants
 # ============================================================================
 DEFAULT_BF_RATIO = 0.125  # BF disk radius as fraction of detector size (1/8)
-SPARSE_MASK_THRESHOLD = 0.2  # Use sparse indexing below this mask coverage
 MIN_LOG_VALUE = 1e-10  # Minimum value for log scale to avoid log(0)
 DEFAULT_VI_ROI_RATIO = 0.15  # Default VI ROI size as fraction of scan dimension
 
@@ -84,12 +71,14 @@ class Show4DSTEM(anywidget.AnyWidget):
         for time-series or tilt-series data.
     scan_shape : tuple, optional
         If data is flattened (N, det_rows, det_cols), provide scan dimensions.
-    pixel_size : float, optional
-        Pixel size in Å (real-space). Used for scale bar.
-        Auto-extracted from Dataset4dstem if not provided.
-    k_pixel_size : float, optional
-        Detector pixel size in mrad (k-space). Used for scale bar.
-        Auto-extracted from Dataset4dstem if not provided.
+    sampling : tuple of 4 floats, optional
+        Pixel size per axis ``(scan_row, scan_col, k_row, k_col)``. Scalar
+        broadcasts to all four axes. Defaults to ``(1, 1, 1, 1)``.
+        Auto-extracted from ``Dataset4dstem`` if not provided.
+    units : list of 4 str, optional
+        Unit string per axis. Common: ``["A", "A", "mrad", "mrad"]``.
+        Defaults to ``["pixels"] * 4``. Auto-extracted from
+        ``Dataset4dstem`` if not provided.
     center : tuple[float, float], optional
         (center_row, center_col) of the diffraction pattern in pixels.
         If not provided, defaults to detector center.
@@ -100,43 +89,58 @@ class Show4DSTEM(anywidget.AnyWidget):
     frame_dim_label : str, optional
         Label for the frame dimension when 5D data is provided.
         Defaults to "Frame". Common values: "Tilt", "Time", "Focus".
-    disabled_tools : list of str, optional
-        Tool groups to lock while still showing controls. Supported:
-        ``"display"``, ``"histogram"``, ``"stats"``, ``"navigation"``,
-        ``"playback"``, ``"view"``, ``"export"``, ``"roi"``,
-        ``"profile"``, ``"fft"``, ``"virtual"``, ``"frame"``, ``"all"``.
-    disable_* : bool, optional
-        Convenience flags mirroring ``disabled_tools`` for each tool group,
-        plus ``disable_all``.
-    hidden_tools : list of str, optional
-        Tool groups to hide from the UI. Uses the same keys as
-        ``disabled_tools``.
-    hide_* : bool, optional
-        Convenience flags mirroring ``disable_*`` for ``hidden_tools``.
-
     Examples
     --------
-    >>> # From Dataset4dstem (calibration auto-extracted)
-    >>> from quantem.core.io.file_readers import read_emdfile_to_4dstem
-    >>> dataset = read_emdfile_to_4dstem("data.h5")
-    >>> Show4DSTEM(dataset)
-
-    >>> # From raw array with manual calibration
     >>> import numpy as np
-    >>> data = np.random.rand(64, 64, 128, 128)
-    >>> Show4DSTEM(data, pixel_size=2.39, k_pixel_size=0.46)
+    >>> from quantem.widget import Show4DSTEM
 
-    >>> # With raster animation
-    >>> widget = Show4DSTEM(dataset)
-    >>> widget.raster(step=2, interval_ms=50)
+    4D NumPy array ``(scan_rows, scan_cols, det_rows, det_cols)``:
 
-    >>> # 5D time-series or tilt-series data
-    >>> data_5d = np.random.rand(20, 64, 64, 128, 128)  # 20 frames
-    >>> Show4DSTEM(data_5d, frame_dim_label="Tilt")
+    >>> Show4DSTEM(np.random.rand(64, 64, 128, 128))
+
+    PyTorch tensor (CPU or GPU):
+
+    >>> import torch
+    >>> Show4DSTEM(torch.rand(64, 64, 128, 128))
+
+    With explicit calibration (real-space Å, k-space mrad):
+
+    >>> Show4DSTEM(np.random.rand(64, 64, 128, 128),
+    ...            sampling=(2.39, 2.39, 0.46, 0.46),
+    ...            units=["A", "A", "mrad", "mrad"])
+
+    quantem ``Dataset4dstem`` — calibration + units auto-extracted:
+
+    >>> from quantem.core.datastructures import Dataset4dstem
+    >>> ds = Dataset4dstem.from_array(np.random.rand(64, 64, 128, 128))
+    >>> Show4DSTEM(ds)
+
+    Flattened scan ``(N, det_rows, det_cols)`` with explicit scan shape:
+
+    >>> Show4DSTEM(np.random.rand(4096, 128, 128), scan_shape=(64, 64))
+
+    Custom BF disk center and radius (overrides auto-detection):
+
+    >>> Show4DSTEM(np.random.rand(64, 64, 128, 128),
+    ...            center=(64, 64), bf_radius=12)
+
+    5D time-series or tilt-series ``(n_frames, scan_r, scan_c, det_r, det_c)``:
+
+    >>> Show4DSTEM(np.random.rand(20, 64, 64, 128, 128), frame_dim_label="Tilt")
+
+    Raster animation (scan path through 4D dataset):
+
+    >>> w = Show4DSTEM(np.random.rand(64, 64, 128, 128))
+    >>> w.raster(step=2, interval_ms=50)
+
+    Static export to PDF or PNG (single panel or all four):
+
+    >>> w = Show4DSTEM(np.random.rand(64, 64, 128, 128))
+    >>> w.save_image("dp.pdf", view="diffraction")
+    >>> w.save_image("all.pdf", view="all")
     """
 
     _esm = pathlib.Path(__file__).parent / "static" / "show4dstem.js"
-    _css = pathlib.Path(__file__).parent / "static" / "show4dstem.css"
 
     # Position in scan space
     widget_version = traitlets.Unicode("unknown").tag(sync=True)
@@ -188,9 +192,7 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     # Virtual Image (ROI-based, updates as you drag ROI on DP)
     # =========================================================================
-    virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)  # Raw float32
-    vi_data_min = traitlets.Float(0.0).tag(sync=True)  # Min of current VI for normalization
-    vi_data_max = traitlets.Float(1.0).tag(sync=True)  # Max of current VI for normalization
+    virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)  # Raw float32 (JS computes stats + range)
 
     # =========================================================================
     # VI ROI (real-space region selection for summed DP)
@@ -198,18 +200,25 @@ class Show4DSTEM(anywidget.AnyWidget):
     vi_roi_mode = traitlets.Unicode("off").tag(sync=True)  # "off", "circle", "rect"
     vi_roi_center_row = traitlets.Float(0.0).tag(sync=True)
     vi_roi_center_col = traitlets.Float(0.0).tag(sync=True)
+    # Compound (row, col) trait — JS sets in one call; one observer fires; bytes
+    # never compute against split-trait state (old col + new row, or vice versa).
+    vi_roi_center = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0]).tag(sync=True)
     vi_roi_radius = traitlets.Float(5.0).tag(sync=True)
     vi_roi_width = traitlets.Float(10.0).tag(sync=True)
     vi_roi_height = traitlets.Float(10.0).tag(sync=True)
-    summed_dp_bytes = traitlets.Bytes(b"").tag(sync=True)  # Summed DP from VI ROI
-    summed_dp_count = traitlets.Int(0).tag(sync=True)  # Number of positions summed
+    # Reduction over scan positions inside vi_roi: mean is default (size-invariant DP),
+    # sum scales with area (quantitative counts), max picks brightest position per detector pixel.
+    vi_roi_reduce = traitlets.Unicode("mean").tag(sync=True)
+    vi_roi_dp_bytes = traitlets.Bytes(b"").tag(sync=True)  # Reduced DP from VI ROI
 
     # =========================================================================
     # Scale Bar
     # =========================================================================
-    pixel_size = traitlets.Float(1.0).tag(sync=True)  # Å per pixel (real-space)
-    k_pixel_size = traitlets.Float(1.0).tag(sync=True)  # mrad per pixel (k-space)
-    k_calibrated = traitlets.Bool(False).tag(sync=True)  # True if k-space has mrad calibration
+    pixel_size = traitlets.Float(1.0).tag(sync=True)  # real-space pixel size (col axis)
+    pixel_unit = traitlets.Unicode("pixels").tag(sync=True)
+    k_pixel_size = traitlets.Float(1.0).tag(sync=True)  # k-space pixel size (col axis)
+    k_pixel_unit = traitlets.Unicode("pixels").tag(sync=True)
+    k_calibrated = traitlets.Bool(False).tag(sync=True)  # True if k-space has real units
 
     # =========================================================================
     # Path Animation (programmatic crosshair control)
@@ -223,14 +232,13 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     # Auto-detection trigger (frontend sets to True, backend resets to False)
     # =========================================================================
-    auto_detect_trigger = traitlets.Bool(False).tag(sync=True)
 
     # =========================================================================
     # Statistics for display (mean, min, max, std)
     # =========================================================================
-    dp_stats = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0, 0.0, 0.0]).tag(sync=True)
-    vi_stats = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0, 0.0, 0.0]).tag(sync=True)
-    mask_dc = traitlets.Bool(True).tag(sync=True)  # Mask center pixel for DP stats
+    # dp_stats and vi_stats are computed JS-side from frame_bytes / virtual_image_bytes.
+    # Keeping them out of Python traits eliminates a 4-message comm race that produced
+    # mismatched bytes/min/max on rapid preset/ROI changes.
 
     # =========================================================================
     # Display settings (synced for programmatic export parity)
@@ -239,13 +247,9 @@ class Show4DSTEM(anywidget.AnyWidget):
     vi_colormap = traitlets.Unicode("inferno").tag(sync=True)
     fft_colormap = traitlets.Unicode("inferno").tag(sync=True)
 
-    dp_scale_mode = traitlets.Unicode("linear").tag(sync=True)  # "linear" | "log" | "power"
-    vi_scale_mode = traitlets.Unicode("linear").tag(sync=True)  # "linear" | "log" | "power"
-    fft_scale_mode = traitlets.Unicode("linear").tag(sync=True)  # "linear" | "log" | "power"
-
-    dp_power_exp = traitlets.Float(0.5).tag(sync=True)
-    vi_power_exp = traitlets.Float(0.5).tag(sync=True)
-    fft_power_exp = traitlets.Float(0.5).tag(sync=True)
+    dp_scale_mode = traitlets.Unicode("linear").tag(sync=True)  # "linear" | "log"
+    vi_scale_mode = traitlets.Unicode("linear").tag(sync=True)  # "linear" | "log"
+    fft_scale_mode = traitlets.Unicode("linear").tag(sync=True)  # "linear" | "log"
 
     dp_vmin_pct = traitlets.Float(0.0).tag(sync=True)
     dp_vmax_pct = traitlets.Float(100.0).tag(sync=True)
@@ -262,14 +266,19 @@ class Show4DSTEM(anywidget.AnyWidget):
 
     fft_auto = traitlets.Bool(True).tag(sync=True)
     show_fft = traitlets.Bool(False).tag(sync=True)
+    # Single-trait preset request: JS sets to "bf"/"abf"/"adf"/"haadf" → Python
+    # observer calls apply_preset() which batches the 5 ROI trait writes
+    # atomically. Avoids the JS-side ordering race where individual roi_mode/
+    # radius/center traits would commit in separate comm messages.
+    _preset_request = traitlets.Unicode("").tag(sync=True)
     fft_window = traitlets.Bool(True).tag(sync=True)
     show_controls = traitlets.Bool(True).tag(sync=True)
     dp_show_colorbar = traitlets.Bool(False).tag(sync=True)
-    export_default_view = traitlets.Unicode("all").tag(sync=True)
-    export_default_format = traitlets.Unicode("png").tag(sync=True)
-    export_include_overlays = traitlets.Bool(True).tag(sync=True)
-    export_include_scalebar = traitlets.Bool(True).tag(sync=True)
-    export_default_dpi = traitlets.Int(300).tag(sync=True)
+    # VI panel auto-contrast (1st/99th percentile clip) and CSS smoothing.
+    # DP panel doesn't need either — Bragg spots are best read with nearest-
+    # neighbor + the slider's percentile range.
+    vi_auto_contrast = traitlets.Bool(False).tag(sync=True)
+    vi_smooth = traitlets.Bool(False).tag(sync=True)
 
     # =========================================================================
     # Frame Animation (5D time/tilt series)
@@ -294,139 +303,18 @@ class Show4DSTEM(anywidget.AnyWidget):
     profile_width = traitlets.Int(1).tag(sync=True)
 
     # =========================================================================
-    # Tool visibility / locking
-    # =========================================================================
-    disabled_tools = traitlets.List(traitlets.Unicode()).tag(sync=True)
-    hidden_tools = traitlets.List(traitlets.Unicode()).tag(sync=True)
-
-    @classmethod
-    def _normalize_tool_groups(cls, tool_groups) -> list[str]:
-        return normalize_tool_groups("Show4DSTEM", tool_groups)
-
-    @classmethod
-    def _build_disabled_tools(
-        cls,
-        disabled_tools=None,
-        disable_display: bool = False,
-        disable_histogram: bool = False,
-        disable_stats: bool = False,
-        disable_navigation: bool = False,
-        disable_playback: bool = False,
-        disable_view: bool = False,
-        disable_export: bool = False,
-        disable_roi: bool = False,
-        disable_profile: bool = False,
-        disable_fft: bool = False,
-        disable_virtual: bool = False,
-        disable_frame: bool = False,
-        disable_all: bool = False,
-    ) -> list[str]:
-        return build_tool_groups(
-            "Show4DSTEM",
-            tool_groups=disabled_tools,
-            all_flag=disable_all,
-            flag_map={
-                "display": disable_display,
-                "histogram": disable_histogram,
-                "stats": disable_stats,
-                "navigation": disable_navigation,
-                "playback": disable_playback,
-                "view": disable_view,
-                "export": disable_export,
-                "roi": disable_roi,
-                "profile": disable_profile,
-                "fft": disable_fft,
-                "virtual": disable_virtual,
-                "frame": disable_frame,
-            },
-        )
-
-    @classmethod
-    def _build_hidden_tools(
-        cls,
-        hidden_tools=None,
-        hide_display: bool = False,
-        hide_histogram: bool = False,
-        hide_stats: bool = False,
-        hide_navigation: bool = False,
-        hide_playback: bool = False,
-        hide_view: bool = False,
-        hide_export: bool = False,
-        hide_roi: bool = False,
-        hide_profile: bool = False,
-        hide_fft: bool = False,
-        hide_virtual: bool = False,
-        hide_frame: bool = False,
-        hide_all: bool = False,
-    ) -> list[str]:
-        return build_tool_groups(
-            "Show4DSTEM",
-            tool_groups=hidden_tools,
-            all_flag=hide_all,
-            flag_map={
-                "display": hide_display,
-                "histogram": hide_histogram,
-                "stats": hide_stats,
-                "navigation": hide_navigation,
-                "playback": hide_playback,
-                "view": hide_view,
-                "export": hide_export,
-                "roi": hide_roi,
-                "profile": hide_profile,
-                "fft": hide_fft,
-                "virtual": hide_virtual,
-                "frame": hide_frame,
-            },
-        )
-
-    @traitlets.validate("disabled_tools")
-    def _validate_disabled_tools(self, proposal):
-        return self._normalize_tool_groups(proposal["value"])
-
-    @traitlets.validate("hidden_tools")
-    def _validate_hidden_tools(self, proposal):
-        return self._normalize_tool_groups(proposal["value"])
-
     def __init__(
         self,
         data: "Dataset4dstem | np.ndarray",
         scan_shape: tuple[int, int] | None = None,
-        pixel_size: float | None = None,
-        k_pixel_size: float | None = None,
+        sampling: tuple[float, ...] | list[float] | None = None,
+        units: list[str] | tuple[str, ...] | None = None,
         center: tuple[float, float] | None = None,
         bf_radius: float | None = None,
-        precompute_virtual_images: bool = False,
+        precompute_virtual_images: bool = True,
         frame_dim_label: str | None = None,
         frame_labels: list[str] | None = None,
         title: str = "",
-        disabled_tools: list[str] | None = None,
-        disable_display: bool = False,
-        disable_histogram: bool = False,
-        disable_stats: bool = False,
-        disable_navigation: bool = False,
-        disable_playback: bool = False,
-        disable_view: bool = False,
-        disable_export: bool = False,
-        disable_roi: bool = False,
-        disable_profile: bool = False,
-        disable_fft: bool = False,
-        disable_virtual: bool = False,
-        disable_frame: bool = False,
-        disable_all: bool = False,
-        hidden_tools: list[str] | None = None,
-        hide_display: bool = False,
-        hide_histogram: bool = False,
-        hide_stats: bool = False,
-        hide_navigation: bool = False,
-        hide_playback: bool = False,
-        hide_view: bool = False,
-        hide_export: bool = False,
-        hide_roi: bool = False,
-        hide_profile: bool = False,
-        hide_fft: bool = False,
-        hide_virtual: bool = False,
-        hide_frame: bool = False,
-        hide_all: bool = False,
         show_fft: bool = False,
         fft_window: bool = True,
         show_controls: bool = True,
@@ -445,60 +333,38 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         _io_labels = None
 
-        # Extract calibration from Dataset4dstem if provided
-        k_calibrated = False
+        # Auto-extract sampling + units from Dataset4dstem if available.
         if hasattr(data, "sampling") and hasattr(data, "array"):
-            # Dataset4dstem: extract calibration and array
-            # sampling = [scan_rows, scan_cols, det_rows, det_cols]
             if not title and hasattr(data, "name") and data.name:
                 title = str(data.name)
-            units = getattr(data, "units", ["pixels"] * 4)
-            if pixel_size is None and units[0] in ("Å", "angstrom", "A", "nm"):
-                pixel_size = float(data.sampling[0])
-                if units[0] == "nm":
-                    pixel_size *= 10  # Convert nm to Å
-            if k_pixel_size is None and units[2] in ("mrad", "1/Å", "1/A"):
-                k_pixel_size = float(data.sampling[2])
-                k_calibrated = True
+            if sampling is None:
+                sampling = tuple(float(s) for s in data.sampling)
+            if units is None and hasattr(data, "units"):
+                units = list(data.units)
             data = data.array
 
+        # Resolve sampling + units (4 axes for 4D-STEM):
+        # [scan_row, scan_col, k_row, k_col]. Scalar/None broadcast to (1, 1, 1, 1).
+        if sampling is None:
+            sampling = (1.0, 1.0, 1.0, 1.0)
+        elif isinstance(sampling, (int, float)):
+            sampling = (float(sampling),) * 4
+        else:
+            sampling = tuple(float(s) for s in sampling)
+        if units is None:
+            units = ["pixels"] * 4
+        elif isinstance(units, str):
+            units = [units] * 4
+        else:
+            units = [str(u) for u in units]
+
         self.title = title
-        # Store calibration values (default to 1.0 if not provided)
-        self.pixel_size = pixel_size if pixel_size is not None else 1.0
-        self.k_pixel_size = k_pixel_size if k_pixel_size is not None else 1.0
-        self.k_calibrated = k_calibrated or (k_pixel_size is not None)
-        self.disabled_tools = self._build_disabled_tools(
-            disabled_tools=disabled_tools,
-            disable_display=disable_display,
-            disable_histogram=disable_histogram,
-            disable_stats=disable_stats,
-            disable_navigation=disable_navigation,
-            disable_playback=disable_playback,
-            disable_view=disable_view,
-            disable_export=disable_export,
-            disable_roi=disable_roi,
-            disable_profile=disable_profile,
-            disable_fft=disable_fft,
-            disable_virtual=disable_virtual,
-            disable_frame=disable_frame,
-            disable_all=disable_all,
-        )
-        self.hidden_tools = self._build_hidden_tools(
-            hidden_tools=hidden_tools,
-            hide_display=hide_display,
-            hide_histogram=hide_histogram,
-            hide_stats=hide_stats,
-            hide_navigation=hide_navigation,
-            hide_playback=hide_playback,
-            hide_view=hide_view,
-            hide_export=hide_export,
-            hide_roi=hide_roi,
-            hide_profile=hide_profile,
-            hide_fft=hide_fft,
-            hide_virtual=hide_virtual,
-            hide_frame=hide_frame,
-            hide_all=hide_all,
-        )
+        self.pixel_size = sampling[1]   # scan_col axis (horizontal scale bar)
+        self.pixel_unit = units[1] if len(units) > 1 else "pixels"
+        self.k_pixel_size = sampling[3] if len(sampling) > 3 else 1.0
+        self.k_pixel_unit = units[3] if len(units) > 3 else "pixels"
+        # k-space considered calibrated when its unit is real (mrad, 1/Å, etc.).
+        self.k_calibrated = self.k_pixel_unit not in ("pixels", "")
         self.show_fft = show_fft
         self.fft_window = fft_window
         self.show_controls = show_controls
@@ -508,44 +374,40 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.vi_vmax = vi_vmax
         # Path animation (configured via set_path() or raster())
         self._path_points: list[tuple[int, int]] = []
-        # Named user presets saved during this session
-        self._named_presets: dict[str, dict[str, Any]] = {}
-        # Session-scoped reproducibility log for all export calls
-        self._export_session_id = uuid4().hex
-        self._export_session_started_utc = datetime.now(timezone.utc).isoformat()
-        self._export_log: list[dict[str, Any]] = []
-        # Sparse sampling state (for streaming/adaptive acquisition workflows)
-        self._sparse_samples: dict[tuple[int, int, int], np.ndarray] = {}
-        self._sparse_order: list[tuple[int, int, int]] = []
-        # Convert to NumPy then PyTorch tensor using quantem device config
-        data_np = to_numpy(data)
-        device_str, _ = validate_device(None)  # Get device from quantem config
-        self._device = torch.device(device_str)
-        # Remove saturated hot pixels in numpy (before any torch conversion)
-        saturated_value = 65535.0 if data_np.dtype == np.uint16 else 255.0 if data_np.dtype == np.uint8 else None
-        if data_np.dtype != np.float32:
-            _tc = time.perf_counter()
-            data_np = data_np.astype(np.float32)
-            if _verbose:
-                print(f"  astype float32: {time.perf_counter() - _tc:.2f}s")
-        if saturated_value is not None:
-            data_np[data_np >= saturated_value] = 0
+        # Suppress per-trait recompute during apply_preset batch writes
+        self._suppress_roi_recompute = False
+        # Torch tensor input keeps its device (lets user pin a specific GPU via
+        # `data.cuda(1)`). NumPy / Dataset input gets default-validated device.
+        if isinstance(data, torch.Tensor):
+            self._device = data.device
+            self._data_pre = data
+            data_np = None
+        else:
+            device_str, _ = validate_device(None)
+            self._device = torch.device(device_str)
+            data_np = to_numpy(data)
+            self._data_pre = None
+            self._saturation_value = (
+                65535 if data_np.dtype == np.uint16
+                else 255 if data_np.dtype == np.uint8
+                else None
+            )
         # Handle dimensionality — 5D loads eagerly for instant frame switching
-        ndim = data_np.ndim
+        # Resolve shape from whichever input path we took
+        shape = tuple(self._data_pre.shape) if self._data_pre is not None else data_np.shape
+        size_elements = int(np.prod(shape))
+        ndim = len(shape)
         _tc = time.perf_counter()
         if ndim == 5:
-            self.n_frames = data_np.shape[0]
-            self._scan_shape = (data_np.shape[1], data_np.shape[2])
-            self._det_shape = (data_np.shape[3], data_np.shape[4])
-            if data_np.size > 2**31 - 1 and device_str == "mps":
-                self._device = torch.device("cpu")
-            self._data = torch.from_numpy(data_np).to(self._device)
+            self.n_frames = shape[0]
+            self._scan_shape = (shape[1], shape[2])
+            self._det_shape = (shape[3], shape[4])
         elif ndim == 3:
             self.n_frames = 1
             if scan_shape is not None:
                 self._scan_shape = scan_shape
             else:
-                n = data_np.shape[0]
+                n = shape[0]
                 side = int(n ** 0.5)
                 if side * side != n:
                     raise ValueError(
@@ -553,24 +415,45 @@ class Show4DSTEM(anywidget.AnyWidget):
                         f"Provide scan_shape explicitly."
                     )
                 self._scan_shape = (side, side)
-            self._det_shape = (data_np.shape[1], data_np.shape[2])
-            # MPS backend can't handle tensors >INT_MAX elements; fall back to CPU
-            if data_np.size > 2**31 - 1 and device_str == "mps":
-                self._device = torch.device("cpu")
-            self._data = torch.from_numpy(data_np).to(self._device)
+            self._det_shape = (shape[1], shape[2])
         elif ndim == 4:
             self.n_frames = 1
-            self._scan_shape = (data_np.shape[0], data_np.shape[1])
-            self._det_shape = (data_np.shape[2], data_np.shape[3])
-            if data_np.size > 2**31 - 1 and device_str == "mps":
-                self._device = torch.device("cpu")
-            self._data = torch.from_numpy(data_np).to(self._device)
+            self._scan_shape = (shape[0], shape[1])
+            self._det_shape = (shape[2], shape[3])
         else:
-            raise ValueError(f"Show4DSTEM expects a 3D ((N, det_h, det_w) flat-scan), 4D ((scan_h, scan_w, det_h, det_w)), or 5D ((n_frames, scan_h, scan_w, det_h, det_w)) array. Got {ndim}D. Reshape with array.reshape((scan_h, scan_w, det_h, det_w)) or pass a Dataset4dstem.")
+            raise ValueError(f"Show4DSTEM expects a 3D ((N, det_h, det_w) flat-scan), 4D ((scan_h, scan_w, det_h, det_w)), or 5D ((n_frames, scan_h, scan_w, det_h, det_w)) array. Got {ndim}D.")
+        if self._data_pre is not None:
+            self._data = self._data_pre if self._data_pre.device == self._device else self._data_pre.to(self._device)
+            del self._data_pre
+        else:
+            self._data = torch.from_numpy(data_np).to(self._device)
+            # Saturation filter: zero detector pixels at full-scale (65535 / 255).
+            # PyTorch lacks unsigned int comparison kernels, but uint16 viewed
+            # as int16 has identical bytes (65535 → -1) and int16 comparison
+            # works on every device. Apply in scan-row chunks so the transient
+            # bool mask stays bounded (≤600 MB) and fits constrained-VRAM
+            # devices (Mac 24 GB unified, etc.). View-write keeps native dtype.
+            sat = getattr(self, "_saturation_value", None)
+            view_dtype = (
+                torch.int16 if sat is not None and self._data.dtype == torch.uint16
+                else torch.int8 if sat is not None and self._data.dtype == torch.uint8
+                else None
+            )
+            if view_dtype is not None:
+                view = self._data.view(view_dtype).reshape(-1, *self._det_shape)
+                rows = view.shape[0]
+                # Bool mask transient = positions × det_h × det_w bytes; cap at budget.
+                pos_per_chunk = max(1, _CHUNK_BYTE_BUDGET // max(1, self._det_shape[0] * self._det_shape[1]))
+                for i in range(0, rows, pos_per_chunk):
+                    chunk = view[i:i + pos_per_chunk]
+                    chunk.masked_fill_(chunk == -1, 0)
+        # Keep native dtype (uint8/uint16) to bound memory at ~ data_size.
+        # Reductions cast in chunks (bounded transient).
         if _verbose:
             if str(self._device) == "mps":
                 torch.mps.synchronize()
-            print(f"  to {self._device}: {time.perf_counter() - _tc:.2f}s ({data_np.nbytes / 1e9:.1f} GB)")
+            n_bytes = self._data.element_size() * self._data.numel()
+            print(f"  to {self._device}: {time.perf_counter() - _tc:.2f}s ({n_bytes / 1e9:.1f} GB)")
 
         self.shape_rows = self._scan_shape[0]
         self.shape_cols = self._scan_shape[1]
@@ -586,17 +469,20 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._frame_labels = resolved_labels
         if resolved_labels:
             self.frame_labels = list(resolved_labels)
-        # Histogram axis range — first frame is enough (JS does per-frame percentile clipping)
+        # Histogram axis range — first frame is enough (JS does per-frame percentile clipping).
+        # Cast to float for min/max reductions: PyTorch CUDA lacks integer min/max kernels,
+        # and the first slice is tiny (144 KB at 192×192) so the cast is free.
         first_frame = self._data[0] if self._data.ndim == 5 else self._data
-        self.dp_global_min = max(float(first_frame.min()), MIN_LOG_VALUE)
-        self.dp_global_max = float(first_frame.max())
+        first_frame_sample = first_frame[0] if first_frame.ndim >= 3 else first_frame
+        if not torch.is_floating_point(first_frame_sample):
+            first_frame_sample = first_frame_sample.float()
+        self.dp_global_min = max(float(first_frame_sample.min()), MIN_LOG_VALUE)
+        self.dp_global_max = float(first_frame_sample.max())
         # Cache coordinate tensors for mask creation (avoid repeated torch.arange)
         self._det_row_coords = torch.arange(self.det_rows, device=self._device, dtype=torch.float32)[:, None]
         self._det_col_coords = torch.arange(self.det_cols, device=self._device, dtype=torch.float32)[None, :]
         self._scan_row_coords = torch.arange(self.shape_rows, device=self._device, dtype=torch.float32)[:, None]
         self._scan_col_coords = torch.arange(self.shape_cols, device=self._device, dtype=torch.float32)[None, :]
-        self._sparse_mask = np.zeros((self.n_frames, self.shape_rows, self.shape_cols), dtype=bool)
-        self._dose_map = np.zeros((self.n_frames, self.shape_rows, self.shape_cols), dtype=np.float32)
         # Setup center and BF radius
         det_size = min(self.det_rows, self.det_cols)
         if center is not None and bf_radius is not None:
@@ -628,6 +514,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._cached_bf_virtual = None
         self._cached_abf_virtual = None
         self._cached_adf_virtual = None
+        self._cached_haadf_virtual = None
         if precompute_virtual_images and self.n_frames == 1:
             self._precompute_common_virtual_images()
 
@@ -662,9 +549,9 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         # Frame animation (5D): observe frame_idx changes from frontend
         self.observe(self._on_frame_idx_change, names=["frame_idx"])
+        self.observe(self._on_preset_request, names=["_preset_request"])
 
         # Auto-detect trigger: observe changes from frontend
-        self.observe(self._on_auto_detect_trigger, names=["auto_detect_trigger"])
 
         # VI ROI: observe changes for summed DP computation
         # Initialize VI ROI center to scan center with reasonable default sizes
@@ -677,8 +564,9 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.vi_roi_height = float(default_roi_size)
         self.observe(self._on_vi_roi_change, names=[
             "vi_roi_mode", "vi_roi_center_row", "vi_roi_center_col",
-            "vi_roi_radius", "vi_roi_width", "vi_roi_height"
+            "vi_roi_radius", "vi_roi_width", "vi_roi_height", "vi_roi_reduce"
         ])
+        self.observe(self._on_vi_roi_center_change, names=["vi_roi_center"])
 
         if state is not None:
             if isinstance(state, (str, pathlib.Path)):
@@ -700,16 +588,12 @@ class Show4DSTEM(anywidget.AnyWidget):
             data = data.array
         data_np = to_numpy(data)
         saturated_value = 65535.0 if data_np.dtype == np.uint16 else 255.0 if data_np.dtype == np.uint8 else None
-        if data_np.dtype != np.float32:
-            data_np = data_np.astype(np.float32)
         if saturated_value is not None:
             data_np[data_np >= saturated_value] = 0
         if data_np.ndim == 5:
             self.n_frames = data_np.shape[0]
             self._scan_shape = (data_np.shape[1], data_np.shape[2])
             self._det_shape = (data_np.shape[3], data_np.shape[4])
-            if data_np.size > 2**31 - 1 and str(self._device) == "mps":
-                self._device = torch.device("cpu")
             self._data = torch.from_numpy(data_np).to(self._device)
         elif data_np.ndim == 3:
             self.n_frames = 1
@@ -736,19 +620,19 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.det_rows = self._det_shape[0]
         self.det_cols = self._det_shape[1]
         first_frame = self._data[0] if self._data.ndim == 5 else self._data
-        self.dp_global_min = max(float(first_frame.min()), MIN_LOG_VALUE)
-        self.dp_global_max = float(first_frame.max())
+        first_frame_sample = first_frame[0] if first_frame.ndim >= 3 else first_frame
+        if not torch.is_floating_point(first_frame_sample):
+            first_frame_sample = first_frame_sample.float()
+        self.dp_global_min = max(float(first_frame_sample.min()), MIN_LOG_VALUE)
+        self.dp_global_max = float(first_frame_sample.max())
         self._det_row_coords = torch.arange(self.det_rows, device=self._device, dtype=torch.float32)[:, None]
         self._det_col_coords = torch.arange(self.det_cols, device=self._device, dtype=torch.float32)[None, :]
         self._scan_row_coords = torch.arange(self.shape_rows, device=self._device, dtype=torch.float32)[:, None]
         self._scan_col_coords = torch.arange(self.shape_cols, device=self._device, dtype=torch.float32)[None, :]
-        self._sparse_mask = np.zeros((self.n_frames, self.shape_rows, self.shape_cols), dtype=bool)
-        self._dose_map = np.zeros((self.n_frames, self.shape_rows, self.shape_cols), dtype=np.float32)
-        self._sparse_samples = {}
-        self._sparse_order = []
         self._cached_bf_virtual = None
         self._cached_abf_virtual = None
         self._cached_adf_virtual = None
+        self._cached_haadf_virtual = None
         with self.hold_trait_notifications():
             self.pos_row = min(self.pos_row, self.shape_rows - 1)
             self.pos_col = min(self.pos_col, self.shape_cols - 1)
@@ -756,7 +640,6 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._update_frame()
 
     def __repr__(self) -> str:
-        k_unit = "mrad" if self.k_calibrated else "px"
         shape = (
             f"({self.n_frames}, {self.shape_rows}, {self.shape_cols}, {self.det_rows}, {self.det_cols})"
             if self.n_frames > 1
@@ -766,7 +649,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         title_info = f", title='{self.title}'" if self.title else ""
         return (
             f"Show4DSTEM(shape={shape}, "
-            f"sampling=({self.pixel_size} Å, {self.k_pixel_size} {k_unit}), "
+            f"sampling=({self.pixel_size} {self.pixel_unit}, {self.k_pixel_size} {self.k_pixel_unit}), "
             f"pos=({self.pos_row}, {self.pos_col}){frame_info}{title_info})"
         )
 
@@ -776,7 +659,9 @@ class Show4DSTEM(anywidget.AnyWidget):
             "pos_row": self.pos_row,
             "pos_col": self.pos_col,
             "pixel_size": self.pixel_size,
+            "pixel_unit": self.pixel_unit,
             "k_pixel_size": self.k_pixel_size,
+            "k_pixel_unit": self.k_pixel_unit,
             "k_calibrated": self.k_calibrated,
             "center_row": self.center_row,
             "center_col": self.center_col,
@@ -795,16 +680,13 @@ class Show4DSTEM(anywidget.AnyWidget):
             "vi_roi_radius": self.vi_roi_radius,
             "vi_roi_width": self.vi_roi_width,
             "vi_roi_height": self.vi_roi_height,
-            "mask_dc": self.mask_dc,
+            "vi_roi_reduce": self.vi_roi_reduce,
             "dp_colormap": self.dp_colormap,
             "vi_colormap": self.vi_colormap,
             "fft_colormap": self.fft_colormap,
             "dp_scale_mode": self.dp_scale_mode,
             "vi_scale_mode": self.vi_scale_mode,
             "fft_scale_mode": self.fft_scale_mode,
-            "dp_power_exp": self.dp_power_exp,
-            "vi_power_exp": self.vi_power_exp,
-            "fft_power_exp": self.fft_power_exp,
             "dp_vmin_pct": self.dp_vmin_pct,
             "dp_vmax_pct": self.dp_vmax_pct,
             "vi_vmin_pct": self.vi_vmin_pct,
@@ -820,11 +702,8 @@ class Show4DSTEM(anywidget.AnyWidget):
             "fft_window": self.fft_window,
             "show_controls": self.show_controls,
             "dp_show_colorbar": self.dp_show_colorbar,
-            "export_default_view": self.export_default_view,
-            "export_default_format": self.export_default_format,
-            "export_include_overlays": self.export_include_overlays,
-            "export_include_scalebar": self.export_include_scalebar,
-            "export_default_dpi": self.export_default_dpi,
+            "vi_auto_contrast": self.vi_auto_contrast,
+            "vi_smooth": self.vi_smooth,
             "path_interval_ms": self.path_interval_ms,
             "path_loop": self.path_loop,
             "profile_line": self.profile_line,
@@ -836,8 +715,6 @@ class Show4DSTEM(anywidget.AnyWidget):
             "frame_fps": self.frame_fps,
             "frame_reverse": self.frame_reverse,
             "frame_boomerang": self.frame_boomerang,
-            "disabled_tools": self.disabled_tools,
-            "hidden_tools": self.hidden_tools,
         }
 
     def save(self, path: str):
@@ -881,16 +758,11 @@ class Show4DSTEM(anywidget.AnyWidget):
         gc.collect()
         if device == "mps":
             try:
-                import torch
                 torch.mps.empty_cache()
-            except Exception:
+            except AttributeError:
                 pass
         elif device.startswith("cuda"):
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            torch.cuda.empty_cache()
         if nbytes > 0:
             print(f"freed {_format_memory(nbytes)} ({device})")
 
@@ -912,15 +784,10 @@ class Show4DSTEM(anywidget.AnyWidget):
                     lines.append(f"Labels:   {self._frame_labels}")
                 else:
                     lines.append(f"Labels:   {self._frame_labels[:3]} ... ({len(self._frame_labels)} total)")
-        lines.append(f"Scan:     {self.shape_rows}×{self.shape_cols} ({self.pixel_size:.2f} Å/px)")
-        k_unit = "mrad" if self.k_calibrated else "px"
-        lines.append(f"Detector: {self.det_rows}×{self.det_cols} ({self.k_pixel_size:.4f} {k_unit}/px)")
+        lines.append(f"Scan:     {self.shape_rows}×{self.shape_cols} ({self.pixel_size:.2f} {self.pixel_unit}/px)")
+        lines.append(f"Detector: {self.det_rows}×{self.det_cols} ({self.k_pixel_size:.4f} {self.k_pixel_unit}/px)")
         lines.append(f"Position: ({self.pos_row}, {self.pos_col})")
         lines.append(f"Center:   ({self.center_row:.1f}, {self.center_col:.1f})  BF r={self.bf_radius:.1f} px")
-        display_parts = []
-        if self.mask_dc:
-            display_parts.append("DC masked")
-        lines.append(f"Display:  {', '.join(display_parts) if display_parts else 'default'}")
         if self.roi_active:
             lines.append(f"ROI:      {self.roi_mode} at ({self.roi_center_row:.1f}, {self.roi_center_col:.1f}) r={self.roi_radius:.1f}")
         if self.vi_roi_mode != "off":
@@ -945,10 +812,6 @@ class Show4DSTEM(anywidget.AnyWidget):
         if self.profile_line and len(self.profile_line) == 2:
             p0, p1 = self.profile_line[0], self.profile_line[1]
             lines.append(f"Profile:  ({p0['row']:.0f}, {p0['col']:.0f}) -> ({p1['row']:.0f}, {p1['col']:.0f}) width={self.profile_width}")
-        if self.disabled_tools:
-            lines.append(f"Locked:   {', '.join(self.disabled_tools)}")
-        if self.hidden_tools:
-            lines.append(f"Hidden:   {', '.join(self.hidden_tools)}")
         print("\n".join(lines))
 
     # =========================================================================
@@ -1124,12 +987,12 @@ class Show4DSTEM(anywidget.AnyWidget):
             self.pos_row = max(0, min(self.shape_rows - 1, row))
             self.pos_col = max(0, min(self.shape_cols - 1, col))
 
-    def _on_auto_detect_trigger(self, change):
-        """Called when auto_detect_trigger is set to True from frontend."""
-        if change["new"]:
-            self.auto_detect_center()
-            # Reset trigger to allow re-triggering
-            self.auto_detect_trigger = False
+    def _on_preset_request(self, change):
+        """JS preset shortcut → atomic apply_preset (no per-trait race)."""
+        name = (change.get("new") or "").strip().lower()
+        if name in ("bf", "abf", "adf", "haadf"):
+            self.apply_preset(name)
+            self._preset_request = ""  # consume trigger
 
     def _on_frame_idx_change(self, change=None):
         """Called when frame_idx changes (5D time/tilt series).
@@ -1143,12 +1006,13 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._cached_bf_virtual = None
         self._cached_abf_virtual = None
         self._cached_adf_virtual = None
+        self._cached_haadf_virtual = None
         # Recompute virtual image and displayed frame
         self._compute_virtual_image_from_roi()
         self._update_frame()
-        # Recompute summed DP if VI ROI is active
+        # Recompute reduced DP if VI ROI is active
         if self.vi_roi_mode != "off":
-            self._compute_summed_dp_from_vi_roi()
+            self._compute_vi_roi_dp()
 
     # =========================================================================
     # Path Animation Patterns
@@ -1353,28 +1217,26 @@ class Show4DSTEM(anywidget.AnyWidget):
         >>> widget = Show4DSTEM(data)
         >>> widget.auto_detect_center()  # Auto-detect and apply
         """
-        # Sum all diffraction patterns to get average (PyTorch)
-        if self._data.ndim == 5:
-            summed_dp = self._data.sum(dim=(0, 1, 2))
-        elif self._data.ndim == 4:
-            summed_dp = self._data.sum(dim=(0, 1))
-        else:
-            summed_dp = self._data.sum(dim=0)
+        # Sum diffraction patterns over scan positions to find BF disk centroid.
+        # Single chunked torch float path: works identically on CUDA / MPS / CPU.
+        # Each chunk casts uint16 → float32 transiently (~600 MB max), accumulates.
+        data_flat = self._data.reshape(-1, *self._det_shape)
+        n_pos = data_flat.shape[0]
+        mean_dp = torch.zeros(self._det_shape, dtype=torch.float32, device=self._device)
+        # Float32 cast transient = positions × det_h × det_w × 4 bytes; cap at budget.
+        pos_per_chunk = max(1, _CHUNK_BYTE_BUDGET // max(1, self._det_shape[0] * self._det_shape[1] * 4))
+        for i in range(0, n_pos, pos_per_chunk):
+            mean_dp += data_flat[i:i + pos_per_chunk].sum(dim=0, dtype=torch.float32)
 
-        # Threshold at mean + std to isolate BF disk
-        threshold = summed_dp.mean() + summed_dp.std()
-        mask = summed_dp > threshold
+        threshold = mean_dp.mean() + mean_dp.std()
+        mask = mean_dp > threshold
 
-        # Avoid division by zero
         total = mask.sum()
         if total == 0:
             return self
 
-        # Calculate centroid using cached coordinate grids
         cx = float((self._det_col_coords * mask).sum() / total)
         cy = float((self._det_row_coords * mask).sum() / total)
-
-        # Estimate radius from mask area (A = pi*r^2)
         radius = float(torch.sqrt(total / torch.pi))
 
         # Apply detected values
@@ -1402,17 +1264,10 @@ class Show4DSTEM(anywidget.AnyWidget):
         else:
             return data[row, col].cpu().numpy()
 
-    def _apply_scale_mode(
-        self,
-        data: np.ndarray,
-        mode: str,
-        power_exp: float = 0.5,
-    ) -> np.ndarray:
+    def _apply_scale_mode(self, data: np.ndarray, mode: str) -> np.ndarray:
         arr = np.asarray(data, dtype=np.float32)
         if mode == "log":
             return np.log1p(np.maximum(arr, 0.0)).astype(np.float32)
-        if mode == "power":
-            return np.power(np.maximum(arr, 0.0), float(power_exp)).astype(np.float32)
         return arr.astype(np.float32)
 
     def _slider_range(
@@ -1458,13 +1313,13 @@ class Show4DSTEM(anywidget.AnyWidget):
             return np.zeros((self.shape_rows, self.shape_cols), dtype=np.float32)
         return arr.reshape(self.shape_rows, self.shape_cols).copy()
 
-    def _get_summed_dp_array(self) -> np.ndarray | None:
+    def _get_vi_roi_dp_array(self) -> np.ndarray | None:
         if self.vi_roi_mode == "off":
             return None
-        self._compute_summed_dp_from_vi_roi()
-        if not self.summed_dp_bytes:
+        self._compute_vi_roi_dp()
+        if not self.vi_roi_dp_bytes:
             return None
-        arr = np.frombuffer(self.summed_dp_bytes, dtype=np.float32)
+        arr = np.frombuffer(self.vi_roi_dp_bytes, dtype=np.float32)
         expected = self.det_rows * self.det_cols
         if arr.size != expected:
             return None
@@ -1497,24 +1352,24 @@ class Show4DSTEM(anywidget.AnyWidget):
         return dmin, pmax
 
     def _render_dp_rgb(self) -> tuple[np.ndarray, dict]:
-        summed_dp = self._get_summed_dp_array()
-        if summed_dp is not None:
-            raw = summed_dp
-            source = "summed_dp"
+        vi_roi_arr = self._get_vi_roi_dp_array()
+        if vi_roi_arr is not None:
+            raw = vi_roi_arr
+            source = "vi_roi_dp"
         else:
             raw = self._get_frame(self.pos_row, self.pos_col).astype(np.float32)
             source = "single_frame"
 
         scale_mode = self.dp_scale_mode
-        scaled = self._apply_scale_mode(raw, scale_mode, self.dp_power_exp)
+        scaled = self._apply_scale_mode(raw, scale_mode)
         data_min = float(scaled.min()) if scaled.size else 0.0
         data_max = float(scaled.max()) if scaled.size else 0.0
         if self.dp_vmin is not None and self.dp_vmax is not None:
             vmin = float(self._apply_scale_mode(
-                np.array([max(self.dp_vmin, 0)], dtype=np.float32), scale_mode, self.dp_power_exp
+                np.array([max(self.dp_vmin, 0)], dtype=np.float32), scale_mode
             )[0])
             vmax = float(self._apply_scale_mode(
-                np.array([max(self.dp_vmax, 0)], dtype=np.float32), scale_mode, self.dp_power_exp
+                np.array([max(self.dp_vmax, 0)], dtype=np.float32), scale_mode
             )[0])
         else:
             vmin, vmax = self._slider_range(data_min, data_max, self.dp_vmin_pct, self.dp_vmax_pct)
@@ -1532,15 +1387,15 @@ class Show4DSTEM(anywidget.AnyWidget):
 
     def _render_virtual_rgb(self) -> tuple[np.ndarray, dict]:
         raw = self._get_virtual_image_array()
-        scaled = self._apply_scale_mode(raw, self.vi_scale_mode, self.vi_power_exp)
+        scaled = self._apply_scale_mode(raw, self.vi_scale_mode)
         data_min = float(scaled.min()) if scaled.size else 0.0
         data_max = float(scaled.max()) if scaled.size else 0.0
         if self.vi_vmin is not None and self.vi_vmax is not None:
             vmin = float(self._apply_scale_mode(
-                np.array([max(self.vi_vmin, 0)], dtype=np.float32), self.vi_scale_mode, self.vi_power_exp
+                np.array([max(self.vi_vmin, 0)], dtype=np.float32), self.vi_scale_mode
             )[0])
             vmax = float(self._apply_scale_mode(
-                np.array([max(self.vi_vmax, 0)], dtype=np.float32), self.vi_scale_mode, self.vi_power_exp
+                np.array([max(self.vi_vmax, 0)], dtype=np.float32), self.vi_scale_mode
             )[0])
         else:
             vmin, vmax = self._slider_range(data_min, data_max, self.vi_vmin_pct, self.vi_vmax_pct)
@@ -1559,7 +1414,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         virtual_raw = self._get_virtual_image_array()
         fft = np.fft.fftshift(np.fft.fft2(virtual_raw))
         mag = np.abs(fft).astype(np.float32)
-        scaled = self._apply_scale_mode(mag, self.fft_scale_mode, self.fft_power_exp)
+        scaled = self._apply_scale_mode(mag, self.fft_scale_mode)
         if self.fft_auto:
             display_min, display_max = self._fft_enhanced_range(scaled)
         else:
@@ -1578,28 +1433,13 @@ class Show4DSTEM(anywidget.AnyWidget):
         }
         return rgb, metadata
 
-    def list_export_views(self) -> tuple[str, ...]:
-        return ("diffraction", "virtual", "fft", "all")
-
-    def list_export_formats(self) -> tuple[str, ...]:
-        return ("png", "pdf")
-
-    def list_figure_templates(self) -> tuple[str, ...]:
-        return ("dp_vi", "dp_vi_fft", "publication_dp_vi", "publication_dp_vi_fft")
-
-    def list_presets(self) -> tuple[str, ...]:
-        builtin = ("bf", "abf", "adf", "haadf")
-        custom = tuple(sorted(self._named_presets.keys()))
-        return builtin + custom
+    _EXPORT_VIEWS = ("diffraction", "virtual", "fft", "all")
+    _EXPORT_FORMATS = ("png", "pdf")
 
     def _validate_export_view(self, view: str | None) -> str:
-        candidate = self.export_default_view if view is None else str(view)
-        view_key = str(candidate).strip().lower()
-        allowed = self.list_export_views()
-        if view_key not in allowed:
-            raise ValueError(
-                f"Unsupported view '{view}'. Supported: {', '.join(allowed)}"
-            )
+        view_key = (view or "all").strip().lower()
+        if view_key not in self._EXPORT_VIEWS:
+            raise ValueError(f"Unsupported view '{view}'. Supported: {', '.join(self._EXPORT_VIEWS)}")
         return view_key
 
     def _validate_frame_idx(self, frame_idx: int | None) -> int:
@@ -1628,21 +1468,10 @@ class Show4DSTEM(anywidget.AnyWidget):
             )
         return row, col
 
-    def _resolve_export_format(
-        self,
-        path: pathlib.Path,
-        fmt: str | None,
-    ) -> str:
-        if fmt is not None and str(fmt).strip():
-            resolved = str(fmt).strip().lower()
-        else:
-            from_path = path.suffix.lstrip(".").lower()
-            resolved = from_path if from_path else str(self.export_default_format).strip().lower()
-        allowed = self.list_export_formats()
-        if resolved not in allowed:
-            raise ValueError(
-                f"Unsupported format '{resolved}'. Supported: {', '.join(allowed)}"
-            )
+    def _resolve_export_format(self, path: pathlib.Path, fmt: str | None) -> str:
+        resolved = (fmt or path.suffix.lstrip(".") or "png").strip().lower()
+        if resolved not in self._EXPORT_FORMATS:
+            raise ValueError(f"Unsupported format '{resolved}'. Supported: {', '.join(self._EXPORT_FORMATS)}")
         return resolved
 
     @staticmethod
@@ -1917,15 +1746,6 @@ class Show4DSTEM(anywidget.AnyWidget):
             "height": float(self.vi_roi_height),
         }
 
-    def _export_settings_metadata(self) -> dict[str, Any]:
-        return {
-            "default_view": self.export_default_view,
-            "default_format": self.export_default_format,
-            "include_overlays": bool(self.export_include_overlays),
-            "include_scalebar": bool(self.export_include_scalebar),
-            "dpi": int(self.export_default_dpi),
-        }
-
     def _build_image_export_metadata(
         self,
         export_path: pathlib.Path,
@@ -1954,981 +1774,10 @@ class Show4DSTEM(anywidget.AnyWidget):
             "display": render_meta,
             "include_overlays": bool(include_overlays),
             "include_scalebar": bool(include_scalebar),
-            "export_settings": self._export_settings_metadata(),
         }
         if extra:
             metadata.update(extra)
         return metadata
-
-    @staticmethod
-    def _sha256_file(path: pathlib.Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as f:
-            while True:
-                chunk = f.read(1_048_576)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    def _build_file_record(
-        self,
-        path: pathlib.Path,
-        metadata_path: pathlib.Path | None = None,
-        index: int | None = None,
-    ) -> dict[str, Any]:
-        record: dict[str, Any] = {
-            "path": str(path),
-            "sha256": self._sha256_file(path),
-            "size_bytes": int(path.stat().st_size),
-        }
-        if metadata_path is not None and metadata_path.exists():
-            record["metadata_path"] = str(metadata_path)
-            record["metadata_sha256"] = self._sha256_file(metadata_path)
-            record["metadata_size_bytes"] = int(metadata_path.stat().st_size)
-        if index is not None:
-            record["index"] = int(index)
-        return record
-
-    def _record_export_event(self, event: dict[str, Any]) -> None:
-        payload = {
-            "session_id": self._export_session_id,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        }
-        payload.update(event)
-        self._export_log.append(payload)
-
-    def _validate_sparse_frame_idx(self, frame_idx: int | None) -> int:
-        if self.n_frames <= 1:
-            return 0
-        if frame_idx is None:
-            return int(self.frame_idx)
-        idx = int(frame_idx)
-        if idx < 0 or idx >= self.n_frames:
-            raise ValueError(f"frame_idx={idx} is out of range [0, {self.n_frames - 1}]")
-        return idx
-
-    def _normalize_sparse_mask(self, mask: np.ndarray) -> np.ndarray:
-        arr = np.asarray(mask)
-        if self.n_frames <= 1:
-            if arr.shape == (self.shape_rows, self.shape_cols):
-                arr = arr[None, ...]
-            elif arr.shape != (1, self.shape_rows, self.shape_cols):
-                raise ValueError(
-                    f"mask shape {arr.shape} does not match "
-                    f"(scan_rows, scan_cols)=({self.shape_rows}, {self.shape_cols})"
-                )
-        elif arr.shape != (self.n_frames, self.shape_rows, self.shape_cols):
-            raise ValueError(
-                f"mask shape {arr.shape} does not match "
-                f"(n_frames, scan_rows, scan_cols)=({self.n_frames}, {self.shape_rows}, {self.shape_cols})"
-            )
-        return arr.astype(bool, copy=False)
-
-    def _coerce_dp_array(self, dp: np.ndarray) -> np.ndarray:
-        arr = np.asarray(to_numpy(dp), dtype=np.float32)
-        if arr.shape != (self.det_rows, self.det_cols):
-            raise ValueError(
-                f"dp shape {arr.shape} does not match detector_shape "
-                f"({self.det_rows}, {self.det_cols})"
-            )
-        return arr
-
-    def _write_dp_to_data(self, frame_idx: int, row: int, col: int, dp_arr: np.ndarray) -> None:
-        dp_tensor = torch.from_numpy(dp_arr).to(device=self._device, dtype=torch.float32)
-        if self.n_frames > 1:
-            self._data[frame_idx, row, col] = dp_tensor
-        elif self._data.ndim == 4:
-            self._data[row, col] = dp_tensor
-        else:
-            flat_idx = row * self.shape_cols + col
-            self._data[flat_idx] = dp_tensor
-
-    def _ingest_scan_point_core(
-        self,
-        row: int,
-        col: int,
-        dp: np.ndarray,
-        frame_idx: int,
-        dose: float,
-        refresh: bool,
-    ) -> None:
-        row_i, col_i = self._validate_position((row, col))
-        frame_i = self._validate_sparse_frame_idx(frame_idx)
-        dp_arr = self._coerce_dp_array(dp)
-        dose_value = float(dose)
-        if not np.isfinite(dose_value) or dose_value < 0:
-            raise ValueError(f"dose must be finite and >= 0, got {dose}")
-
-        key = (int(frame_i), int(row_i), int(col_i))
-        if key not in self._sparse_samples:
-            self._sparse_order.append(key)
-        self._sparse_samples[key] = dp_arr.copy()
-        self._sparse_mask[frame_i, row_i, col_i] = True
-        self._dose_map[frame_i, row_i, col_i] += dose_value
-
-        self._write_dp_to_data(frame_i, row_i, col_i, dp_arr)
-        self.dp_global_min = max(min(float(self.dp_global_min), float(dp_arr.min())), MIN_LOG_VALUE)
-        self.dp_global_max = max(float(self.dp_global_max), float(dp_arr.max()))
-
-        if refresh:
-            self._compute_virtual_image_from_roi()
-            self._update_frame()
-
-    def _detector_integration_kernel(self) -> tuple[np.ndarray | None, tuple[int, int] | None]:
-        cx, cy = float(self.roi_center_col), float(self.roi_center_row)
-        rr, cc = np.meshgrid(
-            np.arange(self.det_rows, dtype=np.float32),
-            np.arange(self.det_cols, dtype=np.float32),
-            indexing="ij",
-        )
-        if self.roi_mode == "circle" and self.roi_radius > 0:
-            mask = (cc - cx) ** 2 + (rr - cy) ** 2 <= float(self.roi_radius) ** 2
-            return mask.astype(np.float32, copy=False), None
-        if self.roi_mode == "square" and self.roi_radius > 0:
-            half = float(self.roi_radius)
-            mask = (np.abs(cc - cx) <= half) & (np.abs(rr - cy) <= half)
-            return mask.astype(np.float32, copy=False), None
-        if self.roi_mode == "annular" and self.roi_radius > 0:
-            outer = float(self.roi_radius)
-            inner = float(self.roi_radius_inner)
-            dist_sq = (cc - cx) ** 2 + (rr - cy) ** 2
-            mask = (dist_sq >= inner**2) & (dist_sq <= outer**2)
-            return mask.astype(np.float32, copy=False), None
-        if self.roi_mode == "rect" and self.roi_width > 0 and self.roi_height > 0:
-            hw = float(self.roi_width) / 2.0
-            hh = float(self.roi_height) / 2.0
-            mask = (np.abs(cc - cx) <= hw) & (np.abs(rr - cy) <= hh)
-            return mask.astype(np.float32, copy=False), None
-        row = int(max(0, min(round(cy), self.det_rows - 1)))
-        col = int(max(0, min(round(cx), self.det_cols - 1)))
-        return None, (row, col)
-
-    def _integrate_dp_value(
-        self,
-        dp: np.ndarray,
-        mask: np.ndarray | None,
-        point_idx: tuple[int, int] | None,
-    ) -> float:
-        arr = np.asarray(dp, dtype=np.float32)
-        if point_idx is not None:
-            row, col = point_idx
-            return float(arr[row, col])
-        if mask is None:
-            return 0.0
-        return float((arr * mask).sum())
-
-    def _virtual_image_from_frame_array(self, frame_data: np.ndarray) -> np.ndarray:
-        arr = np.asarray(frame_data, dtype=np.float32)
-        if arr.shape != (self.shape_rows, self.shape_cols, self.det_rows, self.det_cols):
-            raise ValueError(
-                f"frame_data shape {arr.shape} does not match "
-                f"({self.shape_rows}, {self.shape_cols}, {self.det_rows}, {self.det_cols})"
-            )
-        mask, point_idx = self._detector_integration_kernel()
-        if point_idx is not None:
-            row, col = point_idx
-            return arr[:, :, row, col].astype(np.float32, copy=False)
-        return (arr * mask[None, None, :, :]).sum(axis=(2, 3)).astype(np.float32)
-
-    @staticmethod
-    def _idw_reconstruct(
-        shape: tuple[int, int],
-        points: np.ndarray,
-        values: np.ndarray,
-        power: float = 2.0,
-        k_neighbors: int = 16,
-    ) -> np.ndarray:
-        if points.size == 0:
-            return np.zeros(shape, dtype=np.float32)
-        rr, cc = np.meshgrid(
-            np.arange(shape[0], dtype=np.float32),
-            np.arange(shape[1], dtype=np.float32),
-            indexing="ij",
-        )
-        coords = np.stack([rr.reshape(-1), cc.reshape(-1)], axis=1)
-        dist_sq = ((coords[:, None, :] - points[None, :, :]) ** 2).sum(axis=2) + 1e-6
-
-        if k_neighbors > 0 and points.shape[0] > k_neighbors:
-            idx = np.argpartition(dist_sq, kth=k_neighbors - 1, axis=1)[:, :k_neighbors]
-            dist_sq = np.take_along_axis(dist_sq, idx, axis=1)
-            vals_local = values[idx]
-        else:
-            vals_local = np.broadcast_to(values[None, :], dist_sq.shape)
-
-        weights = 1.0 / np.power(dist_sq, power / 2.0)
-        pred = (weights * vals_local).sum(axis=1) / np.maximum(weights.sum(axis=1), 1e-6)
-        return pred.reshape(shape).astype(np.float32, copy=False)
-
-    def _resolve_reference_virtual_image(
-        self,
-        reference: str | np.ndarray,
-        frame_idx: int,
-    ) -> tuple[np.ndarray, str]:
-        if isinstance(reference, str):
-            key = reference.strip().lower()
-            if key != "full_raster":
-                raise ValueError("reference must be 'full_raster' or a NumPy array")
-            if self.n_frames > 1:
-                frame = self._data[frame_idx].detach().cpu().numpy()
-            elif self._data.ndim == 4:
-                frame = self._data.detach().cpu().numpy()
-            else:
-                frame = self._data.detach().cpu().numpy().reshape(
-                    self.shape_rows, self.shape_cols, self.det_rows, self.det_cols
-                )
-            return self._virtual_image_from_frame_array(frame), "full_raster"
-
-        arr = np.asarray(to_numpy(reference), dtype=np.float32)
-        if arr.shape == (self.shape_rows, self.shape_cols):
-            return arr.astype(np.float32, copy=False), "virtual_image"
-        if arr.shape == (self.shape_rows, self.shape_cols, self.det_rows, self.det_cols):
-            return self._virtual_image_from_frame_array(arr), "frame_data"
-        if arr.shape == (self.n_frames, self.shape_rows, self.shape_cols, self.det_rows, self.det_cols):
-            return self._virtual_image_from_frame_array(arr[frame_idx]), "stack_frame_data"
-        raise ValueError(
-            "Unsupported reference shape. Expected one of: "
-            f"(scan_rows, scan_cols), "
-            f"(scan_rows, scan_cols, det_rows, det_cols), or "
-            f"(n_frames, scan_rows, scan_cols, det_rows, det_cols)."
-        )
-
-    def _extract_sparse_samples(self, frame_idx: int) -> tuple[np.ndarray, np.ndarray]:
-        mask = self._sparse_mask[frame_idx]
-        coords = np.argwhere(mask)
-        if coords.size == 0:
-            return (
-                np.zeros((0, 2), dtype=np.float32),
-                np.zeros((0,), dtype=np.float32),
-            )
-
-        integ_mask, point_idx = self._detector_integration_kernel()
-        values = np.zeros((coords.shape[0],), dtype=np.float32)
-        for i, (row, col) in enumerate(coords):
-            key = (int(frame_idx), int(row), int(col))
-            dp = self._sparse_samples.get(key)
-            if dp is None:
-                dp = self._get_frame(int(row), int(col))
-            values[i] = self._integrate_dp_value(dp, integ_mask, point_idx)
-        points = coords.astype(np.float32, copy=False)
-        return points, values
-
-    def ingest_scan_point(
-        self,
-        row: int,
-        col: int,
-        dp: np.ndarray,
-        frame_idx: int = 0,
-        dose: float | None = None,
-    ) -> Self:
-        """
-        Ingest one scanned diffraction pattern into sparse acquisition state.
-
-        Parameters
-        ----------
-        row : int
-            Scan-space row index.
-        col : int
-            Scan-space column index.
-        dp : array_like
-            Diffraction pattern with shape ``(det_rows, det_cols)``.
-        frame_idx : int, default 0
-            Frame index for 5D data.
-        dose : float, optional
-            Dose contribution for this acquisition event. Defaults to ``1.0``.
-
-        Returns
-        -------
-        Show4DSTEM
-            Self for method chaining.
-        """
-        self._ingest_scan_point_core(
-            row=row,
-            col=col,
-            dp=dp,
-            frame_idx=frame_idx,
-            dose=1.0 if dose is None else float(dose),
-            refresh=True,
-        )
-        self._record_export_event(
-            {
-                "export_kind": "ingest_scan_point",
-                "frame_idx": int(self._validate_sparse_frame_idx(frame_idx)),
-                "row": int(row),
-                "col": int(col),
-                "dose": float(1.0 if dose is None else dose),
-            }
-        )
-        return self
-
-    def ingest_scan_block(
-        self,
-        rows: list[int] | np.ndarray,
-        cols: list[int] | np.ndarray,
-        dp_block: np.ndarray,
-        frame_idx: int = 0,
-    ) -> Self:
-        """
-        Ingest multiple scanned diffraction patterns in one call.
-
-        Parameters
-        ----------
-        rows : list[int] or np.ndarray
-            Row indices for each pattern in ``dp_block``.
-        cols : list[int] or np.ndarray
-            Column indices for each pattern in ``dp_block``.
-        dp_block : np.ndarray
-            Diffraction stack with shape ``(n_points, det_rows, det_cols)``.
-        frame_idx : int, default 0
-            Frame index for 5D data.
-
-        Returns
-        -------
-        Show4DSTEM
-            Self for method chaining.
-        """
-        rows_arr = np.asarray(rows, dtype=np.int64).reshape(-1)
-        cols_arr = np.asarray(cols, dtype=np.int64).reshape(-1)
-        if rows_arr.size != cols_arr.size:
-            raise ValueError("rows and cols must have the same length")
-
-        block = np.asarray(to_numpy(dp_block), dtype=np.float32)
-        if block.ndim == 2:
-            block = block[None, ...]
-        if block.ndim != 3 or block.shape[1:] != (self.det_rows, self.det_cols):
-            raise ValueError(
-                f"dp_block shape must be (n_points, {self.det_rows}, {self.det_cols}), got {block.shape}"
-            )
-        if block.shape[0] != rows_arr.size:
-            raise ValueError(
-                f"dp_block has {block.shape[0]} patterns but rows/cols specify {rows_arr.size} points"
-            )
-
-        frame_i = self._validate_sparse_frame_idx(frame_idx)
-        for idx in range(rows_arr.size):
-            self._ingest_scan_point_core(
-                row=int(rows_arr[idx]),
-                col=int(cols_arr[idx]),
-                dp=block[idx],
-                frame_idx=frame_i,
-                dose=1.0,
-                refresh=False,
-            )
-
-        self._compute_virtual_image_from_roi()
-        self._update_frame()
-        self._record_export_event(
-            {
-                "export_kind": "ingest_scan_block",
-                "frame_idx": int(frame_i),
-                "n_points": int(rows_arr.size),
-            }
-        )
-        return self
-
-    def get_sparse_state(self) -> dict[str, Any]:
-        """
-        Return sparse acquisition state for checkpointing or replay.
-
-        Returns
-        -------
-        dict
-            Sparse state with sampling mask, sampled diffraction stack,
-            sampled-point coordinates, and dose map.
-        """
-        coords = np.argwhere(self._sparse_mask)
-        sampled_points = [
-            {"frame_idx": int(f), "row": int(r), "col": int(c)}
-            for (f, r, c) in coords
-        ]
-        if coords.size:
-            sampled_data = np.stack(
-                [
-                    self._sparse_samples.get((int(f), int(r), int(c)), self._get_frame(int(r), int(c)))
-                    for (f, r, c) in coords
-                ],
-                axis=0,
-            ).astype(np.float32, copy=False)
-        else:
-            sampled_data = np.zeros((0, self.det_rows, self.det_cols), dtype=np.float32)
-
-        mask_payload = self._sparse_mask[0].copy() if self.n_frames <= 1 else self._sparse_mask.copy()
-        dose_payload = self._dose_map[0].copy() if self.n_frames <= 1 else self._dose_map.copy()
-        return {
-            **build_json_header("Show4DSTEM"),
-            "format": "json",
-            "export_kind": "sparse_state_snapshot",
-            "frame_idx": int(self.frame_idx),
-            "scan_shape": {"rows": int(self.shape_rows), "cols": int(self.shape_cols)},
-            "detector_shape": {"rows": int(self.det_rows), "cols": int(self.det_cols)},
-            "mask": mask_payload,
-            "sampled_data": sampled_data,
-            "sampled_points": sampled_points,
-            "dose_map": dose_payload,
-            "n_sampled": int(len(sampled_points)),
-            "total_dose": float(self._dose_map.sum()),
-        }
-
-    def set_sparse_state(
-        self,
-        mask: np.ndarray,
-        sampled_data: np.ndarray,
-    ) -> Self:
-        """
-        Restore sparse acquisition state from mask + sampled data.
-
-        Parameters
-        ----------
-        mask : np.ndarray
-            Boolean scan mask. Shape ``(scan_rows, scan_cols)`` for 4D,
-            or ``(n_frames, scan_rows, scan_cols)`` for 5D.
-        sampled_data : np.ndarray
-            Either compact stack ``(n_sampled, det_rows, det_cols)``
-            matching row-major ``mask`` order, or dense data aligned to mask:
-            ``(scan_rows, scan_cols, det_rows, det_cols)`` for 4D,
-            ``(n_frames, scan_rows, scan_cols, det_rows, det_cols)`` for 5D.
-
-        Returns
-        -------
-        Show4DSTEM
-            Self for method chaining.
-        """
-        mask_3d = self._normalize_sparse_mask(mask)
-        coords = np.argwhere(mask_3d)
-
-        payload = np.asarray(to_numpy(sampled_data), dtype=np.float32)
-        n_points = int(coords.shape[0])
-
-        if payload.ndim == 3:
-            if payload.shape[0] != n_points or payload.shape[1:] != (self.det_rows, self.det_cols):
-                raise ValueError(
-                    f"Compact sampled_data must be (n_sampled, {self.det_rows}, {self.det_cols}); "
-                    f"got {payload.shape} for n_sampled={n_points}"
-                )
-            compact = payload
-        elif self.n_frames <= 1 and payload.shape == (self.shape_rows, self.shape_cols, self.det_rows, self.det_cols):
-            compact = np.stack(
-                [payload[int(r), int(c)] for (_, r, c) in coords],
-                axis=0,
-            ) if n_points else np.zeros((0, self.det_rows, self.det_cols), dtype=np.float32)
-        elif payload.shape == (
-            self.n_frames,
-            self.shape_rows,
-            self.shape_cols,
-            self.det_rows,
-            self.det_cols,
-        ):
-            compact = np.stack(
-                [payload[int(f), int(r), int(c)] for (f, r, c) in coords],
-                axis=0,
-            ) if n_points else np.zeros((0, self.det_rows, self.det_cols), dtype=np.float32)
-        else:
-            raise ValueError(
-                "Unsupported sampled_data shape for set_sparse_state. "
-                "Use compact (n_sampled, det_rows, det_cols) or dense per-mask arrays."
-            )
-
-        self._sparse_samples = {}
-        self._sparse_order = []
-        self._sparse_mask = np.zeros((self.n_frames, self.shape_rows, self.shape_cols), dtype=bool)
-        self._dose_map = np.zeros((self.n_frames, self.shape_rows, self.shape_cols), dtype=np.float32)
-
-        for idx, (frame_idx, row, col) in enumerate(coords):
-            self._ingest_scan_point_core(
-                row=int(row),
-                col=int(col),
-                dp=compact[idx],
-                frame_idx=int(frame_idx),
-                dose=1.0,
-                refresh=False,
-            )
-
-        self._compute_virtual_image_from_roi()
-        self._update_frame()
-        self._record_export_event(
-            {
-                "export_kind": "set_sparse_state",
-                "n_sampled": int(n_points),
-            }
-        )
-        return self
-
-    def _resolve_proposal_count(
-        self,
-        k: int,
-        frame_idx: int,
-        budget: dict[str, Any] | None,
-    ) -> int:
-        count = int(k)
-        if count < 1:
-            raise ValueError(f"k must be >= 1, got {k}")
-        if budget is None:
-            return count
-
-        existing_points = int(self._sparse_mask[frame_idx].sum())
-        existing_dose = float(self._dose_map[frame_idx].sum())
-        total_points = int(self.shape_rows * self.shape_cols)
-
-        if "max_new_points" in budget:
-            count = min(count, int(budget["max_new_points"]))
-        if "max_total_points" in budget:
-            count = min(count, max(0, int(budget["max_total_points"]) - existing_points))
-        if "max_total_fraction" in budget:
-            allowed_total = int(round(float(budget["max_total_fraction"]) * total_points))
-            count = min(count, max(0, allowed_total - existing_points))
-        if "max_total_dose" in budget:
-            dose_per_point = float(budget.get("dose_per_point", 1.0))
-            if dose_per_point <= 0:
-                raise ValueError("budget['dose_per_point'] must be > 0")
-            remaining = float(budget["max_total_dose"]) - existing_dose
-            count = min(count, max(0, int(math.floor(remaining / dose_per_point))))
-        return max(0, int(count))
-
-    def propose_next_points(
-        self,
-        k: int,
-        strategy: str = "adaptive",
-        budget: dict[str, Any] | None = None,
-    ) -> list[tuple[int, int]]:
-        """
-        Propose next scan points from current sparse acquisition state.
-
-        Parameters
-        ----------
-        k : int
-            Maximum number of new points to propose.
-        strategy : str, default "adaptive"
-            Proposal strategy: ``"adaptive"``, ``"random"``, or ``"raster"``.
-        budget : dict, optional
-            Optional constraints and strategy parameters. Supported keys:
-            ``frame_idx``, ``max_new_points``, ``max_total_points``,
-            ``max_total_fraction``, ``max_total_dose``, ``dose_per_point``,
-            ``roi_mask``, ``seed``, ``min_spacing``, ``step``,
-            ``local_window``, ``dose_lambda``, ``weights``, ``bidirectional``.
-
-        Returns
-        -------
-        list[tuple[int, int]]
-            Proposed ``(row, col)`` scan coordinates.
-        """
-        budget_dict = {} if budget is None else dict(budget)
-        strategy_key = str(strategy).strip().lower()
-        if strategy_key not in {"adaptive", "random", "raster"}:
-            raise ValueError("strategy must be one of: adaptive, random, raster")
-
-        frame_idx = self._validate_sparse_frame_idx(budget_dict.get("frame_idx", self.frame_idx))
-        n_select = self._resolve_proposal_count(int(k), frame_idx, budget_dict)
-        if n_select <= 0:
-            return []
-
-        sampled_mask = self._sparse_mask[frame_idx].copy()
-        allowed_mask = ~sampled_mask
-        roi_mask_raw = budget_dict.get("roi_mask", None)
-        if roi_mask_raw is not None:
-            roi_mask = np.asarray(roi_mask_raw, dtype=bool)
-            if roi_mask.shape != (self.shape_rows, self.shape_cols):
-                raise ValueError(
-                    f"roi_mask shape {roi_mask.shape} must match "
-                    f"scan_shape ({self.shape_rows}, {self.shape_cols})"
-                )
-            allowed_mask &= roi_mask
-
-        proposals: list[tuple[int, int]] = []
-        if strategy_key == "adaptive":
-            local_window = int(budget_dict.get("local_window", 5))
-            if local_window < 1:
-                raise ValueError("budget['local_window'] must be >= 1")
-            min_spacing = int(budget_dict.get("min_spacing", 2))
-            if min_spacing < 0:
-                raise ValueError("budget['min_spacing'] must be >= 0")
-            dose_lambda = float(budget_dict.get("dose_lambda", 0.25))
-            if not np.isfinite(dose_lambda):
-                raise ValueError("budget['dose_lambda'] must be finite")
-
-            default_weights = {
-                "vi_gradient": 0.4,
-                "vi_local_std": 0.3,
-                "dp_variance": 0.3,
-            }
-            merged_weights = dict(default_weights)
-            raw_weights = budget_dict.get("weights", None)
-            if raw_weights is not None:
-                for key, value in dict(raw_weights).items():
-                    if key not in default_weights:
-                        raise ValueError(
-                            f"Unsupported adaptive weight '{key}'. "
-                            f"Supported: {', '.join(default_weights.keys())}"
-                        )
-                    merged_weights[key] = float(value)
-            weight_sum = sum(max(0.0, float(v)) for v in merged_weights.values())
-            if weight_sum <= 0:
-                raise ValueError("At least one adaptive weight must be > 0")
-            weights = {k: max(0.0, float(v)) / weight_sum for k, v in merged_weights.items()}
-
-            vi = self._virtual_image_for_frame(frame_idx)
-            grad_row, grad_col = np.gradient(vi)
-            vi_gradient = np.hypot(grad_row, grad_col).astype(np.float32)
-            mean_local = self._box_mean_map(vi, local_window)
-            mean_sq_local = self._box_mean_map(vi * vi, local_window)
-            vi_local_std = np.sqrt(np.maximum(mean_sq_local - mean_local * mean_local, 0.0)).astype(np.float32)
-            dp_variance = self._dp_variance_map(frame_idx=frame_idx)
-
-            utility = (
-                weights["vi_gradient"] * self._normalize_score_map(vi_gradient)
-                + weights["vi_local_std"] * self._normalize_score_map(vi_local_std)
-                + weights["dp_variance"] * self._normalize_score_map(dp_variance)
-            ).astype(np.float32)
-
-            frame_dose = self._dose_map[frame_idx].astype(np.float32, copy=False)
-            if float(frame_dose.max()) > 0:
-                utility = utility - float(dose_lambda) * (frame_dose / float(frame_dose.max()))
-
-            picks = self._select_spaced_topk(
-                scores=utility,
-                k=n_select,
-                min_spacing=min_spacing,
-                allowed_mask=allowed_mask,
-                excluded_mask=np.zeros_like(allowed_mask, dtype=bool),
-            )
-            proposals = [(int(r), int(c)) for (r, c) in picks]
-        elif strategy_key == "random":
-            coords = np.argwhere(allowed_mask)
-            if coords.size:
-                seed = budget_dict.get("seed", None)
-                rng = np.random.default_rng(None if seed is None else int(seed))
-                n_take = min(n_select, int(coords.shape[0]))
-                idx = rng.choice(coords.shape[0], size=n_take, replace=False)
-                chosen = coords[idx]
-                proposals = [(int(r), int(c)) for r, c in chosen]
-        else:
-            step = int(budget_dict.get("step", 1))
-            if step < 1:
-                raise ValueError("budget['step'] must be >= 1")
-            bidirectional = bool(budget_dict.get("bidirectional", True))
-            for row in range(0, self.shape_rows, step):
-                cols = list(range(0, self.shape_cols, step))
-                if bidirectional and ((row // step) % 2 == 1):
-                    cols.reverse()
-                for col in cols:
-                    if allowed_mask[row, col]:
-                        proposals.append((int(row), int(col)))
-                        if len(proposals) >= n_select:
-                            break
-                if len(proposals) >= n_select:
-                    break
-
-        self._record_export_event(
-            {
-                "export_kind": "propose_next_points",
-                "strategy": strategy_key,
-                "frame_idx": int(frame_idx),
-                "k_requested": int(k),
-                "k_returned": int(len(proposals)),
-            }
-        )
-        return proposals
-
-    def evaluate_against_reference(
-        self,
-        reference: str | np.ndarray = "full_raster",
-        metrics: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """
-        Evaluate sparse-sampled reconstruction against a reference image.
-
-        Parameters
-        ----------
-        reference : str or np.ndarray, default "full_raster"
-            Reference target. ``"full_raster"`` uses the current full dataset
-            and current ROI integration settings. Arrays are also accepted
-            (virtual image or full diffraction stack; see method docs).
-        metrics : list[str], optional
-            Metric names to compute. Supported: ``"rmse"``, ``"nrmse"``,
-            ``"mae"``, ``"psnr"``.
-
-        Returns
-        -------
-        dict
-            Evaluation summary including sampled fraction and metric values.
-        """
-        metric_names = (
-            ["rmse", "nrmse", "mae", "psnr"]
-            if metrics is None
-            else [str(name).strip().lower() for name in metrics]
-        )
-        supported = {"rmse", "nrmse", "mae", "psnr"}
-        unknown = [name for name in metric_names if name not in supported]
-        if unknown:
-            raise ValueError(f"Unsupported metrics: {unknown}. Supported: {sorted(supported)}")
-
-        frame_idx = int(self.frame_idx if self.n_frames <= 1 else self._validate_sparse_frame_idx(self.frame_idx))
-        points, values = self._extract_sparse_samples(frame_idx)
-        if points.shape[0] == 0:
-            raise ValueError("No sparse samples available for evaluation. Ingest points first.")
-
-        reference_vi, reference_kind = self._resolve_reference_virtual_image(reference, frame_idx)
-        reconstruction = self._idw_reconstruct(
-            shape=(self.shape_rows, self.shape_cols),
-            points=points,
-            values=values,
-            power=2.0,
-            k_neighbors=16,
-        )
-
-        ref = np.asarray(reference_vi, dtype=np.float32)
-        pred = np.asarray(reconstruction, dtype=np.float32)
-        diff = pred - ref
-        mse = float(np.mean(diff * diff))
-        rmse = float(np.sqrt(mse))
-        mae = float(np.mean(np.abs(diff)))
-        ref_range = float(ref.max() - ref.min()) + 1e-6
-        nrmse = float(rmse / ref_range)
-        peak = float(max(float(ref.max()), 1e-6))
-        psnr = 120.0 if mse <= 1e-12 else float(20.0 * np.log10(peak) - 10.0 * np.log10(mse))
-
-        metric_values = {
-            "rmse": rmse,
-            "nrmse": nrmse,
-            "mae": mae,
-            "psnr": psnr,
-        }
-        selected_metrics = {name: float(metric_values[name]) for name in metric_names}
-
-        summary = {
-            "reference_kind": reference_kind,
-            "frame_idx": int(frame_idx),
-            "n_sampled": int(points.shape[0]),
-            "sampled_fraction": float(points.shape[0] / max(1, self.shape_rows * self.shape_cols)),
-            "metrics": selected_metrics,
-            "scan_shape": {"rows": int(self.shape_rows), "cols": int(self.shape_cols)},
-            "detector_shape": {"rows": int(self.det_rows), "cols": int(self.det_cols)},
-        }
-        self._record_export_event(
-            {
-                "export_kind": "evaluate_against_reference",
-                "reference_kind": reference_kind,
-                "frame_idx": int(frame_idx),
-                "n_sampled": int(points.shape[0]),
-                "sampled_fraction": float(summary["sampled_fraction"]),
-                "metrics": selected_metrics,
-            }
-        )
-        return summary
-
-    def export_session_bundle(
-        self,
-        path: str | pathlib.Path,
-    ) -> pathlib.Path:
-        """
-        Export a reproducible session bundle for sparse/adaptive workflows.
-
-        The bundle includes widget state, sparse-state arrays, a current view
-        image with metadata, and the reproducibility report.
-
-        Parameters
-        ----------
-        path : str or pathlib.Path
-            Output directory for bundle files.
-
-        Returns
-        -------
-        pathlib.Path
-            Path to the bundle manifest JSON.
-        """
-        bundle_dir = pathlib.Path(path)
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-
-        state_path = bundle_dir / "widget_state.json"
-        self.save(state_path)
-
-        sparse_state = self.get_sparse_state()
-        sparse_npz_path = bundle_dir / "sparse_state.npz"
-        np.savez_compressed(
-            sparse_npz_path,
-            mask=sparse_state["mask"],
-            sampled_data=sparse_state["sampled_data"],
-            dose_map=sparse_state["dose_map"],
-        )
-
-        sparse_points_path = bundle_dir / "sparse_points.json"
-        sparse_points_payload = {
-            **build_json_header("Show4DSTEM"),
-            "format": "json",
-            "export_kind": "sparse_points",
-            "n_sampled": int(sparse_state["n_sampled"]),
-            "sampled_points": sparse_state["sampled_points"],
-        }
-        sparse_points_path.write_text(json.dumps(sparse_points_payload, indent=2))
-
-        image_path = bundle_dir / "current_all.png"
-        image_written = self.save_image(
-            image_path,
-            view="all",
-            include_metadata=True,
-            include_overlays=True,
-            include_scalebar=True,
-        )
-        image_meta_path = image_written.with_suffix(".json")
-
-        report_path = self.save_reproducibility_report(bundle_dir / "reproducibility_report.json")
-
-        manifest_path = bundle_dir / "session_bundle_manifest.json"
-        manifest_payload = {
-            **build_json_header("Show4DSTEM"),
-            "format": "json",
-            "export_kind": "session_bundle",
-            "bundle_path": str(bundle_dir),
-            "created_utc": datetime.now(timezone.utc).isoformat(),
-            "session_id": self._export_session_id,
-            "scan_shape": {"rows": int(self.shape_rows), "cols": int(self.shape_cols)},
-            "detector_shape": {"rows": int(self.det_rows), "cols": int(self.det_cols)},
-            "sparse_summary": {
-                "n_sampled": int(sparse_state["n_sampled"]),
-                "sampled_fraction": float(
-                    sparse_state["n_sampled"] / max(1, self.shape_rows * self.shape_cols * self.n_frames)
-                ),
-                "total_dose": float(sparse_state["total_dose"]),
-            },
-            "files": {
-                "state": str(state_path),
-                "sparse_npz": str(sparse_npz_path),
-                "sparse_points_json": str(sparse_points_path),
-                "image": str(image_written),
-                "image_metadata": str(image_meta_path),
-                "reproducibility_report": str(report_path),
-            },
-        }
-        manifest_path.write_text(json.dumps(manifest_payload, indent=2))
-
-        self._record_export_event(
-            {
-                "export_kind": "session_bundle",
-                "n_sampled": int(sparse_state["n_sampled"]),
-                "outputs": [
-                    self._build_file_record(state_path),
-                    self._build_file_record(sparse_npz_path),
-                    self._build_file_record(sparse_points_path),
-                    self._build_file_record(image_written, metadata_path=image_meta_path),
-                    self._build_file_record(report_path),
-                    self._build_file_record(manifest_path),
-                ],
-            }
-        )
-        return manifest_path
-
-    def _normalize_score_map(self, values: np.ndarray) -> np.ndarray:
-        arr = np.asarray(values, dtype=np.float32)
-        if arr.size == 0:
-            return np.zeros_like(arr, dtype=np.float32)
-        vmin = float(np.percentile(arr, 1.0))
-        vmax = float(np.percentile(arr, 99.0))
-        if vmax <= vmin:
-            return np.zeros_like(arr, dtype=np.float32)
-        return np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0).astype(np.float32)
-
-    def _box_mean_map(self, values: np.ndarray, window: int) -> np.ndarray:
-        arr = np.asarray(values, dtype=np.float32)
-        win = int(window)
-        if win <= 1:
-            return arr.copy()
-        if win % 2 == 0:
-            win += 1
-        pad = win // 2
-        padded = np.pad(arr, ((pad, pad), (pad, pad)), mode="reflect")
-        integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
-        sums = (
-            integral[win:, win:]
-            - integral[:-win, win:]
-            - integral[win:, :-win]
-            + integral[:-win, :-win]
-        )
-        return (sums / float(win * win)).astype(np.float32)
-
-    def _dp_variance_map(self, frame_idx: int | None = None) -> np.ndarray:
-        if frame_idx is None or self.n_frames <= 1:
-            data = self._frame_data
-        else:
-            idx = self._validate_sparse_frame_idx(frame_idx)
-            data = self._data[idx]
-        if data.ndim == 4:
-            variance = data.var(dim=(2, 3), unbiased=False)
-            return variance.detach().cpu().numpy().astype(np.float32, copy=False)
-        variance = data.var(dim=(1, 2), unbiased=False)
-        return variance.detach().cpu().numpy().reshape(self.shape_rows, self.shape_cols).astype(np.float32, copy=False)
-
-    def _build_coarse_points(self, step: int, bidirectional: bool) -> list[tuple[int, int]]:
-        points: list[tuple[int, int]] = []
-        for r in range(0, self.shape_rows, step):
-            cols = list(range(0, self.shape_cols, step))
-            if bidirectional and ((r // step) % 2 == 1):
-                cols.reverse()
-            for c in cols:
-                points.append((int(r), int(c)))
-        return points
-
-    def _select_spaced_topk(
-        self,
-        scores: np.ndarray,
-        k: int,
-        min_spacing: int,
-        allowed_mask: np.ndarray,
-        excluded_mask: np.ndarray,
-    ) -> list[tuple[int, int]]:
-        work = np.asarray(scores, dtype=np.float32).copy()
-        work[~allowed_mask] = -np.inf
-        work[excluded_mask] = -np.inf
-        selected: list[tuple[int, int]] = []
-        radius = max(0, int(min_spacing))
-
-        for _ in range(int(max(0, k))):
-            flat_idx = int(np.argmax(work))
-            best_score = float(work.flat[flat_idx])
-            if not np.isfinite(best_score):
-                break
-            row, col = np.unravel_index(flat_idx, work.shape)
-            selected.append((int(row), int(col)))
-            if radius == 0:
-                work[row, col] = -np.inf
-                continue
-            r0 = max(0, row - radius)
-            r1 = min(work.shape[0], row + radius + 1)
-            c0 = max(0, col - radius)
-            c1 = min(work.shape[1], col + radius + 1)
-            rr, cc = np.ogrid[r0:r1, c0:c1]
-            neighborhood = (rr - row) ** 2 + (cc - col) ** 2 <= radius ** 2
-            block = work[r0:r1, c0:c1]
-            block[neighborhood] = -np.inf
-        return selected
-
-    def _nearest_neighbor_order(
-        self,
-        points: list[tuple[int, int]],
-        start: tuple[int, int] | None = None,
-    ) -> list[tuple[int, int]]:
-        remaining = [tuple(map(int, pt)) for pt in points]
-        if not remaining:
-            return []
-
-        if start is None:
-            current = remaining.pop(0)
-        else:
-            sr, sc = int(start[0]), int(start[1])
-            start_idx = min(
-                range(len(remaining)),
-                key=lambda i: (remaining[i][0] - sr) ** 2 + (remaining[i][1] - sc) ** 2,
-            )
-            current = remaining.pop(start_idx)
-
-        ordered = [current]
-        while remaining:
-            cr, cc = current
-            next_idx = min(
-                range(len(remaining)),
-                key=lambda i: (remaining[i][0] - cr) ** 2 + (remaining[i][1] - cc) ** 2,
-            )
-            current = remaining.pop(next_idx)
-            ordered.append(current)
-        return ordered
 
     def save_image(
         self,
@@ -2963,12 +1812,10 @@ class Show4DSTEM(anywidget.AnyWidget):
             If True, writes JSON metadata next to the image.
         metadata_path : str or pathlib.Path, optional
             Override metadata JSON path.
-        include_overlays : bool, optional
+        include_overlays : bool, default True
             Draw ROI/profile/crosshair overlays on exported panels.
-            Defaults to ``export_include_overlays``.
-        include_scalebar : bool, optional
+        include_scalebar : bool, default True
             Draw panel scale bars on exported panels.
-            Defaults to ``export_include_scalebar``.
         restore_state : bool, default True
             If True, temporary position/frame overrides are reverted after export.
         dpi : int, optional
@@ -2984,18 +1831,9 @@ class Show4DSTEM(anywidget.AnyWidget):
         export_path = pathlib.Path(path)
         view_key = self._validate_export_view(view)
         fmt = self._resolve_export_format(export_path, format)
-        dpi_value = int(self.export_default_dpi if dpi is None else dpi)
-        overlays_enabled = (
-            bool(self.export_include_overlays)
-            if include_overlays is None
-            else bool(include_overlays)
-        )
-        scalebar_enabled = (
-            bool(self.export_include_scalebar)
-            if include_scalebar is None
-            else bool(include_scalebar)
-        )
-
+        dpi_value = 300 if dpi is None else int(dpi)
+        overlays_enabled = True if include_overlays is None else bool(include_overlays)
+        scalebar_enabled = True if include_scalebar is None else bool(include_scalebar)
         if dpi_value <= 0:
             raise ValueError(f"dpi must be > 0, got {dpi_value}")
 
@@ -3083,870 +1921,72 @@ class Show4DSTEM(anywidget.AnyWidget):
                 self.pos_row = prev_row
                 self.pos_col = prev_col
 
-        self._record_export_event(
-            {
-                "export_kind": "single_view_image",
-                "view": view_key,
-                "format": fmt,
-                "position": {"row": export_row, "col": export_col},
-                "frame_idx": export_frame,
-                "include_overlays": bool(overlays_enabled),
-                "include_scalebar": bool(scalebar_enabled),
-                "dpi": int(dpi_value),
-                "outputs": [
-                    self._build_file_record(export_path, metadata_path=meta_path),
-                ],
-            }
-        )
         return export_path
-
-    def _build_preset_payload(self) -> dict[str, Any]:
-        return {
-            "detector": {
-                "center_row": float(self.center_row),
-                "center_col": float(self.center_col),
-                "bf_radius": float(self.bf_radius),
-                "roi_active": bool(self.roi_active),
-                "roi_mode": self.roi_mode,
-                "roi_center_row": float(self.roi_center_row),
-                "roi_center_col": float(self.roi_center_col),
-                "roi_radius": float(self.roi_radius),
-                "roi_radius_inner": float(self.roi_radius_inner),
-                "roi_width": float(self.roi_width),
-                "roi_height": float(self.roi_height),
-            },
-            "vi_roi": {
-                "mode": self.vi_roi_mode,
-                "center_row": float(self.vi_roi_center_row),
-                "center_col": float(self.vi_roi_center_col),
-                "radius": float(self.vi_roi_radius),
-                "width": float(self.vi_roi_width),
-                "height": float(self.vi_roi_height),
-            },
-            "display": {
-                "mask_dc": bool(self.mask_dc),
-                "dp_colormap": self.dp_colormap,
-                "vi_colormap": self.vi_colormap,
-                "fft_colormap": self.fft_colormap,
-                "dp_scale_mode": self.dp_scale_mode,
-                "vi_scale_mode": self.vi_scale_mode,
-                "fft_scale_mode": self.fft_scale_mode,
-                "dp_power_exp": float(self.dp_power_exp),
-                "vi_power_exp": float(self.vi_power_exp),
-                "fft_power_exp": float(self.fft_power_exp),
-                "dp_vmin_pct": float(self.dp_vmin_pct),
-                "dp_vmax_pct": float(self.dp_vmax_pct),
-                "vi_vmin_pct": float(self.vi_vmin_pct),
-                "vi_vmax_pct": float(self.vi_vmax_pct),
-                "fft_vmin_pct": float(self.fft_vmin_pct),
-                "fft_vmax_pct": float(self.fft_vmax_pct),
-                "fft_auto": bool(self.fft_auto),
-                "show_fft": bool(self.show_fft),
-                "dp_show_colorbar": bool(self.dp_show_colorbar),
-                "profile_line": self.profile_line,
-                "profile_width": int(self.profile_width),
-            },
-            "export": self._export_settings_metadata(),
-        }
-
-    def _apply_preset_payload(self, preset: dict[str, Any]) -> None:
-        detector = preset.get("detector", {})
-        vi_roi = preset.get("vi_roi", {})
-        display = preset.get("display", {})
-        export = preset.get("export", {})
-
-        detector_map = {
-            "center_row": "center_row",
-            "center_col": "center_col",
-            "bf_radius": "bf_radius",
-            "roi_active": "roi_active",
-            "roi_mode": "roi_mode",
-            "roi_center_row": "roi_center_row",
-            "roi_center_col": "roi_center_col",
-            "roi_radius": "roi_radius",
-            "roi_radius_inner": "roi_radius_inner",
-            "roi_width": "roi_width",
-            "roi_height": "roi_height",
-        }
-        for key, trait_name in detector_map.items():
-            if key in detector and hasattr(self, trait_name):
-                setattr(self, trait_name, detector[key])
-
-        vi_roi_map = {
-            "mode": "vi_roi_mode",
-            "center_row": "vi_roi_center_row",
-            "center_col": "vi_roi_center_col",
-            "radius": "vi_roi_radius",
-            "width": "vi_roi_width",
-            "height": "vi_roi_height",
-        }
-        for key, trait_name in vi_roi_map.items():
-            if key in vi_roi and hasattr(self, trait_name):
-                setattr(self, trait_name, vi_roi[key])
-
-        _display_keys = {
-            "dp_colormap", "vi_colormap", "fft_colormap",
-            "dp_scale_mode", "vi_scale_mode", "fft_scale_mode",
-            "dp_power_exp", "vi_power_exp", "fft_power_exp",
-            "dp_vmin_pct", "dp_vmax_pct", "vi_vmin_pct", "vi_vmax_pct",
-            "fft_vmin_pct", "fft_vmax_pct", "fft_auto",
-            "mask_dc", "dp_show_colorbar", "show_fft", "fft_window",
-            "show_controls",
-        }
-        for key, value in display.items():
-            if key in _display_keys:
-                setattr(self, key, value)
-
-        export_map = {
-            "default_view": "export_default_view",
-            "default_format": "export_default_format",
-            "include_overlays": "export_include_overlays",
-            "include_scalebar": "export_include_scalebar",
-            "dpi": "export_default_dpi",
-        }
-        for key, trait_name in export_map.items():
-            if key in export and hasattr(self, trait_name):
-                setattr(self, trait_name, export[key])
-
-    def save_preset(
-        self,
-        name: str,
-        path: str | pathlib.Path | None = None,
-    ) -> dict[str, Any]:
-        preset_name = str(name).strip()
-        if not preset_name:
-            raise ValueError("Preset name must be non-empty.")
-        preset_key = preset_name.lower()
-
-        payload = self._build_preset_payload()
-        self._named_presets[preset_key] = payload
-
-        if path is not None:
-            out_path = pathlib.Path(path)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            serialized = {
-                **build_json_header("Show4DSTEM"),
-                "format": "json",
-                "export_kind": "widget_preset",
-                "preset_name": preset_name,
-                "preset": payload,
-            }
-            out_path.write_text(json.dumps(serialized, indent=2))
-
-        return payload
-
-    def load_preset(
-        self,
-        name: str,
-        path: str | pathlib.Path | None = None,
-        apply: bool = True,
-    ) -> dict[str, Any]:
-        preset_name = str(name).strip()
-        preset_key = preset_name.lower()
-        if path is not None:
-            payload = json.loads(pathlib.Path(path).read_text())
-            if not isinstance(payload, dict):
-                raise ValueError("Preset file must contain a JSON object.")
-            if "preset" in payload:
-                preset = payload["preset"]
-            else:
-                preset = payload
-            if not isinstance(preset, dict):
-                raise ValueError("Preset payload must be a JSON object.")
-            if preset_name:
-                self._named_presets[preset_key] = preset
-        else:
-            if preset_key not in self._named_presets:
-                raise ValueError(
-                    f"Preset '{preset_name}' not found. Available: {', '.join(self.list_presets())}"
-                )
-            preset = self._named_presets[preset_key]
-
-        if apply:
-            self._apply_preset_payload(preset)
-        return preset
 
     def apply_preset(self, name: str) -> Self:
         preset_name = str(name).strip().lower()
-        if preset_name == "bf":
-            self.roi_active = True
-            self.roi_mode = "circle"
-            self.roi_center_row = float(self.center_row)
-            self.roi_center_col = float(self.center_col)
-            self.roi_radius = float(max(1.0, self.bf_radius))
-            return self
-        if preset_name == "abf":
-            self.roi_active = True
-            self.roi_mode = "annular"
-            self.roi_center_row = float(self.center_row)
-            self.roi_center_col = float(self.center_col)
-            self.roi_radius_inner = float(max(0.5, self.bf_radius * 0.5))
-            self.roi_radius = float(max(1.0, self.bf_radius))
-            return self
-        if preset_name == "adf":
-            self.roi_active = True
-            self.roi_mode = "annular"
-            self.roi_center_row = float(self.center_row)
-            self.roi_center_col = float(self.center_col)
-            self.roi_radius_inner = float(max(1.0, self.bf_radius))
-            self.roi_radius = float(max(self.roi_radius_inner + 1.0, self.bf_radius * 2.0))
-            return self
-        if preset_name == "haadf":
-            self.roi_active = True
-            self.roi_mode = "annular"
-            self.roi_center_row = float(self.center_row)
-            self.roi_center_col = float(self.center_col)
-            self.roi_radius_inner = float(max(1.0, self.bf_radius * 2.0))
-            self.roi_radius = float(max(self.roi_radius_inner + 1.0, self.bf_radius * 4.0))
-            return self
-
-        self.load_preset(preset_name, apply=True)
+        # Batch all trait writes atomically. Without this, each individual
+        # trait change fires _on_roi_change, and intermediate states (e.g. mode
+        # just switched to "annular" but radius_inner still stale from the
+        # previous preset) compute a wrong mask -> black VI flashes before the
+        # final correct frame. hold_trait_notifications defers observers until
+        # all 5 traits have committed.
+        bf = self.bf_radius
+        center_row = float(self.center_row)
+        center_col = float(self.center_col)
+        self._suppress_roi_recompute = True
+        try:
+            if preset_name == "bf":
+                with self.hold_trait_notifications():
+                    self.roi_active = True
+                    self.roi_mode = "circle"
+                    self.roi_center_row = center_row
+                    self.roi_center_col = center_col
+                    self.roi_radius = float(max(1.0, bf))
+            elif preset_name == "abf":
+                with self.hold_trait_notifications():
+                    self.roi_active = True
+                    self.roi_mode = "annular"
+                    self.roi_center_row = center_row
+                    self.roi_center_col = center_col
+                    self.roi_radius_inner = float(max(0.5, bf * 0.5))
+                    self.roi_radius = float(max(1.0, bf))
+            elif preset_name == "adf":
+                with self.hold_trait_notifications():
+                    self.roi_active = True
+                    self.roi_mode = "annular"
+                    self.roi_center_row = center_row
+                    self.roi_center_col = center_col
+                    self.roi_radius_inner = float(max(1.0, bf))
+                    self.roi_radius = float(max(bf + 1.0, bf * 2.0))
+            elif preset_name == "haadf":
+                with self.hold_trait_notifications():
+                    self.roi_active = True
+                    self.roi_mode = "annular"
+                    self.roi_center_row = center_row
+                    self.roi_center_col = center_col
+                    self.roi_radius_inner = float(max(1.0, bf * 2.0))
+                    self.roi_radius = float(max(bf * 2.0 + 1.0, bf * 4.0))
+            else:
+                raise ValueError(
+                    f"Unknown preset {name!r}. Choices: 'bf', 'abf', 'adf', 'haadf'."
+                )
+        finally:
+            self._suppress_roi_recompute = False
+        # Single recompute with final, consistent state.
+        self._compute_virtual_image_from_roi()
         return self
 
-    def _resolve_figure_template(self, template: str) -> tuple[str, list[str], bool]:
-        key = str(template).strip().lower()
-        mapping = {
-            "dp_vi": (["diffraction", "virtual"], False),
-            "dp_vi_fft": (["diffraction", "virtual", "fft"], False),
-            "publication_dp_vi": (["diffraction", "virtual"], True),
-            "publication_dp_vi_fft": (["diffraction", "virtual", "fft"], True),
-        }
-        if key not in mapping:
-            raise ValueError(
-                f"Unsupported template '{template}'. "
-                f"Supported: {', '.join(self.list_figure_templates())}"
-            )
-        panels, publication = mapping[key]
-        return key, panels, publication
-
-    def save_figure(
-        self,
-        path: str | pathlib.Path,
-        template: str = "dp_vi_fft",
-        position: tuple[int, int] | None = None,
-        frame_idx: int | None = None,
-        format: str | None = None,
-        include_metadata: bool = True,
-        metadata_path: str | pathlib.Path | None = None,
-        include_overlays: bool | None = None,
-        include_scalebar: bool | None = None,
-        restore_state: bool = True,
-        dpi: int | None = None,
-        title: str | None = None,
-        annotations: dict[str, str] | None = None,
-    ) -> pathlib.Path:
-        from PIL import Image, ImageDraw, ImageFont
-
-        export_path = pathlib.Path(path)
-        template_key, panel_keys, publication_style = self._resolve_figure_template(template)
-        fmt = self._resolve_export_format(export_path, format)
-        dpi_value = int(self.export_default_dpi if dpi is None else dpi)
-        overlays_enabled = (
-            bool(self.export_include_overlays)
-            if include_overlays is None
-            else bool(include_overlays)
-        )
-        scalebar_enabled = (
-            bool(self.export_include_scalebar)
-            if include_scalebar is None
-            else bool(include_scalebar)
-        )
-        if dpi_value <= 0:
-            raise ValueError(f"dpi must be > 0, got {dpi_value}")
-
-        export_path.parent.mkdir(parents=True, exist_ok=True)
-        font = ImageFont.load_default()
-
-        prev_row, prev_col = self.pos_row, self.pos_col
-        prev_frame = self.frame_idx
-        meta_path: pathlib.Path | None = None
-
-        try:
-            if frame_idx is not None:
-                self.frame_idx = self._validate_frame_idx(frame_idx)
-            if position is not None:
-                row, col = self._validate_position(position)
-                self.pos_row = row
-                self.pos_col = col
-
-            panel_images: list[Any] = []
-            render_meta: dict[str, Any] = {}
-            for panel_key in panel_keys:
-                panel, panel_meta = self._render_panel_image(
-                    panel_key,
-                    include_overlays=overlays_enabled,
-                    include_scalebar=scalebar_enabled,
-                )
-                panel_images.append(panel)
-                render_meta[panel_key] = panel_meta
-
-            gap = 24 if publication_style else 8
-            padding = 24 if publication_style else 10
-            label_height = 22 if publication_style else 0
-            title_text = title
-            if title_text is None and publication_style:
-                if self.n_frames > 1:
-                    title_text = f"4D-STEM Figure ({self.frame_dim_label} {self.frame_idx})"
-                else:
-                    title_text = "4D-STEM Figure"
-            title_height = 34 if title_text else 0
-
-            max_panel_height = max(panel.height for panel in panel_images)
-            total_width = padding * 2 + sum(panel.width for panel in panel_images) + gap * (len(panel_images) - 1)
-            total_height = padding * 2 + title_height + label_height + max_panel_height
-
-            figure = Image.new("RGB", (total_width, total_height), color=(255, 255, 255))
-            draw = ImageDraw.Draw(figure, mode="RGBA")
-
-            y_title = padding
-            if title_text:
-                draw.text((padding, y_title), title_text, fill=(0, 0, 0, 255), font=font)
-
-            y_panels = padding + title_height
-            if publication_style:
-                y_panels += label_height
-
-            panel_names = {
-                "diffraction": "Diffraction",
-                "virtual": "Virtual",
-                "fft": "FFT",
-            }
-            annotation_map = annotations or {}
-
-            x0 = padding
-            for idx, panel in enumerate(panel_images):
-                panel_key = panel_keys[idx]
-                if publication_style:
-                    draw.text(
-                        (x0, padding + title_height),
-                        panel_names.get(panel_key, panel_key),
-                        fill=(0, 0, 0, 255),
-                        font=font,
-                    )
-
-                figure.paste(panel, (x0, y_panels))
-
-                if publication_style:
-                    draw.rectangle(
-                        [(x0, y_panels), (x0 + panel.width - 1, y_panels + panel.height - 1)],
-                        outline=(80, 80, 80, 255),
-                        width=1,
-                    )
-
-                if panel_key in annotation_map and str(annotation_map[panel_key]).strip():
-                    text = str(annotation_map[panel_key]).strip()
-                    text_bbox = draw.textbbox((0, 0), text, font=font)
-                    text_w = text_bbox[2] - text_bbox[0]
-                    text_h = text_bbox[3] - text_bbox[1]
-                    tx = x0 + 8
-                    ty = y_panels + 8
-                    draw.rectangle(
-                        [(tx - 4, ty - 3), (tx + text_w + 4, ty + text_h + 3)],
-                        fill=(0, 0, 0, 180),
-                    )
-                    draw.text((tx, ty), text, fill=(255, 255, 255, 255), font=font)
-
-                x0 += panel.width + gap
-
-            if fmt == "pdf":
-                Image.init()
-                figure = figure.convert("RGB")
-                figure.save(export_path, format="PDF", resolution=dpi_value)
-            else:
-                figure.save(export_path, format="PNG", dpi=(dpi_value, dpi_value))
-
-            if include_metadata:
-                meta_path = (
-                    pathlib.Path(metadata_path)
-                    if metadata_path is not None
-                    else export_path.with_suffix(".json")
-                )
-                metadata = self._build_image_export_metadata(
-                    export_path=export_path,
-                    view_key="figure",
-                    fmt=fmt,
-                    render_meta=render_meta,
-                    include_overlays=overlays_enabled,
-                    include_scalebar=scalebar_enabled,
-                    export_kind="figure_template",
-                    extra={
-                        "template": template_key,
-                        "panels": panel_keys,
-                        "publication_style": bool(publication_style),
-                        "title": title_text or "",
-                        "annotations": annotation_map,
-                        "dpi": int(dpi_value),
-                    },
-                )
-                meta_path.write_text(json.dumps(metadata, indent=2))
-        finally:
-            if restore_state:
-                self.frame_idx = prev_frame
-                self.pos_row = prev_row
-                self.pos_col = prev_col
-
-        self._record_export_event(
-            {
-                "export_kind": "figure_template",
-                "template": template_key,
-                "format": fmt,
-                "dpi": int(dpi_value),
-                "include_overlays": bool(overlays_enabled),
-                "include_scalebar": bool(scalebar_enabled),
-                "outputs": [
-                    self._build_file_record(export_path, metadata_path=meta_path),
-                ],
-            }
-        )
-        return export_path
-
-    def _resolve_frame_sequence(
-        self,
-        frame_indices: list[int] | None,
-        frame_range: tuple[int, int] | None,
-    ) -> list[int]:
-        if frame_indices is not None and frame_range is not None:
-            raise ValueError("Use either frame_indices or frame_range, not both.")
-
-        if frame_indices is not None:
-            if len(frame_indices) == 0:
-                raise ValueError("frame_indices cannot be empty.")
-            return [self._validate_frame_idx(idx) for idx in frame_indices]
-
-        if frame_range is not None:
-            if len(frame_range) != 2:
-                raise ValueError("frame_range must be a (start, end) tuple.")
-            start, end = int(frame_range[0]), int(frame_range[1])
-            if start > end:
-                raise ValueError("frame_range start must be <= end.")
-            return [self._validate_frame_idx(idx) for idx in range(start, end + 1)]
-
-        return [int(i) for i in range(self.n_frames)]
-
-    def _resolve_position_sequence(
-        self,
-        mode: str,
-        path_points: list[tuple[int, int]] | None,
-        raster_step: int,
-        raster_bidirectional: bool,
-    ) -> list[tuple[int, int]]:
-        if mode == "path":
-            points = self._path_points if path_points is None else path_points
-            if not points:
-                raise ValueError(
-                    "Path mode requires points via set_path(...) or path_points=..."
-                )
-            return [self._validate_position((int(r), int(c))) for r, c in points]
-
-        if mode == "raster":
-            step = int(raster_step)
-            if step < 1:
-                raise ValueError("raster_step must be >= 1")
-            points: list[tuple[int, int]] = []
-            for r in range(0, self.shape_rows, step):
-                cols = list(range(0, self.shape_cols, step))
-                if raster_bidirectional and ((r // step) % 2 == 1):
-                    cols.reverse()
-                for c in cols:
-                    points.append((int(r), int(c)))
-            return points
-
-        raise ValueError(f"Unsupported position sequence mode '{mode}'")
-
-    def suggest_adaptive_path(
-        self,
-        coarse_step: int = 4,
-        target_fraction: float = 0.25,
-        min_spacing: int = 2,
-        include_coarse: bool = True,
-        coarse_bidirectional: bool = True,
-        local_window: int = 5,
-        dose_lambda: float = 0.25,
-        weights: dict[str, float] | None = None,
-        roi_mask: np.ndarray | None = None,
-        update_widget_path: bool = True,
-        interval_ms: int | None = None,
-        loop: bool = False,
-        autoplay: bool = False,
-        return_maps: bool = False,
-    ) -> dict[str, Any]:
-        """
-        Suggest a sparse adaptive scan path using coarse-to-fine utility ranking.
-
-        The planner computes utility from current virtual-image and diffraction
-        statistics, then selects spatially distributed high-utility points.
-
-        Parameters
-        ----------
-        coarse_step : int, default 4
-            Spacing of the initial coarse grid.
-        target_fraction : float, default 0.25
-            Target total sampled fraction of scan positions in (0, 1].
-        min_spacing : int, default 2
-            Minimum pixel spacing between selected dense points.
-        include_coarse : bool, default True
-            If True, include coarse-grid points in the returned path.
-        coarse_bidirectional : bool, default True
-            Use snake ordering for coarse-grid traversal.
-        local_window : int, default 5
-            Window size for local-std utility component.
-        dose_lambda : float, default 0.25
-            Penalty weight for re-sampling coarse points.
-        weights : dict[str, float], optional
-            Utility weights for keys: ``vi_gradient``, ``vi_local_std``, ``dp_variance``.
-        roi_mask : np.ndarray, optional
-            Optional boolean mask of shape ``scan_shape`` restricting dense picks.
-        update_widget_path : bool, default True
-            If True, calls ``set_path(...)`` with the suggested path.
-        interval_ms : int, optional
-            Path interval when ``update_widget_path=True``.
-        loop : bool, default False
-            Path looping behavior when ``update_widget_path=True``.
-        autoplay : bool, default False
-            Start playback immediately when ``update_widget_path=True``.
-        return_maps : bool, default False
-            If True, include utility component maps in the returned dict.
-
-        Returns
-        -------
-        dict
-            Planning result with coarse points, dense points, and final path.
-        """
-        step = int(coarse_step)
-        if step < 1:
-            raise ValueError(f"coarse_step must be >= 1, got {coarse_step}")
-
-        frac = float(target_fraction)
-        if frac <= 0 or frac > 1:
-            raise ValueError(f"target_fraction must be in (0, 1], got {target_fraction}")
-
-        spacing = int(min_spacing)
-        if spacing < 0:
-            raise ValueError(f"min_spacing must be >= 0, got {min_spacing}")
-
-        if local_window < 1:
-            raise ValueError(f"local_window must be >= 1, got {local_window}")
-
-        if not np.isfinite(float(dose_lambda)):
-            raise ValueError("dose_lambda must be finite")
-
-        default_weights = {
-            "vi_gradient": 0.4,
-            "vi_local_std": 0.3,
-            "dp_variance": 0.3,
-        }
-        merged_weights = dict(default_weights)
-        if weights is not None:
-            for key, value in weights.items():
-                if key not in default_weights:
-                    raise ValueError(
-                        f"Unsupported utility weight '{key}'. "
-                        f"Supported: {', '.join(default_weights.keys())}"
-                    )
-                merged_weights[key] = float(value)
-
-        weight_sum = sum(max(0.0, float(v)) for v in merged_weights.values())
-        if weight_sum <= 0:
-            raise ValueError("At least one utility weight must be > 0.")
-        normalized_weights = {
-            key: max(0.0, float(value)) / weight_sum
-            for key, value in merged_weights.items()
-        }
-
-        n_total = int(self.shape_rows * self.shape_cols)
-        target_count = int(max(1, round(frac * n_total)))
-
-        coarse_points = self._build_coarse_points(step=step, bidirectional=bool(coarse_bidirectional))
-        coarse_count = len(coarse_points) if include_coarse else 0
-        if include_coarse and target_count < coarse_count:
-            raise ValueError(
-                f"target_fraction={target_fraction} gives {target_count} points, "
-                f"but coarse grid already has {coarse_count}. "
-                "Increase target_fraction or coarse_step."
-            )
-        dense_count = target_count - coarse_count if include_coarse else target_count
-        dense_count = max(0, int(dense_count))
-
-        vi = self._get_virtual_image_array().astype(np.float32, copy=False)
-        grad_row, grad_col = np.gradient(vi)
-        vi_gradient = np.hypot(grad_row, grad_col).astype(np.float32)
-
-        mean_local = self._box_mean_map(vi, local_window)
-        mean_sq_local = self._box_mean_map(vi * vi, local_window)
-        variance_local = np.maximum(mean_sq_local - mean_local * mean_local, 0.0)
-        vi_local_std = np.sqrt(variance_local).astype(np.float32)
-
-        dp_variance = self._dp_variance_map()
-
-        grad_score = self._normalize_score_map(vi_gradient)
-        local_std_score = self._normalize_score_map(vi_local_std)
-        dp_var_score = self._normalize_score_map(dp_variance)
-
-        utility = (
-            normalized_weights["vi_gradient"] * grad_score
-            + normalized_weights["vi_local_std"] * local_std_score
-            + normalized_weights["dp_variance"] * dp_var_score
-        ).astype(np.float32)
-
-        dose_penalty = np.zeros_like(utility, dtype=np.float32)
-        for row, col in coarse_points:
-            dose_penalty[int(row), int(col)] = 1.0
-        utility = utility - float(dose_lambda) * dose_penalty
-
-        allowed_mask = np.ones((self.shape_rows, self.shape_cols), dtype=bool)
-        if roi_mask is not None:
-            mask = np.asarray(roi_mask)
-            if mask.shape != (self.shape_rows, self.shape_cols):
-                raise ValueError(
-                    f"roi_mask shape {mask.shape} does not match scan_shape "
-                    f"({self.shape_rows}, {self.shape_cols})"
-                )
-            allowed_mask &= mask.astype(bool)
-
-        excluded_mask = np.zeros_like(allowed_mask, dtype=bool)
-        for row, col in coarse_points:
-            excluded_mask[int(row), int(col)] = True
-
-        dense_points = self._select_spaced_topk(
-            scores=utility,
-            k=dense_count,
-            min_spacing=spacing,
-            allowed_mask=allowed_mask,
-            excluded_mask=excluded_mask,
-        )
-
-        start_point = coarse_points[-1] if include_coarse and coarse_points else None
-        dense_path = self._nearest_neighbor_order(dense_points, start=start_point)
-        path_points = list(coarse_points) + dense_path if include_coarse else dense_path
-
-        if update_widget_path and path_points:
-            interval_value = int(self.path_interval_ms if interval_ms is None else interval_ms)
-            if interval_value < 1:
-                raise ValueError(f"interval_ms must be >= 1, got {interval_value}")
-            self.set_path(
-                points=path_points,
-                interval_ms=interval_value,
-                loop=bool(loop),
-                autoplay=bool(autoplay),
-            )
-
-        result: dict[str, Any] = {
-            "target_fraction": float(frac),
-            "target_count": int(target_count),
-            "coarse_step": int(step),
-            "coarse_count": int(len(coarse_points)),
-            "dense_count": int(len(dense_points)),
-            "path_count": int(len(path_points)),
-            "weights": normalized_weights,
-            "dose_lambda": float(dose_lambda),
-            "coarse_points": coarse_points,
-            "dense_points": dense_points,
-            "path_points": path_points,
-            "selected_fraction": float(len(path_points) / max(1, n_total)),
-        }
-        if return_maps:
-            result["utility_map"] = utility
-            result["utility_components"] = {
-                "vi_gradient": grad_score,
-                "vi_local_std": local_std_score,
-                "dp_variance": dp_var_score,
-                "dose_penalty": dose_penalty,
-            }
-
-        self._record_export_event(
-            {
-                "export_kind": "adaptive_path_suggestion",
-                "target_fraction": float(frac),
-                "target_count": int(target_count),
-                "coarse_step": int(step),
-                "coarse_count": int(len(coarse_points)),
-                "dense_count": int(len(dense_points)),
-                "path_count": int(len(path_points)),
-                "selected_fraction": float(len(path_points) / max(1, n_total)),
-                "weights": normalized_weights,
-                "dose_lambda": float(dose_lambda),
-            }
-        )
-        return result
-
-    def save_sequence(
-        self,
-        output_dir: str | pathlib.Path,
-        mode: str = "path",
-        view: str | None = None,
-        format: str | None = None,
-        include_metadata: bool = True,
-        include_overlays: bool | None = None,
-        include_scalebar: bool | None = None,
-        frame_idx: int | None = None,
-        position: tuple[int, int] | None = None,
-        path_points: list[tuple[int, int]] | None = None,
-        raster_step: int = 1,
-        raster_bidirectional: bool = False,
-        frame_indices: list[int] | None = None,
-        frame_range: tuple[int, int] | None = None,
-        filename_prefix: str | None = None,
-        manifest_name: str = "save_sequence_manifest.json",
-        restore_state: bool = True,
-        dpi: int | None = None,
-    ) -> pathlib.Path:
-        output_root = pathlib.Path(output_dir)
-        output_root.mkdir(parents=True, exist_ok=True)
-        mode_key = str(mode).strip().lower()
-        if mode_key not in {"path", "raster", "frames"}:
-            raise ValueError("mode must be one of: path, raster, frames")
-
-        view_key = self._validate_export_view(view)
-        fmt = self._resolve_export_format(pathlib.Path(f"sequence.{self.export_default_format}"), format or self.export_default_format)
-        dpi_value = int(self.export_default_dpi if dpi is None else dpi)
-        overlays_enabled = (
-            bool(self.export_include_overlays)
-            if include_overlays is None
-            else bool(include_overlays)
-        )
-        scalebar_enabled = (
-            bool(self.export_include_scalebar)
-            if include_scalebar is None
-            else bool(include_scalebar)
-        )
-        if dpi_value <= 0:
-            raise ValueError(f"dpi must be > 0, got {dpi_value}")
-
-        export_rows: list[dict[str, Any]] = []
-        prefix = (
-            str(filename_prefix).strip()
-            if filename_prefix is not None and str(filename_prefix).strip()
-            else f"{mode_key}_{view_key}"
-        )
-
-        prev_row, prev_col = self.pos_row, self.pos_col
-        prev_frame = self.frame_idx
-        frame_for_paths = self._validate_frame_idx(frame_idx) if frame_idx is not None else int(self.frame_idx)
-
-        if mode_key == "frames":
-            row, col = self._validate_position(position)
-            frames = self._resolve_frame_sequence(frame_indices, frame_range)
-            jobs = [
-                {"row": int(row), "col": int(col), "frame_idx": int(fi)}
-                for fi in frames
-            ]
-        else:
-            positions = self._resolve_position_sequence(
-                mode=mode_key,
-                path_points=path_points,
-                raster_step=raster_step,
-                raster_bidirectional=raster_bidirectional,
-            )
-            jobs = [
-                {"row": int(r), "col": int(c), "frame_idx": int(frame_for_paths)}
-                for r, c in positions
-            ]
-
-        try:
-            for idx, job in enumerate(jobs):
-                row = int(job["row"])
-                col = int(job["col"])
-                fr = int(job["frame_idx"])
-                basename = (
-                    f"{prefix}_{idx:04d}_f{fr:04d}_r{row:04d}_c{col:04d}.{fmt}"
-                )
-                out_path = output_root / basename
-                out_meta = out_path.with_suffix(".json") if include_metadata else None
-
-                self.save_image(
-                    out_path,
-                    view=view_key,
-                    position=(row, col),
-                    frame_idx=fr,
-                    format=fmt,
-                    include_metadata=include_metadata,
-                    metadata_path=out_meta,
-                    include_overlays=overlays_enabled,
-                    include_scalebar=scalebar_enabled,
-                    restore_state=False,
-                    dpi=dpi_value,
-                )
-
-                record = {
-                    "index": int(idx),
-                    "row": row,
-                    "col": col,
-                    "frame_idx": fr,
-                }
-                record.update(self._build_file_record(out_path, metadata_path=out_meta, index=idx))
-                export_rows.append(record)
-        finally:
-            if restore_state:
-                self.frame_idx = prev_frame
-                self.pos_row = prev_row
-                self.pos_col = prev_col
-
-        manifest_path = output_root / str(manifest_name)
-        manifest_payload = {
-            **build_json_header("Show4DSTEM"),
-            "format": "json",
-            "export_kind": "sequence_batch",
-            "mode": mode_key,
-            "view": view_key,
-            "image_format": fmt,
-            "output_dir": str(output_root),
-            "filename_prefix": prefix,
-            "n_exports": int(len(export_rows)),
-            "include_overlays": bool(overlays_enabled),
-            "include_scalebar": bool(scalebar_enabled),
-            "dpi": int(dpi_value),
-            "scan_shape": {"rows": int(self.shape_rows), "cols": int(self.shape_cols)},
-            "detector_shape": {"rows": int(self.det_rows), "cols": int(self.det_cols)},
-            "exports": export_rows,
-        }
-        manifest_path.write_text(json.dumps(manifest_payload, indent=2))
-
-        manifest_record = self._build_file_record(manifest_path)
-        self._record_export_event(
-            {
-                "export_kind": "sequence_batch",
-                "mode": mode_key,
-                "view": view_key,
-                "format": fmt,
-                "n_exports": int(len(export_rows)),
-                "include_overlays": bool(overlays_enabled),
-                "include_scalebar": bool(scalebar_enabled),
-                "dpi": int(dpi_value),
-                "outputs": [manifest_record],
-            }
-        )
-        return manifest_path
-
-    def save_reproducibility_report(
-        self,
-        path: str | pathlib.Path,
-    ) -> pathlib.Path:
-        report_path = pathlib.Path(path)
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            **build_json_header("Show4DSTEM"),
-            "format": "json",
-            "export_kind": "reproducibility_report",
-            "session_id": self._export_session_id,
-            "session_started_utc": self._export_session_started_utc,
-            "report_generated_utc": datetime.now(timezone.utc).isoformat(),
-            "scan_shape": {"rows": int(self.shape_rows), "cols": int(self.shape_cols)},
-            "detector_shape": {"rows": int(self.det_rows), "cols": int(self.det_cols)},
-            "n_exports": int(len(self._export_log)),
-            "exports": self._export_log,
-        }
-        report_path.write_text(json.dumps(payload, indent=2))
-        return report_path
 
     def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
         mode = self.dp_scale_mode
-        scaled = self._apply_scale_mode(frame, mode, self.dp_power_exp)
+        scaled = self._apply_scale_mode(frame, mode)
         if self.dp_vmin is not None and self.dp_vmax is not None:
             fmin = float(self._apply_scale_mode(
-                np.array([max(self.dp_vmin, 0)], dtype=np.float32), mode, self.dp_power_exp
+                np.array([max(self.dp_vmin, 0)], dtype=np.float32), mode
             )[0])
             fmax = float(self._apply_scale_mode(
-                np.array([max(self.dp_vmax, 0)], dtype=np.float32), mode, self.dp_power_exp
+                np.array([max(self.dp_vmax, 0)], dtype=np.float32), mode
             )[0])
         else:
             fmin = float(scaled.min())
@@ -4038,31 +2078,14 @@ class Show4DSTEM(anywidget.AnyWidget):
         else:
             frame = data[self.pos_row, self.pos_col]
 
-        # Compute stats from frame (optionally mask DC component)
-        if self.mask_dc and self.det_rows > 3 and self.det_cols > 3:
-            # Mask center 3x3 region for stats using detected center (not geometric center)
-            cr = int(round(self.center_row))
-            cc = int(round(self.center_col))
-            cr = max(1, min(self.det_rows - 2, cr))
-            cc = max(1, min(self.det_cols - 2, cc))
-            mask = torch.ones_like(frame, dtype=torch.bool)
-            mask[cr-1:cr+2, cc-1:cc+2] = False
-            masked_vals = frame[mask]
-            self.dp_stats = [
-                float(masked_vals.mean()),
-                float(masked_vals.min()),
-                float(masked_vals.max()),
-                float(masked_vals.std()),
-            ]
-        else:
-            self.dp_stats = [
-                float(frame.mean()),
-                float(frame.min()),
-                float(frame.max()),
-                float(frame.std()),
-            ]
-
-        # Convert to numpy only for sending bytes to frontend
+        # Cast small frame to float32 for stats and JS transfer. Bulk data
+        # stays in native dtype; only this single 192×192 (~144 KB) frame
+        # gets promoted.
+        if frame.dtype != torch.float32:
+            frame = frame.float()
+        # Stats compute moved to JS (frontend has frame_bytes; computeStats() in
+        # js/stats.ts does mean/min/max/std on the Float32Array directly,
+        # avoiding 4 sync trait round-trips per scan-position click).
         self.frame_bytes = frame.cpu().numpy().tobytes()
 
     def _on_roi_change(self, change=None):
@@ -4071,6 +2094,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         High-frequency drag updates use the compound roi_center trait instead.
         """
         if not self.roi_active:
+            return
+        if getattr(self, "_suppress_roi_recompute", False):
             return
         self._compute_virtual_image_from_roi()
 
@@ -4082,6 +2107,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         """
         if not self.roi_active:
             return
+        if getattr(self, "_suppress_roi_recompute", False):
+            return
         if change and "new" in change:
             row, col = change["new"]
             # Sync to individual traits (without triggering _on_roi_change observers)
@@ -4091,19 +2118,36 @@ class Show4DSTEM(anywidget.AnyWidget):
             self.observe(self._on_roi_change, names=["roi_center_col", "roi_center_row"])
         self._compute_virtual_image_from_roi()
 
-    def _on_vi_roi_change(self, change=None):
-        """Compute summed DP when VI ROI changes."""
+    def _on_vi_roi_center_change(self, change=None):
+        """Apply compound (row, col) update atomically (avoids split-trait race)."""
+        if change and "new" in change:
+            row, col = change["new"]
+            self.unobserve(self._on_vi_roi_change, names=["vi_roi_center_row", "vi_roi_center_col"])
+            self.vi_roi_center_row = float(row)
+            self.vi_roi_center_col = float(col)
+            self.observe(self._on_vi_roi_change, names=["vi_roi_center_row", "vi_roi_center_col"])
         if self.vi_roi_mode == "off":
-            self.summed_dp_bytes = b""
-            self.summed_dp_count = 0
+            self.vi_roi_dp_bytes = b""
             return
-        self._compute_summed_dp_from_vi_roi()
+        self._compute_vi_roi_dp()
 
-    def _compute_summed_dp_from_vi_roi(self):
-        """Sum diffraction patterns from positions inside VI ROI (PyTorch)."""
+    def _on_vi_roi_change(self, change=None):
+        """Recompute reduced DP when VI ROI or reduction changes."""
+        if self.vi_roi_mode == "off":
+            self.vi_roi_dp_bytes = b""
+            return
+        self._compute_vi_roi_dp()
+
+    def _compute_vi_roi_dp(self):
+        """Reduce diffraction patterns over scan positions inside VI ROI.
+
+        Reduction selected by `vi_roi_reduce`:
+        - "mean": average DP (size-invariant, default for region-of-interest analysis)
+        - "sum": total counts (scales with ROI area; use for quantitative integration)
+        - "max": brightest pixel per detector position across the region
+        """
         if self._data is None:
             return
-        # Create mask in scan space using cached coordinates
         if self.vi_roi_mode == "circle":
             mask = (self._scan_row_coords - self.vi_roi_center_row) ** 2 + (self._scan_col_coords - self.vi_roi_center_col) ** 2 <= self.vi_roi_radius ** 2
         elif self.vi_roi_mode == "square":
@@ -4116,27 +2160,41 @@ class Show4DSTEM(anywidget.AnyWidget):
         else:
             return
 
-        # Count positions in mask
         n_positions = int(mask.sum())
         if n_positions == 0:
-            self.summed_dp_bytes = b""
-            self.summed_dp_count = 0
+            self.vi_roi_dp_bytes = b""
             return
 
-        self.summed_dp_count = n_positions
-
-        # Compute average DP using masked sum (vectorized)
+        reduce = self.vi_roi_reduce
         data = self._frame_data
-        if data.ndim == 4:
-            # (scan_rows, scan_cols, det_rows, det_cols) - sum over masked scan positions
-            avg_dp = data[mask].mean(dim=0)
-        else:
-            # Flattened: (N, det_rows, det_cols) - need to convert mask indices
-            flat_indices = torch.nonzero(mask.flatten(), as_tuple=True)[0]
-            avg_dp = data[flat_indices].mean(dim=0)
+        # Single chunked torch path. For each scan-row chunk: cast to float32 and
+        # broadcast-multiply by the mask (no `chunk[row_mask]` slab, which would
+        # roughly duplicate the chunk in memory when the mask is dense). Sum/mean
+        # use einsum over scan dims; max masks zero rows then takes amax.
+        data_4d = data if data.ndim == 4 else data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
+        rows_per_chunk = self._chunk_rows()
+        if reduce == "sum" or reduce == "mean":
+            dp = torch.zeros(self._det_shape, dtype=torch.float32, device=self._device)
+        else:  # max
+            dp = torch.full(self._det_shape, -float("inf"), dtype=torch.float32, device=self._device)
+        for i in range(0, self._scan_shape[0], rows_per_chunk):
+            row_mask = mask[i:i + rows_per_chunk]
+            if not bool(row_mask.any()):
+                continue
+            chunk = data_4d[i:i + rows_per_chunk]
+            if not torch.is_floating_point(chunk):
+                chunk = chunk.float()
+            row_mask_f = row_mask.float()
+            if reduce == "max":
+                # Outside-mask positions become 0; doesn't affect amax provided
+                # the data has any non-negative pixels (true for detector counts).
+                dp = torch.maximum(dp, (chunk * row_mask_f[..., None, None]).amax(dim=(0, 1)))
+            else:
+                dp += torch.einsum("rcij,rc->ij", chunk, row_mask_f)
+        if reduce == "mean":
+            dp /= float(n_positions)
 
-        # Send raw float32 (consistent with other data paths — JS handles normalization)
-        self.summed_dp_bytes = avg_dp.cpu().numpy().tobytes()
+        self.vi_roi_dp_bytes = dp.cpu().numpy().tobytes()
 
     def _create_circular_mask(self, cx: float, cy: float, radius: float):
         """Create circular mask (boolean tensor on device)."""
@@ -4162,31 +2220,24 @@ class Show4DSTEM(anywidget.AnyWidget):
         return mask
 
     def _precompute_common_virtual_images(self):
-        """Pre-compute BF/ABF/ADF virtual images for instant preset switching."""
+        """Pre-compute BF/ABF/ADF/HAADF virtual image bytes. Annular ranges match
+        apply_preset() so the cache always hits on preset clicks."""
         cx, cy, bf = self.center_col, self.center_row, self.bf_radius
-        # Cache (bytes, stats, min, max) for each preset
-        bf_arr = self._fast_masked_sum(self._create_circular_mask(cx, cy, bf))
-        abf_arr = self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 0.5, bf))
-        adf_arr = self._fast_masked_sum(self._create_annular_mask(cx, cy, bf, bf * 4.0))
-
-        self._cached_bf_virtual = (
-            self._to_float32_bytes(bf_arr, update_vi_stats=False),
-            [float(bf_arr.mean()), float(bf_arr.min()), float(bf_arr.max()), float(bf_arr.std())],
-            float(bf_arr.min()), float(bf_arr.max())
+        self._cached_bf_virtual = self._to_float32_bytes(
+            self._fast_masked_sum(self._create_circular_mask(cx, cy, bf))
         )
-        self._cached_abf_virtual = (
-            self._to_float32_bytes(abf_arr, update_vi_stats=False),
-            [float(abf_arr.mean()), float(abf_arr.min()), float(abf_arr.max()), float(abf_arr.std())],
-            float(abf_arr.min()), float(abf_arr.max())
+        self._cached_abf_virtual = self._to_float32_bytes(
+            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 0.5, bf))
         )
-        self._cached_adf_virtual = (
-            self._to_float32_bytes(adf_arr, update_vi_stats=False),
-            [float(adf_arr.mean()), float(adf_arr.min()), float(adf_arr.max()), float(adf_arr.std())],
-            float(adf_arr.min()), float(adf_arr.max())
+        self._cached_adf_virtual = self._to_float32_bytes(
+            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf, bf * 2.0))
+        )
+        self._cached_haadf_virtual = self._to_float32_bytes(
+            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 2.0, bf * 4.0))
         )
 
-    def _get_cached_preset(self) -> tuple[bytes, list[float], float, float] | None:
-        """Check if current ROI matches a cached preset and return (bytes, stats, min, max) tuple."""
+    def _get_cached_preset(self) -> bytes | None:
+        """Return cached preset bytes if current ROI matches BF/ABF/ADF preset shape."""
         # Must be centered on detector center
         if abs(self.roi_center_col - self.center_col) >= 1 or abs(self.roi_center_row - self.center_row) >= 1:
             return None
@@ -4203,16 +2254,25 @@ class Show4DSTEM(anywidget.AnyWidget):
             abs(self.roi_radius - bf) < 1):
             return self._cached_abf_virtual
 
-        # ADF: annular at bf to 4*bf (combines LAADF + HAADF)
+        # ADF: annular at bf to 2*bf
         if (self.roi_mode == "annular" and
             abs(self.roi_radius_inner - bf) < 1 and
-            abs(self.roi_radius - bf * 4.0) < 1):
+            abs(self.roi_radius - bf * 2.0) < 1):
             return self._cached_adf_virtual
+
+        # HAADF: annular at 2*bf to 4*bf
+        if (self.roi_mode == "annular" and
+            abs(self.roi_radius_inner - bf * 2.0) < 1 and
+            abs(self.roi_radius - bf * 4.0) < 1):
+            return self._cached_haadf_virtual
 
         return None
 
     def _virtual_image_for_frame(self, frame_idx: int) -> np.ndarray:
-        """Compute virtual image array for a specific frame without mutating traits."""
+        """Compute virtual image for a specific 5D frame without mutating traits.
+
+        Single chunked-torch path matching _fast_masked_sum.
+        """
         data = self._data[frame_idx] if self.n_frames > 1 else self._data
         cx, cy = self.roi_center_col, self.roi_center_row
         if self.roi_mode == "circle" and self.roi_radius > 0:
@@ -4231,68 +2291,65 @@ class Show4DSTEM(anywidget.AnyWidget):
             else:
                 vi = data[:, row, col].reshape(self._scan_shape)
             return vi.cpu().numpy().astype(np.float32, copy=False)
-        mask_float = mask.float()
-        n_det = self._det_shape[0] * self._det_shape[1]
-        n_nonzero = int(mask.sum())
-        coverage = n_nonzero / n_det
-        if coverage < SPARSE_MASK_THRESHOLD:
-            indices = torch.nonzero(mask_float.flatten(), as_tuple=True)[0]
-            n_scan = self._scan_shape[0] * self._scan_shape[1]
-            data_flat = data.reshape(n_scan, n_det)
-            result = data_flat[:, indices].sum(dim=1).reshape(self._scan_shape)
-        else:
-            if data.ndim == 3:
-                data_4d = data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
-            else:
-                data_4d = data
-            result = torch.tensordot(data_4d, mask_float, dims=([2, 3], [0, 1]))
-        return result.cpu().numpy().astype(np.float32, copy=False)
+        data_4d = data if data.ndim == 4 else data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
+        mask_f = mask.float()
+        rows_per_chunk = self._chunk_rows()
+        out = torch.zeros(self._scan_shape, dtype=torch.float32, device=self._device)
+        for i in range(0, data_4d.shape[0], rows_per_chunk):
+            chunk = data_4d[i:i + rows_per_chunk]
+            if not torch.is_floating_point(chunk):
+                chunk = chunk.float()
+            out[i:i + rows_per_chunk] = torch.tensordot(chunk, mask_f, dims=([2, 3], [0, 1]))
+        return out.cpu().numpy().astype(np.float32, copy=False)
+
+    def _chunk_rows(self) -> int:
+        """Pick rows-per-chunk so float32 transient stays under _CHUNK_BYTE_BUDGET.
+
+        Float32 cast of one chunk = rows × scan_cols × det_h × det_w × 4 bytes.
+        Selected slabs (e.g. vi_roi reduce) inherit the same per-row budget.
+        """
+        per_row = self._scan_shape[1] * self._det_shape[0] * self._det_shape[1] * 4
+        return max(1, _CHUNK_BYTE_BUDGET // max(1, per_row))
 
     def _fast_masked_sum(self, mask: torch.Tensor) -> torch.Tensor:
-        """Compute masked sum using PyTorch.
+        """Sum data over scan positions weighted by detector mask.
 
-        Uses sparse indexing for small masks (<20% coverage) which is faster
-        because it only processes non-zero pixels:
-        - r=10 (1%): ~0.8ms (sparse) vs ~13ms (full)
-        - r=30 (8%): ~4ms (sparse) vs ~13ms (full)
-
-        For large masks (≥20%), uses full tensordot which has constant ~13ms.
+        Chunked tensordot. Per-chunk float32 cast bounded by _CHUNK_BYTE_BUDGET.
+        Identical math on CUDA / MPS / CPU.
         """
         data = self._frame_data
-        mask_float = mask.float()
-        n_det = self._det_shape[0] * self._det_shape[1]
-        n_nonzero = int(mask.sum())
-        coverage = n_nonzero / n_det
-
-        if coverage < SPARSE_MASK_THRESHOLD:
-            # Sparse: faster for small masks
-            indices = torch.nonzero(mask_float.flatten(), as_tuple=True)[0]
-            n_scan = self._scan_shape[0] * self._scan_shape[1]
-            data_flat = data.reshape(n_scan, n_det)
-            result = data_flat[:, indices].sum(dim=1).reshape(self._scan_shape)
+        if data.ndim == 3:
+            data_4d = data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
         else:
-            # Tensordot: faster for large masks
-            # Reshape to 4D if needed (3D flattened data)
-            if data.ndim == 3:
-                data_4d = data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
-            else:
-                data_4d = data
-            result = torch.tensordot(data_4d, mask_float, dims=([2, 3], [0, 1]))
+            data_4d = data
+        # Single chunked torch path. Per scan-row chunk: cast to float32, contract
+        # with mask via tensordot. Transient memory bounded by chunk size. Same
+        # code on CUDA / MPS / CPU. Identical results regardless of device.
+        mask_f = mask.float()
+        n_rows = data_4d.shape[0]
+        out = torch.zeros(self._scan_shape, dtype=torch.float32, device=self._device)
+        # Convert positions chunk size to row chunks based on scan width.
+        rows_per_chunk = self._chunk_rows()
+        for i in range(0, n_rows, rows_per_chunk):
+            chunk = data_4d[i:i + rows_per_chunk]
+            if not torch.is_floating_point(chunk):
+                chunk = chunk.float()
+            out[i:i + rows_per_chunk] = torch.tensordot(chunk, mask_f, dims=([2, 3], [0, 1]))
+        return out
 
-        return result
+    def _to_float32_bytes(self, arr: torch.Tensor) -> bytes:
+        """Convert tensor (any numeric dtype) to float32 bytes for JS transfer.
 
-    def _to_float32_bytes(self, arr: torch.Tensor, update_vi_stats: bool = True) -> bytes:
-        """Convert tensor to float32 bytes."""
-        # Compute min/max (fast on GPU)
-        vmin = float(arr.min())
-        vmax = float(arr.max())
-
-        # Only update traits when requested (avoids side effects during precomputation)
-        if update_vi_stats:
-            self.vi_data_min = vmin
-            self.vi_data_max = vmax
-            self.vi_stats = [float(arr.mean()), vmin, vmax, float(arr.std())]
-
+        Cast to float32 only at the small output. Integer reductions (uint16 sums,
+        int64 accumulators) get promoted here so the multi-GB raw data never gets
+        copied to float. Stats (min/max/mean/std) are computed JS-side from the
+        same Float32Array — keeping them out of separate traits avoids a
+        comm-message ordering race where bytes from click N arrive with stats
+        from click N-1, producing a wrong colormap normalization (uniform white
+        flash on rapid preset switching).
+        """
+        if arr.dtype != torch.float32:
+            arr = arr.float()
         return arr.cpu().numpy().tobytes()
 
     def _compute_virtual_image_from_roi(self):
@@ -4301,12 +2358,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             return
         cached = self._get_cached_preset()
         if cached is not None:
-            # Cached preset returns (bytes, stats, min, max) tuple
-            vi_bytes, vi_stats, vi_min, vi_max = cached
-            self.virtual_image_bytes = vi_bytes
-            self.vi_stats = vi_stats
-            self.vi_data_min = vi_min
-            self.vi_data_max = vi_max
+            self.virtual_image_bytes = cached
             return
 
         cx, cy = self.roi_center_col, self.roi_center_row
@@ -4333,5 +2385,3 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         self.virtual_image_bytes = self._to_float32_bytes(self._fast_masked_sum(mask))
 
-
-bind_tool_runtime_api(Show4DSTEM, "Show4DSTEM")

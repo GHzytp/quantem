@@ -12,8 +12,6 @@ def resolve_widget_version() -> str:
         return importlib.metadata.version("quantem-widget")
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
-    except Exception:
-        return "unknown"
 
 
 def build_json_header(widget_name: str) -> dict[str, Any]:

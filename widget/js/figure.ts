@@ -5,8 +5,6 @@
 
 import { formatNumber } from "./format";
 
-export type ScaleUnit = "Å" | "mrad" | "px" | "Å⁻¹";
-
 /** Round a physical value to a "nice" number (1, 2, 5, 10, 20, 50, ...) */
 export function roundToNiceValue(value: number): number {
   if (value <= 0) return 1;
@@ -18,23 +16,10 @@ export function roundToNiceValue(value: number): number {
   return 10 * magnitude;
 }
 
-/** Format scale bar label with appropriate unit and auto-conversion (Å→nm, mrad→rad, Å⁻¹→nm⁻¹) */
-export function formatScaleLabel(value: number, unit: ScaleUnit): string {
+/** Format scale bar label. Unit string is displayed verbatim - no conversion. */
+export function formatScaleLabel(value: number, unit: string): string {
   const nice = roundToNiceValue(value);
-  if (unit === "Å") {
-    if (nice >= 10) return `${Math.round(nice / 10)} nm`;
-    return nice >= 1 ? `${Math.round(nice)} Å` : `${nice.toFixed(2)} Å`;
-  }
-  if (unit === "Å⁻¹") {
-    // 10 Å⁻¹ = 1 nm⁻¹
-    if (nice >= 10) return `${Math.round(nice / 10)} nm⁻¹`;
-    return nice >= 1 ? `${Math.round(nice)} Å⁻¹` : `${nice.toFixed(2)} Å⁻¹`;
-  }
-  if (unit === "px") {
-    return nice >= 1 ? `${Math.round(nice)} px` : `${nice.toFixed(1)} px`;
-  }
-  if (nice >= 1000) return `${Math.round(nice / 1000)} rad`;
-  return nice >= 1 ? `${Math.round(nice)} mrad` : `${nice.toFixed(2)} mrad`;
+  return nice >= 1 ? `${Math.round(nice)} ${unit}` : `${nice.toFixed(2)} ${unit}`;
 }
 
 const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
@@ -48,7 +33,7 @@ export function drawScaleBarHiDPI(
   dpr: number,
   zoom: number,
   pixelSize: number,
-  unit: "Å" | "mrad" | "px",
+  unit: string,
   imageWidth: number,
 ) {
   const ctx = canvas.getContext("2d");
@@ -107,6 +92,7 @@ export function drawFFTScaleBarHiDPI(
   fftZoom: number,
   fftPixelSize: number,
   imageWidth: number,
+  unit: string = "1/px",
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx || fftPixelSize <= 0) return;
@@ -139,7 +125,7 @@ export function drawFFTScaleBarHiDPI(
   ctx.fillStyle = "white";
   ctx.fillRect(barX, barY, barPx, barThickness);
 
-  const label = formatScaleLabel(nicePhysical, "Å⁻¹");
+  const label = formatScaleLabel(nicePhysical, unit);
   ctx.font = `${fontSize}px ${FONT}`;
   ctx.fillStyle = "white";
   ctx.textAlign = "center";
@@ -220,8 +206,10 @@ export interface ExportFigureOptions {
   vmin?: number;
   vmax?: number;
   logScale?: boolean;
-  /** Pixel size in Å (for scale bar computation). */
+  /** Pixel size in user-supplied unit (for scale bar computation). */
   pixelSize?: number;
+  /** Unit string for the scale bar label (e.g. "A", "nm", "mrad"). */
+  pixelUnit?: string;
   showColorbar?: boolean;
   showScaleBar?: boolean;
   /** Upscale factor for high-resolution output (default 4). Image pixels use nearest-neighbor for sharp edges. */
@@ -243,6 +231,7 @@ export function exportFigure(options: ExportFigureOptions): HTMLCanvasElement {
     vmax = 1,
     logScale = false,
     pixelSize = 0,
+    pixelUnit = "pixels",
     showColorbar = true,
     showScaleBar = true,
     scale: s = 4,
@@ -323,7 +312,7 @@ export function exportFigure(options: ExportFigureOptions): HTMLCanvasElement {
     ctx.fillStyle = "white";
     ctx.fillRect(barX, barY, barPx, barThickness);
 
-    const label = formatScaleLabel(nicePhysical, "Å");
+    const label = formatScaleLabel(nicePhysical, pixelUnit);
     ctx.font = `bold ${fontSize}px ${FONT}`;
     ctx.fillStyle = "white";
     ctx.textAlign = "center";

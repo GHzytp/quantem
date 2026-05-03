@@ -24,12 +24,7 @@ import traitlets
 
 from quantem.core.datastructures import Dataset2d, Dataset3d
 from quantem.widget.array_utils import to_numpy, _resize_image
-from quantem.widget.json_state import resolve_widget_version, save_state_file, unwrap_state_payload
-from quantem.widget.tool_parity import (
-    bind_tool_runtime_api,
-    build_tool_groups,
-    normalize_tool_groups,
-)
+from quantem.widget.state import resolve_widget_version, save_state_file, unwrap_state_payload
 
 
 
@@ -94,8 +89,12 @@ class Show2D(anywidget.AnyWidget):
         Title to display above the image(s).
     cmap : str, default "inferno"
         Colormap name ("magma", "viridis", "gray", "inferno", "plasma").
-    pixel_size : float, optional
-        Pixel size in angstroms for scale bar display.
+    sampling : float or tuple of float, optional
+        Pixel size per axis ``(row, col)``. Scalar broadcasts to both axes.
+        Used for scale bar display. Defaults to ``(1, 1)``.
+    units : str or list of str, optional
+        Unit string per axis. Scalar broadcasts to both. Common: ``"A"``,
+        ``"nm"``, ``"pixels"``. Defaults to ``["pixels", "pixels"]``.
     show_fft : bool, default False
         Show FFT and histogram panels.
     show_stats : bool, default True
@@ -106,7 +105,7 @@ class Show2D(anywidget.AnyWidget):
         Use percentile-based contrast.
     vmin : float, optional
         Absolute minimum intensity for color mapping. When both vmin and vmax
-        are set, all gallery images share the same intensity scale — essential
+        are set, all gallery images share the same intensity scale: essential
         for A/B visual comparison.
     vmax : float, optional
         Absolute maximum intensity for color mapping.
@@ -117,24 +116,8 @@ class Show2D(anywidget.AnyWidget):
         ``0`` uses the frontend default: 500 px for a single image, 300 px per
         image in gallery mode.  Pass e.g. ``size=800`` to enlarge for a
         presentation, or ``size=200`` to compress alongside a control panel.
-        This controls **display only** — the underlying image resolution is
+        This controls **display only**: the underlying image resolution is
         never resampled; zooming into a 4K image preserves every pixel.
-    disabled_tools : list of str, optional
-        Tool groups to lock while still showing controls. Supported:
-        ``"display"``, ``"histogram"``, ``"stats"``, ``"navigation"``,
-        ``"view"``, ``"export"``, ``"roi"``, ``"profile"``, ``"all"``.
-    disable_* : bool, optional
-        Convenience flags (``disable_display``, ``disable_histogram``,
-        ``disable_stats``, ``disable_navigation``, ``disable_view``,
-        ``disable_export``, ``disable_roi``, ``disable_profile``,
-        ``disable_all``) equivalent to adding those keys to
-        ``disabled_tools``.
-    hidden_tools : list of str, optional
-        Tool groups to hide from the UI. Uses the same keys as
-        ``disabled_tools``.
-    hide_* : bool, optional
-        Convenience flags mirroring ``disable_*`` for ``hidden_tools``.
-
     Attributes
     ----------
     render_total_ms : int or None
@@ -153,17 +136,61 @@ class Show2D(anywidget.AnyWidget):
     --------
     >>> import numpy as np
     >>> from quantem.widget import Show2D
-    >>>
-    >>> # Single image with FFT
-    >>> Show2D(image, title="HRTEM Image", show_fft=True, pixel_size=1.0)
-    >>>
-    >>> # Gallery of multiple images
-    >>> labels = ["Raw", "Filtered", "FFT"]
-    >>> Show2D([img1, img2, img3], labels=labels, ncols=3)
+
+    Single 2D NumPy array:
+
+    >>> Show2D(np.random.rand(512, 512))
+
+    PyTorch tensor (CPU or GPU, any dtype):
+
+    >>> import torch
+    >>> Show2D(torch.rand(512, 512))
+
+    3D NumPy stack ``(N, H, W)`` rendered as a gallery:
+
+    >>> Show2D(np.random.rand(6, 256, 256), ncols=3)
+
+    List of arrays with different shapes (center-padded to a common canvas):
+
+    >>> Show2D([np.random.rand(256, 256), np.random.rand(300, 400)])
+
+    quantem ``Dataset2d``: title, sampling, units auto-extracted:
+
+    >>> from quantem.core.datastructures import Dataset2d
+    >>> ds = Dataset2d.from_array(np.random.rand(512, 512))
+    >>> Show2D(ds)
+
+    quantem ``Dataset3d``: gallery view of N frames with calibration:
+
+    >>> from quantem.core.datastructures import Dataset3d
+    >>> ds = Dataset3d.from_array(np.random.rand(6, 256, 256))
+    >>> Show2D(ds, ncols=3)
+
+    A/B comparison with shared contrast and linked zoom/pan:
+
+    >>> a, b = np.random.rand(512, 512), np.random.rand(512, 512)
+    >>> Show2D([a, b], vmin=0, vmax=1, link_zoom=True, link_pan=True)
+
+    Per-image absolute contrast (one ``vmin``/``vmax`` per image):
+
+    >>> Show2D([a, b], vmin=[0.0, 0.2], vmax=[1.0, 0.8])
+
+    Drift comparison: diff mode adds a ``A - B`` panel alongside the originals
+    (gallery becomes ``[A, B, A - B]``):
+
+    >>> Show2D([a, b], diff_mode=True, link_zoom=True, link_pan=True)
+
+    Large image: display-only canvas size (full resolution preserved):
+
+    >>> Show2D(np.random.rand(4096, 4096), size=800)
+
+    Static export to PDF or PNG (vector PDF for publication figures):
+
+    >>> w = Show2D(np.random.rand(512, 512), sampling=0.5, units="nm")
+    >>> w.save_image("figure.pdf", dpi=150)
     """
 
     _esm = pathlib.Path(__file__).parent / "static" / "show2d.js"
-    _css = pathlib.Path(__file__).parent / "static" / "show2d.css"
 
     # =========================================================================
     # Core State
@@ -201,6 +228,7 @@ class Show2D(anywidget.AnyWidget):
     # Scale Bar
     # =========================================================================
     pixel_size = traitlets.Float(0.0).tag(sync=True)
+    pixel_unit = traitlets.Unicode("pixels").tag(sync=True)
     scale_bar_visible = traitlets.Bool(True).tag(sync=True)
     size = traitlets.Int(0).tag(sync=True)  # Canvas rendering size in CSS pixels; 0 = frontend default
     smooth = traitlets.Bool(False).tag(sync=True)
@@ -218,8 +246,6 @@ class Show2D(anywidget.AnyWidget):
     # =========================================================================
     show_controls = traitlets.Bool(True).tag(sync=True)
     show_stats = traitlets.Bool(True).tag(sync=True)
-    disabled_tools = traitlets.List(traitlets.Unicode()).tag(sync=True)
-    hidden_tools = traitlets.List(traitlets.Unicode()).tag(sync=True)
     stats_mean = traitlets.List(traitlets.Float()).tag(sync=True)
     stats_min = traitlets.List(traitlets.Float()).tag(sync=True)
     stats_max = traitlets.List(traitlets.Float()).tag(sync=True)
@@ -253,114 +279,24 @@ class Show2D(anywidget.AnyWidget):
     # =========================================================================
     image_rotations = traitlets.List(traitlets.Int(), []).tag(sync=True)
 
-    @classmethod
-    def _normalize_tool_groups(cls, tool_groups) -> list[str]:
-        return normalize_tool_groups("Show2D", tool_groups)
-
-    @classmethod
-    def _build_disabled_tools(
-        cls,
-        disabled_tools=None,
-        disable_display: bool = False,
-        disable_histogram: bool = False,
-        disable_stats: bool = False,
-        disable_navigation: bool = False,
-        disable_view: bool = False,
-        disable_export: bool = False,
-        disable_roi: bool = False,
-        disable_profile: bool = False,
-        disable_all: bool = False,
-    ) -> list[str]:
-        return build_tool_groups(
-            "Show2D",
-            tool_groups=disabled_tools,
-            all_flag=disable_all,
-            flag_map={
-                "display": disable_display,
-                "histogram": disable_histogram,
-                "stats": disable_stats,
-                "navigation": disable_navigation,
-                "view": disable_view,
-                "export": disable_export,
-                "roi": disable_roi,
-                "profile": disable_profile,
-            },
-        )
-
-    @classmethod
-    def _build_hidden_tools(
-        cls,
-        hidden_tools=None,
-        hide_display: bool = False,
-        hide_histogram: bool = False,
-        hide_stats: bool = False,
-        hide_navigation: bool = False,
-        hide_view: bool = False,
-        hide_export: bool = False,
-        hide_roi: bool = False,
-        hide_profile: bool = False,
-        hide_all: bool = False,
-    ) -> list[str]:
-        return build_tool_groups(
-            "Show2D",
-            tool_groups=hidden_tools,
-            all_flag=hide_all,
-            flag_map={
-                "display": hide_display,
-                "histogram": hide_histogram,
-                "stats": hide_stats,
-                "navigation": hide_navigation,
-                "view": hide_view,
-                "export": hide_export,
-                "roi": hide_roi,
-                "profile": hide_profile,
-            },
-        )
-
-    @traitlets.validate("disabled_tools")
-    def _validate_disabled_tools(self, proposal):
-        return self._normalize_tool_groups(proposal["value"])
-
-    @traitlets.validate("hidden_tools")
-    def _validate_hidden_tools(self, proposal):
-        return self._normalize_tool_groups(proposal["value"])
-
     def __init__(
         self,
         data: np.ndarray | list[np.ndarray],
         labels: list[str | None] = None,
         title: str = "",
         cmap: str | Colormap = Colormap.INFERNO,
-        pixel_size: float = 0.0,
+        sampling: float | tuple[float, float] | list[float] | None = None,
+        units: str | list[str] | None = None,
         scale_bar_visible: bool = True,
         show_fft: bool = False,
         fft_window: bool = True,
         show_controls: bool = True,
         show_stats: bool = True,
+        verbose: bool = True,
         log_scale: bool = False,
         auto_contrast: bool = False,
         vmin: float | list | None = None,
         vmax: float | list | None = None,
-        disabled_tools: list[str | None] = None,
-        disable_display: bool = False,
-        disable_histogram: bool = False,
-        disable_stats: bool = False,
-        disable_navigation: bool = False,
-        disable_view: bool = False,
-        disable_export: bool = False,
-        disable_roi: bool = False,
-        disable_profile: bool = False,
-        disable_all: bool = False,
-        hidden_tools: list[str | None] = None,
-        hide_display: bool = False,
-        hide_histogram: bool = False,
-        hide_stats: bool = False,
-        hide_navigation: bool = False,
-        hide_view: bool = False,
-        hide_export: bool = False,
-        hide_roi: bool = False,
-        hide_profile: bool = False,
-        hide_all: bool = False,
         ncols: int = 3,
         size: int = 0,
         smooth: bool = False,
@@ -390,70 +326,41 @@ class Show2D(anywidget.AnyWidget):
         with self.hold_sync():
             self._init_sync(
                 data=data, labels=labels, title=title, cmap=cmap,
-                pixel_size=pixel_size, scale_bar_visible=scale_bar_visible,
+                sampling=sampling, units=units, scale_bar_visible=scale_bar_visible,
                 show_fft=show_fft, fft_window=fft_window,
                 show_controls=show_controls, show_stats=show_stats,
                 log_scale=log_scale, auto_contrast=auto_contrast,
                 vmin=vmin, vmax=vmax,
-                disabled_tools=disabled_tools,
-                disable_display=disable_display,
-                disable_histogram=disable_histogram,
-                disable_stats=disable_stats,
-                disable_navigation=disable_navigation,
-                disable_view=disable_view,
-                disable_export=disable_export,
-                disable_roi=disable_roi,
-                disable_profile=disable_profile,
-                disable_all=disable_all,
-                hidden_tools=hidden_tools,
-                hide_display=hide_display,
-                hide_histogram=hide_histogram,
-                hide_stats=hide_stats,
-                hide_navigation=hide_navigation,
-                hide_view=hide_view,
-                hide_export=hide_export,
-                hide_roi=hide_roi,
-                hide_profile=hide_profile,
-                hide_all=hide_all,
                 ncols=ncols, size=size, smooth=smooth, zoom=zoom,
                 zoom_row=zoom_row, zoom_col=zoom_col,
                 link_zoom=link_zoom, link_pan=link_pan, link_contrast=link_contrast,
                 diff_mode=diff_mode, view_box=view_box,
-                display_bin=display_bin, state=state, _t0=_t0)
+                display_bin=display_bin, verbose=verbose, state=state, _t0=_t0)
 
-    def _init_sync(self, *, data, labels, title, cmap, pixel_size,
+    def _init_sync(self, *, data, labels, title, cmap, sampling, units,
                    scale_bar_visible, show_fft, fft_window,
                    show_controls, show_stats, log_scale, auto_contrast,
-                   vmin, vmax, disabled_tools,
-                   disable_display, disable_histogram, disable_stats,
-                   disable_navigation, disable_view, disable_export,
-                   disable_roi, disable_profile, disable_all,
-                   hidden_tools, hide_display, hide_histogram, hide_stats,
-                   hide_navigation, hide_view, hide_export, hide_roi,
-                   hide_profile, hide_all,
+                   vmin, vmax,
                    ncols, size, smooth, zoom, zoom_row, zoom_col,
                    link_zoom, link_pan, link_contrast, diff_mode, view_box,
-                   display_bin, state, _t0):
+                   display_bin, verbose, state, _t0):
         import time as _time
+        self._verbose = verbose
         self.widget_version = resolve_widget_version()
         self._display_data = None  # initialized after data setup
         self._display_bin = 1
 
         # First-class support for quantem Dataset2d / Dataset3d:
-        # extract array + auto-populate title, pixel_size from sampling+units.
-        # (Duck-typing fallback below covers any other object exposing the same API.)
+        # auto-extract array + sampling + units from the dataset object.
         if isinstance(data, (Dataset2d, Dataset3d)) or (
             hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling")
         ):
             if not title and data.name:
                 title = data.name
-            if pixel_size == 0.0 and hasattr(data, "units"):
-                units = list(data.units)
-                sampling_val = float(data.sampling[-1])
-                if units[-1] in ("nm",):
-                    pixel_size = sampling_val * 10  # nm → Å
-                elif units[-1] in ("Å", "angstrom", "A"):
-                    pixel_size = sampling_val
+            if sampling is None:
+                sampling = tuple(float(s) for s in data.sampling[-2:])
+            if units is None and hasattr(data, "units"):
+                units = list(data.units[-2:])
             data = data.array
 
         # Convert NumPy / PyTorch / list inputs to a NumPy array.
@@ -481,7 +388,7 @@ class Show2D(anywidget.AnyWidget):
             self._data = np.array(data, dtype=np.float32, copy=True)
         else:
             self._data = np.asarray(data, dtype=np.float32)
-        # Store originals for rotation reset — views into _data (no copy).
+        # Store originals for rotation reset: views into _data (no copy).
         # Only materialized as independent copies when a rotation is applied.
         self._data_original = [self._data[i] for i in range(self._data.shape[0])]
         self._originals_are_views = True
@@ -499,7 +406,20 @@ class Show2D(anywidget.AnyWidget):
         # Options
         self.title = title
         self.cmap = cmap
-        self.pixel_size = pixel_size
+        # Resolve sampling + units to scalar pixel_size + pixel_unit (column axis).
+        # Scalar shorthand: sampling=0.5 → (0.5, 0.5). units="nm" → ["nm", "nm"].
+        if sampling is None:
+            self.pixel_size = 0.0
+        elif isinstance(sampling, (int, float)):
+            self.pixel_size = float(sampling)
+        else:
+            self.pixel_size = float(sampling[-1])
+        if units is None:
+            self.pixel_unit = "pixels"
+        elif isinstance(units, str):
+            self.pixel_unit = units
+        else:
+            self.pixel_unit = str(units[-1])
         self.scale_bar_visible = scale_bar_visible
         self.size = size
         self.smooth = smooth
@@ -547,30 +467,6 @@ class Show2D(anywidget.AnyWidget):
         else:
             self.vmin = vmin
             self.vmax = vmax
-        self.disabled_tools = self._build_disabled_tools(
-            disabled_tools=disabled_tools,
-            disable_display=disable_display,
-            disable_histogram=disable_histogram,
-            disable_stats=disable_stats,
-            disable_navigation=disable_navigation,
-            disable_view=disable_view,
-            disable_export=disable_export,
-            disable_roi=disable_roi,
-            disable_profile=disable_profile,
-            disable_all=disable_all,
-        )
-        self.hidden_tools = self._build_hidden_tools(
-            hidden_tools=hidden_tools,
-            hide_display=hide_display,
-            hide_histogram=hide_histogram,
-            hide_stats=hide_stats,
-            hide_navigation=hide_navigation,
-            hide_view=hide_view,
-            hide_export=hide_export,
-            hide_roi=hide_roi,
-            hide_profile=hide_profile,
-            hide_all=hide_all,
-        )
         self.ncols = ncols
 
         # Auto-bin for display: keep full-res in _data, send binned to JS.
@@ -601,10 +497,11 @@ class Show2D(anywidget.AnyWidget):
             self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
             self.height = int(self._display_data.shape[1])
             self.width = int(self._display_data.shape[2])
-            if pixel_size > 0:
-                self.pixel_size = pixel_size * self._display_bin
+            if self.pixel_size > 0:
+                self.pixel_size = self.pixel_size * self._display_bin
             self._display_bin_factor = self._display_bin
-            print(f"  Display bin {self._display_bin}×: {orig_h}×{orig_w} → {self.height}×{self.width} ({self._display_data.nbytes // 1024 // 1024} MB)")
+            if verbose:
+                print(f"  Display bin {self._display_bin}×: {orig_h}×{orig_w} → {self.height}×{self.width} ({self._display_data.nbytes // 1024 // 1024} MB)")
         else:
             self._display_data = self._data
             self._display_bin_factor = 1
@@ -629,7 +526,7 @@ class Show2D(anywidget.AnyWidget):
 
         # Stash wall-clock start on the instance; the observer below prints the
         # TRUE end-to-end time after JS signals first paint.  The Python-only
-        # __init__ number is misleading for widget UX — a widget is not "done"
+        # __init__ number is misleading for widget UX: a widget is not "done"
         # until the browser has painted its first frame.
         self._init_t0 = _t0
         self._init_py_elapsed_ms = (_time.perf_counter() - _t0) * 1000
@@ -646,13 +543,15 @@ class Show2D(anywidget.AnyWidget):
         mem = self._data.nbytes
         mem_str = f"{mem / (1 << 20):.0f} MB" if mem >= 1 << 20 else f"{mem / (1 << 10):.0f} KB"
         # Expose as attributes so tests and notebooks can assert on them.
-        # These are the ground truth for "did JS actually paint" — if they're
+        # These are the ground truth for "did JS actually paint": if they're
         # None, the JS side never signaled first render.
         self.render_total_ms = int(total_ms)
         self.render_python_build_ms = int(py_ms)
         self.render_wire_js_ms = int(total_ms - py_ms)
+        if not getattr(self, "_verbose", True):
+            return
         print(
-            f"Show2D: {shape} {mem_str} — "
+            f"Show2D: {shape} {mem_str}: "
             f"rendered in {total_ms:.0f} ms (Python build {py_ms:.0f} ms, "
             f"wire+JS {total_ms - py_ms:.0f} ms)",
             flush=True,
@@ -660,7 +559,7 @@ class Show2D(anywidget.AnyWidget):
         # Detach observer: one-shot, we only care about the first paint.
         try:
             self.unobserve(self._on_first_render, names=["_js_rendered"])
-        except Exception:
+        except (ValueError, KeyError):
             pass
 
     def set_image(self, data, labels=None):
@@ -706,7 +605,8 @@ class Show2D(anywidget.AnyWidget):
             self.height = int(self._display_data.shape[1])
             self.width = int(self._display_data.shape[2])
             self._display_bin_factor = self._display_bin
-            print(f"  Display bin {self._display_bin}×: {data.shape[1]}×{data.shape[2]} → {self.height}×{self.width}")
+            if getattr(self, "_verbose", True):
+                print(f"  Display bin {self._display_bin}×: {data.shape[1]}×{data.shape[2]} → {self.height}×{self.width}")
         else:
             self._display_data = self._data
             self.height = int(data.shape[1])
@@ -900,7 +800,6 @@ class Show2D(anywidget.AnyWidget):
             cb.set_ticklabels(tick_labels)
 
         if scalebar and self.pixel_size > 0:
-            from matplotlib.patches import FancyBboxPatch
             # Compute a nice scale bar length
             target_frac = 0.2  # ~20% of image width
             raw_length_px = target_frac * w
@@ -942,9 +841,8 @@ class Show2D(anywidget.AnyWidget):
             "show_fft": self.show_fft,
             "fft_window": self.fft_window,
             "show_controls": self.show_controls,
-            "disabled_tools": self.disabled_tools,
-            "hidden_tools": self.hidden_tools,
             "pixel_size": self.pixel_size,
+            "pixel_unit": self.pixel_unit,
             "scale_bar_visible": self.scale_bar_visible,
             "size": self.size,
             "smooth": self.smooth,
@@ -1012,10 +910,6 @@ class Show2D(anywidget.AnyWidget):
             if not self.fft_window:
                 display += " (no window)"
         lines.append(f"Display:  {display}")
-        if self.disabled_tools:
-            lines.append(f"Locked:   {', '.join(self.disabled_tools)}")
-        if self.hidden_tools:
-            lines.append(f"Hidden:   {', '.join(self.hidden_tools)}")
         if self.roi_active and self.roi_list:
             lines.append(f"ROI:      {len(self.roi_list)} region(s)")
         if self.profile_line:
@@ -1310,5 +1204,3 @@ class Show2D(anywidget.AnyWidget):
             return dist_px * self.pixel_size
         return dist_px
 
-
-bind_tool_runtime_api(Show2D, "Show2D")

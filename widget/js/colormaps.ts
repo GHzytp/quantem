@@ -1,3 +1,7 @@
+// ============================================================================
+// Color palettes (LUT control points)
+// ============================================================================
+
 const COLORMAP_POINTS: Record<string, number[][]> = {
   inferno: [
     [0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99],
@@ -57,6 +61,10 @@ function createColormapLUT(points: number[][]): Uint8Array {
 export const COLORMAPS: Record<string, Uint8Array> = Object.fromEntries(
   Object.entries(COLORMAP_POINTS).map(([name, points]) => [name, createColormapLUT(points)])
 );
+
+// ============================================================================
+// CPU colormap (Float32 -> RGBA via 256-entry LUT)
+// ============================================================================
 
 /** Apply colormap LUT to float data, writing into an RGBA Uint8ClampedArray. */
 export function applyColormap(
@@ -119,6 +127,10 @@ export function renderToOffscreenReuse(
 
 // 2D dispatch (16×16 workgroups) to stay within WebGPU's 65535 workgroup limit.
 // 1D dispatch with wg=256 needs ceil(4096*4096/256)=65536 — exceeds the limit by 1.
+// ============================================================================
+// WebGPU colormap engine (compute shader, ~300x faster than CPU loop on 4K data)
+// ============================================================================
+
 const COLORMAP_SHADER = /* wgsl */ `
 struct Params {
   width: u32,
@@ -1061,9 +1073,9 @@ let gpuColormapEngine: GPUColormapEngine | null = null;
 /** Get or create the singleton GPU colormap engine. Returns null if WebGPU unavailable. */
 export async function getGPUColormapEngine(): Promise<GPUColormapEngine | null> {
   if (gpuColormapEngine) return gpuColormapEngine;
-  // Reuse the GPU device from webgpu-fft
+  // Reuse the GPU device from fft
   try {
-    const { getGPUDevice } = await import("./webgpu-fft");
+    const { getGPUDevice } = await import("./fft");
     const device = await getGPUDevice();
     if (!device) return null;
     gpuColormapEngine = new GPUColormapEngine(device);

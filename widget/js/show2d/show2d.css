@@ -1,9 +1,0 @@
-/* show2d.css - Minimal CSS for Show2D */
-
-.show2d-root {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-
-.show2d-root canvas {
-  display: block;
-}

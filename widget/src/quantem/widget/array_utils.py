@@ -1,68 +1,21 @@
-"""
-Array utilities for widgets. Supports NumPy + PyTorch input.
-"""
-
-from typing import Literal
+"""Array utilities for widgets. NumPy + PyTorch input."""
 import numpy as np
-
-try:
-    import torch
-    _HAS_TORCH = True
-except ImportError:
-    _HAS_TORCH = False
-
-
-ArrayBackend = Literal["numpy", "torch", "unknown"]
-
-
-def get_array_backend(data) -> ArrayBackend:
-    """Detect array backend. Returns 'numpy', 'torch', or 'unknown'."""
-    if _HAS_TORCH and isinstance(data, torch.Tensor):
-        return "torch"
-    if isinstance(data, np.ndarray):
-        return "numpy"
-    return "unknown"
+import torch
 
 
 def to_numpy(data, dtype: np.dtype | None = None) -> np.ndarray:
-    """Convert NumPy or PyTorch array to NumPy.
-
-    Parameters
-    ----------
-    data : np.ndarray or torch.Tensor
-        Input array.
-    dtype : np.dtype, optional
-        Target dtype.
-
-    Returns
-    -------
-    np.ndarray
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> to_numpy(np.zeros((4, 4)))
-    >>> import torch
-    >>> to_numpy(torch.zeros(4, 4))
-
-    Raises
-    ------
-    TypeError
-        If `data` is not a NumPy array or PyTorch tensor.
-    """
-    backend = get_array_backend(data)
-    if backend == "torch":
+    """Convert NumPy / PyTorch / Dataset to NumPy."""
+    if isinstance(data, torch.Tensor):
         result = data.detach().cpu().numpy()
-    elif backend == "numpy":
+    elif isinstance(data, np.ndarray):
         result = data
     else:
-        # Try np.asarray as last-resort fallback for things like Dataset arrays
+        # Last-resort fallback covers Dataset.__array__, dlpack-compatible objects, etc.
         try:
             result = np.asarray(data)
         except Exception as e:
             raise TypeError(
-                f"to_numpy expected a NumPy array or PyTorch tensor, got {type(data).__name__}. "
-                f"Convert your input via np.asarray(...) or tensor.cpu().numpy() first."
+                f"to_numpy expected a NumPy array or PyTorch tensor, got {type(data).__name__}."
             ) from e
     if dtype is not None:
         result = np.asarray(result, dtype=dtype)
@@ -70,10 +23,7 @@ def to_numpy(data, dtype: np.dtype | None = None) -> np.ndarray:
 
 
 def _resize_image(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Center-pad an image to (target_h, target_w) with zeros.
-
-    Used to align gallery images of different shapes to a common canvas.
-    """
+    """Center-pad image to (target_h, target_w) with zeros. For gallery alignment."""
     h, w = img.shape[-2:]
     if h == target_h and w == target_w:
         return img
@@ -84,28 +34,14 @@ def _resize_image(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     return np.pad(img, ((pad_top, pad_bot), (pad_left, pad_right)), mode="constant", constant_values=0)
 
 
-def apply_shift(img: np.ndarray, dy: float, dx: float) -> np.ndarray:
-    """Sub-pixel image shift via bilinear interpolation. Used for diff alignment."""
-    if not _HAS_TORCH:
-        # Fallback: integer roll only
-        return np.roll(img, (int(round(dy)), int(round(dx))), axis=(-2, -1))
-    t = torch.from_numpy(img).float()
-    if t.ndim == 2:
-        t = t.unsqueeze(0).unsqueeze(0)
-    h, w = t.shape[-2:]
-    y = torch.arange(h, dtype=torch.float32) - dy
-    x = torch.arange(w, dtype=torch.float32) - dx
-    yy, xx = torch.meshgrid(y, x, indexing="ij")
-    grid = torch.stack(((xx / (w - 1)) * 2 - 1, (yy / (h - 1)) * 2 - 1), dim=-1).unsqueeze(0)
-    out = torch.nn.functional.grid_sample(t, grid, mode="bilinear", padding_mode="border", align_corners=True)
-    return out.squeeze().numpy()
-
-
-def bin2d(img: np.ndarray, factor: int) -> np.ndarray:
-    """Reduce 2D image by integer binning factor. Mean of f×f blocks."""
+def bin2d(img: np.ndarray, factor: int, mode: str = "mean") -> np.ndarray:
+    """Reduce 2D image by integer binning factor. mean or sum of f×f blocks."""
     if factor <= 1:
         return img
     h, w = img.shape[-2:]
     h2, w2 = h - h % factor, w - w % factor
     img = img[..., :h2, :w2]
-    return img.reshape(*img.shape[:-2], h2 // factor, factor, w2 // factor, factor).mean(axis=(-3, -1))
+    blocks = img.reshape(*img.shape[:-2], h2 // factor, factor, w2 // factor, factor)
+    if mode == "sum":
+        return blocks.sum(axis=(-3, -1))
+    return blocks.mean(axis=(-3, -1))

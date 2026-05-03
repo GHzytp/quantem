@@ -85,63 +85,24 @@ export function fftshift(data: Float32Array, width: number, height: number): voi
 // CPU FFT Web Worker — runs fft2d + fftshift + computeMagnitude off main thread
 // ============================================================================
 
+// Build worker source by stringifying the same fft1d/fft2d/fftshift defined
+// above. Single source of truth: fix a bug once, both paths get it. Pure
+// functions only (no module-state closures), so .toString() captures the full
+// behavior. Use Function.name in the onmessage body so minified names still
+// match (esbuild may rename `fft2d` -> `a`; the .name property tracks rename).
 const FFT_WORKER_CODE = `
-function nextPow2(n) { return Math.pow(2, Math.ceil(Math.log2(n))); }
-function fft1d(real, imag, inverse) {
-  var n = real.length; if (n <= 1) return;
-  var j = 0;
-  for (var i = 0; i < n - 1; i++) {
-    if (i < j) { var t = real[i]; real[i] = real[j]; real[j] = t; t = imag[i]; imag[i] = imag[j]; imag[j] = t; }
-    var k = n >> 1; while (k <= j) { j -= k; k >>= 1; } j += k;
-  }
-  var sign = inverse ? 1 : -1;
-  for (var len = 2; len <= n; len <<= 1) {
-    var halfLen = len >> 1, angle = (sign * 2 * Math.PI) / len;
-    var wR = Math.cos(angle), wI = Math.sin(angle);
-    for (var i = 0; i < n; i += len) {
-      var cR = 1, cI = 0;
-      for (var k = 0; k < halfLen; k++) {
-        var eI = i + k, oI = i + k + halfLen;
-        var tR = cR * real[oI] - cI * imag[oI], tI = cR * imag[oI] + cI * real[oI];
-        real[oI] = real[eI] - tR; imag[oI] = imag[eI] - tI;
-        real[eI] += tR; imag[eI] += tI;
-        var nR = cR * wR - cI * wI; cI = cR * wI + cI * wR; cR = nR;
-      }
-    }
-  }
-  if (inverse) { for (var i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
-}
-function fft2d(real, imag, width, height, inverse) {
-  var pW = nextPow2(width), pH = nextPow2(height), pad = pW !== width || pH !== height;
-  var wR, wI;
-  if (pad) {
-    wR = new Float32Array(pW * pH); wI = new Float32Array(pW * pH);
-    for (var y = 0; y < height; y++) for (var x = 0; x < width; x++) { wR[y*pW+x] = real[y*width+x]; wI[y*pW+x] = imag[y*width+x]; }
-  } else { wR = real; wI = imag; }
-  var rR = new Float32Array(pW), rI = new Float32Array(pW);
-  for (var y = 0; y < pH; y++) {
-    var o = y * pW; for (var x = 0; x < pW; x++) { rR[x] = wR[o+x]; rI[x] = wI[o+x]; }
-    fft1d(rR, rI, inverse); for (var x = 0; x < pW; x++) { wR[o+x] = rR[x]; wI[o+x] = rI[x]; }
-  }
-  var cR = new Float32Array(pH), cI = new Float32Array(pH);
-  for (var x = 0; x < pW; x++) {
-    for (var y = 0; y < pH; y++) { cR[y] = wR[y*pW+x]; cI[y] = wI[y*pW+x]; }
-    fft1d(cR, cI, inverse); for (var y = 0; y < pH; y++) { wR[y*pW+x] = cR[y]; wI[y*pW+x] = cI[y]; }
-  }
-  if (pad) { for (var y = 0; y < height; y++) for (var x = 0; x < width; x++) { real[y*width+x] = wR[y*pW+x]; imag[y*width+x] = wI[y*pW+x]; } }
-}
-function fftshift(data, width, height) {
-  var hW = width >> 1, hH = height >> 1, temp = new Float32Array(width * height);
-  for (var y = 0; y < height; y++) for (var x = 0; x < width; x++) temp[((y+hH)%height)*width+((x+hW)%width)] = data[y*width+x];
-  data.set(temp);
-}
+${nextPow2.toString()}
+${fft1d.toString()}
+${fft2d.toString()}
+${fftshift.toString()}
 self.onmessage = function(e) {
-  var d = e.data, real = d.real, imag = d.imag, w = d.width, h = d.height;
-  fft2d(real, imag, w, h, d.inverse);
-  fftshift(real, w, h); fftshift(imag, w, h);
-  var n = real.length, mag = new Float32Array(n);
-  for (var i = 0; i < n; i++) mag[i] = Math.sqrt(real[i]*real[i] + imag[i]*imag[i]);
-  self.postMessage({ id: d.id, magnitude: mag, real: real, imag: imag }, [mag.buffer, real.buffer, imag.buffer]);
+  const d = e.data;
+  ${fft2d.name}(d.real, d.imag, d.width, d.height, d.inverse);
+  ${fftshift.name}(d.real, d.width, d.height);
+  ${fftshift.name}(d.imag, d.width, d.height);
+  const n = d.real.length, mag = new Float32Array(n);
+  for (let i = 0; i < n; i++) mag[i] = Math.sqrt(d.real[i]*d.real[i] + d.imag[i]*d.imag[i]);
+  self.postMessage({ id: d.id, magnitude: mag, real: d.real, imag: d.imag }, [mag.buffer, d.real.buffer, d.imag.buffer]);
 };
 `;
 
@@ -187,6 +148,10 @@ export function fft2dAsync(
 
 // ============================================================================
 // WebGPU FFT — GPU-accelerated 2D FFT
+// ============================================================================
+
+// ============================================================================
+// WebGPU FFT (compute shader, GPU-resident)
 // ============================================================================
 
 const FFT_2D_SHADER = /* wgsl */`
