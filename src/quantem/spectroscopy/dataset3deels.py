@@ -325,8 +325,39 @@ class Dataset3deels(Dataset3dspectroscopy):
         else:
             return zlp_measured
 
-    def apply_zlp_correction(self):
-        return
+    def apply_zlp_correction(
+        self, zlp_guess_x=None, fit_window=0.8, fit_to_plane=True, return_3d_dataset=True
+    ):
+        zlp_array = self.measure_zlp_offset(zlp_guess_x, fit_window, fit_to_plane)
+
+        corrected_array = np.zeros_like(self.array)
+
+        n_energy, n_y, n_x = self.array.shape
+
+        dE = float(self.sampling[0])
+        E0 = float(self.origin[0])
+        energy_axis = E0 + np.arange(n_energy) * dE
+
+        for iy in range(n_y):
+            for ix in range(n_x):
+                E_shift = energy_axis - zlp_array[iy, ix]
+                interpolator = interp1d(
+                    E_shift,
+                    self.array[:, iy, ix],
+                    kind="linear",
+                    bounds_error=False,
+                    fill_value=0.0,
+                )
+                corrected_array[:, iy, ix] = interpolator(energy_axis)
+
+        if return_3d_dataset:
+            return Dataset3deels.from_array(
+                array=corrected_array,
+                name=self.name,
+                sampling=self.sampling,
+                origin=self.origin,
+                units=self.units,
+            )
 
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
