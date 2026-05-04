@@ -1176,13 +1176,7 @@ class Dataset3dspectroscopy(Dataset3d):
         subtracted_mean_spectrum = np.maximum(spec - background, 0)
 
         # PLOT MEAN BACKGROUND-SUBTRACTED SPECTRUM ---------------------------------------------------------------------------
-
-        # TODO: store energy axis variable so it doesn't have to be reinitialized repeatedly.
-        # for now, this chunk is borrowed from calculate_mean_spectrum
-        ###
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
-        E = E0 + dE * np.arange(self.shape[0])
+        E = self.energy_axis
 
         if energy_range is not None:
             energy_range[0] = np.maximum(energy_range[0], E[0])
