@@ -242,10 +242,14 @@ class Dataset3deels(Dataset3dspectroscopy):
         """
 
         # Define Gaussian constraint to fit ZLP to
-        def gaussian_fit(x, A, mu, sigma):
+        def _gaussian_fit(x, A, mu, sigma):
             return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
-        n_energy, n_y, n_x = self.array.shape()
+        def _plane_fit_2d(M, a, b, c):
+            x, y = M
+            return (a * x) + (b * y) + c
+
+        n_energy, n_y, n_x = self.array.shape
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0])
@@ -258,7 +262,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         for iy in range(n_y):
             for ix in range(n_x):
                 # Apply median filter to discount hot pixels that might spuriously produce the maximum intensity of the spectrum
-                spec_filt = median_filter(self.array[:, iy, ix], size=3)
+                spec_filt = np.median_filter(self.array[:, iy, ix], 3)
 
                 # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
                 if zlp_guess_x is not None:
@@ -294,13 +298,20 @@ class Dataset3deels(Dataset3dspectroscopy):
                     ),
                 )
 
-                popt, _ = curve_fit(gaussian_fit, xw, yw, p0=p0, bounds=bounds)
+                popt, _ = curve_fit(_gaussian_fit, xw, yw, p0=p0, bounds=bounds)
 
-                zlp_measured[n_y, n_x] = popt[1]
+                zlp_measured[n_y - 1, n_x - 1] = popt[1]
 
         # Fit a 2D plane to the array of measured ZLPs
+        xdata = np.arange(n_x)
+        ydata = np.arange(n_y)
 
-        return
+        xdata_unpacked = np.vstack(xdata.ravel(), ydata.ravel())
+        ydata_unpacked = zlp_measured.ravel()
+
+        popt, _ = curve_fit(_plane_fit_2d, xdata_unpacked, ydata_unpacked)
+
+        return _plane_fit_2d(xdata_unpacked, popt[0], popt[1], popt[2])
 
     def apply_zlp_correction():
         return
