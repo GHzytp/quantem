@@ -237,9 +237,9 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return smoothed_data3d
 
-    def measure_zlp_offset(self, zlp_guess_x=None, fit_window=0.8):
+    def measure_zlp_offset(self, zlp_guess_x=None, fit_window=0.8, fit_to_plane=True):
         """
-        Measure ZLP offset at each pixel position by fitting each spectrum to a Gaussian and returning a 2D plane fit of ZLP positions.
+        Measure ZLP offset at each pixel position by using a guess of ZLP posfitting each spectrum to a Gaussian
         """
 
         # Define Gaussian constraint to fit ZLP to
@@ -320,7 +320,10 @@ class Dataset3deels(Dataset3dspectroscopy):
             title=["Measured ZLP (Gaussian)", "ZLP plane fit"],
         )
 
-        return zlp_plane_2d
+        if fit_to_plane:
+            return zlp_plane_2d
+        else:
+            return zlp_measured
 
     def apply_zlp_correction(self):
         return
