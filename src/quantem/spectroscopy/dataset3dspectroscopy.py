@@ -337,6 +337,7 @@ class Dataset3dspectroscopy(Dataset3d):
         mask: Optional[NDArray] = None,
         plot_results: bool = True,
         random_state: Optional[int] = 42,
+        return_results=False,
     ) -> dict:
         """
         Perform Principal Component Analysis (PCA) on the spectroscopy dataset.
@@ -348,70 +349,73 @@ class Dataset3dspectroscopy(Dataset3d):
         standardize : bool
             If True, standardize the data before PCA (zero mean, unit variance)
         mask : Optional[NDArray]
-            Optional spatial mask to select pixels for analysis
+            Optional spatial mask to select pixels for analysis. Accepts shape
+            (scan_y, scan_x) or a flattened spatial mask.
         plot_results : bool
             If True, plot the explained variance and first few components
         random_state : Optional[int]
-            Random state for reproducibility
+            Accepted for API compatibility. PCA uses deterministic SVD.
 
         Returns
         -------
         dict
             Dictionary containing:
-            - 'pca': fitted PCA object
+            - 'pca': PCA result attributes
             - 'components': principal component spectra (n_components x n_energy)
-            - 'loadings': spatial loadings (n_components x n_pixels)
+            - 'loadings': spatial loadings (n_components x scan_y x scan_x)
             - 'explained_variance_ratio': explained variance for each component
             - 'reconstructed': reconstructed dataset (dataset3dspectroscopy) using n_components
         """
 
-        from quantem.spectroscopy import (
-            Dataset3deds as Dataset3deds,
-        )
-        from quantem.spectroscopy import (
-            Dataset3deels as Dataset3deels,
-        )
+        from quantem.spectroscopy import Dataset3deds, Dataset3deels
 
         data = np.asarray(self.array, dtype=float)
         n_energy, ny, nx = data.shape
+        n_pixels = ny * nx
 
-        # Reshape data to (n_pixels, n_energy) for PCA
-        data_reshaped = data.reshape(n_energy, -1).T  # (n_pixels, n_energy)
+        spectra = np.moveaxis(data, 0, -1).reshape(n_pixels, n_energy)
+        pixel_mask = np.ones(n_pixels, dtype=bool)
 
         if mask is not None:
-            mask_flat = mask.flatten()
-            data_masked = data_reshaped[mask_flat]
-        else:
-            data_masked = data_reshaped
+            mask_array = np.asarray(mask, dtype=bool)
+            if mask_array.shape == (ny, nx):
+                pixel_mask = mask_array.reshape(-1)
+            elif mask_array.shape == (n_pixels,):
+                pixel_mask = mask_array
+            else:
+                raise ValueError(
+                    f"mask shape {mask_array.shape} must match spatial shape {(ny, nx)} "
+                    f"or flattened shape {(n_pixels,)}"
+                )
+
+        if not np.any(pixel_mask):
+            raise ValueError("mask must select at least one spatial pixel")
+
+        selected_spectra = spectra[pixel_mask]
 
         if standardize:
-            mean = np.mean(data_masked, axis=0)
-            std = np.std(data_masked, axis=0)
+            mean = np.mean(selected_spectra, axis=0)
+            std = np.std(selected_spectra, axis=0)
             std[std == 0] = 1  # Avoid division by zero
-            data_processed = (data_masked - mean) / std
+            pca_input = (selected_spectra - mean) / std
         else:
-            data_processed = data_masked
+            mean = np.zeros(n_energy)
+            std = np.ones(n_energy)
+            pca_input = selected_spectra
 
-        # Perform PCA
-        del random_state
         (
             components,
             loadings,
             explained_variance,
             explained_variance_ratio,
             reconstructed,
-        ) = self._run_pca(data_processed, n_components)
+        ) = self._run_pca(pca_input, n_components)
 
-        # Reconstruct data
-        if standardize:
-            reconstructed = reconstructed * std + mean
+        reconstructed = reconstructed * std + mean
 
-        if mask is None:
-            loadings_spatial = loadings.T.reshape(n_components, ny, nx)
-        else:
-            loadings_spatial = np.zeros((n_components, ny * nx))
-            loadings_spatial[:, mask_flat] = loadings.T
-            loadings_spatial = loadings_spatial.reshape(n_components, ny, nx)
+        loadings_flat = np.zeros((n_components, n_pixels), dtype=loadings.dtype)
+        loadings_flat[:, pixel_mask] = loadings.T
+        loadings_spatial = loadings_flat.reshape(n_components, ny, nx)
 
         if plot_results:
             self._plot_pca_results(
@@ -421,33 +425,38 @@ class Dataset3dspectroscopy(Dataset3d):
                 n_show=min(4, n_components),
             )
 
-        if self.dataset_type == "eds":
-            reconstructed_data3d = Dataset3deds.from_array(
-                array=reconstructed.T.reshape(n_energy, ny, nx),
-                sampling=self.sampling,
-                origin=self.origin,
-                units=self.units,
-            )
-        elif self.dataset_type == "eels":
-            reconstructed_data3d = Dataset3deels.from_array(
-                array=reconstructed.T.reshape(n_energy, ny, nx),
-                sampling=self.sampling,
-                origin=self.origin,
-                units=self.units,
-            )
+        reconstructed_spectra = spectra.copy()
+        reconstructed_spectra[pixel_mask] = reconstructed
+        reconstructed_array = reconstructed_spectra.reshape(ny, nx, n_energy).transpose(2, 0, 1)
 
-        return {
-            "pca": {
-                "components_": components,
-                "explained_variance_": explained_variance,
-                "explained_variance_ratio_": explained_variance_ratio,
-            },
-            "components": components,
-            "loadings": loadings_spatial,
-            "explained_variance_ratio": explained_variance_ratio,
-            "explained_variance": explained_variance,
-            "reconstructed": reconstructed_data3d if mask is None else reconstructed_data3d,
-        }
+        dataset_type = str(self.dataset_type).lower()
+        if dataset_type == "eds":
+            dataset_class = Dataset3deds
+        elif dataset_type == "eels":
+            dataset_class = Dataset3deels
+        else:
+            raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
+
+        reconstructed_data3d = dataset_class.from_array(
+            array=reconstructed_array,
+            sampling=self.sampling,
+            origin=self.origin,
+            units=self.units,
+        )
+
+        if return_results:
+            return {
+                "pca": {
+                    "components_": components,
+                    "explained_variance_": explained_variance,
+                    "explained_variance_ratio_": explained_variance_ratio,
+                },
+                "components": components,
+                "loadings": loadings_spatial,
+                "explained_variance_ratio": explained_variance_ratio,
+                "explained_variance": explained_variance,
+                "reconstructed": reconstructed_data3d,
+            }
 
     def _run_pca(self, data: NDArray | Any, n_components: int):
         array = np.asarray(data, dtype=float)
@@ -502,76 +511,56 @@ class Dataset3dspectroscopy(Dataset3d):
         n_show : int
             Number of components to show
         """
-        fig = plt.figure(figsize=(15, 10))
-        gs = fig.add_gridspec(3, n_show + 1, width_ratios=[1.5] + [1] * n_show)
-
-        # Plot 1: Scree plot (explained variance)
-        ax_scree = fig.add_subplot(gs[0, 0])
+        fig, (ax_scree, ax_components) = plt.subplots(1, 2, figsize=(12, 4))
         cumsum_var = np.cumsum(explained_variance_ratio)
+        component_numbers = np.arange(1, len(explained_variance_ratio) + 1)
 
         ax_scree.bar(
-            range(1, len(explained_variance_ratio) + 1),
+            component_numbers,
             explained_variance_ratio * 100,
             alpha=0.6,
             label="Individual",
         )
-        ax_scree.plot(
-            range(1, len(explained_variance_ratio) + 1),
-            cumsum_var * 100,
-            "ro-",
-            label="Cumulative",
-        )
+        ax_scree.plot(component_numbers, cumsum_var * 100, "ro-", label="Cumulative")
         ax_scree.set_xlabel("Component Number")
         ax_scree.set_ylabel("Explained Variance (%)")
         ax_scree.set_title("Scree Plot")
         ax_scree.legend()
         ax_scree.grid(True, alpha=0.3)
 
-        # Get energy axis
         energy_sampling = float(self.sampling[0])
         energy_origin = float(self.origin[0])
         energy_axis = energy_origin + energy_sampling * np.arange(components.shape[1])
 
-        # Plot components and loadings
         for i in range(n_show):
-            ax_comp = fig.add_subplot(gs[1, i + 1])
-            ax_comp.plot(energy_axis, components[i])
-            ax_comp.set_title(f"PC{i + 1} ({explained_variance_ratio[i] * 100:.1f}%)")
-            ax_comp.set_xlabel("Energy")
-            if i == 0:
-                ax_comp.set_ylabel("Component")
-            ax_comp.grid(True, alpha=0.3)
+            ax_components.plot(
+                energy_axis,
+                components[i],
+                label=f"PC{i + 1} ({explained_variance_ratio[i] * 100:.1f}%)",
+            )
+        ax_components.set_xlabel("Energy")
+        ax_components.set_ylabel("Component")
+        ax_components.set_title("Principal Component Spectra")
+        ax_components.legend()
+        ax_components.grid(True, alpha=0.3)
 
-            ax_load = fig.add_subplot(gs[2, i + 1])
-            im = ax_load.imshow(loadings[i], cmap="RdBu_r", origin="lower")
-            ax_load.set_title(f"Loading {i + 1}")
-            ax_load.axis("off")
-            plt.colorbar(im, ax=ax_load, fraction=0.046, pad=0.04)
+        fig.suptitle("PCA Analysis")
+        fig.tight_layout()
+        plt.show()
 
-        ax_stats = fig.add_subplot(gs[1:, 0])
-        ax_stats.axis("off")
-
-        stats_text = "PCA Summary\n" + "=" * 20 + "\n\n"
-        stats_text += f"Total components: {len(explained_variance_ratio)}\n"
-        stats_text += f"Components for 95% var: {np.argmax(cumsum_var >= 0.95) + 1}\n"
-        stats_text += f"Components for 99% var: {np.argmax(cumsum_var >= 0.99) + 1}\n\n"
-
-        for i in range(min(5, len(explained_variance_ratio))):
-            stats_text += f"PC{i + 1}: {explained_variance_ratio[i] * 100:.2f}%\n"
-
-        ax_stats.text(
-            0.1,
-            0.9,
-            stats_text,
-            transform=ax_stats.transAxes,
-            fontsize=10,
-            verticalalignment="top",
-            fontfamily="monospace",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        show_2d(
+            [loadings[i] for i in range(n_show)],
+            title=[
+                f"Loading {i + 1} ({explained_variance_ratio[i] * 100:.1f}%)"
+                for i in range(n_show)
+            ],
+            cmap="RdBu_r",
+            cbar=True,
+            scalebar={
+                "sampling": float(self.sampling[1]),
+                "units": str(self.units[1]),
+            },
         )
-
-        plt.suptitle("PCA Analysis Results", fontsize=14, fontweight="bold")
-        plt.tight_layout()
         plt.show()
 
     def _calibrated_position_to_pixel(self, value, axis):
@@ -1155,106 +1144,282 @@ class Dataset3dspectroscopy(Dataset3d):
         method="powerlaw",
         return_dataset=True,
         attach_spectrum=True,
+        fit_mode="global",
+        kernel_width=1,
+        show=True,
+        return_background=False,
     ):
         """
-        Perform appropriate background subtraction routine on mean spectrum from a 3D spectroscopy dataset.
+        Subtract fitted background from a 3D spectroscopy dataset.
 
+        Parameters
+        ----------
+        fit_mode : {"global", "local"}, optional
+            ``"global"`` fits one background to the ROI mean spectrum and subtracts
+            it from every probe position. ``"local"`` fits a background at each
+            probe position from the average spectrum of its nearest spatial
+            neighbors.
+        kernel_width : int, optional
+            Number of nearest spatial neighbors to average for each local
+            background fit. The current pixel is included. Used only when
+            ``fit_mode="local"``.
+        show : bool, optional
+            If True, plot the mean raw spectrum, fitted background, and
+            background-subtracted spectrum.
+        return_background : bool, optional
+            If True, return ``(dataset, background_cube)`` when ``return_dataset``
+            is True, otherwise return the background cube.
 
-        returns:
-        A dataset3dspectroscopy object with background subtraction performed at all probe positions
-
+        Returns
+        -------
+        Dataset3dspectroscopy or tuple or ndarray or None
+            Background-subtracted dataset by default. If ``return_background`` is
+            True, also returns the fitted background cube.
         """
 
-        from quantem.spectroscopy import (
-            Dataset3deds as Dataset3deds,
-        )
-        from quantem.spectroscopy import (
-            Dataset3deels as Dataset3deels,
-        )
+        del ignore_range
+        from quantem.spectroscopy import Dataset3deds, Dataset3deels
 
-        spec = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+        fit_mode = str(fit_mode).lower()
+        if fit_mode not in {"global", "local"}:
+            raise ValueError("fit_mode must be 'global' or 'local'")
 
-        if self.dataset_type == "eds":
-            background = self.calculate_background_powerlaw(spec)
-        elif self.dataset_type == "eels":
-            if method == "powerlaw":
-                background = self.powerlaw_backgroundfit_eels(
-                    spec, energy_range, target_edge, window_size
-                )
-            elif method == "iterative":
-                background = self.calculate_background_iterative(spec)
+        E, indices = self._background_energy_axis_and_indices(energy_range, mask)
+        array3d = np.asarray(self.array, dtype=float)[indices, :, :]
+        y, x, dy, dx = self._resolve_roi(roi=roi)
 
-        subtracted_mean_spectrum = np.maximum(spec - background, 0)
-
-        # PLOT MEAN BACKGROUND-SUBTRACTED SPECTRUM ---------------------------------------------------------------------------
-
-        # TODO: store energy axis variable so it doesn't have to be reinitialized repeatedly.
-        # for now, this chunk is borrowed from calculate_mean_spectrum
-        ###
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
-        E = E0 + dE * np.arange(self.shape[0])
-
-        if energy_range is not None:
-            energy_range[0] = np.maximum(energy_range[0], E[0])
-            energy_range[1] = np.minimum(energy_range[1], E[-1])
-
-            indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
-            E = E[indices]
+        if fit_mode == "global":
+            input_spectrum = array3d[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+            background = self._fit_background_spectrum(
+                input_spectrum,
+                E,
+                method=method,
+                target_edge=target_edge,
+                window_size=window_size,
+            )
+            background_cube = np.broadcast_to(background[:, None, None], array3d.shape)
         else:
-            indices = np.arange(self.shape[0])
-        ###
+            background_cube = self._fit_local_background_cube(
+                array3d,
+                E,
+                method=method,
+                target_edge=target_edge,
+                window_size=window_size,
+                kernel_width=kernel_width,
+            )
+
+        spec3D_subtracted = np.maximum(array3d - background_cube, 0)
+        input_mean_spectrum = array3d[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+        background_mean_spectrum = background_cube[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+        subtracted_mean_spectrum = spec3D_subtracted[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+
+        if attach_spectrum:
+            self.add_spectrum_to_data(subtracted_mean_spectrum, E)
+
+        if show:
+            self._plot_background_subtraction(
+                E,
+                input_mean_spectrum,
+                background_mean_spectrum,
+                subtracted_mean_spectrum,
+                fit_mode=fit_mode,
+            )
+
+        dataset_type = str(self.dataset_type).lower()
+        if dataset_type == "eds":
+            dataset_class = Dataset3deds
+        elif dataset_type == "eels":
+            dataset_class = Dataset3deels
+        else:
+            raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
 
         output_origin = np.array(self.origin, dtype=float, copy=True)
         output_origin[0] = E[0]
 
+        if return_dataset:
+            subtracted_dataset = dataset_class.from_array(
+                array=spec3D_subtracted,
+                sampling=self.sampling,
+                origin=output_origin,
+                units=self.units,
+            )
+            if return_background:
+                background_dataset = dataset_class.from_array(
+                    array=np.array(background_cube, copy=True),
+                    sampling=self.sampling,
+                    origin=output_origin,
+                    units=self.units,
+                )
+                return subtracted_dataset, background_dataset
+            return subtracted_dataset
+
+        if return_background:
+            return background_cube
+
+        print("Notice: no 3D dataset was returned")
+
+    def _background_energy_axis_and_indices(self, energy_range, mask):
+        E = np.asarray(self.energy_axis, dtype=float)
+        selected = np.ones(E.shape, dtype=bool)
+
+        if energy_range is not None:
+            if len(energy_range) != 2:
+                raise ValueError("energy_range must be [min_energy, max_energy]")
+            e_min = float(energy_range[0])
+            e_max = float(energy_range[1])
+            if e_min >= e_max:
+                raise ValueError("Invalid energy range parameter.")
+            if e_max < E[0] or e_min > E[-1]:
+                raise ValueError("Energy range parameter is outside of data bounds.")
+            e_min = max(e_min, float(E[0]))
+            e_max = min(e_max, float(E[-1]))
+            selected &= (E >= e_min) & (E <= e_max)
+
+        if mask is not None:
+            mask = np.asarray(mask, dtype=bool)
+            if mask.shape != E.shape:
+                raise ValueError(
+                    f"Mask shape {mask.shape} does not match energy axis shape {E.shape}"
+                )
+            selected &= mask
+
+        if not np.any(selected):
+            raise ValueError("No energy channels selected. Adjust energy_range or mask")
+
+        indices = np.where(selected)[0]
+        return E[indices], indices
+
+    def _fit_background_spectrum(self, spectrum, energy_axis, method, target_edge, window_size):
+        dataset_type = str(self.dataset_type).lower()
+        spectrum = np.asarray(spectrum, dtype=float)
+
+        if dataset_type == "eds":
+            return self.calculate_background_powerlaw(spectrum)
+
+        if dataset_type != "eels":
+            raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
+
+        method = str(method).lower()
+        if method == "iterative":
+            return np.full_like(spectrum, float(self.calculate_background_iterative(spectrum)))
+        if method != "powerlaw":
+            raise ValueError("EELS background method must be 'powerlaw' or 'iterative'")
+        if target_edge is None:
+            raise ValueError("target_edge is required for EELS powerlaw background fitting")
+
+        return self._fit_eels_powerlaw_background(
+            spectrum,
+            np.asarray(energy_axis, dtype=float),
+            target_edge=target_edge,
+            window_size=window_size,
+        )
+
+    def _fit_eels_powerlaw_background(self, spectrum, energy_axis, target_edge, window_size):
+        from scipy.optimize import curve_fit
+
+        if window_size < 10 or window_size > 30:
+            raise ValueError("Invalid window size. Please input a value of between 10 and 30.")
+
+        target_edge = float(target_edge)
+        if target_edge < energy_axis[0] or target_edge > energy_axis[-1]:
+            raise ValueError("Target edge is outside of energy range.")
+
+        window_minE = (target_edge - 5) - target_edge * (float(window_size) / 100)
+        window_maxE = target_edge - 5
+        if window_minE < energy_axis[0]:
+            raise ValueError(
+                "Insufficient pre-edge background fitting region for this target edge "
+                "and window size within given energy range."
+            )
+
+        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
+        if len(window_indices) < 2:
+            raise ValueError("Insufficient points in EELS pre-edge background fitting window.")
+
+        window_E = energy_axis[window_indices]
+        window_I = np.asarray(spectrum, dtype=float)[window_indices]
+
+        def powerlaw_function(E, A, r):
+            return A * (E ** (-r))
+
+        popt, _ = curve_fit(powerlaw_function, window_E, window_I, maxfev=2000)
+        return powerlaw_function(energy_axis, popt[0], popt[1])
+
+    def _fit_local_background_cube(
+        self,
+        array3d,
+        energy_axis,
+        method,
+        target_edge,
+        window_size,
+        kernel_width,
+    ):
+        from scipy.spatial import cKDTree
+
+        n_energy, ny, nx = array3d.shape
+        n_pixels = ny * nx
+        try:
+            n_neighbors = int(kernel_width)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("kernel_width must be an integer") from exc
+        if n_neighbors < 1:
+            raise ValueError("kernel_width must be >= 1")
+        n_neighbors = min(n_neighbors, n_pixels)
+
+        yy, xx = np.indices((ny, nx))
+        coords = np.column_stack((yy.reshape(-1), xx.reshape(-1)))
+        _, neighbor_indices = cKDTree(coords).query(coords, k=n_neighbors)
+        if n_neighbors == 1:
+            neighbor_indices = neighbor_indices[:, None]
+
+        spectra = np.moveaxis(array3d, 0, -1).reshape(n_pixels, n_energy)
+        background = np.empty_like(spectra)
+
+        for pixel_index, neighbors in enumerate(neighbor_indices):
+            local_spectrum = spectra[neighbors].mean(axis=0)
+            try:
+                background[pixel_index] = self._fit_background_spectrum(
+                    local_spectrum,
+                    energy_axis,
+                    method=method,
+                    target_edge=target_edge,
+                    window_size=window_size,
+                )
+            except Exception as exc:
+                y, x = divmod(pixel_index, nx)
+                raise RuntimeError(f"Background fit failed at pixel ({y}, {x})") from exc
+
+        return background.reshape(ny, nx, n_energy).transpose(2, 0, 1)
+
+    def _plot_background_subtraction(
+        self,
+        energy_axis,
+        input_spectrum,
+        background_spectrum,
+        subtracted_spectrum,
+        fit_mode,
+    ):
         fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
 
-        ax_specbacksub.plot(E, subtracted_mean_spectrum, linewidth=1.5)
+        ax_specbacksub.plot(energy_axis, input_spectrum, linewidth=1.2, label="Input")
+        ax_specbacksub.plot(energy_axis, background_spectrum, linewidth=1.2, label="Background")
+        ax_specbacksub.plot(
+            energy_axis,
+            subtracted_spectrum,
+            linewidth=1.5,
+            label="Background-subtracted",
+        )
         if self.dataset_type == "eds":
             ax_specbacksub.set_xlabel("Energy (keV)")
         else:
             ax_specbacksub.set_xlabel("Energy (eV)")
         ax_specbacksub.set_ylabel("Intensity")
-        ax_specbacksub.set_title("Background-subtracted spectrum from ROI")
+        ax_specbacksub.set_title(f"Background-subtracted spectrum from ROI ({fit_mode})")
         ax_specbacksub.grid(True, alpha=0.1)
+        ax_specbacksub.legend()
 
         fig.tight_layout()
         plt.show()
-
-        # NOTE: currently, if an energy_range parameter is set, subtract_background considers ONLY
-        # the spectrum data within that energy range, and the output dataset3dspectroscopy object
-        # only includes data from that energy range embedded. Not sure that's the best way to implement this.
-
-        spec3D_subtracted = np.empty([spec.shape[0], self.shape[1], self.shape[2]], dtype=float)
-
-        for p in range(self.shape[1]):
-            for q in range(self.shape[2]):
-                spec3D_subtracted[:, p, q] = np.maximum(self.array[indices, p, q] - background, 0)
-
-        if return_dataset:
-            if self.dataset_type == "eds":
-                return Dataset3deds.from_array(
-                    array=spec3D_subtracted,
-                    sampling=self.sampling,
-                    origin=output_origin,
-                    units=self.units,
-                )
-
-            elif self.dataset_type == "eels":
-                return Dataset3deels.from_array(
-                    array=spec3D_subtracted,
-                    sampling=self.sampling,
-                    origin=output_origin,
-                    units=self.units,
-                )
-        else:
-            print("Notice: no 3D dataset was returned")
-
-        if attach_spectrum:
-            self.add_spectrum_to_data(subtracted_mean_spectrum, E)
-        else:
-            print(f"Notice: no spectrum recorded to attached_spectra in {self}")
 
     @property
     def energy_axis(self):
