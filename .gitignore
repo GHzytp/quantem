@@ -202,6 +202,7 @@ widget/.gitignore
 widget/docs/
 widget/notebooks/
 widget/scripts/
+!widget/scripts/build.mjs
 widget/tests/integration/
 widget/tests/snapshots/
 

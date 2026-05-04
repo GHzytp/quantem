@@ -585,6 +585,24 @@ function Show2D() {
   const [fftColormap, setFftColormap] = React.useState("inferno");
   const [fftScaleMode, setFftScaleMode] = React.useState<"linear" | "log" | "power">("linear");
   const [fftAuto, setFftAuto] = React.useState(true);
+  const [fftSmooth, setFftSmooth] = React.useState(true);
+  const [fftLinkedZoom, setFftLinkedZoom] = React.useState(false);
+  const [fftLinkPan, setFftLinkPan] = React.useState(false);
+  const [fftLinkedContrast, setFftLinkedContrast] = React.useState(true);
+  // Per-image FFT contrast (used when fftLinkedContrast=false)
+  const [fftContrastStates, setFftContrastStates] = React.useState<Map<number, { vminPct: number; vmaxPct: number }>>(new Map());
+  const fftContrastFor = React.useCallback((idx: number) => {
+    if (fftLinkedContrast) return { vminPct: fftVminPct, vmaxPct: fftVmaxPct };
+    return fftContrastStates.get(idx) || { vminPct: 0, vmaxPct: 100 };
+  }, [fftLinkedContrast, fftVminPct, fftVmaxPct, fftContrastStates]);
+  const setFftContrastFor = React.useCallback((idx: number, val: { vminPct: number; vmaxPct: number }) => {
+    if (fftLinkedContrast) {
+      setFftVminPct(val.vminPct);
+      setFftVmaxPct(val.vmaxPct);
+    } else {
+      setFftContrastStates(prev => new Map(prev).set(idx, val));
+    }
+  }, [fftLinkedContrast]);
   const [fftStats, setFftStats] = React.useState<number[] | null>(null);
   const [fftShowColorbar, setFftShowColorbar] = React.useState(false);
 
@@ -640,16 +658,34 @@ function Show2D() {
   const [linkedFftZoomState, setLinkedFftZoomState] = React.useState<ZoomState>({ zoom: DEFAULT_FFT_ZOOM, panX: 0, panY: 0 });
   const [fftPanningIdx, setFftPanningIdx] = React.useState<number | null>(null);
   const getGalleryFftState = React.useCallback((idx: number) => {
-    if (linkedZoom) return linkedFftZoomState;
-    return galleryFftStates.get(idx) || { zoom: DEFAULT_FFT_ZOOM, panX: 0, panY: 0 };
-  }, [linkedZoom, linkedFftZoomState, galleryFftStates]);
+    const per = galleryFftStates.get(idx) || { zoom: DEFAULT_FFT_ZOOM, panX: 0, panY: 0 };
+    return {
+      zoom: fftLinkedZoom ? linkedFftZoomState.zoom : per.zoom,
+      panX: fftLinkPan ? linkedFftZoomState.panX : per.panX,
+      panY: fftLinkPan ? linkedFftZoomState.panY : per.panY,
+    };
+  }, [fftLinkedZoom, fftLinkPan, linkedFftZoomState, galleryFftStates]);
   const setGalleryFftState = React.useCallback((idx: number, state: ZoomState) => {
-    if (linkedZoom) {
-      setLinkedFftZoomState(state);
-    } else {
-      setGalleryFftStates(prev => new Map(prev).set(idx, state));
+    if (fftLinkedZoom || fftLinkPan) {
+      setLinkedFftZoomState(prev => ({
+        zoom: fftLinkedZoom ? state.zoom : prev.zoom,
+        panX: fftLinkPan ? state.panX : prev.panX,
+        panY: fftLinkPan ? state.panY : prev.panY,
+      }));
     }
-  }, [linkedZoom]);
+    if (!fftLinkedZoom || !fftLinkPan) {
+      setGalleryFftStates(prev => {
+        const cur = prev.get(idx) || { zoom: DEFAULT_FFT_ZOOM, panX: 0, panY: 0 };
+        const next = new Map(prev);
+        next.set(idx, {
+          zoom: fftLinkedZoom ? cur.zoom : state.zoom,
+          panX: fftLinkPan ? cur.panX : state.panX,
+          panY: fftLinkPan ? cur.panY : state.panY,
+        });
+        return next;
+      });
+    }
+  }, [fftLinkedZoom, fftLinkPan]);
 
   // Resizable state (gallery starts smaller)
   const [canvasSize, setCanvasSize] = React.useState(nImages > 1 ? GALLERY_IMAGE_TARGET : SINGLE_IMAGE_TARGET);
@@ -875,12 +911,12 @@ function Show2D() {
       if (!off) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-      ctx.imageSmoothingEnabled = fftW < canvasW || fftH < canvasH;
+      ctx.imageSmoothingEnabled = fftSmooth;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(off, 0, 0, fftW, fftH, 0, 0, canvasW, canvasH);
     })();
     return () => { cancelled = true; };
-  }, [effectiveShowFft, showDiffPanel, nImages, dataVersion, width, height, fftWindow, fftColormap, canvasW, canvasH]);
+  }, [effectiveShowFft, showDiffPanel, nImages, dataVersion, width, height, fftWindow, fftColormap, canvasW, canvasH, fftSmooth]);
 
   // Diff panels render — DYNAMIC. One per non-reference image: image[ref] − image[i].
   // Computed at canvas resolution from raw float data, re-running on zoom/pan/align change.
@@ -2075,7 +2111,7 @@ function Show2D() {
     const fftH = offscreen.height;
 
     // Use bilinear smoothing when FFT is smaller than canvas (avoids blocky upscaling)
-    ctx.imageSmoothingEnabled = fftW < canvasW || fftH < canvasH;
+    ctx.imageSmoothingEnabled = fftSmooth || (fftW < canvasW || fftH < canvasH);
     ctx.clearRect(0, 0, canvasW, canvasH);
     ctx.save();
 
@@ -2087,7 +2123,7 @@ function Show2D() {
     // Stretch cropped FFT to fill the full canvas (no layout change during drag)
     ctx.drawImage(offscreen, 0, 0, fftW, fftH, 0, 0, canvasW, canvasH);
     ctx.restore();
-  }, [effectiveShowFft, isGallery, fftOffscreenVersion, canvasW, canvasH, fftZoom, fftPanX, fftPanY]);
+  }, [effectiveShowFft, isGallery, fftOffscreenVersion, canvasW, canvasH, fftZoom, fftPanX, fftPanY, fftSmooth]);
 
   // -------------------------------------------------------------------------
   // Render FFT overlay (scale bar + colorbar + d-spacing marker)
@@ -2317,7 +2353,8 @@ function Show2D() {
       } else {
         ({ min: displayMin, max: displayMax } = findDataRange(displayData));
       }
-      const { vmin, vmax } = sliderRange(displayMin, displayMax, fftVminPct, fftVmaxPct);
+      const fc = fftContrastFor(idx);
+      const { vmin, vmax } = sliderRange(displayMin, displayMax, fc.vminPct, fc.vmaxPct);
 
       const offscreen = renderToOffscreen(displayData, fftW, fftH, lut, vmin, vmax);
       if (!offscreen) continue;
@@ -2335,7 +2372,7 @@ function Show2D() {
       setFftDataRange(findDataRange(histData));
     }
     setGalleryFftOffscreenVersion(v => v + 1);
-  }, [effectiveShowFft, isGallery, nImages, width, height, galleryFftMagVersion, fftColormap, fftScaleMode, fftAuto, fftVminPct, fftVmaxPct, selectedIdx]);
+  }, [effectiveShowFft, isGallery, nImages, width, height, galleryFftMagVersion, fftColormap, fftScaleMode, fftAuto, fftVminPct, fftVmaxPct, selectedIdx, fftLinkedContrast, fftContrastStates]);
 
   // Gallery FFT draw effect: cheap drawImage from cached offscreens (zoom/pan changes)
   React.useLayoutEffect(() => {
@@ -2351,7 +2388,7 @@ function Show2D() {
       if (!ctx) continue;
 
       const { zoom, panX, panY } = getGalleryFftState(idx);
-      ctx.imageSmoothingEnabled = fftW < canvasW || fftH < canvasH;
+      ctx.imageSmoothingEnabled = fftSmooth;
       ctx.clearRect(0, 0, canvasW, canvasH);
       ctx.save();
       const cx = canvasW / 2;
@@ -2362,7 +2399,7 @@ function Show2D() {
       ctx.drawImage(offscreen, 0, 0, fftW, fftH, 0, 0, canvasW, canvasH);
       ctx.restore();
     }
-  }, [effectiveShowFft, isGallery, nImages, canvasW, canvasH, width, height, galleryFftOffscreenVersion, galleryFftStates, linkedZoom, linkedFftZoomState]);
+  }, [effectiveShowFft, isGallery, nImages, canvasW, canvasH, width, height, galleryFftOffscreenVersion, galleryFftStates, fftLinkedZoom, linkedFftZoomState, fftSmooth]);
 
   // -------------------------------------------------------------------------
   // Mouse Handlers for Zoom/Pan
@@ -2526,7 +2563,7 @@ function Show2D() {
 
   // Gallery FFT zoom/pan handlers (only selected image's FFT responds)
   const handleGalleryFftWheel = (e: React.WheelEvent, idx: number) => {
-    if (isGallery && idx !== selectedIdx && !linkedZoom) return;
+    if (isGallery && idx !== selectedIdx && !fftLinkedZoom) return;
     e.preventDefault(); // Prevent page scroll when zooming FFT
     const zs = getGalleryFftState(idx);
     const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
@@ -3636,7 +3673,7 @@ function Show2D() {
                     <Box
                       ref={(el: HTMLDivElement | null) => { fftContainerRefs.current[i] = el; }}
                       sx={{ mt: 0.5, position: "relative", border: `2px solid ${i === selectedIdx ? themeColors.accent : themeColors.border}`, borderRadius: 0, bgcolor: "#000", cursor: "grab" }}
-                      onWheel={(i === selectedIdx || linkedZoom) ? (e) => handleGalleryFftWheel(e, i) : undefined}
+                      onWheel={(i === selectedIdx || fftLinkedZoom) ? (e) => handleGalleryFftWheel(e, i) : undefined}
                       onDoubleClick={() => setGalleryFftState(i, { zoom: DEFAULT_FFT_ZOOM, panX: 0, panY: 0 })}
                       onMouseDown={(e) => handleGalleryFftMouseDown(e, i)}
                       onMouseMove={(e) => handleGalleryFftMouseMove(e, i)}
@@ -3747,13 +3784,10 @@ function Show2D() {
               <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "flex-start" }}>
                 <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, opacity: 1, pointerEvents: "auto" }}>
                   <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Scale:</Typography>
-                  <Select value={fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log" | "power")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
+                  <Select value={fftScaleMode === "power" ? "linear" : fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
                     <MenuItem value="linear">Lin</MenuItem>
                     <MenuItem value="log">Log</MenuItem>
-                    <MenuItem value="power">Pow</MenuItem>
                   </Select>
-                  <Typography sx={{ ...typography.label, fontSize: 10 }}>Auto:</Typography>
-                  <Switch checked={fftAuto} onChange={(e) => { setFftAuto(e.target.checked); }} size="small" sx={switchStyles.small} />
                   {roiFftActive && fftCropDims && (
                     <>
                       <Typography sx={{ ...typography.label, fontSize: 10 }}>Win:</Typography>
@@ -3765,11 +3799,69 @@ function Show2D() {
                     {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
                   </Select>
                 </Box>
+                {/* FFT Row 2: Auto + Smooth + Link Zoom/Pan/Contrast (mirrors main image Row 2) */}
+                <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, opacity: 1, pointerEvents: "auto" }}>
+                  <Typography sx={{ ...typography.label, fontSize: 10 }}>Auto:</Typography>
+                  <Switch checked={fftAuto} onChange={(e) => { setFftAuto(e.target.checked); }} size="small" sx={switchStyles.small} />
+                  <Typography sx={{ ...typography.label, fontSize: 10 }} title="CSS bilinear interpolation on the FFT canvas.">Smooth:</Typography>
+                  <Switch checked={fftSmooth} onChange={(e) => { setFftSmooth(e.target.checked); }} size="small" sx={switchStyles.small} />
+                  {isGallery && (
+                    <>
+                      <Typography sx={{ ...typography.label, fontSize: 10 }}>Link:</Typography>
+                      <Typography sx={{ ...typography.label, fontSize: 10 }} title="Zoom together across FFT panels (FFT-only, independent of main image link).">Zoom</Typography>
+                      <Switch checked={fftLinkedZoom} onChange={() => { setFftLinkedZoom(!fftLinkedZoom); }} size="small" sx={switchStyles.small} />
+                      <Typography sx={{ ...typography.label, fontSize: 10 }} title="Pan FFT panels together (FFT-only).">Pan</Typography>
+                      <Switch checked={fftLinkPan} onChange={() => { setFftLinkPan(!fftLinkPan); }} size="small" sx={switchStyles.small} />
+                      <Typography sx={{ ...typography.label, fontSize: 10 }} title="Share FFT contrast slider across panels (FFT-only).">Contrast</Typography>
+                      <Switch checked={fftLinkedContrast} onChange={() => { setFftLinkedContrast(!fftLinkedContrast); }} size="small" sx={switchStyles.small} />
+                    </>
+                  )}
+                </Box>
               </Box>
               {(
                 <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", opacity: 1, pointerEvents: "auto" }}>
                   {fftHistogramData && (
-                    <Histogram data={fftHistogramData} vminPct={fftVminPct} vmaxPct={fftVmaxPct} onRangeChange={(min, max) => { setFftVminPct(min); setFftVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme === "dark" ? "dark" : "light"} dataMin={fftDataRange.min} dataMax={fftDataRange.max} />
+                    !fftLinkedContrast && isGallery ? (
+                      <Box sx={{ display: "grid", gridTemplateColumns: `repeat(${effectiveNcols}, 110px)`, gap: "15px" }}>
+                        {Array.from({ length: nImages }).map((_, i) => {
+                          const fc = fftContrastFor(i);
+                          const mag = fftMagCacheGalleryRef.current[i];
+                          let perData: Float32Array | null = null;
+                          if (mag) {
+                            if (fftScaleMode === "log") perData = applyLogScale(mag);
+                            else if (fftScaleMode === "power") {
+                              perData = new Float32Array(mag.length);
+                              for (let j = 0; j < mag.length; j++) perData[j] = Math.sqrt(mag[j]);
+                            } else perData = mag;
+                          }
+                          const dr = perData ? findDataRange(perData) : fftDataRange;
+                          return (
+                            <Histogram
+                              key={i}
+                              data={perData || fftHistogramData}
+                              vminPct={fc.vminPct} vmaxPct={fc.vmaxPct}
+                              onRangeChange={(min, max) => { setFftContrastFor(i, { vminPct: min, vmaxPct: max }); }}
+                              width={110} height={58}
+                              theme={themeInfo.theme === "dark" ? "dark" : "light"}
+                              dataMin={dr.min} dataMax={dr.max}
+                            />
+                          );
+                        })}
+                      </Box>
+                    ) : (() => {
+                      const fc = fftContrastFor(selectedIdx);
+                      return (
+                        <Histogram
+                          data={fftHistogramData}
+                          vminPct={fc.vminPct}
+                          vmaxPct={fc.vmaxPct}
+                          onRangeChange={(min, max) => { setFftContrastFor(selectedIdx, { vminPct: min, vmaxPct: max }); }}
+                          width={110} height={58}
+                          theme={themeInfo.theme === "dark" ? "dark" : "light"}
+                          dataMin={fftDataRange.min} dataMax={fftDataRange.max}
+                        />
+                      );
+                    })()
                   )}
                 </Box>
               )}
@@ -3798,7 +3890,7 @@ function Show2D() {
 
           {/* Controls: two rows left + histogram right, ROI below */}
           {showControls && (
-            <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, boxSizing: "border-box" }}>
+            <Box sx={{ mt: (effectiveShowFft && isGallery) ? `${SPACING.XS}px` : `${SPACING.SM}px`, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, boxSizing: "border-box" }}>
               {/* Top: control rows + histogram side by side */}
               <Box sx={{ display: "flex", gap: `${SPACING.SM}px` }}>
                 <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "flex-start" }}>
@@ -3856,10 +3948,10 @@ function Show2D() {
                 </Box>
                 {/* Right: histograms. Unlinked + gallery → grid matching gallery layout
                     (same effectiveNcols × rows). Linked or single image → one histogram. */}
-                {(imageHistogramData || imageHistogramBins) && (
+                {(imageHistogramData || imageHistogramBins || (isGallery && !linkedContrast && rawDataRef.current)) && (
                   <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "flex-start", gap: 0.5, opacity: 1, pointerEvents: "auto" }}>
                     {(!linkedContrast && isGallery && rawDataRef.current) ? (
-                      <Box sx={{ display: "grid", gridTemplateColumns: `repeat(${effectiveNcols}, 110px)`, gap: "2px" }}>
+                      <Box sx={{ display: "grid", gridTemplateColumns: `repeat(${effectiveNcols}, 110px)`, gap: "15px" }}>
                         {Array.from({ length: nImages }).map((_, i) => {
                           const cs = contrastStates.get(i) || { vminPct: 0, vmaxPct: 100 };
                           const raw = rawDataRef.current?.[i] || null;
@@ -4060,10 +4152,9 @@ function Show2D() {
                   {/* Row 1: Scale + Color + Colorbar */}
                   <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, opacity: 1, pointerEvents: "auto" }}>
                     <Typography sx={{ ...typography.label, fontSize: 10 }}>Scale:</Typography>
-                    <Select value={fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log" | "power")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
+                    <Select value={fftScaleMode === "power" ? "linear" : fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
                       <MenuItem value="linear">Lin</MenuItem>
                       <MenuItem value="log">Log</MenuItem>
-                      <MenuItem value="power">Pow</MenuItem>
                     </Select>
                     <Typography sx={{ ...typography.label, fontSize: 10 }}>Color:</Typography>
                     <Select value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 65, fontSize: 10 }} MenuProps={themedMenuProps}>
