@@ -8,6 +8,7 @@ from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
 from scipy.stats import norm
 
+from quantem.core.visualization import show_2d
 from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy
 
 
@@ -262,7 +263,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         for iy in range(n_y):
             for ix in range(n_x):
                 # Apply median filter to discount hot pixels that might spuriously produce the maximum intensity of the spectrum
-                spec_filt = np.median_filter(self.array[:, iy, ix], 3)
+                spec_filt = median_filter(self.array[:, iy, ix], 3)
 
                 # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
                 if zlp_guess_x is not None:
@@ -300,20 +301,28 @@ class Dataset3deels(Dataset3dspectroscopy):
 
                 popt, _ = curve_fit(_gaussian_fit, xw, yw, p0=p0, bounds=bounds)
 
-                zlp_measured[n_y - 1, n_x - 1] = popt[1]
+                zlp_measured[iy - 1, ix - 1] = float(popt[1])
 
         # Fit a 2D plane to the array of measured ZLPs
-        xdata = np.arange(n_x)
-        ydata = np.arange(n_y)
+        xdata, ydata = np.meshgrid(np.arange(n_x), np.arange(n_y))
 
-        xdata_unpacked = np.vstack(xdata.ravel(), ydata.ravel())
+        xdata_unpacked = np.vstack((xdata.ravel(), ydata.ravel()))
         ydata_unpacked = zlp_measured.ravel()
 
         popt, _ = curve_fit(_plane_fit_2d, xdata_unpacked, ydata_unpacked)
 
-        return _plane_fit_2d(xdata_unpacked, popt[0], popt[1], popt[2])
+        zlp_plane_1d = _plane_fit_2d(xdata_unpacked, popt[0], popt[1], popt[2])
+        zlp_plane_2d = zlp_plane_1d.reshape(n_y, n_x)
 
-    def apply_zlp_correction():
+        show_2d(
+            [zlp_measured, zlp_plane_2d],
+            cmap="magma",
+            title=["Measured ZLP (Gaussian)", "ZLP plane fit"],
+        )
+
+        return zlp_plane_2d
+
+    def apply_zlp_correction(self):
         return
 
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
