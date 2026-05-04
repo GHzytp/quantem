@@ -350,6 +350,19 @@ class Dataset3deels(Dataset3dspectroscopy):
                 )
                 corrected_array[:, iy, ix] = interpolator(energy_axis)
 
+        mean_spectrum_raw = self.array.mean(axis=(1, 2))
+        mean_spectrum_corrected = corrected_array.mean(axis=(1, 2))
+
+        fig, ax = plt.subplots()
+        ax.plot(energy_axis, mean_spectrum_corrected, label="ZLP-corrected spectrum", color="b")
+        ax.plot(energy_axis, mean_spectrum_raw, label="Raw mean spectrum", color="r")
+        ax.set_xlabel("Energy (eV)")
+        ax.set_ylabel("Intensity")
+        ax.grid(True, alpha=0.1)
+        ax.legend()
+
+        fig.tight_layout()
+
         if return_3d_dataset:
             return Dataset3deels.from_array(
                 array=corrected_array,
