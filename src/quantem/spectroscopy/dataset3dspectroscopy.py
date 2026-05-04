@@ -1144,100 +1144,282 @@ class Dataset3dspectroscopy(Dataset3d):
         method="powerlaw",
         return_dataset=True,
         attach_spectrum=True,
+        fit_mode="global",
+        kernel_width=1,
+        show=True,
+        return_background=False,
     ):
         """
-        Perform appropriate background subtraction routine on mean spectrum from a 3D spectroscopy dataset.
+        Subtract fitted background from a 3D spectroscopy dataset.
 
+        Parameters
+        ----------
+        fit_mode : {"global", "local"}, optional
+            ``"global"`` fits one background to the ROI mean spectrum and subtracts
+            it from every probe position. ``"local"`` fits a background at each
+            probe position from the average spectrum of its nearest spatial
+            neighbors.
+        kernel_width : int, optional
+            Number of nearest spatial neighbors to average for each local
+            background fit. The current pixel is included. Used only when
+            ``fit_mode="local"``.
+        show : bool, optional
+            If True, plot the mean raw spectrum, fitted background, and
+            background-subtracted spectrum.
+        return_background : bool, optional
+            If True, return ``(dataset, background_cube)`` when ``return_dataset``
+            is True, otherwise return the background cube.
 
-        returns:
-        A dataset3dspectroscopy object with background subtraction performed at all probe positions
-
+        Returns
+        -------
+        Dataset3dspectroscopy or tuple or ndarray or None
+            Background-subtracted dataset by default. If ``return_background`` is
+            True, also returns the fitted background cube.
         """
 
-        from quantem.spectroscopy import (
-            Dataset3deds as Dataset3deds,
-        )
-        from quantem.spectroscopy import (
-            Dataset3deels as Dataset3deels,
-        )
+        del ignore_range
+        from quantem.spectroscopy import Dataset3deds, Dataset3deels
 
-        spec = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+        fit_mode = str(fit_mode).lower()
+        if fit_mode not in {"global", "local"}:
+            raise ValueError("fit_mode must be 'global' or 'local'")
 
-        if self.dataset_type == "eds":
-            background = self.calculate_background_powerlaw(spec)
-        elif self.dataset_type == "eels":
-            if method == "powerlaw":
-                background = self.powerlaw_backgroundfit_eels(
-                    spec, energy_range, target_edge, window_size
-                )
-            elif method == "iterative":
-                background = self.calculate_background_iterative(spec)
+        E, indices = self._background_energy_axis_and_indices(energy_range, mask)
+        array3d = np.asarray(self.array, dtype=float)[indices, :, :]
+        y, x, dy, dx = self._resolve_roi(roi=roi)
 
-        subtracted_mean_spectrum = np.maximum(spec - background, 0)
-
-        # PLOT MEAN BACKGROUND-SUBTRACTED SPECTRUM ---------------------------------------------------------------------------
-        E = self.energy_axis
-
-        if energy_range is not None:
-            energy_range[0] = np.maximum(energy_range[0], E[0])
-            energy_range[1] = np.minimum(energy_range[1], E[-1])
-
-            indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
-            E = E[indices]
+        if fit_mode == "global":
+            input_spectrum = array3d[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+            background = self._fit_background_spectrum(
+                input_spectrum,
+                E,
+                method=method,
+                target_edge=target_edge,
+                window_size=window_size,
+            )
+            background_cube = np.broadcast_to(background[:, None, None], array3d.shape)
         else:
-            indices = np.arange(self.shape[0])
-        ###
+            background_cube = self._fit_local_background_cube(
+                array3d,
+                E,
+                method=method,
+                target_edge=target_edge,
+                window_size=window_size,
+                kernel_width=kernel_width,
+            )
+
+        spec3D_subtracted = np.maximum(array3d - background_cube, 0)
+        input_mean_spectrum = array3d[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+        background_mean_spectrum = background_cube[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+        subtracted_mean_spectrum = spec3D_subtracted[:, y : y + dy, x : x + dx].mean(axis=(1, 2))
+
+        if attach_spectrum:
+            self.add_spectrum_to_data(subtracted_mean_spectrum, E)
+
+        if show:
+            self._plot_background_subtraction(
+                E,
+                input_mean_spectrum,
+                background_mean_spectrum,
+                subtracted_mean_spectrum,
+                fit_mode=fit_mode,
+            )
+
+        dataset_type = str(self.dataset_type).lower()
+        if dataset_type == "eds":
+            dataset_class = Dataset3deds
+        elif dataset_type == "eels":
+            dataset_class = Dataset3deels
+        else:
+            raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
 
         output_origin = np.array(self.origin, dtype=float, copy=True)
         output_origin[0] = E[0]
 
+        if return_dataset:
+            subtracted_dataset = dataset_class.from_array(
+                array=spec3D_subtracted,
+                sampling=self.sampling,
+                origin=output_origin,
+                units=self.units,
+            )
+            if return_background:
+                background_dataset = dataset_class.from_array(
+                    array=np.array(background_cube, copy=True),
+                    sampling=self.sampling,
+                    origin=output_origin,
+                    units=self.units,
+                )
+                return subtracted_dataset, background_dataset
+            return subtracted_dataset
+
+        if return_background:
+            return background_cube
+
+        print("Notice: no 3D dataset was returned")
+
+    def _background_energy_axis_and_indices(self, energy_range, mask):
+        E = np.asarray(self.energy_axis, dtype=float)
+        selected = np.ones(E.shape, dtype=bool)
+
+        if energy_range is not None:
+            if len(energy_range) != 2:
+                raise ValueError("energy_range must be [min_energy, max_energy]")
+            e_min = float(energy_range[0])
+            e_max = float(energy_range[1])
+            if e_min >= e_max:
+                raise ValueError("Invalid energy range parameter.")
+            if e_max < E[0] or e_min > E[-1]:
+                raise ValueError("Energy range parameter is outside of data bounds.")
+            e_min = max(e_min, float(E[0]))
+            e_max = min(e_max, float(E[-1]))
+            selected &= (E >= e_min) & (E <= e_max)
+
+        if mask is not None:
+            mask = np.asarray(mask, dtype=bool)
+            if mask.shape != E.shape:
+                raise ValueError(
+                    f"Mask shape {mask.shape} does not match energy axis shape {E.shape}"
+                )
+            selected &= mask
+
+        if not np.any(selected):
+            raise ValueError("No energy channels selected. Adjust energy_range or mask")
+
+        indices = np.where(selected)[0]
+        return E[indices], indices
+
+    def _fit_background_spectrum(self, spectrum, energy_axis, method, target_edge, window_size):
+        dataset_type = str(self.dataset_type).lower()
+        spectrum = np.asarray(spectrum, dtype=float)
+
+        if dataset_type == "eds":
+            return self.calculate_background_powerlaw(spectrum)
+
+        if dataset_type != "eels":
+            raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
+
+        method = str(method).lower()
+        if method == "iterative":
+            return np.full_like(spectrum, float(self.calculate_background_iterative(spectrum)))
+        if method != "powerlaw":
+            raise ValueError("EELS background method must be 'powerlaw' or 'iterative'")
+        if target_edge is None:
+            raise ValueError("target_edge is required for EELS powerlaw background fitting")
+
+        return self._fit_eels_powerlaw_background(
+            spectrum,
+            np.asarray(energy_axis, dtype=float),
+            target_edge=target_edge,
+            window_size=window_size,
+        )
+
+    def _fit_eels_powerlaw_background(self, spectrum, energy_axis, target_edge, window_size):
+        from scipy.optimize import curve_fit
+
+        if window_size < 10 or window_size > 30:
+            raise ValueError("Invalid window size. Please input a value of between 10 and 30.")
+
+        target_edge = float(target_edge)
+        if target_edge < energy_axis[0] or target_edge > energy_axis[-1]:
+            raise ValueError("Target edge is outside of energy range.")
+
+        window_minE = (target_edge - 5) - target_edge * (float(window_size) / 100)
+        window_maxE = target_edge - 5
+        if window_minE < energy_axis[0]:
+            raise ValueError(
+                "Insufficient pre-edge background fitting region for this target edge "
+                "and window size within given energy range."
+            )
+
+        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
+        if len(window_indices) < 2:
+            raise ValueError("Insufficient points in EELS pre-edge background fitting window.")
+
+        window_E = energy_axis[window_indices]
+        window_I = np.asarray(spectrum, dtype=float)[window_indices]
+
+        def powerlaw_function(E, A, r):
+            return A * (E ** (-r))
+
+        popt, _ = curve_fit(powerlaw_function, window_E, window_I, maxfev=2000)
+        return powerlaw_function(energy_axis, popt[0], popt[1])
+
+    def _fit_local_background_cube(
+        self,
+        array3d,
+        energy_axis,
+        method,
+        target_edge,
+        window_size,
+        kernel_width,
+    ):
+        from scipy.spatial import cKDTree
+
+        n_energy, ny, nx = array3d.shape
+        n_pixels = ny * nx
+        try:
+            n_neighbors = int(kernel_width)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("kernel_width must be an integer") from exc
+        if n_neighbors < 1:
+            raise ValueError("kernel_width must be >= 1")
+        n_neighbors = min(n_neighbors, n_pixels)
+
+        yy, xx = np.indices((ny, nx))
+        coords = np.column_stack((yy.reshape(-1), xx.reshape(-1)))
+        _, neighbor_indices = cKDTree(coords).query(coords, k=n_neighbors)
+        if n_neighbors == 1:
+            neighbor_indices = neighbor_indices[:, None]
+
+        spectra = np.moveaxis(array3d, 0, -1).reshape(n_pixels, n_energy)
+        background = np.empty_like(spectra)
+
+        for pixel_index, neighbors in enumerate(neighbor_indices):
+            local_spectrum = spectra[neighbors].mean(axis=0)
+            try:
+                background[pixel_index] = self._fit_background_spectrum(
+                    local_spectrum,
+                    energy_axis,
+                    method=method,
+                    target_edge=target_edge,
+                    window_size=window_size,
+                )
+            except Exception as exc:
+                y, x = divmod(pixel_index, nx)
+                raise RuntimeError(f"Background fit failed at pixel ({y}, {x})") from exc
+
+        return background.reshape(ny, nx, n_energy).transpose(2, 0, 1)
+
+    def _plot_background_subtraction(
+        self,
+        energy_axis,
+        input_spectrum,
+        background_spectrum,
+        subtracted_spectrum,
+        fit_mode,
+    ):
         fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
 
-        ax_specbacksub.plot(E, subtracted_mean_spectrum, linewidth=1.5)
+        ax_specbacksub.plot(energy_axis, input_spectrum, linewidth=1.2, label="Input")
+        ax_specbacksub.plot(energy_axis, background_spectrum, linewidth=1.2, label="Background")
+        ax_specbacksub.plot(
+            energy_axis,
+            subtracted_spectrum,
+            linewidth=1.5,
+            label="Background-subtracted",
+        )
         if self.dataset_type == "eds":
             ax_specbacksub.set_xlabel("Energy (keV)")
         else:
             ax_specbacksub.set_xlabel("Energy (eV)")
         ax_specbacksub.set_ylabel("Intensity")
-        ax_specbacksub.set_title("Background-subtracted spectrum from ROI")
+        ax_specbacksub.set_title(f"Background-subtracted spectrum from ROI ({fit_mode})")
         ax_specbacksub.grid(True, alpha=0.1)
+        ax_specbacksub.legend()
 
         fig.tight_layout()
         plt.show()
-
-        # NOTE: currently, if an energy_range parameter is set, subtract_background considers ONLY
-        # the spectrum data within that energy range, and the output dataset3dspectroscopy object
-        # only includes data from that energy range embedded. Not sure that's the best way to implement this.
-
-        spec3D_subtracted = np.empty([spec.shape[0], self.shape[1], self.shape[2]], dtype=float)
-
-        for p in range(self.shape[1]):
-            for q in range(self.shape[2]):
-                spec3D_subtracted[:, p, q] = np.maximum(self.array[indices, p, q] - background, 0)
-
-        if return_dataset:
-            if self.dataset_type == "eds":
-                return Dataset3deds.from_array(
-                    array=spec3D_subtracted,
-                    sampling=self.sampling,
-                    origin=output_origin,
-                    units=self.units,
-                )
-
-            elif self.dataset_type == "eels":
-                return Dataset3deels.from_array(
-                    array=spec3D_subtracted,
-                    sampling=self.sampling,
-                    origin=output_origin,
-                    units=self.units,
-                )
-        else:
-            print("Notice: no 3D dataset was returned")
-
-        if attach_spectrum:
-            self.add_spectrum_to_data(subtracted_mean_spectrum, E)
-        else:
-            print(f"Notice: no spectrum recorded to attached_spectra in {self}")
 
     @property
     def energy_axis(self):
