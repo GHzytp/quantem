@@ -337,6 +337,7 @@ class Dataset3dspectroscopy(Dataset3d):
         mask: Optional[NDArray] = None,
         plot_results: bool = True,
         random_state: Optional[int] = 42,
+        return_results=False,
     ) -> dict:
         """
         Perform Principal Component Analysis (PCA) on the spectroscopy dataset.
@@ -348,70 +349,73 @@ class Dataset3dspectroscopy(Dataset3d):
         standardize : bool
             If True, standardize the data before PCA (zero mean, unit variance)
         mask : Optional[NDArray]
-            Optional spatial mask to select pixels for analysis
+            Optional spatial mask to select pixels for analysis. Accepts shape
+            (scan_y, scan_x) or a flattened spatial mask.
         plot_results : bool
             If True, plot the explained variance and first few components
         random_state : Optional[int]
-            Random state for reproducibility
+            Accepted for API compatibility. PCA uses deterministic SVD.
 
         Returns
         -------
         dict
             Dictionary containing:
-            - 'pca': fitted PCA object
+            - 'pca': PCA result attributes
             - 'components': principal component spectra (n_components x n_energy)
-            - 'loadings': spatial loadings (n_components x n_pixels)
+            - 'loadings': spatial loadings (n_components x scan_y x scan_x)
             - 'explained_variance_ratio': explained variance for each component
             - 'reconstructed': reconstructed dataset (dataset3dspectroscopy) using n_components
         """
 
-        from quantem.spectroscopy import (
-            Dataset3deds as Dataset3deds,
-        )
-        from quantem.spectroscopy import (
-            Dataset3deels as Dataset3deels,
-        )
+        from quantem.spectroscopy import Dataset3deds, Dataset3deels
 
         data = np.asarray(self.array, dtype=float)
         n_energy, ny, nx = data.shape
+        n_pixels = ny * nx
 
-        # Reshape data to (n_pixels, n_energy) for PCA
-        data_reshaped = data.reshape(n_energy, -1).T  # (n_pixels, n_energy)
+        spectra = np.moveaxis(data, 0, -1).reshape(n_pixels, n_energy)
+        pixel_mask = np.ones(n_pixels, dtype=bool)
 
         if mask is not None:
-            mask_flat = mask.flatten()
-            data_masked = data_reshaped[mask_flat]
-        else:
-            data_masked = data_reshaped
+            mask_array = np.asarray(mask, dtype=bool)
+            if mask_array.shape == (ny, nx):
+                pixel_mask = mask_array.reshape(-1)
+            elif mask_array.shape == (n_pixels,):
+                pixel_mask = mask_array
+            else:
+                raise ValueError(
+                    f"mask shape {mask_array.shape} must match spatial shape {(ny, nx)} "
+                    f"or flattened shape {(n_pixels,)}"
+                )
+
+        if not np.any(pixel_mask):
+            raise ValueError("mask must select at least one spatial pixel")
+
+        selected_spectra = spectra[pixel_mask]
 
         if standardize:
-            mean = np.mean(data_masked, axis=0)
-            std = np.std(data_masked, axis=0)
+            mean = np.mean(selected_spectra, axis=0)
+            std = np.std(selected_spectra, axis=0)
             std[std == 0] = 1  # Avoid division by zero
-            data_processed = (data_masked - mean) / std
+            pca_input = (selected_spectra - mean) / std
         else:
-            data_processed = data_masked
+            mean = np.zeros(n_energy)
+            std = np.ones(n_energy)
+            pca_input = selected_spectra
 
-        # Perform PCA
-        del random_state
         (
             components,
             loadings,
             explained_variance,
             explained_variance_ratio,
             reconstructed,
-        ) = self._run_pca(data_processed, n_components)
+        ) = self._run_pca(pca_input, n_components)
 
-        # Reconstruct data
-        if standardize:
-            reconstructed = reconstructed * std + mean
+        reconstructed = reconstructed * std + mean
 
-        if mask is None:
-            loadings_spatial = loadings.T.reshape(n_components, ny, nx)
-        else:
-            loadings_spatial = np.zeros((n_components, ny * nx))
-            loadings_spatial[:, mask_flat] = loadings.T
-            loadings_spatial = loadings_spatial.reshape(n_components, ny, nx)
+        loadings_flat = np.zeros((n_components, n_pixels), dtype=loadings.dtype)
+        loadings_flat[:, pixel_mask] = loadings.T
+        loadings_spatial = loadings_flat.reshape(n_components, ny, nx)
 
         if plot_results:
             self._plot_pca_results(
@@ -421,33 +425,38 @@ class Dataset3dspectroscopy(Dataset3d):
                 n_show=min(4, n_components),
             )
 
-        if self.dataset_type == "eds":
-            reconstructed_data3d = Dataset3deds.from_array(
-                array=reconstructed.T.reshape(n_energy, ny, nx),
-                sampling=self.sampling,
-                origin=self.origin,
-                units=self.units,
-            )
-        elif self.dataset_type == "eels":
-            reconstructed_data3d = Dataset3deels.from_array(
-                array=reconstructed.T.reshape(n_energy, ny, nx),
-                sampling=self.sampling,
-                origin=self.origin,
-                units=self.units,
-            )
+        reconstructed_spectra = spectra.copy()
+        reconstructed_spectra[pixel_mask] = reconstructed
+        reconstructed_array = reconstructed_spectra.reshape(ny, nx, n_energy).transpose(2, 0, 1)
 
-        return {
-            "pca": {
-                "components_": components,
-                "explained_variance_": explained_variance,
-                "explained_variance_ratio_": explained_variance_ratio,
-            },
-            "components": components,
-            "loadings": loadings_spatial,
-            "explained_variance_ratio": explained_variance_ratio,
-            "explained_variance": explained_variance,
-            "reconstructed": reconstructed_data3d if mask is None else reconstructed_data3d,
-        }
+        dataset_type = str(self.dataset_type).lower()
+        if dataset_type == "eds":
+            dataset_class = Dataset3deds
+        elif dataset_type == "eels":
+            dataset_class = Dataset3deels
+        else:
+            raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
+
+        reconstructed_data3d = dataset_class.from_array(
+            array=reconstructed_array,
+            sampling=self.sampling,
+            origin=self.origin,
+            units=self.units,
+        )
+
+        if return_results:
+            return {
+                "pca": {
+                    "components_": components,
+                    "explained_variance_": explained_variance,
+                    "explained_variance_ratio_": explained_variance_ratio,
+                },
+                "components": components,
+                "loadings": loadings_spatial,
+                "explained_variance_ratio": explained_variance_ratio,
+                "explained_variance": explained_variance,
+                "reconstructed": reconstructed_data3d,
+            }
 
     def _run_pca(self, data: NDArray | Any, n_components: int):
         array = np.asarray(data, dtype=float)
@@ -502,76 +511,56 @@ class Dataset3dspectroscopy(Dataset3d):
         n_show : int
             Number of components to show
         """
-        fig = plt.figure(figsize=(15, 10))
-        gs = fig.add_gridspec(3, n_show + 1, width_ratios=[1.5] + [1] * n_show)
-
-        # Plot 1: Scree plot (explained variance)
-        ax_scree = fig.add_subplot(gs[0, 0])
+        fig, (ax_scree, ax_components) = plt.subplots(1, 2, figsize=(12, 4))
         cumsum_var = np.cumsum(explained_variance_ratio)
+        component_numbers = np.arange(1, len(explained_variance_ratio) + 1)
 
         ax_scree.bar(
-            range(1, len(explained_variance_ratio) + 1),
+            component_numbers,
             explained_variance_ratio * 100,
             alpha=0.6,
             label="Individual",
         )
-        ax_scree.plot(
-            range(1, len(explained_variance_ratio) + 1),
-            cumsum_var * 100,
-            "ro-",
-            label="Cumulative",
-        )
+        ax_scree.plot(component_numbers, cumsum_var * 100, "ro-", label="Cumulative")
         ax_scree.set_xlabel("Component Number")
         ax_scree.set_ylabel("Explained Variance (%)")
         ax_scree.set_title("Scree Plot")
         ax_scree.legend()
         ax_scree.grid(True, alpha=0.3)
 
-        # Get energy axis
         energy_sampling = float(self.sampling[0])
         energy_origin = float(self.origin[0])
         energy_axis = energy_origin + energy_sampling * np.arange(components.shape[1])
 
-        # Plot components and loadings
         for i in range(n_show):
-            ax_comp = fig.add_subplot(gs[1, i + 1])
-            ax_comp.plot(energy_axis, components[i])
-            ax_comp.set_title(f"PC{i + 1} ({explained_variance_ratio[i] * 100:.1f}%)")
-            ax_comp.set_xlabel("Energy")
-            if i == 0:
-                ax_comp.set_ylabel("Component")
-            ax_comp.grid(True, alpha=0.3)
+            ax_components.plot(
+                energy_axis,
+                components[i],
+                label=f"PC{i + 1} ({explained_variance_ratio[i] * 100:.1f}%)",
+            )
+        ax_components.set_xlabel("Energy")
+        ax_components.set_ylabel("Component")
+        ax_components.set_title("Principal Component Spectra")
+        ax_components.legend()
+        ax_components.grid(True, alpha=0.3)
 
-            ax_load = fig.add_subplot(gs[2, i + 1])
-            im = ax_load.imshow(loadings[i], cmap="RdBu_r", origin="lower")
-            ax_load.set_title(f"Loading {i + 1}")
-            ax_load.axis("off")
-            plt.colorbar(im, ax=ax_load, fraction=0.046, pad=0.04)
+        fig.suptitle("PCA Analysis")
+        fig.tight_layout()
+        plt.show()
 
-        ax_stats = fig.add_subplot(gs[1:, 0])
-        ax_stats.axis("off")
-
-        stats_text = "PCA Summary\n" + "=" * 20 + "\n\n"
-        stats_text += f"Total components: {len(explained_variance_ratio)}\n"
-        stats_text += f"Components for 95% var: {np.argmax(cumsum_var >= 0.95) + 1}\n"
-        stats_text += f"Components for 99% var: {np.argmax(cumsum_var >= 0.99) + 1}\n\n"
-
-        for i in range(min(5, len(explained_variance_ratio))):
-            stats_text += f"PC{i + 1}: {explained_variance_ratio[i] * 100:.2f}%\n"
-
-        ax_stats.text(
-            0.1,
-            0.9,
-            stats_text,
-            transform=ax_stats.transAxes,
-            fontsize=10,
-            verticalalignment="top",
-            fontfamily="monospace",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        show_2d(
+            [loadings[i] for i in range(n_show)],
+            title=[
+                f"Loading {i + 1} ({explained_variance_ratio[i] * 100:.1f}%)"
+                for i in range(n_show)
+            ],
+            cmap="RdBu_r",
+            cbar=True,
+            scalebar={
+                "sampling": float(self.sampling[1]),
+                "units": str(self.units[1]),
+            },
         )
-
-        plt.suptitle("PCA Analysis Results", fontsize=14, fontweight="bold")
-        plt.tight_layout()
         plt.show()
 
     def _calibrated_position_to_pixel(self, value, axis):
