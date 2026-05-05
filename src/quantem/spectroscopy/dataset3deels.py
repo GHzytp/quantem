@@ -237,7 +237,9 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return smoothed_data3d
 
-    def measure_zlp_offset(self, zlp_guess_x=None, fit_window=0.8, fit_to_plane=True):
+    def measure_zlp_offset(
+        self, zlp_guess_x=None, fit_window=0.8, use_gaussian_fit=True, fit_to_plane=True
+    ):
         """
         Measure ZLP offset at each pixel position by using a guess of ZLP posfitting each spectrum to a Gaussian
         """
@@ -317,7 +319,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         show_2d(
             [zlp_measured, zlp_plane_2d],
             cmap="magma",
-            title=["Measured ZLP (Gaussian)", "ZLP plane fit"],
+            title=["Measured ZLP (mean of Gaussian fit)", "ZLP plane fit"],
         )
 
         if fit_to_plane:
@@ -326,9 +328,32 @@ class Dataset3deels(Dataset3dspectroscopy):
             return zlp_measured
 
     def apply_zlp_correction(
-        self, zlp_guess_x=None, fit_window=0.8, fit_to_plane=True, return_3d_dataset=True
+        self,
+        zlp_guess_x=None,
+        zlp_shifts_array=None,
+        fit_window=0.8,
+        measure_offset=True,
+        fit_to_plane=True,
+        return_3d_dataset=True,
     ):
-        zlp_array = self.measure_zlp_offset(zlp_guess_x, fit_window, fit_to_plane)
+        # Default behavior is to automatically call measure_zlp_offset to generate an array of ZLP shifts for each scan position.
+        # Alternatively, a 2D array matching the x and y dimensions of the 3D dataset can be supplied as the value of zlp_shifts_array to skip this step.
+        # If measure_offset is False and no 2D ZLP shifts array is provided, a scalar input for zlp_guess_x can be used to shift the energy axis at every scan position by that amount.
+        if measure_offset:
+            zlp_array = self.measure_zlp_offset(zlp_guess_x, fit_window, fit_to_plane)
+        elif zlp_shifts_array is not None:
+            if zlp_shifts_array.shape == self.array.shape[1:3]:
+                zlp_array = zlp_shifts_array
+            else:
+                raise ValueError(
+                    "Dimensions of input array for ZLP shifts do not match X and Y dimensions of 3D spectroscopy dataset."
+                )
+        elif zlp_guess_x is not None:
+            zlp_array = np.ones(self.array.shape[1:3]) * zlp_guess_x
+        else:
+            raise ValueError(
+                "measure_offset was set to False and no input argument for ZLP shifts was provided."
+            )
 
         corrected_array = np.zeros_like(self.array)
 
