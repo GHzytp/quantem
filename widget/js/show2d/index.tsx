@@ -22,7 +22,7 @@ import Slider from "@mui/material/Slider";
 import Button from "@mui/material/Button";
 import Tooltip from "@mui/material/Tooltip";
 import { useTheme } from "../theme";
-import { drawScaleBarHiDPI, drawFFTScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "../figure";
+import { drawScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "../figure";
 import JSZip from "jszip";
 import { extractFloat32, formatNumber, downloadBlob } from "../format";
 import { computeHistogramFromBytes, findDataRange, applyLogScale, percentileClip, sliderRange, computeStats } from "../stats";
@@ -217,7 +217,7 @@ type ZoomState = { zoom: number; panX: number; panY: number };
 // ============================================================================
 const SINGLE_IMAGE_TARGET = 500;
 const GALLERY_IMAGE_TARGET = 300;
-const DEFAULT_FFT_ZOOM = 3;
+const DEFAULT_FFT_ZOOM = 2;
 const PROFILE_COLORS = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#ef5350", "#ffd54f", "#90a4ae", "#a1887f"];
 type ROIItem = { row: number; col: number; shape: string; radius: number; radius_inner: number; width: number; height: number; color: string; line_width: number; highlight: boolean };
 const ROI_COLORS = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#ef5350", "#ffd54f", "#90a4ae", "#a1887f"];
@@ -754,6 +754,16 @@ function Show2D() {
 
   // Cached FFT offscreen canvas for single mode (avoids reprocessing on zoom/pan)
   const fftOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
+  // Caches transformed magnitude + range + stats so contrast slider drag
+  // doesn't re-run log/power/findDataRange/autoEnhance on every tick.
+  const fftPipelineRef = React.useRef<{
+    magnitude: Float32Array;
+    displayMin: number;
+    displayMax: number;
+    magVersion: number;
+    scaleMode: string;
+    fftAuto: boolean;
+  } | null>(null);
   const [fftOffscreenVersion, setFftOffscreenVersion] = React.useState(0);
 
   // ROI FFT state: when ROI + FFT are both active, compute FFT of cropped ROI region
@@ -901,7 +911,11 @@ function Show2D() {
     }
     let cancelled = false;
     (async () => {
-      const result = await fft2dAsync(real, imag, fftW, fftH, false);
+      // WebGPU primary (matches main + gallery FFT paths). CPU worker fallback
+      // for browsers without WebGPU (Safari <17, FF behind flag).
+      const result = (gpuFFTRef.current && gpuReadyRef.current)
+        ? await gpuFFTRef.current.fft2D(real, imag, fftW, fftH, false)
+        : await fft2dAsync(real, imag, fftW, fftH, false);
       if (cancelled) return;
       const mag = computeMagnitude(result.real, result.imag);
       fftshift(mag, fftW, fftH);
@@ -1958,6 +1972,14 @@ function Show2D() {
       await new Promise<void>(r => requestAnimationFrame(() => r()));
       if (gen !== fftGenRef.current) return;
 
+      // Wait for WebGPU init if it's still in flight — avoids first-call CPU race.
+      if (!gpuReadyRef.current) {
+        try {
+          const fft = await getWebGPUFFT();
+          if (fft) { gpuFFTRef.current = fft; gpuReadyRef.current = true; }
+        } catch (_e) { /* fall to CPU */ }
+        if (gen !== fftGenRef.current) return;
+      }
       const backend = gpuFFTRef.current && gpuReadyRef.current ? "WebGPU" : "CPU Worker";
       setFftComputing(true);
       setFftProgress(`Computing FFT… (${backend})`);
@@ -2062,39 +2084,63 @@ function Show2D() {
     const fftW = fftCropDims?.fftWidth ?? width;
     const fftH = fftCropDims?.fftHeight ?? height;
 
-    // Apply scale mode
-    const magnitude = new Float32Array(fftMag.length);
-    for (let i = 0; i < fftMag.length; i++) {
-      if (fftScaleMode === "log") {
-        magnitude[i] = Math.log1p(fftMag[i]);
-      } else if (fftScaleMode === "power") {
-        magnitude[i] = Math.pow(fftMag[i], 0.5);
-      } else {
-        magnitude[i] = fftMag[i];
+    // Heavy steps (log/power transform, range, stats, histogram-data copy) only
+    // when source magnitude OR scale-mode changed — NOT on every contrast slider tick.
+    // Cached values live in fftPipelineRef for cheap re-renders.
+    const sourceChanged = (
+      fftPipelineRef.current?.magVersion !== fftMagVersion ||
+      fftPipelineRef.current?.scaleMode !== fftScaleMode ||
+      fftPipelineRef.current?.fftAuto !== fftAuto
+    );
+    if (sourceChanged) {
+      const magnitude = new Float32Array(fftMag.length);
+      for (let i = 0; i < fftMag.length; i++) {
+        if (fftScaleMode === "log") magnitude[i] = Math.log1p(fftMag[i]);
+        else if (fftScaleMode === "power") magnitude[i] = Math.pow(fftMag[i], 0.5);
+        else magnitude[i] = fftMag[i];
       }
+      let displayMin: number, displayMax: number;
+      if (fftAuto) ({ min: displayMin, max: displayMax } = autoEnhanceFFT(magnitude, fftW, fftH));
+      else ({ min: displayMin, max: displayMax } = findDataRange(magnitude));
+      const { mean, std } = computeStats(magnitude);
+      setFftStats([mean, displayMin, displayMax, std]);
+      setFftHistogramData(magnitude);  // no .slice() — magnitude is fresh
+      setFftDataRange({ min: displayMin, max: displayMax });
+      fftPipelineRef.current = { magnitude, displayMin, displayMax, magVersion: fftMagVersion, scaleMode: fftScaleMode, fftAuto };
     }
 
-    let displayMin: number, displayMax: number;
-    if (fftAuto) {
-      ({ min: displayMin, max: displayMax } = autoEnhanceFFT(magnitude, fftW, fftH));
-    } else {
-      ({ min: displayMin, max: displayMax } = findDataRange(magnitude));
+    const cache = fftPipelineRef.current!;
+    const { vmin, vmax } = sliderRange(cache.displayMin, cache.displayMax, fftVminPct, fftVmaxPct);
+
+    // GPU colormap path for FFT — uses dedicated slot at index nImages.
+    // Uploads magnitude only when source changed; contrast/cmap drag triggers cheap re-render.
+    const engine = gpuCmapRef.current;
+    const fftSlot = nImages;  // dedicate slot just past main image slots
+    if (engine && gpuCmapReadyRef.current) {
+      try {
+        if (sourceChanged) engine.uploadData(fftSlot, cache.magnitude, fftW, fftH);
+        engine.uploadLUT(fftColormap, lut);
+        const bitmaps = engine.renderSlotsToImageBitmap([fftSlot], [{ vmin, vmax }], false);
+        if (bitmaps && bitmaps[0]) {
+          const oc = fftOffscreenRef.current && fftOffscreenRef.current.width === fftW && fftOffscreenRef.current.height === fftH
+            ? fftOffscreenRef.current
+            : Object.assign(document.createElement("canvas"), { width: fftW, height: fftH });
+          const ctx = oc.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(bitmaps[0], 0, 0);
+            fftOffscreenRef.current = oc;
+            setFftOffscreenVersion(v => v + 1);
+            return;
+          }
+        }
+      } catch (_e) { /* fall through to CPU */ }
     }
-
-    const { mean, std } = computeStats(magnitude);
-    setFftStats([mean, displayMin, displayMax, std]);
-
-    // Store histogram data
-    setFftHistogramData(magnitude.slice());
-    setFftDataRange({ min: displayMin, max: displayMax });
-
-    // Apply histogram slider clipping and render to cached offscreen
-    const { vmin, vmax } = sliderRange(displayMin, displayMax, fftVminPct, fftVmaxPct);
-    const offscreen = renderToOffscreen(magnitude, fftW, fftH, lut, vmin, vmax);
+    // CPU fallback
+    const offscreen = renderToOffscreen(cache.magnitude, fftW, fftH, lut, vmin, vmax);
     if (!offscreen) return;
     fftOffscreenRef.current = offscreen;
     setFftOffscreenVersion(v => v + 1);
-  }, [effectiveShowFft, isGallery, fftMagVersion, fftVminPct, fftVmaxPct, fftColormap, fftScaleMode, fftAuto, width, height, fftCropDims]);
+  }, [effectiveShowFft, isGallery, fftMagVersion, fftVminPct, fftVmaxPct, fftColormap, fftScaleMode, fftAuto, width, height, fftCropDims, nImages]);
 
   // -------------------------------------------------------------------------
   // FFT draw effect: cheap drawImage from cached offscreen (zoom/pan changes)
@@ -2137,12 +2183,6 @@ function Show2D() {
 
     // Use crop dimensions for reciprocal-space calculations
     const fftW = fftCropDims?.fftWidth ?? width;
-
-    // Reciprocal-space scale bar
-    if (pixelSize > 0) {
-      const fftPixelSize = 1 / (fftW * pixelSize);
-      drawFFTScaleBarHiDPI(overlay, DPR, fftZoom, fftPixelSize, fftW);
-    }
 
     // FFT colorbar
     if (fftShowColorbar && fftDataRange.min !== fftDataRange.max) {
@@ -2201,6 +2241,14 @@ function Show2D() {
     let cancelled = false;
 
     const computeAllFFTs = async () => {
+      // Wait for WebGPU init if it's still in flight — avoids first-call CPU race.
+      if (!gpuReadyRef.current) {
+        try {
+          const fft = await getWebGPUFFT();
+          if (fft) { gpuFFTRef.current = fft; gpuReadyRef.current = true; }
+        } catch (_e) { /* fall to CPU */ }
+        if (cancelled) return;
+      }
       // Initialize cache; preserve existing entries (only recompute missing)
       if (fftMagCacheGalleryRef.current.length !== nImages) {
         fftMagCacheGalleryRef.current = new Array(nImages).fill(null);
@@ -2459,11 +2507,36 @@ function Show2D() {
     setFftPanY(0);
   };
 
-  // FFT zoom/pan handlers
+  // FFT zoom/pan — cursor-anchored zoom matching FFT's own canvas transform.
+  // FFT render: translate(centerOffsetX, centerOffsetY) → scale(zoom) where
+  //   centerOffsetX = (canvasW - canvasW*zoom)/2 + panX
+  // Solving for image-space u in [0,1]:
+  //   u = (screenX - centerOffsetX) / (zoom * canvasW)
+  // After zoom change, keep screenX of mouse at u:
+  //   newPanX = mouseX - (canvasW - canvasW*newZoom)/2 - newZoom*u*canvasW
   const handleFftWheel = (e: React.WheelEvent) => {
-    e.preventDefault(); // Prevent page scroll when zooming FFT
+    e.preventDefault();
+    const canvas = fftCanvasRef.current;
+    if (!canvas) {
+      const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+      setFftZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, fftZoom * zoomFactor)));
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+    const cw = canvas.width, ch = canvas.height;
+    const cOffX = (cw - cw * fftZoom) / 2 + fftPanX;
+    const cOffY = (ch - ch * fftZoom) / 2 + fftPanY;
+    const u = (mouseX - cOffX) / (fftZoom * cw);
+    const v = (mouseY - cOffY) / (fftZoom * ch);
     const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-    setFftZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, fftZoom * zoomFactor)));
+    const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, fftZoom * zoomFactor));
+    const newPanX = mouseX - (cw - cw * newZoom) / 2 - newZoom * u * cw;
+    const newPanY = mouseY - (ch - ch * newZoom) / 2 - newZoom * v * ch;
+    setFftZoom(newZoom);
+    setFftPanX(newPanX);
+    setFftPanY(newPanY);
   };
 
   const handleFftDoubleClick = () => {
@@ -3593,9 +3666,6 @@ function Show2D() {
                   size="small"
                   sx={switchStyles.small}
                 />
-                {showFft && width * height > 2048 * 2048 && (
-                  <Typography sx={{ fontSize: 9, color: "#f59e0b", ml: 0.5 }}>slow ({width}×{height})</Typography>
-                )}
                 {nImages === 2 && (
                   <>
                     <Typography sx={{ ...typography.label, fontSize: 10 }} title="Show A − B as a third panel. Use w.align() first to cancel drift.">Diff:</Typography>
@@ -3784,7 +3854,7 @@ function Show2D() {
               <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "flex-start" }}>
                 <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, opacity: 1, pointerEvents: "auto" }}>
                   <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Scale:</Typography>
-                  <Select value={fftScaleMode === "power" ? "linear" : fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
+                  <Select value={fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
                     <MenuItem value="linear">Lin</MenuItem>
                     <MenuItem value="log">Log</MenuItem>
                   </Select>
@@ -4152,7 +4222,7 @@ function Show2D() {
                   {/* Row 1: Scale + Color + Colorbar */}
                   <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, opacity: 1, pointerEvents: "auto" }}>
                     <Typography sx={{ ...typography.label, fontSize: 10 }}>Scale:</Typography>
-                    <Select value={fftScaleMode === "power" ? "linear" : fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
+                    <Select value={fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={themedMenuProps}>
                       <MenuItem value="linear">Lin</MenuItem>
                       <MenuItem value="log">Log</MenuItem>
                     </Select>

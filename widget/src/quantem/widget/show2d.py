@@ -303,8 +303,8 @@ class Show2D(anywidget.AnyWidget):
         zoom: float = 1.0,
         zoom_row: float | None = None,
         zoom_col: float | None = None,
-        link_zoom: bool = False,
-        link_pan: bool = False,
+        link_zoom: bool | None = None,
+        link_pan: bool | None = None,
         link_contrast: bool = True,
         diff_mode: bool = False,
         view_box: tuple | list | None = None,
@@ -362,6 +362,17 @@ class Show2D(anywidget.AnyWidget):
             if units is None and hasattr(data, "units"):
                 units = list(data.units[-2:])
             data = data.array
+        # Same auto-extract for list/tuple of Dataset2d (gallery from per-file load).
+        elif isinstance(data, (list, tuple)) and len(data) > 0 and (
+            isinstance(data[0], (Dataset2d, Dataset3d)) or
+            (hasattr(data[0], "array") and hasattr(data[0], "sampling"))
+        ):
+            first = data[0]
+            if sampling is None:
+                sampling = tuple(float(s) for s in first.sampling[-2:])
+            if units is None and hasattr(first, "units"):
+                units = list(first.units[-2:])
+            data = [d.array for d in data]
 
         # Convert NumPy / PyTorch / list inputs to a NumPy array.
         if isinstance(data, list):
@@ -434,8 +445,10 @@ class Show2D(anywidget.AnyWidget):
         self.initial_zoom = zoom
         self.zoom_row = zoom_row
         self.zoom_col = zoom_col
-        self.link_zoom = link_zoom
-        self.link_pan = link_pan
+        # Auto-link zoom + pan in gallery (n_images >= 2) so dragging one panel
+        # follows the other — typical compare/diff workflow. Single image: no-op.
+        self.link_zoom = (self.n_images >= 2) if link_zoom is None else link_zoom
+        self.link_pan = (self.n_images >= 2) if link_pan is None else link_pan
         self.link_contrast = link_contrast
         self.diff_mode = diff_mode if self.n_images >= 2 else False
         if show_fft and self.height * self.width > 2048 * 2048:
