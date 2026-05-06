@@ -95,6 +95,7 @@ class PtychoLite(Ptychography):
         dset_model.learn_descan = False
         dset_model.scan_positions_px.requires_grad_(False)
         dset_model.descan_shifts.requires_grad_(False)
+        dset_model.remove_optimizer()
 
         if not dset_model.preprocessed:
             dset_model.preprocess(com_fit_function="constant")
