@@ -187,7 +187,11 @@ class PtychoLite(Ptychography):
         if lr_scan_positions < 0:
             raise ValueError(f"lr_scan_positions must be non-negative, got {lr_scan_positions}")
 
-        learn_scan_positions = lr_scan_positions > 0
+        setup_new_optimizers = new_optimizers or reset or self.num_iters == 0
+        has_dataset_optimizer = "dataset" in self.optimizers
+        learn_scan_positions = lr_scan_positions > 0 or (
+            not setup_new_optimizers and has_dataset_optimizer
+        )
         self.dset.learn_scan_positions = learn_scan_positions
         self.dset.learn_descan = False
         self.dset.scan_positions_px.requires_grad_(learn_scan_positions)
@@ -197,12 +201,7 @@ class PtychoLite(Ptychography):
         if not needs_dataset_optimizer and "dataset" in self.optimizers:
             self.remove_optimizer("dataset")
 
-        if (
-            new_optimizers
-            or reset
-            or self.num_iters == 0
-            or (needs_dataset_optimizer and "dataset" not in self.optimizers)
-        ):
+        if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -429,7 +428,11 @@ class PtychoLiteDIP(Ptychography):
         if lr_scan_positions < 0:
             raise ValueError(f"lr_scan_positions must be non-negative, got {lr_scan_positions}")
 
-        learn_scan_positions = lr_scan_positions > 0
+        setup_new_optimizers = new_optimizers or reset or self.num_iters == 0
+        has_dataset_optimizer = "dataset" in self.optimizers
+        learn_scan_positions = lr_scan_positions > 0 or (
+            not setup_new_optimizers and has_dataset_optimizer
+        )
         self.dset.learn_scan_positions = learn_scan_positions
         self.dset.learn_descan = False
         self.dset.scan_positions_px.requires_grad_(learn_scan_positions)
@@ -439,12 +442,7 @@ class PtychoLiteDIP(Ptychography):
         if not needs_dataset_optimizer and "dataset" in self.optimizers:
             self.remove_optimizer("dataset")
 
-        if (
-            new_optimizers
-            or reset
-            or self.num_iters == 0
-            or (needs_dataset_optimizer and "dataset" not in self.optimizers)
-        ):
+        if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
             opt_params = {
                 "object": {
                     "name": "adamw",
