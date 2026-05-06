@@ -4,10 +4,12 @@ from typing import Any, Literal
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.signal.windows import tukey
 
 from quantem.core import config
 from quantem.core.visualization import show_2d
+from quantem.diffractive_imaging.ptycho_utils import AffineTransform
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase, Snapshot
 
 
@@ -927,6 +929,191 @@ class PtychographyVisualizations(PtychographyBase):
                 **kwargs,
             )
         plt.show()
+
+    def show_updated_scan_positions(
+        self,
+        scan_positions_px: np.ndarray | None = None,
+        initial_scan_positions_px: np.ndarray | None = None,
+        scale_arrows: float = 1.0,
+        plot_arrow_freq: int | None = None,
+        plot_cropped_rotated_fov: bool = True,
+        cbar: bool = True,
+        verbose: bool = True,
+        return_fig: bool = False,
+        **kwargs,
+    ):
+        r"""Show changes to scan positions during ptychographic reconstruction.
+
+        The default plot compares the current learned scan positions against the
+        initial scan positions from preprocessing. Stored positions are in object
+        pixels; this visualization converts them to Å for the axis labels and
+        colorbar.
+
+        Parameters
+        ----------
+        scan_positions_px : np.ndarray | None, optional
+            Updated scan positions in object pixels. If None, uses
+            ``self.dset.scan_positions_px``.
+        initial_scan_positions_px : np.ndarray | None, optional
+            Reference scan positions in object pixels. If None, uses
+            ``self.dset.initial_scan_positions_px``.
+        scale_arrows : float, optional
+            Scaling factor applied to displacement vectors before plotting.
+            Default is 1.
+        plot_arrow_freq : int | None, optional
+            If provided, plot every Nth row and column of a raster scan grid.
+        plot_cropped_rotated_fov : bool, optional
+            If True, plot positions in the same cropped/rotated FOV convention as
+            ``show_obj``. Default is True.
+        cbar : bool, optional
+            Whether to show a colorbar for displacement magnitudes. Default is True.
+        verbose : bool, optional
+            Whether to print summary displacement statistics. Default is True.
+        return_fig : bool, optional
+            If True, return ``(fig, ax)`` instead of calling ``plt.show()``.
+        **kwargs
+            Additional keyword arguments passed to ``matplotlib.axes.Axes.quiver``.
+            ``figsize``, ``figax``, ``cmap``, and ``title`` are consumed by this
+            method.
+        """
+
+        if scan_positions_px is None:
+            scan_positions_px = self.dset.scan_positions_px
+        if initial_scan_positions_px is None:
+            initial_scan_positions_px = self.dset.initial_scan_positions_px
+
+        scan_positions_px = self._to_numpy(scan_positions_px).astype(float, copy=False)
+        initial_scan_positions_px = self._to_numpy(initial_scan_positions_px).astype(
+            float, copy=False
+        )
+
+        if scan_positions_px.ndim == 3:
+            scan_positions_px = scan_positions_px.mean(axis=0)
+        if initial_scan_positions_px.ndim == 3:
+            initial_scan_positions_px = initial_scan_positions_px.mean(axis=0)
+
+        if scan_positions_px.ndim != 2 or scan_positions_px.shape[-1] != 2:
+            raise ValueError(
+                "scan_positions_px must have shape (num_positions, 2), "
+                f"got {scan_positions_px.shape}"
+            )
+        if initial_scan_positions_px.ndim != 2 or initial_scan_positions_px.shape[-1] != 2:
+            raise ValueError(
+                "initial_scan_positions_px must have shape (num_positions, 2), "
+                f"got {initial_scan_positions_px.shape}"
+            )
+        if scan_positions_px.shape != initial_scan_positions_px.shape:
+            raise ValueError(
+                "scan_positions_px and initial_scan_positions_px must have the same shape, "
+                f"got {scan_positions_px.shape} and {initial_scan_positions_px.shape}"
+            )
+
+        sampling = np.asarray(self.sampling)
+        scan_positions = scan_positions_px * sampling
+        initial_scan_positions = initial_scan_positions_px * sampling
+
+        if plot_cropped_rotated_fov:
+            angle = (
+                self.dset.com_rotation_rad
+                if self.dset.com_transpose
+                else -self.dset.com_rotation_rad
+            )
+            tf = AffineTransform(angle=angle)
+            origin = initial_scan_positions.mean(axis=0)
+            initial_scan_positions = tf(initial_scan_positions, origin=origin)
+            scan_positions = tf(scan_positions, origin=origin)
+
+            obj_shape = self.obj_cropped.shape[-2:]
+            center_shift = initial_scan_positions.mean(axis=0) - (
+                np.array(obj_shape) / 2 * sampling
+            )
+            initial_scan_positions -= center_shift
+            scan_positions -= center_shift
+        else:
+            obj_shape = self.obj_shape_full[-2:]
+
+        if plot_arrow_freq is not None:
+            freq = int(plot_arrow_freq)
+            if freq <= 0:
+                raise ValueError(f"plot_arrow_freq must be positive, got {plot_arrow_freq}")
+
+            rshape = tuple(self.dset.gpts) + (2,)
+            if np.prod(self.dset.gpts) != initial_scan_positions.shape[0]:
+                raise ValueError(
+                    "plot_arrow_freq only supports full raster scan grids with "
+                    f"{np.prod(self.dset.gpts)} positions, got {initial_scan_positions.shape[0]}"
+                )
+
+            initial_scan_positions = initial_scan_positions.reshape(rshape)[
+                ::freq, ::freq
+            ].reshape(-1, 2)
+            scan_positions = scan_positions.reshape(rshape)[::freq, ::freq].reshape(-1, 2)
+
+        deltas = scan_positions - initial_scan_positions
+        norms = np.linalg.norm(deltas, axis=1)
+
+        if verbose:
+            print(
+                "Updated scan position shifts: "
+                f"mean={norms.mean():.4g} Å, "
+                f"rms={np.sqrt(np.mean(norms**2)):.4g} Å, "
+                f"max={norms.max():.4g} Å"
+            )
+
+        extent = [
+            0,
+            sampling[1] * obj_shape[1],
+            sampling[0] * obj_shape[0],
+            0,
+        ]
+
+        figsize = kwargs.pop("figsize", (4, 4))
+        figax = kwargs.pop("figax", None)
+        cmap = kwargs.pop("cmap", "Reds")
+        title = kwargs.pop("title", "Updated probe positions")
+
+        if figax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig, ax = figax
+
+        quiver_kwargs = {
+            "angles": "xy",
+            "scale_units": "xy",
+            "scale": 1,
+            "cmap": cmap,
+        }
+        quiver_kwargs.update(kwargs)
+
+        im = ax.quiver(
+            initial_scan_positions[:, 1],
+            initial_scan_positions[:, 0],
+            deltas[:, 1] * scale_arrows,
+            deltas[:, 0] * scale_arrows,
+            norms,
+            **quiver_kwargs,
+        )
+
+        if cbar:
+            divider = make_axes_locatable(ax)
+            ax_cb = divider.append_axes("right", size="5%", pad="2.5%")
+            fig.add_axes(ax_cb)
+            cb = fig.colorbar(im, cax=ax_cb)
+            cb.set_label("Δ [Å]", rotation=0, ha="left", va="bottom")
+            cb.ax.yaxis.set_label_coords(0.5, 1.01)
+
+        ax.set_ylabel("x [Å]")
+        ax.set_xlabel("y [Å]")
+        ax.set_xlim((extent[0], extent[1]))
+        ax.set_ylim((extent[2], extent[3]))
+        ax.set_aspect("equal")
+        ax.set_title(title)
+
+        if return_fig:
+            return fig, ax
+
+        plt.show()
+        return None
 
     def show_fourier_probe_and_amplitudes(
         self,

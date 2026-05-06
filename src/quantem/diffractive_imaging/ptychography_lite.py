@@ -91,6 +91,11 @@ class PtychoLite(Ptychography):
                 f"dset must be Dataset4dstem or PtychographyDatasetRaster, got {type(dset)}"
             )
 
+        dset_model.learn_scan_positions = False
+        dset_model.learn_descan = False
+        dset_model.scan_positions_px.requires_grad_(False)
+        dset_model.descan_shifts.requires_grad_(False)
+
         if not dset_model.preprocessed:
             dset_model.preprocess(com_fit_function="constant")
 
@@ -167,6 +172,7 @@ class PtychoLite(Ptychography):
         lr_obj: float = 5e-3,
         learn_probe: bool = True,
         lr_probe: float = 1e-3,
+        lr_scan_positions: float = 0.0,
         batch_size: int | None = None,
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
@@ -177,8 +183,26 @@ class PtychoLite(Ptychography):
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
+        lr_scan_positions = float(lr_scan_positions)
+        if lr_scan_positions < 0:
+            raise ValueError(f"lr_scan_positions must be non-negative, got {lr_scan_positions}")
 
-        if new_optimizers or reset or self.num_iters == 0:
+        learn_scan_positions = lr_scan_positions > 0
+        self.dset.learn_scan_positions = learn_scan_positions
+        self.dset.learn_descan = False
+        self.dset.scan_positions_px.requires_grad_(learn_scan_positions)
+        self.dset.descan_shifts.requires_grad_(False)
+
+        needs_dataset_optimizer = learn_scan_positions
+        if not needs_dataset_optimizer and "dataset" in self.optimizers:
+            self.remove_optimizer("dataset")
+
+        if (
+            new_optimizers
+            or reset
+            or self.num_iters == 0
+            or (needs_dataset_optimizer and "dataset" not in self.optimizers)
+        ):
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -197,6 +221,15 @@ class PtychoLite(Ptychography):
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {
+                    "name": scheduler_type,
+                    "factor": scheduler_factor,
+                }
+            if needs_dataset_optimizer:
+                opt_params["dataset"] = {
+                    "name": "adamw",
+                    "lr": lr_scan_positions,
+                }
+                scheduler_params["dataset"] = {
                     "name": scheduler_type,
                     "factor": scheduler_factor,
                 }
@@ -381,6 +414,7 @@ class PtychoLiteDIP(Ptychography):
         lr_obj: float = 1e-3,
         learn_probe: bool = True,
         lr_probe: float = 1e-3,
+        lr_scan_positions: float = 0.0,
         batch_size: int | None = None,
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
@@ -391,8 +425,26 @@ class PtychoLiteDIP(Ptychography):
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
+        lr_scan_positions = float(lr_scan_positions)
+        if lr_scan_positions < 0:
+            raise ValueError(f"lr_scan_positions must be non-negative, got {lr_scan_positions}")
 
-        if new_optimizers or reset or self.num_iters == 0:
+        learn_scan_positions = lr_scan_positions > 0
+        self.dset.learn_scan_positions = learn_scan_positions
+        self.dset.learn_descan = False
+        self.dset.scan_positions_px.requires_grad_(learn_scan_positions)
+        self.dset.descan_shifts.requires_grad_(False)
+
+        needs_dataset_optimizer = learn_scan_positions
+        if not needs_dataset_optimizer and "dataset" in self.optimizers:
+            self.remove_optimizer("dataset")
+
+        if (
+            new_optimizers
+            or reset
+            or self.num_iters == 0
+            or (needs_dataset_optimizer and "dataset" not in self.optimizers)
+        ):
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -411,6 +463,15 @@ class PtychoLiteDIP(Ptychography):
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {
+                    "name": scheduler_type,
+                    "factor": scheduler_factor,
+                }
+            if needs_dataset_optimizer:
+                opt_params["dataset"] = {
+                    "name": "adamw",
+                    "lr": lr_scan_positions,
+                }
+                scheduler_params["dataset"] = {
                     "name": scheduler_type,
                     "factor": scheduler_factor,
                 }
