@@ -161,6 +161,15 @@ class Dataset3dspectroscopy(Dataset3d):
         line_norm = str(line_name).strip().lower()
         return any(line_norm == sel or line_norm.startswith(sel) for sel in selectors)
 
+    @staticmethod
+    def _line_info_matches_selectors(line_info, selectors):
+        if not selectors or not isinstance(line_info, dict):
+            return False
+        edge_label = str(line_info.get("edge_label", "")).strip().lower()
+        return bool(edge_label) and any(
+            edge_label == sel or edge_label.startswith(sel) for sel in selectors
+        )
+
     @classmethod
     def _select_lines(cls, line_dict, selectors):
         if not isinstance(line_dict, dict):
@@ -173,6 +182,7 @@ class Dataset3dspectroscopy(Dataset3d):
             line_name: line_info
             for line_name, line_info in line_dict.items()
             if cls._line_matches_selectors(line_name, selector_norm)
+            or cls._line_info_matches_selectors(line_info, selector_norm)
         }
 
     def add_elements_to_model(self, elements):
@@ -281,7 +291,10 @@ class Dataset3dspectroscopy(Dataset3d):
             self.model_elements[element_key] = {
                 line_name: line_info
                 for line_name, line_info in lines_info.items()
-                if not type(self)._line_matches_selectors(line_name, selectors)
+                if not (
+                    type(self)._line_matches_selectors(line_name, selectors)
+                    or type(self)._line_info_matches_selectors(line_info, selectors)
+                )
             }
             if not self.model_elements[element_key]:
                 self.model_elements.pop(element_key, None)
