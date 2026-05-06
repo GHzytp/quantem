@@ -23,7 +23,7 @@ class Dataset3deels(Dataset3dspectroscopy):
     """
 
     element_info = None
-    element_info_path = "eels_binding_energies.json"
+    element_info_path = "eels_edges.csv"
     dataset_type = "EELS"
 
     def __init__(

@@ -55,3 +55,56 @@ def load_xray_lines_database(path: Union[Path, str]) -> dict[str, dict[str, dict
             }
 
     return elements
+
+
+def load_eels_edges_database(path: Union[Path, str]) -> dict[str, dict[str, dict[str, object]]]:
+    """Load EELS edge CSV into the legacy element->edge metadata mapping."""
+    elements: dict[str, dict[str, dict[str, object]]] = {}
+    duplicate_counts: dict[tuple[str, str], int] = {}
+
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = set(reader.fieldnames or [])
+        required_columns = ("symbol", "edge_label", "edge_energy_eV")
+        missing_columns = [column for column in required_columns if column not in fieldnames]
+        if missing_columns:
+            raise ValueError(
+                f"{path} is missing required EELS edge columns: {', '.join(missing_columns)}"
+            )
+
+        for row in reader:
+            element_symbol = str(row.get("symbol", "")).strip()
+            if not element_symbol:
+                continue
+
+            energy_ev = _parse_float(row, ("edge_energy_eV", "onset_energy (eV)", "energy_eV"))
+            if energy_ev is None:
+                continue
+
+            edge_label = str(row.get("edge_label", "")).strip()
+            element_edges = elements.setdefault(element_symbol, {})
+            edge_name = f"{energy_ev:g} eV"
+            key = (element_symbol, edge_name)
+            if edge_name in element_edges:
+                duplicate_counts[key] = duplicate_counts.get(key, 1) + 1
+                edge_name = f"{edge_name}__{duplicate_counts[key]}"
+
+            edge_info: dict[str, object] = {
+                "onset_energy (eV)": float(energy_ev),
+            }
+            if edge_label:
+                edge_info["edge_label"] = edge_label
+
+            atomic_number = _parse_float(row, ("atomic_number",))
+            if atomic_number is not None:
+                edge_info["atomic_number"] = (
+                    int(atomic_number) if atomic_number.is_integer() else float(atomic_number)
+                )
+
+            element_name = str(row.get("element", "")).strip()
+            if element_name:
+                edge_info["element"] = element_name
+
+            element_edges[edge_name] = edge_info
+
+    return elements

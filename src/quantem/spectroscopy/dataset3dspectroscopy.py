@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.visualization import show_2d
-from quantem.spectroscopy.utils import load_xray_lines_database
+from quantem.spectroscopy.utils import load_eels_edges_database, load_xray_lines_database
 
 
 class _ModelElementsDict(dict):
@@ -71,7 +71,7 @@ class Dataset3dspectroscopy(Dataset3d):
     # loads elemental information
     @classmethod
     def load_element_info(cls):
-        """Load element database for EDS (X-ray lines) or EELS (binding energies)."""
+        """Load element database for EDS X-ray lines or EELS edges."""
         if cls.element_info is not None:
             return cls.element_info
 
@@ -82,13 +82,17 @@ class Dataset3dspectroscopy(Dataset3d):
             )
         full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
 
+        dataset_type = str(getattr(cls, "dataset_type", "")).lower()
         if path.lower().endswith(".csv"):
-            cls.element_info = load_xray_lines_database(full_path)
+            if dataset_type == "eels":
+                cls.element_info = load_eels_edges_database(full_path)
+            else:
+                cls.element_info = load_xray_lines_database(full_path)
         else:
             with open(full_path, "r", encoding="utf-8") as f:
                 cls.element_info = json.load(f)["elements"]
 
-        if str(getattr(cls, "dataset_type", "")).lower() == "eds":
+        if dataset_type == "eds":
             cls._normalize_element_info()
 
         return cls.element_info
