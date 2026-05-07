@@ -648,7 +648,7 @@ class OptimizerMixin:
                         f"All parameter groups must use the same optimizer type, "
                         f"got {type(opt_specs[0]).__name__} and {type(spec).__name__}"
                     )
-            self._optimizer = optimizer_cls(params)
+            self._optimizer = optimizer_cls(params) # type:ignore 
         else:
             # Single-optimizer case: splat global hyperparameters
             optimizer_cls = self._optimizer_class_for(self._optimizer_params)

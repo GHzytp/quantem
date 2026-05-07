@@ -32,7 +32,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     _token = object()
     _patch_indices: torch.Tensor
 
-    # TODO update optimizers and such to allow for different lrs for different parameters
+    # TODO make this a PPLR so different lrs can be used for different parameters
     DEFAULT_LRS = {
         "descan": 1e-3,
         "scan_positions": 1e-3,
@@ -95,7 +95,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._constraints = {}
         self._probe_energy = None
 
-    def get_optimization_parameters(self):
+    def get_optimization_parameters(self) -> list[dict[str, Any]]:
         """Get the combined descan and scan position parameters for optimization."""
         params = []
         if self.learn_descan:
@@ -106,7 +106,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             raise RuntimeError(
                 "No parameters to optimize for dataset: learn_descan and learn_scan_positions are both False"
             )
-        return params
+        return [{"params": params}] 
 
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device."""

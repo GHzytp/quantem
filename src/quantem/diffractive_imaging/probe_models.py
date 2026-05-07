@@ -94,16 +94,13 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if roi_shape is not None:
             self.roi_shape = roi_shape
 
-    def get_optimization_parameters(self):
+    def get_optimization_parameters(self) -> list[dict[str, Any]]:
         """Get the parameters that should be optimized for this model."""
-        try:
-            params = self.params
-            if params is None:
-                return []
-            return params
-        except NotImplementedError:
-            # This happens when params is not implemented yet in abstract base
+        params = self.params
+        if params is None:
             return []
+        else:
+            return [{"params": params}] # compatible with PPLR
 
     @property
     def learn_probe_tilt(self) -> bool:
