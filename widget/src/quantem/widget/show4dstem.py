@@ -586,34 +586,51 @@ class Show4DSTEM(anywidget.AnyWidget):
         """Replace the 4D-STEM data. Preserves all display and ROI settings."""
         if hasattr(data, "sampling") and hasattr(data, "array"):
             data = data.array
-        data_np = to_numpy(data)
-        saturated_value = 65535.0 if data_np.dtype == np.uint16 else 255.0 if data_np.dtype == np.uint8 else None
-        if saturated_value is not None:
-            data_np[data_np >= saturated_value] = 0
-        if data_np.ndim == 5:
-            self.n_frames = data_np.shape[0]
-            self._scan_shape = (data_np.shape[1], data_np.shape[2])
-            self._det_shape = (data_np.shape[3], data_np.shape[4])
+        if isinstance(data, torch.Tensor):
+            self._device = data.device
+            self._data = data if data.device == self._device else data.to(self._device)
+            shape = tuple(data.shape)
+            ndim = len(shape)
+            view_dtype = (
+                torch.int16 if data.dtype == torch.uint16
+                else torch.int8 if data.dtype == torch.uint8
+                else None
+            )
+            if view_dtype is not None:
+                view = self._data.view(view_dtype).reshape(-1, *shape[-2:])
+                rows = view.shape[0]
+                pos_per_chunk = max(1, _CHUNK_BYTE_BUDGET // max(1, shape[-2] * shape[-1]))
+                for i in range(0, rows, pos_per_chunk):
+                    view[i:i + pos_per_chunk].masked_fill_(view[i:i + pos_per_chunk] == -1, 0)
+        else:
+            data_np = to_numpy(data)
+            saturated_value = 65535.0 if data_np.dtype == np.uint16 else 255.0 if data_np.dtype == np.uint8 else None
+            if saturated_value is not None:
+                data_np[data_np >= saturated_value] = 0
+            shape = data_np.shape
+            ndim = data_np.ndim
             self._data = torch.from_numpy(data_np).to(self._device)
-        elif data_np.ndim == 3:
+        if ndim == 5:
+            self.n_frames = shape[0]
+            self._scan_shape = (shape[1], shape[2])
+            self._det_shape = (shape[3], shape[4])
+        elif ndim == 3:
             self.n_frames = 1
             if scan_shape is not None:
                 self._scan_shape = scan_shape
             else:
-                n = data_np.shape[0]
+                n = shape[0]
                 side = int(n ** 0.5)
                 if side * side != n:
                     raise ValueError(f"Cannot infer square scan_shape from N={n}. Provide scan_shape explicitly.")
                 self._scan_shape = (side, side)
-            self._det_shape = (data_np.shape[1], data_np.shape[2])
-            self._data = torch.from_numpy(data_np).to(self._device)
-        elif data_np.ndim == 4:
+            self._det_shape = (shape[1], shape[2])
+        elif ndim == 4:
             self.n_frames = 1
-            self._scan_shape = (data_np.shape[0], data_np.shape[1])
-            self._det_shape = (data_np.shape[2], data_np.shape[3])
-            self._data = torch.from_numpy(data_np).to(self._device)
+            self._scan_shape = (shape[0], shape[1])
+            self._det_shape = (shape[2], shape[3])
         else:
-            raise ValueError(f"Show4DSTEM expects a 3D, 4D, or 5D array. Got {data_np.ndim}D. See documentation for accepted shapes.")
+            raise ValueError(f"Show4DSTEM expects a 3D, 4D, or 5D array. Got {ndim}D. See documentation for accepted shapes.")
         self.frame_idx = 0
         self.shape_rows = self._scan_shape[0]
         self.shape_cols = self._scan_shape[1]
