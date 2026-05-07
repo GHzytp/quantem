@@ -11,27 +11,19 @@ To reduce data size, bin k-space at the dataset level before viewing:
     widget = Show4DSTEM(dataset)
 """
 
-import hashlib
 import json
 import math
 import pathlib
 import time
-from datetime import datetime, timezone
-from typing import Any, Self
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, Self
+
+if TYPE_CHECKING:
+    from quantem.core.datastructures import Dataset4dstem
 
 import anywidget
 import numpy as np
 import torch
 import traitlets
-
-# Cap transient chunk memory at ~600 MB regardless of detector size.
-# A 4096 × 192² × 4 byte float32 cast = 600 MB; a 4096 × 256² × 4 byte cast
-# would be 1.0 GB. _chunk_rows() picks an N-rows-per-chunk that keeps the
-# transient under this cap.
-_CHUNK_BYTE_BUDGET = 600 * 1024 * 1024
-
-from quantem.core.config import validate_device
 from quantem.widget.array_utils import to_numpy
 from quantem.widget.state import (
     build_json_header,
@@ -40,11 +32,19 @@ from quantem.widget.state import (
     unwrap_state_payload,
 )
 
+from quantem.core.config import validate_device
+
+# Cap transient chunk memory at ~600 MB regardless of detector size.
+_CHUNK_BYTE_BUDGET = 600 * 1024 * 1024
+
 
 def _format_memory(nbytes: int) -> str:
-    if nbytes >= 1 << 30: return f"{nbytes / (1 << 30):.1f} GB"
-    if nbytes >= 1 << 20: return f"{nbytes / (1 << 20):.0f} MB"
-    if nbytes >= 1 << 10: return f"{nbytes / (1 << 10):.0f} KB"
+    if nbytes >= 1 << 30:
+        return f"{nbytes / (1 << 30):.1f} GB"
+    if nbytes >= 1 << 20:
+        return f"{nbytes / (1 << 20):.0f} MB"
+    if nbytes >= 1 << 10:
+        return f"{nbytes / (1 << 10):.0f} KB"
     return f"{nbytes} B"
 
 
@@ -395,7 +395,6 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Handle dimensionality — 5D loads eagerly for instant frame switching
         # Resolve shape from whichever input path we took
         shape = tuple(self._data_pre.shape) if self._data_pre is not None else data_np.shape
-        size_elements = int(np.prod(shape))
         ndim = len(shape)
         _tc = time.perf_counter()
         if ndim == 5:
@@ -1842,9 +1841,6 @@ class Show4DSTEM(anywidget.AnyWidget):
         prev_row, prev_col = self.pos_row, self.pos_col
         prev_frame = self.frame_idx
         meta_path: pathlib.Path | None = None
-        export_row = int(self.pos_row)
-        export_col = int(self.pos_col)
-        export_frame = int(self.frame_idx)
 
         try:
             if frame_idx is not None:
@@ -1853,9 +1849,6 @@ class Show4DSTEM(anywidget.AnyWidget):
                 row, col = self._validate_position(position)
                 self.pos_row = row
                 self.pos_col = col
-            export_row = int(self.pos_row)
-            export_col = int(self.pos_col)
-            export_frame = int(self.frame_idx)
 
             if view_key == "diffraction":
                 image, dp_meta = self._render_panel_image(

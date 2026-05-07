@@ -3,7 +3,6 @@ import json
 import pathlib
 from typing import Any
 
-
 JSON_METADATA_VERSION = "1.0"
 
 

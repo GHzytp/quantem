@@ -11,11 +11,9 @@ Catches silent regressions when traits are added, renamed, or dropped without
 updating the state_dict roundtrip path.
 """
 import json
-import pathlib
 
 import numpy as np
 import pytest
-
 from quantem.widget import Show2D, Show4DSTEM
 
 
