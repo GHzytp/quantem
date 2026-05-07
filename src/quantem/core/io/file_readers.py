@@ -58,7 +58,7 @@ def read_4dstem(
 
     Examples
     --------
-    Load an Arina 4D-STEM master file with the default hot pixel filter:
+    Load a raw Arina 4D-STEM master file:
 
     >>> from quantem.core.io import read_4dstem
     >>> ds = read_4dstem(
@@ -68,12 +68,12 @@ def read_4dstem(
     >>> ds.array.shape
     (256, 256, 192, 192)
 
-    Skip the filter to inspect the raw detector output:
+    Enable the hot pixel filter to repair stuck detector pixels on load:
 
-    >>> ds_raw = read_4dstem(
+    >>> ds = read_4dstem(
     ...     '/path/to/gold_013_master.h5',
     ...     file_type='arina',
-    ...     hot_pixel_filter=False,
+    ...     hot_pixel_filter=True,
     ... )
     """
     if file_type is None:
