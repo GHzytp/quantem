@@ -2592,10 +2592,12 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         current_bottom, current_top = ax_spec.get_ylim()
         padded_bottom = min(current_bottom, y_min - 0.10 * y_scale)
-        ax_spec.set_ylim(bottom=padded_bottom, top=current_top)
+        padded_top = max(current_top, y_max + 0.18 * y_scale)
+        ax_spec.set_ylim(bottom=padded_bottom, top=padded_top)
 
         label_candidates = []
-        top_label_y = 0.92
+        top_label_y = 0.99
+        peak_label_y = 0.92
         # Plot reference lines (dotted) ONLY for explicitly requested elements, not for autodetected/possible
         if requested_elements:
             energy_min, energy_max = float(np.min(E)), float(np.max(E))
@@ -2652,13 +2654,10 @@ class Dataset3deds(Dataset3dspectroscopy):
                     )
 
         if show_text and peak_matches:
-            # Keep label offset proportional to local y-scale so low-intensity
-            # windows (e.g., 5.5-7 keV) do not place text outside the axes.
-            label_offset = 0.08 * y_scale
             label_allowed = set(detected_elements) | possible_elements
             if requested_elements:
                 label_allowed.update(str(el) for el in requested_elements)
-            for pk_idx, height, peak_energy, _, element, match_str, _, _, _, _ in peak_matches:
+            for pk_idx, _height, peak_energy, _, element, match_str, _, _, _, _ in peak_matches:
                 if int(pk_idx) not in plot_peak_indices:
                     continue
                 is_requested = requested_elements is not None and element in requested_elements
@@ -2671,8 +2670,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                         label,
                         element_color_map.get(element, "black"),
                         "-",
-                        float(height + label_offset),
-                        "data",
+                        float(peak_label_y),
+                        "axes_peak",
                         10,
                         "bold",
                         1.0,
@@ -2702,7 +2701,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                     rotation=90,
                     alpha=alpha_value,
                 )
-                if y_mode == "axes_top":
+                if y_mode in {"axes_top", "axes_peak"}:
                     txt = ax_spec.text(
                         peak_energy,
                         y_value,
@@ -2715,7 +2714,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 else:
                     txt = ax_spec.text(peak_energy, y_value, label_text, va="bottom", **common)
                 # Prioritize data-peak labels over top reference labels if collisions occur.
-                priority = 1 if y_mode == "data" else 0
+                priority = 1 if y_mode in {"data", "axes_peak"} else 0
                 drawn_texts.append((txt, label_text, color, linestyle, priority))
 
             if drawn_texts:
