@@ -238,7 +238,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         return smoothed_data3d
 
     def measure_zlp_offset(
-        self, zlp_guess_x=None, fit_window=0.8, use_gaussian_fit=True, fit_to_plane=True
+        self, zlp_guess_x=None, fit_window=0.8, use_gaussian_fit=True, fit_to_plane=False
     ):
         """
         Measure ZLP offset at each pixel position by using a guess of ZLP posfitting each spectrum to a Gaussian
@@ -305,26 +305,30 @@ class Dataset3deels(Dataset3dspectroscopy):
 
                 zlp_measured[iy - 1, ix - 1] = float(popt[1])
 
-        # Fit a 2D plane to the array of measured ZLPs
-        xdata, ydata = np.meshgrid(np.arange(n_x), np.arange(n_y))
-
-        xdata_unpacked = np.vstack((xdata.ravel(), ydata.ravel()))
-        ydata_unpacked = zlp_measured.ravel()
-
-        popt, _ = curve_fit(_plane_fit_2d, xdata_unpacked, ydata_unpacked)
-
-        zlp_plane_1d = _plane_fit_2d(xdata_unpacked, popt[0], popt[1], popt[2])
-        zlp_plane_2d = zlp_plane_1d.reshape(n_y, n_x)
-
-        show_2d(
-            [zlp_measured, zlp_plane_2d],
-            cmap="magma",
-            title=["Measured ZLP (mean of Gaussian fit)", "ZLP plane fit"],
-        )
-
         if fit_to_plane:
+            # Fit a 2D plane to the array of measured ZLPs
+            xdata, ydata = np.meshgrid(np.arange(n_x), np.arange(n_y))
+
+            xdata_unpacked = np.vstack((xdata.ravel(), ydata.ravel()))
+            ydata_unpacked = zlp_measured.ravel()
+
+            popt, _ = curve_fit(_plane_fit_2d, xdata_unpacked, ydata_unpacked)
+
+            zlp_plane_1d = _plane_fit_2d(xdata_unpacked, popt[0], popt[1], popt[2])
+            zlp_plane_2d = zlp_plane_1d.reshape(n_y, n_x)
+
+            show_2d(
+                [zlp_measured, zlp_plane_2d],
+                cmap="magma",
+                title=["Measured ZLP (mean of Gaussian fit)", "ZLP plane fit"],
+            )
             return zlp_plane_2d
         else:
+            show_2d(
+                [zlp_measured],
+                cmap="magma",
+                title=["Measured ZLP (mean of Gaussian fit)"],
+            )
             return zlp_measured
 
     def apply_zlp_correction(
@@ -355,6 +359,7 @@ class Dataset3deels(Dataset3dspectroscopy):
                 "measure_offset was set to False and no input argument for ZLP shifts was provided."
             )
 
+        # Initialize 3D array to populate with spectra aligned along the energy axis
         corrected_array = np.zeros_like(self.array)
 
         n_energy, n_y, n_x = self.array.shape
@@ -363,37 +368,64 @@ class Dataset3deels(Dataset3dspectroscopy):
         E0 = float(self.origin[0])
         energy_axis = E0 + np.arange(n_energy) * dE
 
+        # Record the maximum positive shift to update the origin for the output aligned 3D dataset
+        max_shift = 0
+
+        # Apply the ZLP shift at each probe position, rounding to the nearest integer multiple of the sampling of the data
         for iy in range(n_y):
             for ix in range(n_x):
-                E_shift = energy_axis - zlp_array[iy, ix]
-                interpolator = interp1d(
-                    E_shift,
-                    self.array[:, iy, ix],
-                    kind="linear",
-                    bounds_error=False,
-                    fill_value=0.0,
-                )
-                corrected_array[:, iy, ix] = interpolator(energy_axis)
+                spec = self.array[:, iy, ix]
+                shift_binsampled = np.floor_divide(zlp_array[iy, ix], dE) * (-1)
+                shift_int = shift_binsampled.astype(np.int64)
+                if shift_binsampled < 0:
+                    spec_shifted = np.pad(
+                        spec[-shift_binsampled:],
+                        (0, -shift_int),
+                        mode="constant",
+                        constant_values=np.nan,
+                    )
+                else:
+                    spec_shifted = np.pad(
+                        spec, (shift_int, 0), mode="constant", constant_values=np.nan
+                    )[: len(spec)]
+                # Update maximum shift for origin correction
+                if shift_binsampled > max_shift:
+                    max_shift = shift_binsampled
+                corrected_array[:, iy, ix] = spec_shifted
 
+        # Update origin
+        new_origin = E0 + max_shift * dE
+
+        # Remove all planes along energy axis containing NaN, to equalize spectra lengths across all scan positions
+        mask = np.isnan(corrected_array).any(axis=(1, 2))
+        aligned_data_3d = corrected_array[~mask]
+
+        new_Eaxis = new_origin + np.arange(aligned_data_3d.shape[0]) * dE
+
+        # Calculate mean spectra before and after correction for plotting
         mean_spectrum_raw = self.array.mean(axis=(1, 2))
-        mean_spectrum_corrected = corrected_array.mean(axis=(1, 2))
+        mean_spectrum_corrected = aligned_data_3d.mean(axis=(1, 2))
 
-        fig, ax = plt.subplots()
-        ax.plot(energy_axis, mean_spectrum_corrected, label="ZLP-corrected spectrum", color="b")
-        ax.plot(energy_axis, mean_spectrum_raw, label="Raw mean spectrum", color="r")
-        ax.set_xlabel("Energy (eV)")
-        ax.set_ylabel("Intensity")
-        ax.grid(True, alpha=0.1)
-        ax.legend()
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        ax1.plot(energy_axis, mean_spectrum_raw, label="Raw mean spectrum", color="r")
+        ax2.plot(new_Eaxis, mean_spectrum_corrected, label="ZLP-corrected spectrum", color="b")
+        ax1.set_xlabel("Energy (eV)")
+        ax1.set_ylabel("Intensity")
+        ax1.grid(True, alpha=0.1)
+        ax1.legend()
+        ax2.set_xlabel("Energy (eV)")
+        ax2.set_ylabel("Intensity")
+        ax2.grid(True, alpha=0.1)
+        ax2.legend()
 
         fig.tight_layout()
 
         if return_3d_dataset:
             return Dataset3deels.from_array(
-                array=corrected_array,
+                array=aligned_data_3d,
                 name=self.name,
                 sampling=self.sampling,
-                origin=self.origin,
+                origin=new_origin,
                 units=self.units,
             )
 
