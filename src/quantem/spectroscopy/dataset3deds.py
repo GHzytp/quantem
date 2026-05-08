@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 from matplotlib.lines import Line2D
 from numpy.typing import NDArray
-from scipy.signal import find_peaks
+from scipy.optimize import curve_fit
+from scipy.signal import find_peaks, peak_prominences, peak_widths
 
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy import Dataset3dspectroscopy
@@ -35,7 +36,6 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     element_info = None
     element_info_path = "x_ray_lines.csv"
-    dataset_type = "eds"
 
     def __init__(
         self,
@@ -356,41 +356,43 @@ class Dataset3deds(Dataset3dspectroscopy):
         return requested or saved
 
     @staticmethod
-    def _estimate_snr_thresholds(snr_values, peaks, snr_min=None, snr_threshold=None):
-        """Auto-estimate snr_min and snr_threshold from peak SNR distribution."""
+    def _estimate_snr_thresholds(snr_values, peaks, floor=None, snr_threshold=None):
+        """Auto-estimate SNR floors/thresholds from the peak SNR distribution."""
         snr_values = np.asarray(snr_values, dtype=float)
         snr_values = snr_values[np.isfinite(snr_values)]
 
-        if snr_min is None:
+        if floor is None:
             if snr_values.size:
-                sorted_snrs = np.sort(snr_values)
-                target_rank = min(sorted_snrs.size, int(np.clip(2 * int(peaks), 12, 64)))
-                rank_cutoff = float(sorted_snrs[-target_rank])
-                q30, q40, q50 = np.percentile(sorted_snrs, [30, 40, 50])
-                snr_min = float(
-                    np.clip(min(q50, max(q30, 0.35 * rank_cutoff, 0.9 * q40)), 7.0, 14.0)
-                )
+                # Robust quantile floor: center near the middle/high-middle SNR
+                # band so the floor tracks "visible" peaks without being pulled
+                # down by noise tails or up by a few extreme peaks.
+                q30, q40, q50, q60 = np.percentile(snr_values, [30, 40, 50, 60])
+                floor = 0.5 * float(q40 + q50)
+                floor = float(np.clip(floor, q30, q60))
+                floor = max(0.0, floor)
             else:
-                snr_min = 8.0
+                floor = 8.0
         else:
-            snr_min = float(snr_min)
+            floor = float(floor)
 
         if snr_threshold is None:
             if snr_values.size:
-                high = snr_values[snr_values >= snr_min]
+                high = snr_values[snr_values >= floor]
                 high = high if high.size else snr_values
-                high = np.sort(high)[::-1]
-                anchor = high[: min(high.size, int(np.clip(int(peaks), 10, 40)))]
+                # Keep auto-threshold independent from the requested display
+                # count (peaks). `peaks` should control only how many detected
+                # peaks are shown, not which peaks are detected.
+                anchor = np.sort(high)[::-1][: min(high.size, 40)]
                 med, q75, q90 = np.percentile(anchor, [50, 75, 90])
                 snr_threshold = float(
-                    np.clip(max(med, 0.7 * q75, 2.5 * snr_min), max(2.5 * snr_min, snr_min), q90)
+                    np.clip(max(med, 0.7 * q75, 2.5 * floor), max(2.5 * floor, floor), q90)
                 )
             else:
-                snr_threshold = max(4.0 * snr_min, 30.0)
+                snr_threshold = max(4.0 * floor, 30.0)
         else:
             snr_threshold = float(snr_threshold)
 
-        return snr_min, snr_threshold
+        return floor, snr_threshold
 
     def x_ray_lookup(
         self, spec: str | list[str] | tuple[str, ...] | set[str]
@@ -462,7 +464,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             [lbl for lbl, _, _ in unique],
         )
 
-    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False):
+    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False, show=True):
         """Generate spectrum images by integrating around X-ray line energies.
 
         For each matched X-ray line, sums the spectral intensity within an
@@ -599,7 +601,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         return self.Integrate(spec=spec, width=width, return_maps=return_maps, show=show, **kwargs)
 
     def show_spectrum_images(
-        self, x_ray_lines=None, method="integration", return_fig=False, return_maps=False, **kwargs
+        self, x_ray_lines=None, return_fig=False, return_maps=False, method="integration", **kwargs
     ):
         """Display cached spectrum images.
 
@@ -608,13 +610,11 @@ class Dataset3deds(Dataset3dspectroscopy):
         x_ray_lines : str | sequence[str] | None, optional
             Selectors to filter which images are shown.  If ``None``, one
             panel per element is displayed.
+        return_fig : bool, optional
+            If ``True``, return ``(fig, ax)``.
         method : {"integration", "fit"}, optional
             Which cache to read from: integration-based maps or PyTorch
             fit-based maps.
-        return_fig : bool, optional
-            If ``True``, return ``(fig, ax)``.
-        return_maps: bool, optional
-            If ``True``, return plotted images
         **kwargs
             Forwarded to :func:`show_2d` (e.g. ``cmap``).
 
@@ -882,12 +882,15 @@ class Dataset3deds(Dataset3dspectroscopy):
         min_line_weight=0.0,
         mask=None,
         show_text=True,
+        floor=None,
+        snr_quantile_floor=None,
         snr_min=None,
         snr_threshold=None,
         distance_threshold_for_sample=0.05,
         grid_peaks=None,
         peaks=15,
         mode=None,
+        line=None,
         return_details=False,
     ):
         """Automatically identify elements from EDS peaks in the mean spectrum.
@@ -921,7 +924,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             ``[0, 0.25]`` keV to skip the noise floor.
         threshold : float, optional
             Legacy parameter (currently unused).  SNR filtering is controlled
-            by *snr_min* and *snr_threshold*.
+            by *floor* and *snr_threshold*.
         tolerance : float, optional
             Maximum energy difference in keV between a detected peak and a
             tabulated X-ray line for them to be considered a match.
@@ -933,9 +936,14 @@ class Dataset3deds(Dataset3dspectroscopy):
             contribute to the mean spectrum.
         show_text : bool, optional
             If ``True``, annotate matched peaks on the plot.
-        snr_min : float | None, optional
+        floor : float | None, optional
             Minimum signal-to-noise ratio for a peak to be displayed.  If
-            ``None``, estimated automatically from the SNR distribution.
+            ``None``, estimated from robust middle quantiles (roughly between
+            the 30th and 60th percentile of peak SNRs).
+        snr_quantile_floor : float | None, optional
+            Deprecated alias for *floor*.
+        snr_min : float | None, optional
+            Deprecated alias for *floor*.
         snr_threshold : float | None, optional
             SNR above which a peak match counts as "strong" evidence for an
             element.  If ``None``, estimated automatically.
@@ -952,6 +960,10 @@ class Dataset3deds(Dataset3dspectroscopy):
             *elements*; ``"elements_preferred"`` boosts them but allows others;
             ``"autofill"`` (default when *elements* is ``None``) searches all
             elements.
+        line : float | sequence[float] | None, optional
+            Energy value(s) in keV for reference lines to draw on the spectrum
+            plot, e.g. ``3.692`` or ``[3.692, 4.510]``.  Lines are drawn as
+            dashed black vertical lines.
         return_details : bool, optional
             If ``True``, return a dict with detection details instead of the
             figure.
@@ -962,7 +974,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             By default returns ``(fig, (ax_img, ax_spec))``.  When
             *return_details* is ``True``, returns a dict containing
             ``detected_elements``, ``element_confidence``, ``display_peaks``,
-            ``peak_matches``, ``snr_min``, ``snr_threshold``, and the figure.
+            ``peak_matches``, ``floor``, ``snr_threshold``, and the figure.
         """
         type(self)._ensure_element_info()
         all_info = type(self).element_info or {}
@@ -984,7 +996,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         requested_elements = set(edge_filters) if edge_filters else None
 
         mode = (str(mode).strip().lower() if mode is not None else None) or (
-            "elements_preferred" if requested_elements else "autofill"
+            "elements_only" if requested_elements else "autofill"
         )
         search_elements = requested_elements if mode == "elements_only" else None
         preferred_elements = (
@@ -1006,56 +1018,382 @@ class Dataset3deds(Dataset3dspectroscopy):
             energy_range=energy_range,
             ignore_range=ignore_range,
             mask=mask,
-            attach_mean_spectrum=False,
         )
-        spec = np.asarray(spec, dtype=float)
-        E = np.asarray(self.energy_axis, dtype=float)
+        E = float(self.origin[0]) + float(self.sampling[0]) * np.arange(self.shape[0])
+
+        # Keep the energy axis aligned with calculate_mean_spectrum filtering.
         if mask is not None:
-            E = E[np.asarray(mask, dtype=bool)]
+            mask_arr = np.asarray(mask, dtype=bool)
+            if mask_arr.shape != E.shape:
+                raise ValueError(
+                    f"Mask shape {mask_arr.shape} does not match energy axis shape {E.shape}."
+                )
+            E = E[mask_arr]
+
         if energy_range is not None:
             keep = (energy_range[0] <= E) & (E <= energy_range[1])
             E = E[keep]
-        if E.shape[0] != spec.shape[0]:
-            raise RuntimeError(
-                "Energy axis and mean spectrum lengths do not match after applying "
-                "mask and energy_range."
+
+        if len(spec) != len(E):
+            raise ValueError(
+                "Energy axis length does not match mean spectrum length after filtering. "
+                f"Got len(E)={len(E)} and len(spec)={len(spec)}."
             )
-        spec_for_peaks = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
-        if spec_for_peaks.size:
-            spec_for_peaks = spec_for_peaks - float(np.nanmin(spec_for_peaks))
-            peak_scale = float(np.nanmax(np.abs(spec_for_peaks)))
-            if np.isfinite(peak_scale) and peak_scale > 0:
-                spec_for_peaks = spec_for_peaks / peak_scale
 
         def in_ignore(energy):
             return len(ignore_range) == 2 and ignore_range[0] <= float(energy) <= ignore_range[1]
 
-        peak_indices, props = find_peaks(spec_for_peaks, height=0, distance=5)
-        peak_signal_heights = props["peak_heights"]
-        peak_heights = spec[peak_indices]
-        background_std = np.nanstd(
-            spec_for_peaks[spec_for_peaks <= np.nanpercentile(spec_for_peaks, 50)]
+        peak_indices, props = find_peaks(spec, height=0, distance=5)
+        peak_heights = props["peak_heights"]
+        peak_proms = (
+            peak_prominences(spec, peak_indices)[0]
+            if len(peak_indices)
+            else np.asarray([], dtype=float)
         )
+        peak_width_samples = (
+            peak_widths(spec, peak_indices, rel_height=0.5)[0]
+            if len(peak_indices)
+            else np.asarray([], dtype=float)
+        )
+        background_std = np.nanstd(spec[spec <= np.nanpercentile(spec, 50)])
         if not np.isfinite(background_std) or background_std <= 0:
-            background_std = np.nanstd(spec_for_peaks)
+            background_std = np.nanstd(spec)
         if not np.isfinite(background_std) or background_std <= 0:
             background_std = 1.0
 
-        snr_values = np.asarray(
-            [height / background_std for height in peak_signal_heights], dtype=float
-        )
-        snr_min, snr_threshold = type(self)._estimate_snr_thresholds(
-            snr_values, peaks, snr_min, snr_threshold
+        if floor is None and snr_quantile_floor is not None:
+            floor = snr_quantile_floor
+        if floor is None and snr_min is not None:
+            floor = snr_min
+
+        # Collapse shoulder peaks before SNR filtering.
+        # Two adjacent peaks are treated as one if they are very close in energy
+        # and the valley between them is shallow relative to the smaller peak.
+        # This removes split-peak artifacts that tend to over-label broad peaks.
+        def collapse_shoulder_peaks(indices, heights, prominences, widths):
+            if len(indices) <= 1:
+                return (
+                    np.asarray(indices, dtype=int),
+                    np.asarray(heights, dtype=float),
+                    np.asarray(prominences, dtype=float),
+                    np.asarray(widths, dtype=float),
+                )
+
+            energy_gap_limit = max(6.0 * float(self.sampling[0]), 0.14)
+            min_valley_relief = 0.35
+            min_height_ratio = 0.45
+
+            keep = []
+            i = 0
+            while i < len(indices):
+                best_idx = int(indices[i])
+                best_h = float(heights[i])
+                best_p = float(prominences[i])
+                best_w = float(widths[i])
+                j = i + 1
+
+                while j < len(indices):
+                    cand_idx = int(indices[j])
+                    cand_h = float(heights[j])
+                    cand_p = float(prominences[j])
+                    cand_w = float(widths[j])
+                    if float(E[cand_idx] - E[best_idx]) > energy_gap_limit:
+                        break
+
+                    lo, hi = sorted((best_idx, cand_idx))
+                    if hi - lo <= 1:
+                        valley = float(min(spec[lo], spec[hi]))
+                    else:
+                        valley = float(np.min(spec[lo : hi + 1]))
+
+                    smaller = max(min(best_h, cand_h), 1e-12)
+                    valley_relief = (smaller - valley) / smaller
+                    height_ratio = min(best_h, cand_h) / max(best_h, cand_h)
+
+                    # Not a clearly separated doublet -> merge shoulders.
+                    if valley_relief < min_valley_relief or height_ratio < min_height_ratio:
+                        if (cand_p > best_p) or (cand_p == best_p and cand_h > best_h):
+                            best_idx, best_h, best_p, best_w = cand_idx, cand_h, cand_p, cand_w
+                        j += 1
+                        continue
+
+                    break
+
+                keep.append((best_idx, best_h, best_p, best_w))
+                i = j
+
+            out_idx = np.asarray([pk for pk, _, _, _ in keep], dtype=int)
+            out_h = np.asarray([h for _, h, _, _ in keep], dtype=float)
+            out_p = np.asarray([p for _, _, p, _ in keep], dtype=float)
+            out_w = np.asarray([w for _, _, _, w in keep], dtype=float)
+            order = np.argsort(out_idx)
+            return out_idx[order], out_h[order], out_p[order], out_w[order]
+
+        peak_indices, peak_heights, peak_proms, peak_width_samples = collapse_shoulder_peaks(
+            peak_indices,
+            peak_heights,
+            peak_proms,
+            peak_width_samples,
         )
 
-        display_peaks = [
-            (int(i), float(raw_h), float(E[i]), float(signal_h / background_std))
-            for i, raw_h, signal_h in zip(peak_indices, peak_heights, peak_signal_heights)
-            if not in_ignore(E[i]) and signal_h / background_std >= snr_min
+        snr_values = np.asarray([height / background_std for height in peak_heights], dtype=float)
+        floor, snr_threshold = type(self)._estimate_snr_thresholds(
+            snr_values,
+            peaks,
+            floor,
+            snr_threshold,
+        )
+
+        # Prominence filter in SNR units: suppress shoulder/noise artifacts that
+        # may have acceptable height but do not form a distinct peak.
+        prominence_snr = np.asarray(
+            [float(p) / max(float(background_std), 1e-12) for p in peak_proms], dtype=float
+        )
+
+        def _local_noise_std(pk_idx):
+            # Use local baseline variability so narrow doublets are not lost
+            # when a wide energy range inflates global noise estimates.
+            local_window = max(0.24, 12.0 * float(self.sampling[0]))
+            mask_local = np.abs(E - float(E[int(pk_idx)])) <= local_window
+            if int(np.count_nonzero(mask_local)) < 9:
+                return float(background_std)
+
+            y_local = np.asarray(spec[mask_local], dtype=float)
+            if y_local.size < 9 or not np.all(np.isfinite(y_local)):
+                return float(background_std)
+
+            local_cut = float(np.nanpercentile(y_local, 70))
+            base_local = y_local[y_local <= local_cut]
+            if base_local.size < 5:
+                base_local = y_local
+
+            local_std = float(np.nanstd(base_local))
+            if not np.isfinite(local_std) or local_std <= 0:
+                local_std = float(background_std)
+            return max(local_std, 1e-12)
+
+        local_noise = np.asarray([_local_noise_std(int(i)) for i in peak_indices], dtype=float)
+        local_snr_values = np.asarray(
+            [float(h) / max(float(n), 1e-12) for h, n in zip(peak_heights, local_noise)],
+            dtype=float,
+        )
+        local_prominence_snr = np.asarray(
+            [float(p) / max(float(n), 1e-12) for p, n in zip(peak_proms, local_noise)], dtype=float
+        )
+
+        prominence_floor = max(2.2, 0.85 * float(floor))
+        salience_snr = prominence_snr * np.sqrt(np.maximum(peak_width_samples, 1e-12))
+        salience_floor = max(4.2, 2.0 * float(floor))
+        local_salience_snr = local_prominence_snr * np.sqrt(np.maximum(peak_width_samples, 1e-12))
+
+        adaptive_floor = max(2.0, 0.62 * float(floor))
+        adaptive_prominence_floor = max(1.6, 0.62 * float(prominence_floor))
+        adaptive_salience_floor = max(2.6, 0.62 * float(salience_floor))
+
+        display_peaks_with_prom = [
+            (
+                int(i),
+                float(h),
+                float(E[i]),
+                float(max(float(h / background_std), float(local_snr))),
+                float(max(float(p_snr), float(local_p_snr))),
+                float(max(float(sal), float(local_sal))),
+            )
+            for i, h, p_snr, sal, local_snr, local_p_snr, local_sal in zip(
+                peak_indices,
+                peak_heights,
+                prominence_snr,
+                salience_snr,
+                local_snr_values,
+                local_prominence_snr,
+                local_salience_snr,
+            )
+            if (
+                not in_ignore(E[i])
+                and (
+                    (
+                        h / background_std >= floor
+                        and p_snr >= prominence_floor
+                        and sal >= salience_floor
+                    )
+                    or (
+                        local_snr >= adaptive_floor
+                        and local_p_snr >= adaptive_prominence_floor
+                        and local_sal >= adaptive_salience_floor
+                    )
+                )
+            )
         ]
+
+        # Validate peaks as local Gaussian components (center/sigma/amplitude)
+        # rather than raw single-bin maxima, then merge overlapping components.
+        def _gauss_with_offset(x, amp, mu, sigma, offset):
+            sigma = max(float(sigma), 1e-12)
+            return float(offset) + float(amp) * np.exp(-0.5 * ((x - float(mu)) / sigma) ** 2)
+
+        def _fit_local_gaussian(pk_idx):
+            window = max(0.18, 10.0 * float(self.sampling[0]))
+            x0 = float(E[pk_idx])
+            mask_local = np.abs(E - x0) <= window
+            if int(np.count_nonzero(mask_local)) < 7:
+                return None
+
+            x_local = np.asarray(E[mask_local], dtype=float)
+            y_local = np.asarray(spec[mask_local], dtype=float)
+            if not np.all(np.isfinite(y_local)):
+                return None
+
+            baseline = float(np.percentile(y_local, 20))
+            peak_val = float(spec[pk_idx])
+            amp0 = max(peak_val - baseline, 1e-9)
+            sigma0 = max(0.04, 2.0 * float(self.sampling[0]))
+
+            lo_sigma = max(1.5 * float(self.sampling[0]), 0.010)
+            hi_sigma = 0.18
+            bounds = (
+                [0.0, x0 - 0.06, lo_sigma, baseline - abs(amp0)],
+                [max(amp0 * 5.0, 1e-6), x0 + 0.06, hi_sigma, baseline + abs(amp0)],
+            )
+
+            try:
+                popt, _ = curve_fit(
+                    _gauss_with_offset,
+                    x_local,
+                    y_local,
+                    p0=[amp0, x0, sigma0, baseline],
+                    bounds=bounds,
+                    maxfev=4000,
+                )
+            except Exception:
+                return None
+
+            amp, mu, sigma, offset = map(float, popt)
+            if amp <= 0 or not np.isfinite(mu) or not np.isfinite(sigma):
+                return None
+
+            y_hat = _gauss_with_offset(x_local, amp, mu, sigma, offset)
+            ss_res = float(np.sum((y_local - y_hat) ** 2))
+            ss_tot = float(np.sum((y_local - float(np.mean(y_local))) ** 2))
+            r2 = 1.0 - ss_res / max(ss_tot, 1e-12)
+            amp_snr = amp / max(float(background_std), 1e-12)
+
+            return {
+                "idx": int(pk_idx),
+                "mu": float(mu),
+                "sigma": float(sigma),
+                "amp": float(amp),
+                "amp_snr": float(amp_snr),
+                "r2": float(r2),
+                "area": float(amp * sigma),
+            }
+
+        gaussian_validation_gate = max(2.2 * float(floor), 0.25 * float(snr_threshold))
+        strong_keep_idx = {
+            int(pk_idx)
+            for pk_idx, _, _, snr, _, _ in display_peaks_with_prom
+            if float(snr) >= gaussian_validation_gate
+        }
+
+        gauss_components = []
+        for pk_idx, _, _, snr, _, _ in display_peaks_with_prom:
+            if float(snr) >= gaussian_validation_gate:
+                continue
+            fit = _fit_local_gaussian(int(pk_idx))
+            if fit is None:
+                continue
+            # Keep only physically plausible and sufficiently Gaussian components.
+            if fit["r2"] < 0.58:
+                continue
+            if fit["amp_snr"] < max(2.0, 0.75 * float(floor)):
+                continue
+            if fit["sigma"] < max(1.5 * float(self.sampling[0]), 0.010) or fit["sigma"] > 0.18:
+                continue
+            gauss_components.append(fit)
+
+        gaussian_validated = bool(gauss_components)
+        if gauss_components:
+            # Merge overlapping Gaussian components and keep the stronger one.
+            gauss_components.sort(key=lambda comp: comp["mu"])
+            merged = []
+            for comp in gauss_components:
+                if not merged:
+                    merged.append(comp)
+                    continue
+                prev = merged[-1]
+                # Keep neighbouring components separate unless they are truly
+                # unresolved by both center spacing and valley separation.
+                center_gap = abs(float(comp["mu"]) - float(prev["mu"]))
+                overlap_thresh = 1.15 * min(float(prev["sigma"]), float(comp["sigma"]))
+
+                prev_idx = int(prev["idx"])
+                comp_idx = int(comp["idx"])
+                lo, hi = sorted((prev_idx, comp_idx))
+                if hi - lo <= 1:
+                    valley = float(min(spec[lo], spec[hi]))
+                else:
+                    valley = float(np.min(spec[lo : hi + 1]))
+                smaller_amp = max(min(float(prev["amp"]), float(comp["amp"])), 1e-12)
+                valley_relief = (smaller_amp - valley) / smaller_amp
+
+                unresolved_pair = center_gap <= overlap_thresh and valley_relief < 0.22
+                if unresolved_pair:
+                    if (comp["area"] > prev["area"]) or (
+                        comp["area"] == prev["area"] and comp["amp_snr"] > prev["amp_snr"]
+                    ):
+                        merged[-1] = comp
+                else:
+                    merged.append(comp)
+
+            keep_idx = {int(comp["idx"]) for comp in merged}
+            keep_idx.update(strong_keep_idx)
+            display_peaks_with_prom = [
+                item for item in display_peaks_with_prom if int(item[0]) in keep_idx
+            ]
+        else:
+            # If weak-peak Gaussian fitting did not validate any component,
+            # still keep strong visual peaks.
+            if strong_keep_idx:
+                display_peaks_with_prom = [
+                    item for item in display_peaks_with_prom if int(item[0]) in strong_keep_idx
+                ]
+
+        # Prune weak shoulder-like bumps near a much stronger neighbouring peak.
+        # This prevents over-detecting pseudo-peaks on the flanks of broad peaks.
+        if len(display_peaks_with_prom) > 1 and not gaussian_validated:
+            by_energy = sorted(display_peaks_with_prom, key=lambda item: item[2])
+            shoulder_window = max(8.0 * float(self.sampling[0]), 0.22)
+            weak_snr_ratio = 0.45
+            weak_prom_ratio = 0.65
+            local_prom_floor = max(3.5, 1.10 * float(floor))
+
+            pruned = []
+            for idx, h, en, snr, p_snr, sal in by_energy:
+                strongest_neighbor = None
+                for o_idx, o_h, o_en, o_snr, o_p_snr, o_sal in by_energy:
+                    if o_idx == idx:
+                        continue
+                    if abs(float(o_en) - float(en)) > shoulder_window:
+                        continue
+                    if strongest_neighbor is None or o_snr > strongest_neighbor[0]:
+                        strongest_neighbor = (float(o_snr), float(o_p_snr), float(o_en))
+
+                if strongest_neighbor is None:
+                    pruned.append((idx, h, en, snr, p_snr, sal))
+                    continue
+
+                nbr_snr, nbr_prom, _ = strongest_neighbor
+                is_weak_shoulder = (
+                    float(snr) < weak_snr_ratio * max(nbr_snr, 1e-12)
+                    and float(p_snr) < weak_prom_ratio * max(nbr_prom, 1e-12)
+                    and float(p_snr) < local_prom_floor
+                )
+                if not is_weak_shoulder:
+                    pruned.append((idx, h, en, snr, p_snr, sal))
+
+            display_peaks_with_prom = pruned
+
+        display_peaks = [(idx, h, en, snr) for idx, h, en, snr, _, _ in display_peaks_with_prom]
         display_peaks.sort(key=lambda item: item[3], reverse=True)
-        significant_peaks = list(display_peaks)
-        display_peaks = display_peaks[:peaks]
 
         def candidate_matches(peak_energy, snr, allowed_elements=None):
             matches = []
@@ -1114,6 +1452,144 @@ class Dataset3deds(Dataset3dspectroscopy):
                     best["score"],
                 )
             )
+
+        energy_min = float(np.min(E)) if len(E) else float(self.origin[0])
+        energy_max = float(np.max(E)) if len(E) else energy_min
+
+        def observable_shells_for_element(element):
+            shells = set()
+            for line_name, line_info in (all_info.get(str(element), {}) or {}).items():
+                if not type(self)._line_allowed_for_element(str(element), line_name, edge_filters):
+                    continue
+                shell = type(self)._line_shell(line_name)
+                if shell not in {"K", "L", "M"}:
+                    continue
+                try:
+                    line_energy = float(line_info.get("energy (keV)", line_info.get("energy")))
+                except (TypeError, ValueError):
+                    continue
+                if energy_min <= line_energy <= energy_max:
+                    shells.add(shell)
+            return shells
+
+        def strongest_observable_line(element, shell_name):
+            candidates = []
+            for line_name, line_info in (all_info.get(str(element), {}) or {}).items():
+                if not type(self)._line_allowed_for_element(str(element), line_name, edge_filters):
+                    continue
+                if type(self)._line_shell(line_name) != shell_name:
+                    continue
+                try:
+                    line_energy = float(line_info.get("energy (keV)", line_info.get("energy")))
+                    line_weight = float(line_info.get("weight", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if energy_min <= line_energy <= energy_max:
+                    candidates.append((line_weight, line_energy, str(line_name)))
+            return max(candidates, default=None)
+
+        def shell_has_observable_support(element, shell_name):
+            strongest = strongest_observable_line(element, shell_name)
+            if strongest is None:
+                return True
+
+            _, target_energy, _ = strongest
+            support_window = max(float(tolerance), 3.0 * float(self.sampling[0]), 0.04)
+
+            for _, _, peak_energy, _ in display_peaks:
+                dist_to_target = abs(float(peak_energy) - float(target_energy))
+                if dist_to_target > support_window:
+                    continue
+                # Nearby spectral support exists for this shell line.
+                return True
+
+            local_idx = np.where(np.abs(E - float(target_energy)) <= support_window)[0]
+            if local_idx.size == 0:
+                return False
+
+            local_snr = float(np.nanmax(spec[local_idx]) / max(float(background_std), 1e-9))
+            weak_bump_threshold = max(2.5, 0.35 * float(snr_threshold))
+            if local_snr < weak_bump_threshold:
+                return False
+
+            return True
+
+        def strong_secondary_lines_have_support(
+            element, shell_name, matched_line_energy, weight_threshold=None
+        ):
+            """Return True if all strong secondary lines within shell_name (besides the matched one) have support."""
+            if weight_threshold is None:
+                # Keep L-shell checks strict (e.g. Xe La1 requires visible Lg1),
+                # but avoid over-eliminating K-shell IDs (e.g. Fe Ka without
+                # clearly visible Kb in low-count/trace conditions).
+                if shell_name == "L":
+                    weight_threshold = 0.03
+                elif shell_name == "K":
+                    weight_threshold = 0.12
+                else:
+                    weight_threshold = 0.10
+            support_window = max(float(tolerance), 3.0 * float(self.sampling[0]), 0.04)
+            weak_bump_threshold = max(2.5, 0.35 * float(snr_threshold))
+            for line_name, line_info in (all_info.get(str(element), {}) or {}).items():
+                if not type(self)._line_allowed_for_element(str(element), line_name, edge_filters):
+                    continue
+                if type(self)._line_shell(line_name) != shell_name:
+                    continue
+                try:
+                    line_energy = float(line_info.get("energy (keV)", line_info.get("energy")))
+                    line_weight = float(line_info.get("weight", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if not (energy_min <= line_energy <= energy_max):
+                    continue
+                if line_weight < weight_threshold:
+                    continue
+                # Skip the line that was actually matched — it trivially has support
+                if abs(line_energy - float(matched_line_energy)) <= support_window:
+                    continue
+                # This secondary line needs nearby spectral support.
+                found_support = False
+                for _, _, pe, _ in display_peaks:
+                    if abs(float(pe) - line_energy) > support_window:
+                        continue
+                    found_support = True
+                    break
+                if found_support:
+                    continue
+                # Fallback: raw spectral SNR near the secondary line.
+                local_idx = np.where(np.abs(E - line_energy) <= support_window)[0]
+                if local_idx.size == 0:
+                    return False
+                local_y = np.asarray(spec[local_idx], dtype=float)
+                local_rel = int(np.argmax(local_y))
+                local_max_pos = int(local_idx[local_rel])
+                local_snr = float(spec[local_max_pos] / max(float(background_std), 1e-9))
+
+                # Secondary-line support can be accepted from a clear local
+                # maximum, even if it does not satisfy the stricter SNR gate.
+                has_local_max = True
+                if local_y.size >= 3:
+                    if local_rel <= 0 or local_rel >= int(local_y.size) - 1:
+                        has_local_max = False
+                    else:
+                        has_local_max = bool(
+                            local_y[local_rel] >= local_y[local_rel - 1]
+                            and local_y[local_rel] >= local_y[local_rel + 1]
+                        )
+
+                edge_baseline = float(
+                    np.median([local_y[0], local_y[-1], float(np.percentile(local_y, 30))])
+                )
+                relief_snr = float(
+                    (local_y[local_rel] - edge_baseline) / max(float(background_std), 1e-9)
+                )
+                local_bump_threshold = max(1.2, 0.45 * float(floor))
+
+                if local_snr < weak_bump_threshold and not (
+                    has_local_max and relief_snr >= local_bump_threshold
+                ):
+                    return False
+            return True
 
         element_stats, line_evidence = {}, {}
         for (
@@ -1186,6 +1662,46 @@ class Dataset3deds(Dataset3dspectroscopy):
             if conf > evidence["best_conf"]:
                 evidence["best_conf"] = float(conf)
                 evidence["best_snr"] = float(snr)
+
+        # Collect all candidate elements across every display peak (not just best-match winners)
+        all_candidate_shells: dict[str, set] = {}
+        for peak_idx, height, peak_energy, snr in display_peaks:
+            for m in candidate_matches(peak_energy, snr, search_elements):
+                shell = m["shell"]
+                if shell in {"K", "L", "M"}:
+                    all_candidate_shells.setdefault(m["element"], set()).add(shell)
+
+        shell_hierarchy = ["K", "L", "M"]  # descending energy order
+
+        demoted_elements = set()
+        for element, shells in all_candidate_shells.items():
+            # Prefer shells that actually won first-pass matches for this element.
+            # Using all candidate shells can falsely trigger higher-shell checks
+            # (e.g. Cu candidate L-lines) even when the element is only evidenced by K-lines.
+            observed_shells = set((element_stats.get(element, {}) or {}).get("shells", set())) & {
+                "K",
+                "L",
+                "M",
+            }
+            matched_shells = observed_shells if observed_shells else (shells & {"K", "L", "M"})
+            observable = observable_shells_for_element(element)
+            eliminate = False
+            for matched_shell in matched_shells:
+                shell_idx = shell_hierarchy.index(matched_shell)
+                # Every higher-energy shell that is observable must have spectral support.
+                # Also verify that the supporting shell is genuine by checking its own
+                # strong secondary lines — prevents a coincidental neighbouring peak
+                # (e.g. Cu Kb1,3 near Os La1) from falsely satisfying the L-shell check.
+                for higher_shell in shell_hierarchy[:shell_idx]:
+                    if higher_shell not in observable:
+                        continue
+                    if not shell_has_observable_support(element, higher_shell):
+                        eliminate = True
+                        break
+                if eliminate:
+                    break
+            if eliminate:
+                demoted_elements.add(str(element))
 
         element_confidence = {}
         # --- Intensity ratio check and multi-peak pattern boost ---
@@ -1324,28 +1840,49 @@ class Dataset3deds(Dataset3dspectroscopy):
             return prior, factor
 
         def consistency_boost(element, line_name, peak_energy):
-            if element not in dominant_elements:
-                return 1.0
+            is_detected = element in detected_elements
+            is_dominant = element in dominant_elements
+            if is_dominant:
+                scale = 1.0
+            elif is_detected:
+                scale = 0.80
+            else:
+                scale = 0.65
+            # First, check evidence for this exact line
             evidence = line_evidence.get(f"{element} {line_name}")
-            if not evidence or not any(
-                abs(float(peak_energy) - float(prev)) >= 0.04
+            if evidence and any(
+                abs(float(peak_energy) - float(prev)) <= 0.04
                 for prev in evidence.get("energies", [])
             ):
-                return 1.0
-            best_conf = float(evidence.get("best_conf", 0.0))
-            best_snr = float(evidence.get("best_snr", 0.0))
-            strong = int(evidence.get("strong_matches", 0))
+                best_conf = float(evidence.get("best_conf", 0.0))
+                best_snr = float(evidence.get("best_snr", 0.0))
+                strong = int(evidence.get("strong_matches", 0))
+                line_weight = float(
+                    (all_info.get(element, {}).get(line_name, {}) or {}).get("weight", 0.5)
+                )
+                tier = 1.0 + 0.7 * max(0.0, line_weight - 0.35)
+                if strong >= 1 and best_conf >= 1.4:
+                    return min(3.2, scale * 2.4 * tier)
+                if best_conf >= 1.1 and best_snr >= max(floor, 0.75 * snr_threshold):
+                    return min(2.6, scale * 1.9 * tier)
+                if best_conf >= 0.8:
+                    return min(2.0, scale * 1.5 * tier)
+                return min(1.5, scale * 1.2 * tier)
+            # Element was matched via a different line — boost secondary lines of this element
+            stats = element_stats.get(element, {})
+            elem_conf = float(element_confidence.get(element, 0.0))
+            elem_strong = int(stats.get("strong_matches", 0))
             line_weight = float(
                 (all_info.get(element, {}).get(line_name, {}) or {}).get("weight", 0.5)
             )
-            tier = 1.0 + 0.7 * max(0.0, line_weight - 0.35)
-            if strong >= 1 and best_conf >= 1.4:
-                return min(3.2, 2.4 * tier)
-            if best_conf >= 1.1 and best_snr >= max(snr_min, 0.75 * snr_threshold):
-                return min(2.6, 1.9 * tier)
-            if best_conf >= 0.8:
-                return min(2.0, 1.5 * tier)
-            return min(1.5, 1.2 * tier)
+            tier = 1.0 + 0.5 * max(0.0, line_weight - 0.35)
+            if elem_strong >= 1 and elem_conf >= 1.4:
+                return min(2.4, scale * 1.8 * tier)
+            if elem_conf >= 1.1:
+                return min(2.0, scale * 1.5 * tier)
+            if elem_conf >= 0.8:
+                return min(1.6, scale * 1.2 * tier)
+            return min(1.3, scale * 1.1 * tier)
 
         def dominant_boost(element):
             if element not in dominant_elements:
@@ -1365,42 +1902,333 @@ class Dataset3deds(Dataset3dspectroscopy):
             element_to_lines = {}
             for _, _, _, _, el, _, _, ln, _, _ in peak_matches:
                 element_to_lines.setdefault(el, set()).add(ln)
+
+            def _has_main_line(lines, target):
+                # Accept compact aliases from x_ray_lines.csv such as La1,2 or Kb1,3.
+                for ln in lines:
+                    name = str(ln)
+                    if name == target:
+                        return True
+                    if target in {"Ka1", "Kb1", "La1", "Lb1", "Ma1", "Mb1"} and name.startswith(
+                        target + ","
+                    ):
+                        return True
+                return False
+
+            def _canonical_aliases(target):
+                if target == "La1":
+                    return ("La1", "La1,2")
+                if target == "Lb1":
+                    return ("Lb1",)
+                if target == "Ka1":
+                    return ("Ka1",)
+                if target == "Kb1":
+                    return ("Kb1", "Kb1,3")
+                return (target,)
+
+            def _line_evidence_strength(element, target):
+                best = 0.0
+                for alias in _canonical_aliases(target):
+                    ev = line_evidence.get(f"{element} {alias}")
+                    if not ev:
+                        continue
+                    best_conf = float(ev.get("best_conf", 0.0))
+                    strong = float(ev.get("strong_matches", 0))
+                    count = float(ev.get("match_count", 0))
+                    score = best_conf + 0.45 * strong + 0.15 * count
+                    if score > best:
+                        best = score
+                return best
+
+            def _l_support_strength(element):
+                return _line_evidence_strength(element, "La1") + _line_evidence_strength(
+                    element, "Lb1"
+                )
+
+            candidates = candidate_matches(peak_energy, snr, allowed_elements)
+
+            # For weak peaks, also consider a relaxed-distance pass for already
+            # detected/dominant elements. This keeps context-consistent lines in
+            # play (e.g. Te continuation) even when local calibration/noise shifts
+            # push them slightly beyond the strict tolerance window.
+            weak_peak = float(snr) < max(2.5 * float(floor), 0.30 * float(snr_threshold))
+            if weak_peak:
+                relaxed_tol = max(float(tolerance), 0.30)
+                context_elements = set(map(str, detected_elements | dominant_elements))
+                if context_elements:
+                    for element_name, lines in all_info.items():
+                        element_name = str(element_name)
+                        if element_name not in context_elements:
+                            continue
+                        if allowed_elements is not None and element_name not in allowed_elements:
+                            continue
+                        for line_name, line_info in lines.items():
+                            if not type(self)._line_allowed_for_element(
+                                element_name, line_name, edge_filters
+                            ):
+                                continue
+                            line_weight = float(line_info.get("weight", 0.5))
+                            line_energy = float(line_info["energy (keV)"])
+                            shell = type(self)._line_shell(line_name)
+                            tol = (
+                                relaxed_tol * 0.5
+                                if shell == "M"
+                                and ("Ma" not in line_name and "Mb" not in line_name)
+                                else relaxed_tol
+                            )
+                            distance = abs(float(peak_energy) - line_energy)
+                            if line_weight < min_line_weight or distance > tol:
+                                continue
+                            score = type(self)._peak_confidence(
+                                snr, line_weight, distance, relaxed_tol
+                            ) * type(self)._shell_preference_factor(shell)
+                            candidates.append(
+                                {
+                                    "element": element_name,
+                                    "line": str(line_name),
+                                    "weight": line_weight,
+                                    "distance": distance,
+                                    "score": float(score),
+                                    "shell": shell,
+                                }
+                            )
+
+            # De-duplicate exact element/line candidates, keeping highest score.
+            if candidates:
+                uniq = {}
+                for c in candidates:
+                    key = (str(c["element"]), str(c["line"]))
+                    prev = uniq.get(key)
+                    if prev is None or float(c["score"]) > float(prev["score"]):
+                        uniq[key] = c
+                candidates = list(uniq.values())
+                candidates.sort(key=lambda m: m["score"], reverse=True)
+
+                # Performance guard: the precedence logic below is O(n^2) over
+                # candidates. Keep the strongest candidates, but always retain
+                # context-important elements (confirmed/dominant/preferred).
+                max_candidates = 48
+                if len(candidates) > max_candidates:
+                    context_elements = set(
+                        map(str, detected_elements | dominant_elements | preferred_elements)
+                    )
+                    trimmed = list(candidates[:max_candidates])
+                    if context_elements:
+                        kept_keys = {(str(c["element"]), str(c["line"])) for c in trimmed}
+                        for c in candidates[max_candidates:]:
+                            key = (str(c["element"]), str(c["line"]))
+                            if key in kept_keys:
+                                continue
+                            if str(c["element"]) in context_elements:
+                                trimmed.append(c)
+                                kept_keys.add(key)
+                    candidates = trimmed
+
+            element_has_l_support = {}
+            element_has_l_pair = {}
+            for el, lines in element_to_lines.items():
+                has_la = _has_main_line(lines, "La1")
+                has_lb = _has_main_line(lines, "Lb1")
+                element_has_l_support[str(el)] = has_la or has_lb
+                element_has_l_pair[str(el)] = has_la and has_lb
+
+            # Guard against boosted confirmed elements stealing a peak from a
+            # much-closer strong K/L candidate (e.g. Cu Ka around 8 keV).
+            distance_anchor = None
+            for candidate in candidates:
+                if candidate["shell"] not in {"K", "L"}:
+                    continue
+                if float(candidate["weight"]) < 0.30:
+                    continue
+                if float(candidate["score"]) < 0.45:
+                    continue
+                distance_anchor = max(float(candidate["distance"]), 1e-9)
+                break
+
             scored = []
-            for match in candidate_matches(peak_energy, snr, allowed_elements):
+            for match in candidates:
                 element, line_name, shell = match["element"], match["line"], match["shell"]
+                is_demoted = str(element) in demoted_elements
+
+                minor_l_penalty = 1.0
+
+                # Logical guard for L-series continuation: do not let an orphan
+                # minor L-line assignment (Ll/Lg/Lb2) outrank a closer candidate
+                # from an element that already shows L-series support (La/Lb).
+                if (
+                    shell == "L"
+                    and line_name in {"Ll", "Lg1", "Lb2,15"}
+                    and not element_has_l_support.get(str(element), False)
+                ):
+                    supported_closer_exists = False
+                    for other in candidates:
+                        other_el = str(other["element"])
+                        if other_el == str(element):
+                            continue
+                        if other["shell"] != "L":
+                            continue
+                        if not element_has_l_support.get(other_el, False):
+                            continue
+                        if float(other["distance"]) < float(match["distance"]):
+                            supported_closer_exists = True
+                            break
+                    if supported_closer_exists:
+                        minor_l_penalty *= 0.55
+
+                # Stricter logical precedence: an orphan minor L-line must not
+                # outrank a closer L-line from an element with an established
+                # La/Lb pair in this spectrum.
+                if (
+                    shell == "L"
+                    and line_name in {"Ll", "Lg1", "Lb2,15"}
+                    and not element_has_l_pair.get(str(element), False)
+                ):
+                    paired_closer_exists = False
+                    for other in candidates:
+                        other_el = str(other["element"])
+                        if other_el == str(element):
+                            continue
+                        if other["shell"] != "L":
+                            continue
+                        if not element_has_l_pair.get(other_el, False):
+                            continue
+                        if float(other["distance"]) <= float(match["distance"]):
+                            paired_closer_exists = True
+                            break
+                    if paired_closer_exists:
+                        minor_l_penalty *= 0.70
+
+                # Evidence-strength precedence for minor L-lines:
+                # if another element has materially stronger La/Lb evidence and
+                # a comparable-or-better distance match, do not keep the weaker
+                # minor-L candidate as a possible winner.
+                if shell == "L" and line_name in {"Ll", "Lg1", "Lb2,15"}:
+                    this_el = str(element)
+                    this_dist = float(match["distance"])
+                    this_support = _l_support_strength(this_el)
+                    beaten_by_stronger = False
+                    for other in candidates:
+                        other_el = str(other["element"])
+                        if other_el == this_el or other["shell"] != "L":
+                            continue
+                        other_support = _l_support_strength(other_el)
+                        if other_support <= max(0.4, this_support + 0.30):
+                            continue
+                        # Accept up to 30 eV slack so support can break near ties.
+                        if float(other["distance"]) <= this_dist + 0.03:
+                            beaten_by_stronger = True
+                            break
+                    if beaten_by_stronger:
+                        minor_l_penalty *= 0.60
+
                 prior, prior_factor = prior_boost(element)
                 pref = 1.35 if element in preferred_elements else 1.0
                 anchor = 1.15 if element in anchor_elements and shell in {"K", "L"} else 1.0
-                consistency = consistency_boost(element, line_name, peak_energy)
                 dom = dominant_boost(element)
                 # Pattern boost: if both main lines for K, L, or M are matched by detected peaks, boost candidate score
                 lines_matched = element_to_lines.get(element, set())
-                k_lines = {"Ka1", "Kb1"}
-                l_lines = {"La1", "Lb1"}
-                m_lines = {"Ma1", "Mb1"}
+                has_k_pair = _has_main_line(lines_matched, "Ka1") and _has_main_line(
+                    lines_matched, "Kb1"
+                )
+                has_l_pair = _has_main_line(lines_matched, "La1") and _has_main_line(
+                    lines_matched, "Lb1"
+                )
+                has_m_pair = _has_main_line(lines_matched, "Ma1") and _has_main_line(
+                    lines_matched, "Mb1"
+                )
                 pattern_factor = 1.0
-                if k_lines.issubset(lines_matched):
+                if has_k_pair:
                     pattern_factor = 3.0
-                elif l_lines.issubset(lines_matched):
+                elif has_l_pair:
                     pattern_factor = 2.5
-                elif m_lines.issubset(lines_matched):
+                elif has_m_pair:
                     pattern_factor = 2.0
+
                 if shell == "M":
                     prior_factor = 1.0 + 0.3 * prior
-                    consistency = 1.0
                     dom = min(dom, 1.30)
+
+                # Guard against introducing new singleton elements on weak peaks.
+                # If an element is not already detected/dominant and only appears
+                # as an isolated line, require a very tight distance match.
+                if (
+                    weak_peak
+                    and element not in detected_elements
+                    and element not in dominant_elements
+                ):
+                    matched_lines_for_el = element_to_lines.get(element, set())
+                    # Consider an element supported if it already has any matched
+                    # line in the current spectrum, or strong line evidence from
+                    # first-pass matching. This avoids dropping context-consistent
+                    # secondary lines (e.g. Cu Kb1,3 after Cu Ka1 is matched).
+                    element_line_strength = 0.0
+                    for ln in matched_lines_for_el:
+                        ev = line_evidence.get(f"{element} {ln}")
+                        if not ev:
+                            continue
+                        best_conf = float(ev.get("best_conf", 0.0))
+                        strong = float(ev.get("strong_matches", 0))
+                        count = float(ev.get("match_count", 0))
+                        element_line_strength = max(
+                            element_line_strength, best_conf + 0.4 * strong + 0.1 * count
+                        )
+
+                    has_support = len(matched_lines_for_el) >= 1 or element_line_strength >= 0.8
+                    if not has_support:
+                        if float(match["distance"]) > 0.035:
+                            continue
+                        prior_factor *= 0.65
+                # For confirmed elements (detected or dominant), the line_weight prior is irrelevant —
+                # we already know the element is present. Use weight=1.0 and score purely on distance
+                # so that e.g. Cu Kb1 (weight=0.17) beats Os La1 (weight=1.0) when Cu is confirmed
+                # and Cu Kb1 is closer to the measured peak.
+                confirmed = element in detected_elements or element in dominant_elements
+                if confirmed:
+                    sigma = max(float(tolerance) / 3.0, 1e-9)
+                    distance_factor = np.exp(-0.5 * (float(match["distance"]) / sigma) ** 2)
+                    base_score = (
+                        np.log1p(max(float(snr), 0.0))
+                        * 1.0
+                        * distance_factor
+                        * type(self)._shell_preference_factor(shell)
+                    )
+                    # Once an element is clearly present, prefer physically
+                    # consistent continuation lines over introducing new
+                    # elements for nearby ambiguous peaks.
+                    continuation = consistency_boost(element, line_name, peak_energy)
+                    base_score = base_score * max(1.0, min(float(continuation), 1.8))
+                else:
+                    base_score = match["score"]
+                    consistency = consistency_boost(element, line_name, peak_energy)
+                    # Non-confirmed elements should not gain an aggressive
+                    # boost that steals peaks from already-confirmed elements.
+                    base_score = base_score * min(1.0, float(consistency))
                 score = (
-                    match["score"]
+                    base_score
                     * prior_factor
                     * pref
                     * anchor
-                    * consistency
                     * dom
                     * pattern_factor
+                    * minor_l_penalty
                 )
-                scored.append({**match, "score": float(score)})
 
-            scored.sort(key=lambda m: m["score"], reverse=True)
+                # If there is a strong nearby K/L anchor, damp long-distance
+                # takeovers that are caused mainly by cross-peak boosts.
+                if (
+                    confirmed
+                    and distance_anchor is not None
+                    and float(match["distance"]) > distance_anchor
+                ):
+                    ratio = float(match["distance"]) / distance_anchor
+                    if ratio >= 2.0:
+                        score *= ratio**-1.6
+
+                scored.append({**match, "score": float(score), "demoted": bool(is_demoted)})
+
+            # Ranking-only policy: keep shell-inconsistent elements as options,
+            # but place them behind more plausible (non-demoted) candidates.
+            scored.sort(key=lambda m: (bool(m.get("demoted", False)), -float(m["score"])))
             if mode == "elements_preferred" and preferred_elements:
                 preferred = [m for m in scored if m["element"] in preferred_elements]
                 scored = (
@@ -1443,7 +2271,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         refined_peak_matches = []
         for peak_idx, height, peak_energy, snr in display_peaks:
-            best = reranked_matches(peak_energy, snr, rematch_allowed or None, top_k=1)
+            best = reranked_matches(peak_energy, snr, None, top_k=1)
             best = best[0] if best else None
             if best is None:
                 continue
@@ -1463,6 +2291,34 @@ class Dataset3deds(Dataset3dspectroscopy):
             )
         peak_matches = refined_peak_matches
 
+        # Backfill element_confidence for elements that only appear after the
+        # unrestricted re-rank (e.g. not in search_elements so never entered
+        # element_stats in the first pass).  Use the same base formula as
+        # _peak_confidence so the displayed value is meaningful.
+        for (
+            _,
+            height,
+            peak_energy,
+            snr,
+            element,
+            _,
+            distance,
+            line_name,
+            line_weight,
+            _,
+        ) in peak_matches:
+            if element in element_confidence:
+                continue
+            sigma = max(float(tolerance) / 3.0, 1e-9)
+            dist_factor = float(np.exp(-0.5 * (float(distance) / sigma) ** 2))
+            raw = float(
+                np.log1p(max(float(snr), 0.0)) * max(float(line_weight), 0.0) * dist_factor
+            )
+            shell = type(self)._line_shell(str(line_name))
+            valid_shells = {shell} & {"K", "L", "M"}
+            major_bonus = 1.20 if {"K", "L"} & valid_shells else 1.0
+            element_confidence[element] = raw * major_bonus
+
         matched_elements = {str(match[4]) for match in peak_matches}
         detected_elements = {
             str(el)
@@ -1474,11 +2330,19 @@ class Dataset3deds(Dataset3dspectroscopy):
                 str(el) for el in preferred_elements if str(el) in matched_elements
             )
         refined_match_by_idx = {int(match[0]): match for match in peak_matches}
+        plot_peaks = display_peaks[:peaks]
+        plot_peak_indices = {int(pk_idx) for pk_idx, _, _, _ in plot_peaks}
 
         final_matches_by_element: dict[str, set[str]] = {}
         for _, _, _, _, element, _, _, line_name, _, _ in peak_matches:
             if element not in ignored_elements:
                 final_matches_by_element.setdefault(element, set()).add(str(line_name))
+
+        # For display purposes (table + plot), restrict to elements/lines seen in plot_peaks
+        plot_matches_by_element: dict[str, set[str]] = {}
+        for pk_idx, _, _, _, element, _, _, line_name, _, _ in peak_matches:
+            if int(pk_idx) in plot_peak_indices and element not in ignored_elements:
+                plot_matches_by_element.setdefault(element, set()).add(str(line_name))
 
         candidate_elements = sorted(
             str(el) for el in final_matches_by_element if str(el) not in detected_elements
@@ -1506,21 +2370,33 @@ class Dataset3deds(Dataset3dspectroscopy):
                 )
             return "\n".join(out) if out else "None"
 
-        all_identified = set(detected_elements) | set(candidate_elements)
-        print(
-            f"\nDetected: {format_elements_with_lines(all_identified) if all_identified else 'None'}"
+        plot_all_identified = set(
+            el
+            for el in (set(detected_elements) | set(candidate_elements))
+            if el in plot_matches_by_element
         )
-        visible_dominant = dominant_elements & all_identified
-        if visible_dominant:
-            dominant_str = ", ".join(
-                f"{el} (conf={element_confidence.get(str(el), 0.0):.2f})"
-                for el in sorted(
-                    visible_dominant,
-                    key=lambda el: element_confidence.get(str(el), 0.0),
-                    reverse=True,
+        if plot_all_identified:
+            det_rows = []
+            for element in sorted(map(str, plot_all_identified)):
+                conf = element_confidence.get(element, 0.0)
+                lines_matched = sorted(map(str, plot_matches_by_element.get(element, set())))
+                if element in detected_elements:
+                    status = "Dominant" if element in dominant_elements else "Detected"
+                else:
+                    status = "Possible"
+                det_rows.append(
+                    (element, status, conf, ", ".join(lines_matched) if lines_matched else "-")
                 )
+            det_rows.sort(
+                key=lambda r: (0 if r[1] == "Dominant" else 1 if r[1] == "Detected" else 2, -r[2])
             )
-            print(f"High confidence: {dominant_str}")
+            print(f"\n{'Element':<10} {'Confidence':<12} {'Matched Lines'}")
+            print("-" * 50)
+            for el, status, conf, lines_str in det_rows:
+                print(f"{el:<10} {conf:<12.3f} {lines_str}")
+            print("-" * 50)
+        else:
+            print("\nDetected: None")
 
         elements_for_color = set(detected_elements) | {str(match[4]) for match in peak_matches}
         if search_elements is not None:
@@ -1545,10 +2421,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         element_color_map = {
             el: palette[i % len(palette)] for i, el in enumerate(sorted(elements_for_color))
         }
-
         y_min = float(np.nanmin(spec)) if len(spec) else 0.0
         y_max = float(np.nanmax(spec)) if len(spec) else 1.0
-        y_scale = max(max(1e-9, y_max - y_min), abs(y_max), 1.0)
+        y_scale = max(max(1e-9, y_max - y_min), abs(y_max), abs(y_min), 1e-6)
         y_dot = -0.04 * y_scale
 
         def infer_requested_color(peak_energy):
@@ -1570,7 +2445,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             return best_element
 
         table_rows = []
-        for peak_idx, height, peak_energy, snr in display_peaks:
+        for peak_idx, height, peak_energy, snr in plot_peaks:
             match = refined_match_by_idx.get(int(peak_idx))
             color = (
                 element_color_map.get(match[4], "red")
@@ -1582,7 +2457,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 # Only plot solid lines for matched peaks (autodetected or requested elements)
                 if match is not None:
                     ax_spec.axvline(
-                        peak_energy, color=color, linestyle="-", alpha=0.7, linewidth=1.5
+                        peak_energy, color=color, linestyle="-", alpha=0.5, linewidth=1.5
                     )
                 else:
                     ax_spec.plot(
@@ -1647,17 +2522,17 @@ class Dataset3deds(Dataset3dspectroscopy):
                 )
                 continue
 
-            allowed_for_table = (
-                set(map(str, search_elements))
-                if search_elements is not None
-                else ({str(el) for el in all_info if str(el) not in ignored_elements} or None)
-            )
-            ranked = reranked_matches(peak_energy, snr, allowed_for_table, top_k=3)
+            # Best match for the table MUST be the same element/line shown on the spectrum
+            # (from refined_match_by_idx). Re-rank with all elements for Alt 2/3 alternatives.
+            best_label = f"{match[4]} {match[7]}"
+            ranked = reranked_matches(peak_energy, snr, None, top_k=3)
             labels = [
                 (f"{m['element']} {m['line']}", float(m["score"]), m["element"], m["line"])
                 for m in ranked
             ]
-            best_label = f"{match[4]} {match[7]}"
+            # If the spectrum winner appears in ranked, use that ordering; otherwise prepend it.
+            if not any(lbl.lower() == best_label.lower() for lbl, _, _, _ in labels):
+                labels = [(best_label, 0.0, match[4], match[7])] + labels
 
             def fmt(label, score=None):
                 label = (
@@ -1669,18 +2544,18 @@ class Dataset3deds(Dataset3dspectroscopy):
 
             # Gather all intensities for this element for ratio calculation
             all_element_intensities = {}
-            for intensity in all_info.get(match[4], {}):
+            for ll in all_info.get(match[4], {}):
                 # Find the highest observed intensity for each line
                 obs = 0.0
                 for _, h, _, _, el, _, _, ln, _, _ in peak_matches:
-                    if el == match[4] and ln == intensity:
+                    if el == match[4] and ln == ll:
                         obs = max(obs, float(h))
-                weight = all_info.get(match[4], {}).get(intensity, {}).get("weight", None)
+                weight = all_info.get(match[4], {}).get(ll, {}).get("weight", None)
                 try:
                     weight = float(weight) if weight is not None else 0.0
                 except Exception:
                     weight = 0.0
-                all_element_intensities[intensity] = (obs, weight)
+                all_element_intensities[ll] = (obs, weight)
 
             remaining = [
                 (label, score, elem, line)
@@ -1716,9 +2591,8 @@ class Dataset3deds(Dataset3dspectroscopy):
             )
 
         current_bottom, current_top = ax_spec.get_ylim()
-        ax_spec.set_ylim(
-            bottom=min(current_bottom, y_dot - 0.02 * y_scale, -0.02 * y_scale), top=current_top
-        )
+        padded_bottom = min(current_bottom, y_min - 0.10 * y_scale)
+        ax_spec.set_ylim(bottom=padded_bottom, top=current_top)
 
         label_candidates = []
         top_label_y = 0.92
@@ -1757,11 +2631,11 @@ class Dataset3deds(Dataset3dspectroscopy):
                         for matched_energy in matched_by_element.get(str(element), [])
                     ):
                         continue
-                    color = element_color_map.get(str(element), "black")
+                    color = element_color_map.get(str(element), "gray")
                     style = "--"
-                    alpha = 0.45
+                    alpha = 0.5
                     ax_spec.axvline(
-                        line_energy, color=color, linestyle=style, alpha=alpha, linewidth=1.2
+                        line_energy, color="gray", linestyle=style, alpha=alpha, linewidth=1.2
                     )
                     label_candidates.append(
                         (
@@ -1778,11 +2652,15 @@ class Dataset3deds(Dataset3dspectroscopy):
                     )
 
         if show_text and peak_matches:
-            label_offset = max(0.03 * y_scale, 0.08)
+            # Keep label offset proportional to local y-scale so low-intensity
+            # windows (e.g., 5.5-7 keV) do not place text outside the axes.
+            label_offset = 0.08 * y_scale
             label_allowed = set(detected_elements) | possible_elements
             if requested_elements:
                 label_allowed.update(str(el) for el in requested_elements)
-            for _, height, peak_energy, _, element, match_str, _, _, _, _ in peak_matches:
+            for pk_idx, height, peak_energy, _, element, match_str, _, _, _, _ in peak_matches:
+                if int(pk_idx) not in plot_peak_indices:
+                    continue
                 is_requested = requested_elements is not None and element in requested_elements
                 if element not in label_allowed or in_ignore(peak_energy):
                     continue
@@ -1804,72 +2682,97 @@ class Dataset3deds(Dataset3dspectroscopy):
         legend_handles, legend_labels = [], set()
         if show_text and label_candidates:
             label_candidates.sort(key=lambda item: item[0])
-            groups, current = [], []
-            overlap_threshold = max(0.16, 1.1 * float(tolerance))
-            for label in label_candidates:
-                if not current or abs(label[0] - current[-1][0]) <= overlap_threshold:
-                    current.append(label)
-                else:
-                    groups.append(current)
-                    current = [label]
-            if current:
-                groups.append(current)
-
-            for group in groups:
-                if len(group) == 1:
-                    (
+            drawn_texts = []
+            for (
+                peak_energy,
+                label_text,
+                color,
+                linestyle,
+                y_value,
+                y_mode,
+                font_size,
+                font_weight,
+                alpha_value,
+            ) in label_candidates:
+                common = dict(
+                    ha="center",
+                    fontsize=font_size,
+                    color=color,
+                    weight=font_weight,
+                    rotation=90,
+                    alpha=alpha_value,
+                )
+                if y_mode == "axes_top":
+                    txt = ax_spec.text(
                         peak_energy,
-                        label_text,
-                        color,
-                        _,
                         y_value,
-                        y_mode,
-                        font_size,
-                        font_weight,
-                        alpha_value,
-                    ) = group[0]
-                    common = dict(
-                        ha="center",
-                        fontsize=font_size,
-                        color=color,
-                        weight=font_weight,
-                        rotation=90,
-                        alpha=alpha_value,
+                        label_text,
+                        va="top",
+                        transform=ax_spec.get_xaxis_transform(),
+                        clip_on=True,
+                        **common,
                     )
-                    if y_mode == "axes_top":
-                        ax_spec.text(
-                            peak_energy,
-                            y_value,
-                            label_text,
-                            va="top",
-                            transform=ax_spec.get_xaxis_transform(),
-                            clip_on=True,
-                            **common,
-                        )
-                    else:
-                        ax_spec.text(peak_energy, y_value, label_text, va="bottom", **common)
                 else:
-                    for _, label_text, color, linestyle, *_ in group:
+                    txt = ax_spec.text(peak_energy, y_value, label_text, va="bottom", **common)
+                # Prioritize data-peak labels over top reference labels if collisions occur.
+                priority = 1 if y_mode == "data" else 0
+                drawn_texts.append((txt, label_text, color, linestyle, priority))
+
+            if drawn_texts:
+                fig.canvas.draw()
+                ax_bbox = ax_spec.get_window_extent()
+                renderer = fig.canvas.get_renderer()
+                kept_bboxes = []
+                # Keep higher-priority labels first, then by x-position for stable layout.
+                drawn_texts.sort(key=lambda item: (-item[4], item[0].get_position()[0]))
+                for txt, label_text, color, linestyle, _ in drawn_texts:
+                    txt_bbox = txt.get_window_extent(renderer=renderer)
+                    out_of_bounds = (
+                        txt_bbox.x0 < ax_bbox.x0
+                        or txt_bbox.x1 > ax_bbox.x1
+                        or txt_bbox.y0 < ax_bbox.y0
+                        or txt_bbox.y1 > ax_bbox.y1
+                    )
+                    overlaps_kept = any(txt_bbox.overlaps(prev_bbox) for prev_bbox in kept_bboxes)
+
+                    if out_of_bounds or overlaps_kept:
+                        txt.remove()
                         key = (label_text, str(color), linestyle)
-                        if key in legend_labels:
-                            continue
-                        legend_labels.add(key)
-                        legend_handles.append(
-                            Line2D(
-                                [0],
-                                [0],
-                                color=color,
-                                linestyle=linestyle,
-                                linewidth=1.5,
-                                label=label_text,
+                        if key not in legend_labels:
+                            legend_labels.add(key)
+                            legend_handles.append(
+                                Line2D(
+                                    [0],
+                                    [0],
+                                    color=color,
+                                    linestyle=linestyle,
+                                    linewidth=1.5,
+                                    label=label_text,
+                                )
                             )
-                        )
+                    else:
+                        kept_bboxes.append(txt_bbox)
 
         if legend_handles:
             overlap_legend = ax_spec.legend(
                 handles=legend_handles, loc="upper right", fontsize=8, title="Overlapping Labels"
             )
             ax_spec.add_artist(overlap_legend)
+
+        if line is not None:
+            x_min, x_max = ax_spec.get_xlim()
+            _ref_energies = [line] if isinstance(line, (int, float)) else list(line)
+            for ref_energy in _ref_energies:
+                try:
+                    ref_energy = float(ref_energy)
+                except (TypeError, ValueError):
+                    continue
+                # Do not let out-of-window reference lines change autoscaled limits.
+                if x_min <= ref_energy <= x_max:
+                    ax_spec.axvline(
+                        ref_energy, color="black", linestyle="--", linewidth=1.2, zorder=3
+                    )
+            ax_spec.set_xlim(x_min, x_max)
 
         fig.tight_layout()
         plt.show()
@@ -1885,7 +2788,8 @@ class Dataset3deds(Dataset3dspectroscopy):
             )
         print("-" * 105)
         print(
-            f"{len(display_peaks)} of {len(significant_peaks)} peaks above snr_min={snr_min:.1f}, snr_threshold={snr_threshold:.1f} displayed.\n"
+            f"{len(plot_peaks)} of {len(display_peaks)} peaks above "
+            f"floor={floor:.1f}, snr_threshold={snr_threshold:.1f} displayed.\n"
         )
 
         if return_details:
@@ -1896,7 +2800,9 @@ class Dataset3deds(Dataset3dspectroscopy):
                 "element_confidence": element_confidence,
                 "display_peaks": display_peaks,
                 "peak_matches": peak_matches,
-                "snr_min": snr_min,
+                "floor": floor,
+                "snr_quantile_floor": floor,
+                "snr_min": floor,
                 "snr_threshold": snr_threshold,
             }
         return fig, (ax_img, ax_spec)
