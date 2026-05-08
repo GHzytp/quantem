@@ -291,10 +291,7 @@ class Dataset3dspectroscopy(Dataset3d):
             self.model_elements[element_key] = {
                 line_name: line_info
                 for line_name, line_info in lines_info.items()
-                if not (
-                    type(self)._line_matches_selectors(line_name, selectors)
-                    or type(self)._line_info_matches_selectors(line_info, selectors)
-                )
+                if not type(self)._line_matches_selectors(line_name, selectors)
             }
             if not self.model_elements[element_key]:
                 self.model_elements.pop(element_key, None)
