@@ -527,6 +527,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         ])
         # Observe compound roi_center for batched updates from JS
         self.observe(self._on_roi_center_change, names=["roi_center"])
+        # Invalidate precomputed virtual image caches when calibration changes
+        self.observe(self._on_calibration_change, names=["center_row", "center_col", "bf_radius"])
 
         # Initialize default ROI at BF center — batch to avoid redundant observer callbacks
         with self.hold_trait_notifications():
@@ -2161,6 +2163,12 @@ class Show4DSTEM(anywidget.AnyWidget):
         """Create rectangular mask (boolean tensor on device)."""
         mask = (torch.abs(self._det_col_coords - cx) <= half_width) & (torch.abs(self._det_row_coords - cy) <= half_height)
         return mask
+
+    def _on_calibration_change(self, change=None):
+        self._cached_bf_virtual = None
+        self._cached_abf_virtual = None
+        self._cached_adf_virtual = None
+        self._cached_haadf_virtual = None
 
     def _precompute_common_virtual_images(self):
         """Pre-compute BF/ABF/ADF/HAADF virtual image bytes. Annular ranges match

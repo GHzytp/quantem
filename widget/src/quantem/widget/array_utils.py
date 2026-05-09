@@ -1,11 +1,15 @@
 """Array utilities for widgets. NumPy + PyTorch input."""
 import numpy as np
-import torch
 
 
 def to_numpy(data, dtype: np.dtype | None = None) -> np.ndarray:
     """Convert NumPy / PyTorch / Dataset to NumPy."""
-    if isinstance(data, torch.Tensor):
+    try:
+        import torch
+        is_tensor = isinstance(data, torch.Tensor)
+    except ImportError:
+        is_tensor = False
+    if is_tensor:
         result = data.detach().cpu().numpy()
     elif isinstance(data, np.ndarray):
         result = data

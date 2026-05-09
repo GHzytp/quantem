@@ -575,66 +575,6 @@ class Show2D(anywidget.AnyWidget):
         except (ValueError, KeyError):
             pass
 
-    def set_image(self, data, labels=None):
-        """Replace the displayed image(s). Preserves all display settings."""
-        if hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling"):
-            data = data.array
-        if isinstance(data, list):
-            images = [to_numpy(d) for d in data]
-            shapes = [img.shape for img in images]
-            if len(set(shapes)) > 1:
-                max_h = max(s[0] for s in shapes)
-                max_w = max(s[1] for s in shapes)
-                images = [_resize_image(img, max_h, max_w) for img in images]
-            data = np.stack(images)
-        else:
-            data = to_numpy(data)
-        if data.ndim == 2:
-            data = data[np.newaxis, ...]
-        if data.dtype == np.float32:
-            self._data = np.array(data, dtype=np.float32, copy=True)
-        else:
-            self._data = np.asarray(data, dtype=np.float32)
-        self._data_original = [self._data[i] for i in range(self._data.shape[0])]
-        self._originals_are_views = True
-        self.n_images = int(data.shape[0])
-
-        # Auto-bin for display (reuse existing _display_bin or recompute)
-        gpu_budget_mb = 2500
-        per_image_mb = (data.shape[1] * data.shape[2] * 4 * 3) / (1024 * 1024)
-        total_mb = self.n_images * per_image_mb
-        self._display_bin = 1
-        if total_mb > gpu_budget_mb:
-            for bf in [2, 4, 8]:
-                if total_mb / (bf * bf) <= gpu_budget_mb:
-                    self._display_bin = bf
-                    break
-            else:
-                self._display_bin = 8
-
-        if self._display_bin > 1:
-            from quantem.widget.array_utils import bin2d
-            self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
-            self.height = int(self._display_data.shape[1])
-            self.width = int(self._display_data.shape[2])
-            self._display_bin_factor = self._display_bin
-            if getattr(self, "_verbose", True):
-                print(f"  Display bin {self._display_bin}×: {data.shape[1]}×{data.shape[2]} → {self.height}×{self.width}")
-        else:
-            self._display_data = self._data
-            self.height = int(data.shape[1])
-            self.width = int(data.shape[2])
-            self._display_bin_factor = 1
-
-        self.image_rotations = [0] * self.n_images
-        if labels is not None:
-            self.labels = list(labels)
-        else:
-            self.labels = [f"Image {i+1}" for i in range(self.n_images)]
-        self.selected_idx = 0
-        self._compute_all_stats()
-        self._update_all_frames()
-
     def __repr__(self) -> str:
         if self.n_images > 1:
             shape = f"{self.n_images}×{self.height}×{self.width}"
