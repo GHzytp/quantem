@@ -5,12 +5,12 @@ For displaying a single image or a static gallery of multiple images.
 Unlike Show3D (interactive), Show2D focuses on static visualization.
 """
 
+import base64
+import io
 import json
+import math
 import os
 import pathlib
-import io
-import base64
-import math
 import warnings
 from enum import StrEnum
 from typing import Self
@@ -21,11 +21,10 @@ import matplotlib.patheffects
 import matplotlib.pyplot as plt
 import numpy as np
 import traitlets
-
-from quantem.core.datastructures import Dataset2d, Dataset3d
-from quantem.widget.array_utils import to_numpy, _resize_image
+from quantem.widget.array_utils import _resize_image, to_numpy
 from quantem.widget.state import resolve_widget_version, save_state_file, unwrap_state_payload
 
+from quantem.core.datastructures import Dataset2d, Dataset3d
 
 
 def _reject_unknown_kwargs(cls, kwargs: dict) -> None:
@@ -467,7 +466,8 @@ class Show2D(anywidget.AnyWidget):
         if isinstance(vmin, (list, tuple)) or isinstance(vmax, (list, tuple)):
             n = self.n_images
             def _expand(v):
-                if v is None: return [None] * n
+                if v is None:
+                    return [None] * n
                 if isinstance(v, (list, tuple)):
                     if len(v) != n:
                         raise ValueError(f"vmin/vmax list has length {len(v)} but n_images is {n}. Pass a list of length {n} or a scalar to apply uniformly.")
