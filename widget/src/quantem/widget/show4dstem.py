@@ -582,63 +582,6 @@ class Show4DSTEM(anywidget.AnyWidget):
             shape = "x".join(str(s) for s in self._data.shape)
             print(f"Show4DSTEM: {shape} {self._device}, {time.perf_counter() - _t0:.2f}s total")
 
-    def set_image(self, data, scan_shape=None):
-        """Replace the 4D-STEM data. Preserves all display and ROI settings."""
-        if hasattr(data, "sampling") and hasattr(data, "array"):
-            data = data.array
-        data_np = to_numpy(data)
-        saturated_value = 65535.0 if data_np.dtype == np.uint16 else 255.0 if data_np.dtype == np.uint8 else None
-        if saturated_value is not None:
-            data_np[data_np >= saturated_value] = 0
-        if data_np.ndim == 5:
-            self.n_frames = data_np.shape[0]
-            self._scan_shape = (data_np.shape[1], data_np.shape[2])
-            self._det_shape = (data_np.shape[3], data_np.shape[4])
-            self._data = torch.from_numpy(data_np).to(self._device)
-        elif data_np.ndim == 3:
-            self.n_frames = 1
-            if scan_shape is not None:
-                self._scan_shape = scan_shape
-            else:
-                n = data_np.shape[0]
-                side = int(n ** 0.5)
-                if side * side != n:
-                    raise ValueError(f"Cannot infer square scan_shape from N={n}. Provide scan_shape explicitly.")
-                self._scan_shape = (side, side)
-            self._det_shape = (data_np.shape[1], data_np.shape[2])
-            self._data = torch.from_numpy(data_np).to(self._device)
-        elif data_np.ndim == 4:
-            self.n_frames = 1
-            self._scan_shape = (data_np.shape[0], data_np.shape[1])
-            self._det_shape = (data_np.shape[2], data_np.shape[3])
-            self._data = torch.from_numpy(data_np).to(self._device)
-        else:
-            raise ValueError(f"Show4DSTEM expects a 3D, 4D, or 5D array. Got {data_np.ndim}D. See documentation for accepted shapes.")
-        self.frame_idx = 0
-        self.shape_rows = self._scan_shape[0]
-        self.shape_cols = self._scan_shape[1]
-        self.det_rows = self._det_shape[0]
-        self.det_cols = self._det_shape[1]
-        first_frame = self._data[0] if self._data.ndim == 5 else self._data
-        first_frame_sample = first_frame[0] if first_frame.ndim >= 3 else first_frame
-        if not torch.is_floating_point(first_frame_sample):
-            first_frame_sample = first_frame_sample.float()
-        self.dp_global_min = max(float(first_frame_sample.min()), MIN_LOG_VALUE)
-        self.dp_global_max = float(first_frame_sample.max())
-        self._det_row_coords = torch.arange(self.det_rows, device=self._device, dtype=torch.float32)[:, None]
-        self._det_col_coords = torch.arange(self.det_cols, device=self._device, dtype=torch.float32)[None, :]
-        self._scan_row_coords = torch.arange(self.shape_rows, device=self._device, dtype=torch.float32)[:, None]
-        self._scan_col_coords = torch.arange(self.shape_cols, device=self._device, dtype=torch.float32)[None, :]
-        self._cached_bf_virtual = None
-        self._cached_abf_virtual = None
-        self._cached_adf_virtual = None
-        self._cached_haadf_virtual = None
-        with self.hold_trait_notifications():
-            self.pos_row = min(self.pos_row, self.shape_rows - 1)
-            self.pos_col = min(self.pos_col, self.shape_cols - 1)
-        self._compute_virtual_image_from_roi()
-        self._update_frame()
-
     def __repr__(self) -> str:
         shape = (
             f"({self.n_frames}, {self.shape_rows}, {self.shape_cols}, {self.det_rows}, {self.det_cols})"
