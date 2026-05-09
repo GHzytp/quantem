@@ -42,4 +42,6 @@ def unwrap_state_payload(payload: dict[str, Any], *, require_envelope: bool = Fa
 
 
 def save_state_file(path: str | pathlib.Path, widget_name: str, state: dict[str, Any]) -> None:
-    pathlib.Path(path).write_text(json.dumps(wrap_state_dict(widget_name, state), indent=2))
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(wrap_state_dict(widget_name, state), indent=2))
