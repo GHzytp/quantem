@@ -2898,10 +2898,22 @@ version = "0.0.1"
 source = { editable = "widget" }
 dependencies = [
     { name = "anywidget" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "torch" },
+    { name = "traitlets" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "anywidget", specifier = ">=0.9.0" }]
+requires-dist = [
+    { name = "anywidget", specifier = ">=0.9.0" },
+    { name = "matplotlib", specifier = ">=3.7.0" },
+    { name = "numpy", specifier = ">=2.0.0" },
+    { name = "pillow", specifier = ">=10.0.0" },
+    { name = "torch", specifier = ">=2.0.0" },
+    { name = "traitlets", specifier = ">=5.0.0" },
+]
 
 [[package]]
 name = "referencing"
