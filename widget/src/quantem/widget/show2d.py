@@ -835,6 +835,12 @@ class Show2D(anywidget.AnyWidget):
                 setattr(self, key, val)
 
     def summary(self):
+        """Print a human-readable snapshot of the widget's current state.
+
+        Reports image dimensions and pixel size, data min/max/mean, display
+        settings (colormap, contrast, scale, FFT), active ROIs and profile
+        line, per-image rotations, and the most recent render timings.
+        """
         lines = [self.title or "Show2D", "═" * 32]
         if self.n_images > 1:
             lines.append(f"Image:    {self.n_images}×{self.height}×{self.width} ({self.ncols} cols)")
@@ -897,6 +903,15 @@ class Show2D(anywidget.AnyWidget):
         self.frame_bytes = data.tobytes()
 
     def _apply_rotations(self):
+        """Re-rotate each displayed image from its original by ``image_rotations[i] * 90°``.
+
+        This is purely a display-time reorientation of each 2D image via
+        ``np.rot90`` — it is NOT scan rotation (which would rotate the
+        scan grid in a 4D-STEM dataset). Originals are kept in
+        ``_data_original`` so successive rotations compose from the
+        unrotated source rather than accumulating interpolation error.
+        Mixed shapes after rotation are center-padded to a common size.
+        """
         # Materialize originals as independent copies only when a non-zero
         # rotation exists (they start as views into _data to avoid 800MB copy at init)
         has_rotation = any(
