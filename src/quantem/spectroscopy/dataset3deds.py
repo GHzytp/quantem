@@ -992,7 +992,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             str(k): (set(map(str, v.keys())) if isinstance(v, dict) and v else None)
             for k, v in (getattr(self, "model_elements", {}) or {}).items()
         } or None
-        edge_filters = type(self)._merge_edge_filters(requested, saved)
+        edge_filters = requested if requested is not None else saved
         requested_elements = set(edge_filters) if edge_filters else None
 
         mode = (str(mode).strip().lower() if mode is not None else None) or (
@@ -2271,7 +2271,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         refined_peak_matches = []
         for peak_idx, height, peak_energy, snr in display_peaks:
-            best = reranked_matches(peak_energy, snr, None, top_k=1)
+            best = reranked_matches(peak_energy, snr, search_elements, top_k=1)
             best = best[0] if best else None
             if best is None:
                 continue
@@ -2523,9 +2523,9 @@ class Dataset3deds(Dataset3dspectroscopy):
                 continue
 
             # Best match for the table MUST be the same element/line shown on the spectrum
-            # (from refined_match_by_idx). Re-rank with all elements for Alt 2/3 alternatives.
+            # (from refined_match_by_idx). Preserve elements_only filtering for alternatives.
             best_label = f"{match[4]} {match[7]}"
-            ranked = reranked_matches(peak_energy, snr, None, top_k=3)
+            ranked = reranked_matches(peak_energy, snr, search_elements, top_k=3)
             labels = [
                 (f"{m['element']} {m['line']}", float(m["score"]), m["element"], m["line"])
                 for m in ranked
