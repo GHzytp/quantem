@@ -695,15 +695,15 @@ class Dataset3dspectroscopy(Dataset3d):
         mask=None,
         attach_mean_spectrum=True,
         roi_cal=None,
-        normalize=True,
+        normalize=False,
     ):
         """Calculate a spectrum from a spatial ROI.
 
         Parameters
         ----------
         normalize : bool, optional
-            If ``True``, average over the ROI pixels.  If ``False``, sum counts
-            over the ROI pixels.
+            If ``True``, scale the mean spectrum to the range [0, 1]. If
+            ``False``, return the mean spectrum in original intensity units.
         """
         y, x, dy, dx = self._resolve_roi(roi=roi, roi_cal=roi_cal)
 
@@ -744,7 +744,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
             arr = arr[mask, y : y + dy, x : x + dx]  # select masked energies and ROI
             if arr.shape[0] > 0:
-                spec = arr.mean(axis=(1, 2)) if normalize else arr.sum(axis=(1, 2))
+                spec = arr.mean(axis=(1, 2))
             else:
                 spec = np.zeros(0)
             E = E[mask]  # Mask the energy axis as well
@@ -755,7 +755,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 roi_data = img[y : y + dy, x : x + dx]
                 if roi_data.size == 0:
                     raise ValueError("ROI is empty; check y/x/dy/dx.")
-                spec[k] = roi_data.mean() if normalize else roi_data.sum()
+                spec[k] = roi_data.mean()
 
         # APPLY ENERGY RANGE ---------------------------------------------------------------
 
@@ -776,6 +776,16 @@ class Dataset3dspectroscopy(Dataset3d):
             spec = spec[indices]
             E = E[indices]
 
+        if normalize and spec.size > 0:
+            finite = np.isfinite(spec)
+            if np.any(finite):
+                spec_min = np.min(spec[finite])
+                spec_max = np.max(spec[finite])
+                if spec_max > spec_min:
+                    spec = (spec - spec_min) / (spec_max - spec_min)
+                else:
+                    spec = np.zeros_like(spec, dtype=float)
+
         if attach_mean_spectrum:
             self.add_spectrum_to_data(spec, E)
 
@@ -788,6 +798,7 @@ class Dataset3dspectroscopy(Dataset3d):
         energy_range=None,
         mask=None,
         intensity_range=None,
+        normalize=False,
         **kwargs,
     ):
         """
@@ -810,6 +821,9 @@ class Dataset3dspectroscopy(Dataset3d):
             Boolean mask for pixel selection.
         intensity_range : 2-tuple, None
             If not None, sets intensity range on spectrum plot
+        normalize : bool, optional
+            If ``True``, scale the mean spectrum to the range [0, 1]. If
+            ``False``, plot the mean spectrum in original intensity units.
         Returns
         -------
         (fig, ax) : tuple
@@ -847,7 +861,7 @@ class Dataset3dspectroscopy(Dataset3d):
             roi_cal=roi_cal,
             energy_range=energy_range,
             mask=mask,
-            normalize=False,
+            normalize=normalize,
         )
 
         dE = float(self.sampling[0])
@@ -901,7 +915,7 @@ class Dataset3dspectroscopy(Dataset3d):
             ax_spec.set_xlabel("Energy (keV)")
         else:
             ax_spec.set_xlabel("Energy (eV)")
-        ax_spec.set_ylabel("Intensity")
+        ax_spec.set_ylabel("Normalized intensity" if normalize else "Intensity")
         ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
         ax_spec.grid(True, alpha=0.1)
         if intensity_range is not None:
