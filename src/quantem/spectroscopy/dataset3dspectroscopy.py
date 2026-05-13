@@ -1154,13 +1154,15 @@ class Dataset3dspectroscopy(Dataset3d):
         ignore_range=None,
         mask=None,
         target_edge=None,
-        window_size=10,
+        window_size=None,
         method="powerlaw",
+        polynomial_degree=3,
         return_dataset=True,
         attach_spectrum=True,
         fit_mode="global",
         kernel_width=1,
         show=True,
+        show_subtracted=True,
         return_background=False,
     ):
         """
@@ -1177,9 +1179,17 @@ class Dataset3dspectroscopy(Dataset3d):
             Number of nearest spatial neighbors to average for each local
             background fit. The current pixel is included. Used only when
             ``fit_mode="local"``.
+        window_size : int, optional
+            For EDS, number of spectral channels in the rolling low-percentile
+            envelope used before polynomial fitting. For EELS power-law fitting,
+            percent of ``target_edge`` used for the pre-edge fit window. Defaults
+            to 50 channels for EDS and 10 percent for EELS.
         show : bool, optional
             If True, plot the mean raw spectrum, fitted background, and
             background-subtracted spectrum.
+        polynomial_degree : int, optional
+            Degree of the polynomial power-series background used for EDS data.
+            Ignored for EELS data.
         return_background : bool, optional
             If True, return ``(dataset, background_cube)`` when ``return_dataset``
             is True, otherwise return the background cube.
@@ -1210,6 +1220,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 method=method,
                 target_edge=target_edge,
                 window_size=window_size,
+                polynomial_degree=polynomial_degree,
             )
             background_cube = np.broadcast_to(background[:, None, None], array3d.shape)
         else:
@@ -1219,6 +1230,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 method=method,
                 target_edge=target_edge,
                 window_size=window_size,
+                polynomial_degree=polynomial_degree,
                 kernel_width=kernel_width,
             )
 
@@ -1237,6 +1249,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 background_mean_spectrum,
                 subtracted_mean_spectrum,
                 fit_mode=fit_mode,
+                show_subtracted=show_subtracted,
             )
 
         dataset_type = str(self.dataset_type).lower()
@@ -1303,12 +1316,25 @@ class Dataset3dspectroscopy(Dataset3d):
         indices = np.where(selected)[0]
         return E[indices], indices
 
-    def _fit_background_spectrum(self, spectrum, energy_axis, method, target_edge, window_size):
+    def _fit_background_spectrum(
+        self,
+        spectrum,
+        energy_axis,
+        method,
+        target_edge,
+        window_size,
+        polynomial_degree=3,
+    ):
         dataset_type = str(self.dataset_type).lower()
         spectrum = np.asarray(spectrum, dtype=float)
 
         if dataset_type == "eds":
-            return self.calculate_background_powerlaw(spectrum)
+            return self.calculate_background_polynomial(
+                spectrum,
+                energy_axis=np.asarray(energy_axis, dtype=float),
+                degree=polynomial_degree,
+                window_size=50 if window_size is None else window_size,
+            )
 
         if dataset_type != "eels":
             raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
@@ -1325,7 +1351,7 @@ class Dataset3dspectroscopy(Dataset3d):
             spectrum,
             np.asarray(energy_axis, dtype=float),
             target_edge=target_edge,
-            window_size=window_size,
+            window_size=10 if window_size is None else window_size,
         )
 
     def _fit_eels_powerlaw_background(self, spectrum, energy_axis, target_edge, window_size):
@@ -1366,6 +1392,7 @@ class Dataset3dspectroscopy(Dataset3d):
         method,
         target_edge,
         window_size,
+        polynomial_degree,
         kernel_width,
     ):
         from scipy.spatial import cKDTree
@@ -1398,6 +1425,7 @@ class Dataset3dspectroscopy(Dataset3d):
                     method=method,
                     target_edge=target_edge,
                     window_size=window_size,
+                    polynomial_degree=polynomial_degree,
                 )
             except Exception as exc:
                 y, x = divmod(pixel_index, nx)
@@ -1412,17 +1440,19 @@ class Dataset3dspectroscopy(Dataset3d):
         background_spectrum,
         subtracted_spectrum,
         fit_mode,
+        show_subtracted,
     ):
         fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
 
         ax_specbacksub.plot(energy_axis, input_spectrum, linewidth=1.2, label="Input")
         ax_specbacksub.plot(energy_axis, background_spectrum, linewidth=1.2, label="Background")
-        ax_specbacksub.plot(
-            energy_axis,
-            subtracted_spectrum,
-            linewidth=1.5,
-            label="Background-subtracted",
-        )
+        if show_subtracted:
+            ax_specbacksub.plot(
+                energy_axis,
+                subtracted_spectrum,
+                linewidth=1.5,
+                label="Background-subtracted",
+            )
         if self.dataset_type == "eds":
             ax_specbacksub.set_xlabel("Energy (keV)")
         else:

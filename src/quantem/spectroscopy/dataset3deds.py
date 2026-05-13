@@ -3666,31 +3666,125 @@ class Dataset3deds(Dataset3dspectroscopy):
             "spectrum_images_pytorch": self._spectrum_images_pytorch,
         }
 
-    def calculate_background_powerlaw(self, spectrum):
-        """Estimate a power-law Bremsstrahlung background from the spectrum."""
-        import numpy as np
-        from scipy.ndimage import gaussian_filter
+    def calculate_background_polynomial(
+        self,
+        spectrum,
+        energy_axis=None,
+        degree=3,
+        percentile=10,
+        window_size=50,
+    ):
+        """
+        Fit an EDS continuum background with a polynomial power series in energy.
 
-        # Use a larger window for more conservative background estimation
-        window_size = 15  # Larger window = smoother, less aggressive
-        background = np.zeros_like(spectrum)
+        A rolling low-percentile envelope is used as the fit target so sharp
+        characteristic X-ray peaks do not dominate the continuum fit.
+        """
+
+        spectrum = np.asarray(spectrum, dtype=float)
+        if spectrum.ndim != 1:
+            raise ValueError("spectrum must be a 1D array")
+        if spectrum.size == 0:
+            raise ValueError("spectrum must contain at least one channel")
+
+        if energy_axis is None:
+            energy_axis = np.asarray(self.energy_axis, dtype=float)
+            if energy_axis.shape != spectrum.shape:
+                energy_axis = float(self.origin[0]) + float(self.sampling[0]) * np.arange(
+                    spectrum.size, dtype=float
+                )
+        else:
+            energy_axis = np.asarray(energy_axis, dtype=float)
+        if energy_axis.shape != spectrum.shape:
+            raise ValueError("energy_axis must have the same shape as spectrum")
+
+        if isinstance(degree, bool):
+            raise TypeError("degree must be a non-negative integer")
+        try:
+            degree = int(degree)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("degree must be a non-negative integer") from exc
+        if degree < 0:
+            raise ValueError("degree must be >= 0")
+
+        try:
+            percentile = float(percentile)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("percentile must be a number between 0 and 100") from exc
+        if percentile < 0 or percentile > 100:
+            raise ValueError("percentile must be between 0 and 100")
+
+        if isinstance(window_size, bool):
+            raise TypeError("window_size must be a positive integer")
+        try:
+            window_size = int(window_size)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("window_size must be a positive integer") from exc
+        if window_size < 1:
+            raise ValueError("window_size must be >= 1")
+        window_size = min(window_size, spectrum.size)
+
+        finite = np.isfinite(spectrum) & np.isfinite(energy_axis)
+        if np.count_nonzero(finite) < degree + 1:
+            raise ValueError("not enough finite spectrum points for the requested degree")
+
         half_window = window_size // 2
+        envelope = np.full_like(spectrum, np.nan, dtype=float)
+        for channel in range(spectrum.size):
+            start = max(0, channel - half_window)
+            end = min(spectrum.size, channel + half_window + 1)
+            values = spectrum[start:end]
+            values = values[np.isfinite(values)]
+            if values.size:
+                envelope[channel] = np.percentile(values, percentile)
 
-        # Estimate background from sliding minimum
-        for i in range(len(spectrum)):
-            start = max(0, i - half_window)
-            end = min(len(spectrum), i + half_window + 1)
-            # Use percentile instead of minimum for more robustness
-            background[i] = np.percentile(spectrum[start:end], 10)
+        fit_mask = finite & np.isfinite(envelope)
+        if np.count_nonzero(fit_mask) < degree + 1:
+            raise ValueError("not enough background fit points for the requested degree")
 
-        # Apply heavy smoothing to avoid creating artificial features
-        background = gaussian_filter(background, sigma=5.0)
+        fit_energy = energy_axis[fit_mask]
+        fit_counts = envelope[fit_mask]
+        energy_min = float(np.min(fit_energy))
+        energy_span = float(np.max(fit_energy) - energy_min)
+        if energy_span <= 0:
+            if degree != 0:
+                raise ValueError("energy_axis must span more than one value for degree > 0")
+            return np.full_like(spectrum, max(float(np.median(fit_counts)), 0.0), dtype=float)
 
-        # Be very conservative - only subtract 80% of estimated background
-        # This prevents over-subtraction that creates artificial peaks
-        background = background * 0.8
+        # Scaling improves conditioning; this remains a polynomial in energy.
+        def scaled_energy(energy):
+            return 2.0 * (np.asarray(energy, dtype=float) - energy_min) / energy_span - 1.0
 
-        # Ensure background doesn't exceed spectrum
-        background = np.minimum(background, spectrum * 0.9)
+        def polynomial_background(energy, *coefficients):
+            energy_scaled = scaled_energy(energy)
+            background = np.zeros_like(energy_scaled, dtype=float)
+            for power, coefficient in enumerate(coefficients):
+                background += coefficient * (energy_scaled**power)
+            return background
 
-        return background
+        scaled_fit_energy = scaled_energy(fit_energy)
+        initial_coefficients = np.polynomial.polynomial.polyfit(
+            scaled_fit_energy,
+            fit_counts,
+            deg=degree,
+        )
+        try:
+            coefficients, _ = curve_fit(
+                polynomial_background,
+                fit_energy,
+                fit_counts,
+                p0=initial_coefficients,
+                maxfev=10000,
+            )
+        except (RuntimeError, ValueError, FloatingPointError):
+            coefficients = initial_coefficients
+
+        background = polynomial_background(energy_axis, *coefficients)
+        finite_counts = spectrum[finite]
+        max_count = max(float(np.max(finite_counts)), float(np.max(fit_counts)), 0.0)
+        background = np.nan_to_num(background, nan=0.0, posinf=max_count, neginf=0.0)
+        return np.maximum(background, 0.0)
+
+    def calculate_background_powerlaw(self, spectrum, *args, **kwargs):
+        """Compatibility wrapper for the EDS polynomial background fit."""
+        return self.calculate_background_polynomial(spectrum, *args, **kwargs)
