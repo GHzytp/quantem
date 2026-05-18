@@ -113,6 +113,8 @@ class SO3ParamR9SVD(nn.Module):
     SO(3) rotation bank using R9+SVD parameterization.
     Each rotation is stored as an unconstrained 3x3 matrix M,
     projected to SO(3) via SVD+(M) = U diag(1,1,det(UVt)) Vt.
+
+    Based on Rene Geist et al., 2024: https://arxiv.org/abs/2404.11735v1
     """
 
     def __init__(self, T: int, init: str = "random"):
