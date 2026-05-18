@@ -932,6 +932,12 @@ class ObjectTensorDecomp(ObjectINR):
     # TV Losses
 
     def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        """
+        Gets the summed total variational loss for the tensor decomposition model.
+
+        _get_plane_tv_loss: Total-variation across the planes.
+        _get_volume_tv_loss: Isotropic volume TV 
+        """
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.tensor(0.0, device=ctx.pred.device)
@@ -940,6 +946,9 @@ class ObjectTensorDecomp(ObjectINR):
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
+        """
+        Gets the total-variation across the planes.
+        """
         is_tilted = self.model.tilted
         per_level = []
 
