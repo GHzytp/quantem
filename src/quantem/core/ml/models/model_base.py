@@ -6,7 +6,7 @@ import torch.nn as nn
 
 class PPLR(ABC):
     """
-    Abstract base class for models that require multi-scale parameter optimization.
+    Abstract base class for models that require multi-parameter optimization.
     """
 
     @abstractmethod
