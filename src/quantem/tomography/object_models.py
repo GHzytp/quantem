@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, Optional
+from typing import Any, Callable, Generator, Optional, cast
 
 import numpy as np
 import torch
@@ -200,8 +200,8 @@ ObjConstraintsType = (
 def _unwrap(model: nn.Module | nn.parallel.DistributedDataParallel) -> PlanarDecompositionModel:
     """Unwrap a DistributedDataParallel model to get the underlying module ONLY for tensor decomposition models."""
     if isinstance(model, nn.parallel.DistributedDataParallel):
-        return model.module
-    return model
+        return cast(PlanarDecompositionModel, model.module)
+    return cast(PlanarDecompositionModel, model)
 
 
 class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
