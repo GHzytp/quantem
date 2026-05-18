@@ -1,11 +1,12 @@
 from dataclasses import dataclass
 from typing import Optional
+from quantem.core.ml.constraints import BaseContext
 
 import torch
 
 
 @dataclass
-class ReconstructionContext:
+class ReconstructionContext(BaseContext):
     """
     Handles all reconstruction parameters to be passed into object models.
 

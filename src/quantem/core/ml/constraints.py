@@ -9,6 +9,12 @@ from numpy.typing import NDArray
 
 from quantem.tomography.tomography_context import ReconstructionContext
 
+@dataclass
+class BaseContext(ABC):
+    """
+    Constraints should contain a context object that contains all necessary data for the constraints to be applied.
+    """
+    pass
 
 @dataclass(slots=False)
 class Constraints(ABC):
@@ -95,7 +101,7 @@ class BaseConstraints(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
+    def apply_soft_constraints(self, ctx: BaseContext) -> torch.Tensor:
         """
         Apply soft constraints to the model.
         """
