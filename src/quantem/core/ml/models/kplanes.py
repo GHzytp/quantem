@@ -166,6 +166,9 @@ def interpolate_ms_features(
 
 
 class KPlanes(PPLR, TensorDecompositionModel):
+    """
+    K-Planes model adapted from Fridovich-Keil et al., https://arxiv.org/abs/2301.10241
+    """
     def __init__(
         self,
         # Grid parameters
@@ -354,7 +357,7 @@ def interpolate_ms_features_tilted(
 
 class KPlanesTILTED(KPlanes):
     """
-    K-Planes with T learned SO(3) rotations (TILTED).
+    K-Planes with T learned SO(3) rotations (TILTED). Adapted from Yi et al., https://arxiv.org/abs/2308.15461
 
     Inherits KPlanes for the sigma_net, density_activation, and get_params
     interface.  Overrides:
@@ -646,7 +649,7 @@ def interpolate_ms_features_cp_tilted(
 class CPTilted(PPLR, TensorDecompositionModel):
     """
     CP decomposition with TILTED rotations — the true bottleneck model for
-    phase 1. Rank-1-per-channel feature representation.
+    phase 1. Rank-1-per-channel feature representation. Adapted from Yi et al., https://arxiv.org/abs/2308.15461
 
     Shares the SO3Param and sigma_net design with KPlanesTILTED so you can
     lift τ directly across: cp_model.extract_tau_state() ->
