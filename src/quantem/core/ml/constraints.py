@@ -1,12 +1,13 @@
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any, Generic, Self, TypeVar
 
 import numpy as np
 import torch
 from numpy.typing import NDArray
 
+T_ctx = TypeVar("T_ctx", bound=BaseContext)
 
 @dataclass
 class BaseContext(ABC):
@@ -54,7 +55,7 @@ class Constraints(ABC):
         )
 
 
-class BaseConstraints(ABC):
+class BaseConstraints(ABC, Generic[T_ctx]):
     """
     Base class for constraints.
     """
@@ -100,7 +101,7 @@ class BaseConstraints(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def apply_soft_constraints(self, ctx: BaseContext) -> torch.Tensor:
+    def apply_soft_constraints(self, ctx: T_ctx) -> torch.Tensor:
         """
         Apply soft constraints to the model.
         """
