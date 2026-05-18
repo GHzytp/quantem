@@ -1,4 +1,5 @@
 import math
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -117,7 +118,7 @@ class SO3ParamR9SVD(nn.Module):
     Based on Rene Geist et al., 2024: https://arxiv.org/abs/2404.11735v1
     """
 
-    def __init__(self, T: int, init: str = "random"):
+    def __init__(self, T: int, init: Literal["random", "identity"] = "random"):
         super().__init__()
         if init == "random":
             # Initialize near identity with small noise
