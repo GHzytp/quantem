@@ -16,6 +16,7 @@ class ReconstructionContext(BaseContext):
         - TensorDecomp reads ".coords" and ".pred" (and ".all densities")
     """
 
+    volume: Optional[torch.Tensor] = None
     coords: Optional[torch.Tensor] = None
     pred: Optional[torch.Tensor] = None
     all_densities: Optional[torch.Tensor] = None
