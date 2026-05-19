@@ -58,6 +58,9 @@ class Dataset4dstem(Dataset4d):
         ----------
         array : NDArray | Any
             The underlying 4D array data
+        tensor : torch.Tensor | None, optional
+            Alternative to ``array``: the underlying 4D torch tensor (any device).
+            Provide exactly one of ``array`` or ``tensor``.
         name : str
             A descriptive name for the dataset
         origin : NDArray | tuple | list | float | int

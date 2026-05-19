@@ -139,7 +139,7 @@ class Dataset(AutoSerialize):
     # --- Properties ---
     @property
     def array(self) -> NDArray:
-        """The data as a numpy array.
+        """The underlying n-dimensional NumPy array data.
 
         For tensor-backed datasets, returns a CACHED read-only CPU copy derived
         from ``self.tensor`` (first access pays GPU->CPU transfer, subsequent

@@ -32,7 +32,27 @@ class Dataset4d(Dataset):
         metadata: dict = {},
         _token: object | None = None,
     ):
-        """Initialize a 4D dataset. Pass exactly one of ``array`` (numpy) or ``tensor`` (torch)."""
+        """Initialize a 4D dataset.
+
+        Parameters
+        ----------
+        array : NDArray | None
+            The underlying 4D numpy array. Provide exactly one of ``array`` or ``tensor``.
+        tensor : torch.Tensor | None
+            The underlying 4D torch tensor (any device). Provide exactly one of ``array`` or ``tensor``.
+        name : str
+            A descriptive name for the dataset
+        origin : NDArray | tuple | list | float | int
+            The origin coordinates for each dimension in calibrated units
+        sampling : NDArray | tuple | list | float | int
+            The sampling rate/spacing for each dimension
+        units : list[str] | tuple | list
+            Units for each dimension
+        signal_units : str, optional
+            Units for the array values, by default "arb. units"
+        _token : object | None, optional
+            Token to prevent direct instantiation, by default None
+        """
         super().__init__(
             array=array,
             tensor=tensor,
