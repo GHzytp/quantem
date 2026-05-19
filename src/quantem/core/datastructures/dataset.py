@@ -139,7 +139,7 @@ class Dataset(AutoSerialize):
     def array(self) -> NDArray | None:
         """The underlying n-dimensional NumPy array data.
 
-        Returns ``None`` for tensor-backed datasets — use ``.tensor`` for the
+        Returns ``None`` for tensor-backed datasets. Use ``.tensor`` for the
         torch tensor, or ``.numpy()`` to materialize a numpy copy explicitly.
         """
         return self._array
@@ -215,7 +215,7 @@ class Dataset(AutoSerialize):
     # --- Derived Properties ---
     @property
     def shape(self) -> tuple[int, ...]:
-        # Direct slot access — never triggers .array derive (which would force
+        # Direct slot access (never triggers .array derive, which would force
         # a full GPU->CPU copy on tensor-backed datasets).
         return tuple((self._array if self._array is not None else self._tensor).shape)
 

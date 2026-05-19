@@ -334,9 +334,9 @@ class Show4DSTEM(anywidget.AnyWidget):
         _io_labels = None
 
         # Auto-extract sampling + units from Dataset4dstem if available.
-        # NOTE: avoid `hasattr(data, "array")` — for tensor-backed Datasets the
-        # `.array` getter is an expensive derive (full GPU->CPU copy). Use cheap
-        # `hasattr(data, "sampling")` to identify a Dataset.
+        # NOTE: avoid `hasattr(data, "array")` because for tensor-backed Datasets
+        # the `.array` getter is an expensive derive (full GPU->CPU copy). Use
+        # cheap `hasattr(data, "sampling")` to identify a Dataset.
         if hasattr(data, "sampling"):
             if not title and hasattr(data, "name") and data.name:
                 title = str(data.name)
