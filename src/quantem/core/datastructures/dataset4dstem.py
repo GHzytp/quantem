@@ -189,7 +189,7 @@ class Dataset4dstem(Dataset4d):
         if tensor.ndim != 4:
             raise ValueError(
                 f"Dataset4dstem.from_tensor requires a 4D tensor "
-                f"(scan_y, scan_x, dp_y, dp_x), got shape {tuple(tensor.shape)}."
+                f"(scan_row, scan_col, dp_row, dp_col), got shape {tuple(tensor.shape)}."
             )
         return cls(
             tensor=tensor,
