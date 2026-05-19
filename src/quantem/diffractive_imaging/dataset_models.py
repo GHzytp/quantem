@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from math import ceil
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -403,6 +404,8 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
     @property
     def num_gpts(self) -> int:
+        if hasattr(self, "_local_num_gpts") and self._local_num_gpts is not None:
+            return self._local_num_gpts
         return int(self.dset.shape[0])
 
     @property
@@ -536,7 +539,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             patch_indices_list.append(patch_indices_chunk)
 
         self._patch_indices = torch.cat(patch_indices_list, dim=0)
-        self._last_patch_positions_px = self.scan_positions_px.clone()
+        self._last_patch_positions_px = self.scan_positions_px.detach().clone()
 
     def patch_indices_need_update(self) -> bool:
         """
@@ -549,6 +552,55 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     def reset(self) -> None:
         self.descan_shifts = self.initial_descan_shifts.clone().to(self.device)
         self.scan_positions_px = self.initial_scan_positions_px.clone().to(self.device)
+
+    def shard(self, rank: int, world_size: int) -> None:
+        """Partition diffraction data across DDP ranks (call after preprocess, before to(device)).
+
+        Each rank retains a contiguous slice [start:end] of the N scan positions. The object
+        and probe are not touched — they remain full-size and are replicated on every GPU.
+        After sharding, num_gpts returns the local shard size.
+        """
+        if not self._preprocessed:
+            raise RuntimeError("shard() must be called after preprocess()")
+        n_total = int(self.dset.shape[0])
+        shard_size = ceil(n_total / world_size)
+        start = rank * shard_size
+        end = min(start + shard_size, n_total)
+
+        self._shard_start: int = start
+        self._shard_end: int = end
+        self._global_num_gpts: int = n_total
+        self._local_num_gpts: int = end - start
+
+        sl = slice(start, end)
+
+        # Slice preprocessed amplitude/intensity data (plain attributes, not buffers)
+        for attr in (
+            "_amplitudes",
+            "_centered_amplitudes",
+            "_centered_intensities",
+            "_intensities",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, getattr(self, attr)[sl].clone())
+
+        # Re-register buffers with rank-local slices
+        self.register_buffer("_patch_indices", self._patch_indices[sl].clone())
+        self.register_buffer("_last_patch_positions_px", self._last_patch_positions_px[sl].clone())
+        # _targets will be rebuilt from the sliced amplitudes in _set_targets(); reset it here
+        self.register_buffer("_targets", self._targets[sl].clone())
+
+        # Replace learnable parameters with rank-local slices
+        self._scan_positions_px = nn.Parameter(
+            self._scan_positions_px.data[sl].clone(),
+            requires_grad=self.learn_scan_positions,
+        )
+        self._descan_shifts = nn.Parameter(
+            self._descan_shifts.data[sl].clone(),
+            requires_grad=self.learn_descan,
+        )
+        self._initial_scan_positions_px = self._initial_scan_positions_px[sl].clone()
+        self._initial_descan_shifts = self._initial_descan_shifts[sl].clone()
 
     # endregion --- class methods ---
 

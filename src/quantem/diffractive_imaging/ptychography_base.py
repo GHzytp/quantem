@@ -4,9 +4,11 @@ from warnings import warn
 import numpy as np
 import scipy.ndimage as ndi
 import torch
+import torch.distributed as dist
 
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.dist_utils import all_reduce_params
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
     electron_wavelength_angstrom,
@@ -875,6 +877,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             probe = self._to_numpy(probe)
             intensities = np.abs(probe) ** 2
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
+
+    def _broadcast_parameters(self, src: int = 0) -> None:
+        """Broadcast obj and probe data from rank src to all other ranks."""
+        dist.broadcast(self.obj_model._obj.data, src=src)
+        dist.broadcast(self.probe_model._probe.data, src=src)
+
+    def _all_reduce_gradients(self) -> None:
+        """Average obj.grad and probe.grad across all ranks (call after backward, before step)."""
+        params = [p for p in [self.obj_model._obj, self.probe_model._probe] if p.grad is not None]
+        if params:
+            all_reduce_params(*params)
 
     def to(self, device: str | int | torch.device):
         dev, _id = config.validate_device(device)

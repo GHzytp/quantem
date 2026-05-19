@@ -1,9 +1,10 @@
 import contextlib
 import copy
 import gc
+import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self, Sequence, cast
+from typing import TYPE_CHECKING, Any, Literal, Self, Sequence, cast
 from warnings import warn
 
 import numpy as np
@@ -11,6 +12,10 @@ from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.io.serialize import load as autoserialize_load
+from quantem.core.ml.dist_utils import (
+    init_process_group,
+    is_distributed_launch,
+)
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
@@ -23,9 +28,53 @@ from quantem.diffractive_imaging.ptychography_visualizations import Ptychography
 
 if TYPE_CHECKING:
     import torch
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
 else:
     if config.get("has_torch"):
         import torch
+        import torch.distributed as dist
+        import torch.multiprocessing as mp
+
+
+def _ddp_ptycho_worker(
+    rank: int,
+    world_size: int,
+    ptycho_path: str,
+    devices: list[int],
+    recon_kwargs: dict[str, Any],
+    result_path: str,
+) -> None:
+    """Module-level worker for mp.start_processes — must live at module scope to be picklable.
+
+    Receives a file path rather than the Ptychography object directly so that no
+    large tensors cross the process boundary via pickle (which triggers PyTorch's
+    shared-memory tensor mechanism and fails in some Linux environments).
+    """
+    device_id = devices[rank]
+    init_process_group(rank, world_size, backend="nccl" if torch.cuda.is_available() else "gloo")
+
+    ptycho = torch.load(ptycho_path, map_location="cpu", weights_only=False)
+    ptycho.dset.shard(rank, world_size)
+    ptycho.to(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+
+    if dist.is_available() and dist.is_initialized():
+        ptycho._broadcast_parameters(src=0)
+
+    ptycho._reconstruct_inner(**recon_kwargs, _dist_rank=rank, _dist_world_size=world_size)
+
+    if rank == 0:
+        torch.save(
+            {
+                "obj": ptycho.obj_model._obj.data.cpu(),
+                "probe": ptycho.probe_model._probe.data.cpu(),
+                "iter_losses": ptycho._iter_losses,
+                "iter_val_losses": ptycho._iter_val_losses,
+            },
+            result_path,
+        )
+
+    dist.destroy_process_group()
 
 
 class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase):
@@ -153,23 +202,98 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
-        device: Literal["cpu", "gpu"] | None = None,
+        device: Literal["cpu", "gpu"] | int | list[int] | None = None,
         autograd: bool = True,
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
     ) -> Self:
-        """
-        reason for having a single reconstruct() is so that updating things like constraints
-        or recon_types only happens in one place, reason for having separate reoconstruction_
-        methods would be to simplify the flags for this and not have to include all
+        """Run iterative ptychography reconstruction.
 
+        ``device`` accepts:
+          - ``None``             — keep current device
+          - ``"cpu"`` / ``"gpu"`` — existing string form
+          - ``int``              — specific GPU index, e.g. ``device=2`` → cuda:2
+          - ``list[int]``        — multi-GPU, e.g. ``device=[0,1,2,3]``
+
+        Multi-GPU (``device`` is a list) launches worker processes via ``mp.spawn`` when called
+        from a notebook, or uses the existing distributed process group when launched with
+        ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
         """
-        # TODO maybe make an "process args" method that handles things like:
-        # mode, store_iterations, device,
         self._check_preprocessed()
-        if device is not None:
-            self.to(device)
+
+        # Route to multi-GPU path when a list of device IDs is given
+        if isinstance(device, list):
+            if not autograd:
+                raise ValueError("Multi-GPU reconstruction requires autograd=True.")
+            if not is_distributed_launch():
+                return self._spawn_reconstruct(
+                    devices=device,
+                    num_iters=num_iters,
+                    reset=reset,
+                    optimizer_params=optimizer_params,
+                    scheduler_params=scheduler_params,
+                    constraints=constraints,
+                    batch_size=batch_size,
+                    store_snapshots=store_snapshots,
+                    store_snapshots_every=store_snapshots_every,
+                    autograd=autograd,
+                    loss_type=loss_type,
+                )
+            # torchrun: fall through — process group already initialised externally
+
+        # Handle torchrun distributed launch (RANK env var present)
+        if is_distributed_launch():
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    backend="nccl" if torch.cuda.is_available() else "gloo",
+                    init_method="env://",
+                )
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+            dev = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+            self.to(dev)
+            self.dset.shard(rank, world_size)
+            self._broadcast_parameters(src=0)
+        else:
+            rank, world_size = 0, 1
+            if device is not None and not isinstance(device, list):
+                self.to(device)
+
+        return self._reconstruct_inner(
+            num_iters=num_iters,
+            reset=reset,
+            optimizer_params=optimizer_params,
+            scheduler_params=scheduler_params,
+            constraints=constraints,
+            batch_size=batch_size,
+            store_snapshots=store_snapshots,
+            store_snapshots_every=store_snapshots_every,
+            autograd=autograd,
+            loss_type=loss_type,
+            _dist_rank=rank,
+            _dist_world_size=world_size,
+        )
+
+    def _reconstruct_inner(
+        self,
+        num_iters: int = 0,
+        reset: bool = False,
+        optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        constraints: dict = {},
+        batch_size: int | None = None,
+        store_snapshots: bool | None = None,
+        store_snapshots_every: int | None = None,
+        autograd: bool = True,
+        loss_type: Literal[
+            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
+        ] = "l2_amplitude",
+        _dist_rank: int = 0,
+        _dist_world_size: int = 1,
+    ) -> Self:
+        """Core reconstruction loop. Called by reconstruct() for all launch modes."""
         self.batch_size = batch_size
         self.store_snapshot_every = store_snapshots_every
         if store_snapshots_every is not None and store_snapshots is None:
@@ -203,7 +327,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             val_ratio=self.val_ratio,
             val_mode=self.val_mode,
         )
-        pbar = tqdm(range(num_iters), disable=not self.verbose)
+        pbar = tqdm(range(num_iters), disable=not self.verbose or _dist_rank != 0)
 
         for a0 in pbar:
             consistency_loss = 0.0
@@ -240,6 +364,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     patch_indices,
                     targets,
                 )
+                if _dist_world_size > 1:
+                    self._all_reduce_gradients()
                 self.step_optimizers()
                 consistency_loss += batch_consistency_loss.item()
                 total_loss += batch_loss.item()
@@ -247,6 +373,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             num_batches = len(batcher)
             total_loss = total_loss / num_batches
             consistency_loss = consistency_loss / num_batches
+
+            # Average loss across ranks so rank-0 reports the global mean
+            if _dist_world_size > 1:
+                loss_t = torch.tensor(
+                    [total_loss, consistency_loss], device=self.device, dtype=torch.float64
+                )
+                dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
+                total_loss, consistency_loss = loss_t[0].item(), loss_t[1].item()
 
             # Validation pass (no gradient, no optimizer steps)
             val_loss = None
@@ -271,17 +405,19 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         val_batches += 1
                 if val_batches > 0:
                     val_loss = val_consistency_loss / val_batches
-                    self._iter_val_losses.append(val_loss)
+                    if _dist_rank == 0:
+                        self._iter_val_losses.append(val_loss)
 
-            self._record_iter(total_loss)  # TODO record val loss as well
+            if _dist_rank == 0:
+                self._record_iter(total_loss)  # TODO record val loss as well
 
             # Step schedulers with current loss
             self.step_schedulers(total_loss)
 
-            if self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
+            if _dist_rank == 0 and self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
                 self._store_current_iter_snapshot()
 
-            if self.logger is not None:
+            if _dist_rank == 0 and self.logger is not None:
                 self.logger.log_iter(
                     self.obj_model,
                     self.probe_model,
@@ -292,19 +428,57 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     self._get_current_lrs(),
                 )
 
-            if val_loss is not None:
-                pbar.set_description(
-                    f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
-                )
-            else:
-                pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
+            if _dist_rank == 0:
+                if val_loss is not None:
+                    pbar.set_description(
+                        f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
+                    )
+                else:
+                    pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
 
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if hasattr(torch, "mps") and torch.backends.mps.is_available():
             torch.mps.empty_cache()
         gc.collect()
 
+        return self
+
+    def _spawn_reconstruct(self, devices: list[int], **recon_kwargs) -> Self:
+        """Notebook multi-GPU: spawn one worker process per device via forkserver.
+
+        State is saved to a temp file so that no tensors cross the process boundary
+        via pickle.  PyTorch's ForkingPickler automatically moves all CPU tensors to
+        shared memory when pickling for multiprocessing, which fails on some Linux
+        systems (EINVAL from ftruncate).  Passing only a file path (a plain string)
+        avoids that mechanism entirely.
+        """
+        self.to("cpu")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            ptycho_path = str(tmpdir_path / "ptycho_state.pt")
+            result_path = str(tmpdir_path / "result.pt")
+
+            torch.save(self, ptycho_path, pickle_protocol=4)
+
+            # forkserver: workers fork from a clean pre-started server (no inherited
+            # CUDA, no Jupyter FDs).  Only plain Python scalars/strings cross the
+            # process boundary, so tensor pickling is never triggered.
+            mp.start_processes(
+                _ddp_ptycho_worker,
+                args=(len(devices), ptycho_path, devices, recon_kwargs, result_path),
+                nprocs=len(devices),
+                join=True,
+                start_method="forkserver",
+            )
+            result = torch.load(result_path, map_location="cpu", weights_only=False)
+
+        self.obj_model._obj.data.copy_(result["obj"])
+        self.probe_model._probe.data.copy_(result["probe"])
+        self._iter_losses.extend(result["iter_losses"])
+        self._iter_val_losses.extend(result["iter_val_losses"])
         return self
 
     def _get_current_lrs(self) -> dict[str, float]:

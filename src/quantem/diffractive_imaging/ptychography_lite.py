@@ -180,7 +180,7 @@ class PtychoLite(Ptychography):
         new_optimizers: bool = False,  # not sure what the default should be
         constraints: dict = {},  # TODO add constraints flags
         store_iterations_every: int | None = None,
-        device: Literal["cpu", "gpu"] | None = None,
+        device: "Literal['cpu', 'gpu'] | int | list[int] | None" = None,
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
