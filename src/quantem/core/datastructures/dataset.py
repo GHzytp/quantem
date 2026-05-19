@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional, Self, Union, overload
 
 import numpy as np
+import torch
 from numpy.typing import DTypeLike, NDArray
 
 from quantem.core.io.serialize import AutoSerialize
@@ -38,24 +39,39 @@ class Dataset(AutoSerialize):
 
     def __init__(
         self,
-        array: Any,  # Input can be array-like
-        name: str,
-        origin: NDArray | tuple | list | float | int,
-        sampling: NDArray | tuple | list | float | int,
-        units: list[str] | tuple | list,
+        array: NDArray | None = None,
+        tensor: torch.Tensor | None = None,
+        name: str = "",
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
         metadata: Optional[dict] = None,
         _token: object | None = None,
     ):
         if _token is not self._token:
-            raise RuntimeError("Use Dataset.from_array() to instantiate this class.")
-        super().__init__()
-        arr = ensure_valid_array(array)
-        if not isinstance(arr, np.ndarray):
-            raise TypeError(
-                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            raise RuntimeError(
+                "Use Dataset.from_array() or Dataset.from_tensor() to instantiate this class."
             )
-        self._array = arr
+        super().__init__()
+        # Dual-slot storage: exactly one of (_array, _tensor) is set.
+        if array is None and tensor is None:
+            raise ValueError("Provide either `array` (numpy) or `tensor` (torch).")
+        if array is not None and tensor is not None:
+            raise ValueError("Provide only one of `array` or `tensor`, not both.")
+        if array is not None:
+            arr = ensure_valid_array(array)
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(f"Dataset.array must be numpy.ndarray, got {type(arr).__name__}.")
+            self._array = arr
+            self._tensor = None
+        else:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"Dataset.tensor must be torch.Tensor, got {type(tensor).__name__}.")
+            self._array = None
+            self._tensor = tensor
+        # Lazy cache: derived numpy from tensor, materialized only on first .array access.
+        self._cached_numpy: np.ndarray | None = None
         self.name = name
         self.origin = origin
         self.sampling = sampling
@@ -123,18 +139,34 @@ class Dataset(AutoSerialize):
     # --- Properties ---
     @property
     def array(self) -> NDArray:
-        """The underlying n-dimensional NumPy array data."""
-        return self._array
+        """The data as a numpy array.
+
+        For tensor-backed datasets, returns a CACHED read-only CPU copy derived
+        from ``self.tensor`` (first access pays GPU->CPU transfer, subsequent
+        accesses are free). Torch-aware consumers should prefer ``.tensor``.
+        """
+        if self._array is not None:
+            return self._array
+        if self._cached_numpy is None:
+            self._cached_numpy = self._tensor.detach().cpu().numpy()
+            self._cached_numpy.flags.writeable = False
+        return self._cached_numpy
 
     @array.setter
     def array(self, value: NDArray) -> None:
-        arr = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
+        arr = ensure_valid_array(value, ndim=self.ndim)
         if not isinstance(arr, np.ndarray):
-            raise TypeError(
-                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
-            )
+            raise TypeError(f"Dataset.array must be numpy.ndarray, got {type(arr).__name__}.")
         self._array = arr
-        # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        """Torch tensor backing the data. AttributeError if numpy-backed."""
+        if self._tensor is None:
+            raise AttributeError(
+                f"Dataset '{self.name}' is numpy-backed; use Dataset.from_tensor() at construction."
+            )
+        return self._tensor
 
     @property
     def metadata(self) -> dict:
@@ -191,26 +223,42 @@ class Dataset(AutoSerialize):
     # --- Derived Properties ---
     @property
     def shape(self) -> tuple[int, ...]:
-        return self.array.shape
+        # Direct slot access — never triggers .array derive (which would force
+        # a full GPU->CPU copy on tensor-backed datasets).
+        return tuple((self._array if self._array is not None else self._tensor).shape)
 
     @property
     def ndim(self) -> int:
-        return self.array.ndim
+        return (self._array if self._array is not None else self._tensor).ndim
 
     @property
     def dtype(self) -> DTypeLike:
-        return self.array.dtype
+        return (self._array if self._array is not None else self._tensor).dtype
 
     @property
     def device(self) -> str:
-        """
-        Outputting a string is likely temporary -- once we have our use cases we can
-        figure out a more permanent device solution that enables easier translation between
-        numpy <-> torch <-> numpy, etc.
-
-        For NumPy-only datasets, this is always "cpu".
-        """
+        """``"cpu"`` for numpy-backed; torch device string for tensor-backed."""
+        if self._tensor is not None:
+            return str(self._tensor.device)
         return "cpu"
+
+    def numpy(self) -> NDArray:
+        """Return the data as a numpy array (mirrors ``torch.Tensor.numpy()``).
+
+        Equivalent to ``self.array`` — both return numpy. For tensor-backed
+        datasets, first call materializes a cached read-only CPU copy.
+        """
+        return self.array
+
+    def to(self, device) -> Self:
+        """Move the underlying tensor to ``device``. Raises if numpy-backed."""
+        if self._tensor is None:
+            raise AttributeError(
+                f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'."
+            )
+        self._tensor = self._tensor.to(device)
+        self._cached_numpy = None  # invalidate stale derived numpy
+        return self
 
     # --- Summaries ---
     def __repr__(self) -> str:

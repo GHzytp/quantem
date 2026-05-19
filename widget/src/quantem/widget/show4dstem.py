@@ -334,14 +334,21 @@ class Show4DSTEM(anywidget.AnyWidget):
         _io_labels = None
 
         # Auto-extract sampling + units from Dataset4dstem if available.
-        if hasattr(data, "sampling") and hasattr(data, "array"):
+        # NOTE: avoid `hasattr(data, "array")` — for tensor-backed Datasets the
+        # `.array` getter is an expensive derive (full GPU->CPU copy). Use cheap
+        # `hasattr(data, "sampling")` to identify a Dataset.
+        if hasattr(data, "sampling"):
             if not title and hasattr(data, "name") and data.name:
                 title = str(data.name)
             if sampling is None:
                 sampling = tuple(float(s) for s in data.sampling)
             if units is None and hasattr(data, "units"):
                 units = list(data.units)
-            data = data.array
+            # If tensor-backed (zero-copy GPU path), take .tensor. Else .array (numpy).
+            if getattr(data, "_tensor", None) is not None:
+                data = data.tensor
+            else:
+                data = data.array
 
         # Resolve sampling + units (4 axes for 4D-STEM):
         # [scan_row, scan_col, k_row, k_col]. Scalar/None broadcast to (1, 1, 1, 1).

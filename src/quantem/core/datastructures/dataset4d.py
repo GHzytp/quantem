@@ -1,6 +1,7 @@
 from typing import Any, Self, Union
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
@@ -21,36 +22,20 @@ class Dataset4d(Dataset):
 
     def __init__(
         self,
-        array: NDArray | Any,
-        name: str,
-        origin: NDArray | tuple | list | float | int,
-        sampling: NDArray | tuple | list | float | int,
-        units: list[str] | tuple | list,
+        array: NDArray | None = None,
+        tensor: torch.Tensor | None = None,
+        name: str = "",
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
         metadata: dict = {},
         _token: object | None = None,
     ):
-        """Initialize a 4D dataset.
-
-        Parameters
-        ----------
-        array : NDArray | Any
-            The underlying 3D array data
-        name : str
-            A descriptive name for the dataset
-        origin : NDArray | tuple | list | float | int
-            The origin coordinates for each dimension in calibrated units
-        sampling : NDArray | tuple | list | float | int
-            The sampling rate/spacing for each dimension
-        units : list[str] | tuple | list
-            Units for each dimension
-        signal_units : str, optional
-            Units for the array values, by default "arb. units"
-        _token : object | None, optional
-            Token to prevent direct instantiation, by default None
-        """
+        """Initialize a 4D dataset. Pass exactly one of ``array`` (numpy) or ``tensor`` (torch)."""
         super().__init__(
             array=array,
+            tensor=tensor,
             name=name,
             origin=origin,
             sampling=sampling,
