@@ -70,8 +70,6 @@ class Dataset(AutoSerialize):
                 raise TypeError(f"Dataset.tensor must be torch.Tensor, got {type(tensor).__name__}.")
             self._array = None
             self._tensor = tensor
-        # Lazy cache: derived numpy from tensor, materialized only on first .array access.
-        self._cached_numpy: np.ndarray | None = None
         self.name = name
         self.origin = origin
         self.sampling = sampling
@@ -138,19 +136,13 @@ class Dataset(AutoSerialize):
 
     # --- Properties ---
     @property
-    def array(self) -> NDArray:
+    def array(self) -> NDArray | None:
         """The underlying n-dimensional NumPy array data.
 
-        For tensor-backed datasets, returns a CACHED read-only CPU copy derived
-        from ``self.tensor`` (first access pays GPU->CPU transfer, subsequent
-        accesses are free). Torch-aware consumers should prefer ``.tensor``.
+        Returns ``None`` for tensor-backed datasets — use ``.tensor`` for the
+        torch tensor, or ``.numpy()`` to materialize a numpy copy explicitly.
         """
-        if self._array is not None:
-            return self._array
-        if self._cached_numpy is None:
-            self._cached_numpy = self._tensor.detach().cpu().numpy()
-            self._cached_numpy.flags.writeable = False
-        return self._cached_numpy
+        return self._array
 
     @array.setter
     def array(self, value: NDArray) -> None:
@@ -245,10 +237,12 @@ class Dataset(AutoSerialize):
     def numpy(self) -> NDArray:
         """Return the data as a numpy array (mirrors ``torch.Tensor.numpy()``).
 
-        Equivalent to ``self.array`` — both return numpy. For tensor-backed
-        datasets, first call materializes a cached read-only CPU copy.
+        For numpy-backed datasets, returns ``self.array`` directly. For
+        tensor-backed datasets, materializes a CPU copy via ``.detach().cpu().numpy()``.
         """
-        return self.array
+        if self._array is not None:
+            return self._array
+        return self._tensor.detach().cpu().numpy()
 
     def to(self, device) -> Self:
         """Move the underlying tensor to ``device``. Raises if numpy-backed."""
@@ -257,7 +251,6 @@ class Dataset(AutoSerialize):
                 f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'."
             )
         self._tensor = self._tensor.to(device)
-        self._cached_numpy = None  # invalidate stale derived numpy
         return self
 
     # --- Summaries ---
