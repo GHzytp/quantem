@@ -350,7 +350,6 @@ class Dataset3dspectroscopy(Dataset3d):
         standardize: bool = True,
         mask: Optional[NDArray] = None,
         plot_results: bool = True,
-        random_state: Optional[int] = 42,
         return_results=False,
     ) -> dict:
         """
@@ -367,8 +366,6 @@ class Dataset3dspectroscopy(Dataset3d):
             (scan_y, scan_x) or a flattened spatial mask.
         plot_results : bool
             If True, plot the explained variance and first few components
-        random_state : Optional[int]
-            Accepted for API compatibility. PCA uses deterministic SVD.
 
         Returns
         -------
@@ -691,7 +688,6 @@ class Dataset3dspectroscopy(Dataset3d):
         self,
         roi=None,
         energy_range=None,
-        ignore_range=None,
         mask=None,
         attach_mean_spectrum=True,
         roi_cal=None,
@@ -924,116 +920,6 @@ class Dataset3dspectroscopy(Dataset3d):
         fig.tight_layout()
         return fig, (ax_img, ax_spec)
 
-    def refline(
-        self,
-        elements,
-        ax=None,
-        energy=None,
-        energy_range=None,
-        linestyle=":",
-        linewidth=1.2,
-        alpha=0.35,
-        show_text=True,
-    ):
-        """Overlay reference lines for selected element specifiers on a spectrum axis.
-
-        This is plotting-only and does not modify auto-identification behavior.
-        """
-        if elements is None:
-            raise ValueError("elements must be specified")
-        if energy is not None and energy_range is not None:
-            raise ValueError("Specify either energy or energy_range, not both")
-
-        all_info = type(self)._ensure_element_info()
-
-        specs = type(self)._normalize_element_specs(elements)
-        if len(specs) == 0:
-            raise ValueError("elements must contain at least one selector")
-
-        if ax is None:
-            ax = plt.gca()
-
-        if energy_range is not None:
-            if len(energy_range) != 2:
-                raise ValueError("energy_range must be [min_energy, max_energy]")
-            e_min = float(min(energy_range[0], energy_range[1]))
-            e_max = float(max(energy_range[0], energy_range[1]))
-        elif energy is not None:
-            tol = max(2.0 * abs(float(self.sampling[0])), 1e-9)
-            center = float(energy)
-            e_min = center - tol
-            e_max = center + tol
-        else:
-            xlim = ax.get_xlim()
-            e_min = float(min(xlim))
-            e_max = float(max(xlim))
-
-        artists = []
-        labels = []
-        energies = []
-
-        y_top = ax.get_ylim()[1]
-        y_text = y_top - 0.08 * max(abs(y_top), 1e-12)
-
-        for spec in specs:
-            tokens = str(spec).split()
-            if len(tokens) == 0:
-                continue
-
-            element_key = type(self)._resolve_element_key(all_info, tokens[0])
-            if element_key is None:
-                continue
-
-            selectors = tokens[1:]
-            selected_lines = type(self)._select_lines(all_info.get(element_key, {}), selectors)
-
-            for line_name, line_info in selected_lines.items():
-                if not isinstance(line_info, dict):
-                    continue
-
-                energy_value = line_info.get("energy (keV)")
-                if energy_value is None:
-                    energy_value = line_info.get("onset_energy (eV)")
-                if energy_value is None:
-                    energy_value = line_info.get("energy")
-                if energy_value is None:
-                    continue
-
-                try:
-                    line_energy = float(energy_value)
-                except (TypeError, ValueError):
-                    continue
-
-                if not (e_min <= line_energy <= e_max):
-                    continue
-
-                label = f"{element_key} {line_name}"
-                line_artist = ax.axvline(
-                    line_energy,
-                    linestyle=linestyle,
-                    linewidth=linewidth,
-                    alpha=alpha,
-                    label=label,
-                )
-                artists.append(line_artist)
-                labels.append(label)
-                energies.append(line_energy)
-
-                if show_text:
-                    text_artist = ax.text(
-                        line_energy,
-                        y_text,
-                        label,
-                        rotation=90,
-                        ha="center",
-                        va="top",
-                        alpha=min(1.0, alpha + 0.2),
-                        clip_on=True,
-                    )
-                    artists.append(text_artist)
-
-        return {"ax": ax, "artists": artists, "labels": labels, "energies": np.asarray(energies)}
-
     def show_energy_window_map(
         self,
         energy_window=None,
@@ -1165,7 +1051,6 @@ class Dataset3dspectroscopy(Dataset3d):
         self,
         roi=None,
         energy_range=None,
-        ignore_range=None,
         mask=None,
         target_edge=None,
         window_size=None,
@@ -1215,7 +1100,6 @@ class Dataset3dspectroscopy(Dataset3d):
             True, also returns the fitted background cube.
         """
 
-        del ignore_range
         from quantem.spectroscopy import Dataset3deds, Dataset3deels
 
         fit_mode = str(fit_mode).lower()

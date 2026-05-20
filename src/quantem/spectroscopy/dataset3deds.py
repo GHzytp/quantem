@@ -105,10 +105,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         if not isinstance(cls.element_info, dict):
             return cls.element_info
 
-        if combine_close_peaks is None:
-            combine_close_peaks = cls.combine_close_xray_lines
-        if energy_threshold_ev is None:
-            energy_threshold_ev = cls.close_xray_line_threshold_ev
         threshold_kev = float(energy_threshold_ev) / 1000.0
 
         def line_family(line_name):
@@ -356,7 +352,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         return requested or saved
 
     @staticmethod
-    def _estimate_snr_thresholds(snr_values, peaks, floor=None, snr_threshold=None):
+    def _estimate_snr_thresholds(snr_values, floor=None, snr_threshold=None):
         """Auto-estimate SNR floors/thresholds from the peak SNR distribution."""
         snr_values = np.asarray(snr_values, dtype=float)
         snr_values = snr_values[np.isfinite(snr_values)]
@@ -464,7 +460,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             [lbl for lbl, _, _ in unique],
         )
 
-    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False, show=True):
+    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False):
         """Generate spectrum images by integrating around X-ray line energies.
 
         For each matched X-ray line, sums the spectral intensity within an
@@ -481,8 +477,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             Half-width of the integration window in keV.
         return_maps : bool, optional
             If ``True``, return ``(maps, labels)``.
-        show : bool, optional
-            If ``True``, display the generated maps.
 
         Returns
         -------
@@ -874,10 +868,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         roi_cal=None,
         energy_range=None,
         elements=None,
-        refline=None,
         ignore_elements=None,
         ignore_range=None,
-        threshold=5.0,
         tolerance=0.15,
         min_line_weight=0.0,
         mask=None,
@@ -915,16 +907,11 @@ class Dataset3deds(Dataset3dspectroscopy):
             Element or element-line specifiers to search for, e.g.
             ``'Fe'``, ``'Fe Ka'``, or ``['Cu', 'Zn K']``.  When provided,
             behaviour depends on *mode*.
-        refline : str | None, optional
-            Reserved for future use.
         ignore_elements : str | sequence[str] | None, optional
             Elements to exclude from autodetection.
         ignore_range : sequence[float] | None, optional
             Energy range ``[emin, emax]`` whose peaks are ignored.  Defaults to
             ``[0, 0.25]`` keV to skip the noise floor.
-        threshold : float, optional
-            Legacy parameter (currently unused).  SNR filtering is controlled
-            by *floor* and *snr_threshold*.
         tolerance : float, optional
             Maximum energy difference in keV between a detected peak and a
             tabulated X-ray line for them to be considered a match.
@@ -1016,7 +1003,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             roi=roi,
             roi_cal=roi_cal,
             energy_range=energy_range,
-            ignore_range=ignore_range,
             mask=mask,
         )
         E = float(self.origin[0]) + float(self.sampling[0]) * np.arange(self.shape[0])
@@ -1139,7 +1125,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         snr_values = np.asarray([height / background_std for height in peak_heights], dtype=float)
         floor, snr_threshold = type(self)._estimate_snr_thresholds(
             snr_values,
-            peaks,
             floor,
             snr_threshold,
         )
@@ -1512,83 +1497,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             if local_snr < weak_bump_threshold:
                 return False
 
-            return True
-
-        def strong_secondary_lines_have_support(
-            element, shell_name, matched_line_energy, weight_threshold=None
-        ):
-            """Return True if all strong secondary lines within shell_name (besides the matched one) have support."""
-            if weight_threshold is None:
-                # Keep L-shell checks strict (e.g. Xe La1 requires visible Lg1),
-                # but avoid over-eliminating K-shell IDs (e.g. Fe Ka without
-                # clearly visible Kb in low-count/trace conditions).
-                if shell_name == "L":
-                    weight_threshold = 0.03
-                elif shell_name == "K":
-                    weight_threshold = 0.12
-                else:
-                    weight_threshold = 0.10
-            support_window = max(float(tolerance), 3.0 * float(self.sampling[0]), 0.04)
-            weak_bump_threshold = max(2.5, 0.35 * float(snr_threshold))
-            for line_name, line_info in (all_info.get(str(element), {}) or {}).items():
-                if not type(self)._line_allowed_for_element(str(element), line_name, edge_filters):
-                    continue
-                if type(self)._line_shell(line_name) != shell_name:
-                    continue
-                try:
-                    line_energy = float(line_info.get("energy (keV)", line_info.get("energy")))
-                    line_weight = float(line_info.get("weight", 0.0))
-                except (TypeError, ValueError):
-                    continue
-                if not (energy_min <= line_energy <= energy_max):
-                    continue
-                if line_weight < weight_threshold:
-                    continue
-                # Skip the line that was actually matched — it trivially has support
-                if abs(line_energy - float(matched_line_energy)) <= support_window:
-                    continue
-                # This secondary line needs nearby spectral support.
-                found_support = False
-                for _, _, pe, _ in display_peaks:
-                    if abs(float(pe) - line_energy) > support_window:
-                        continue
-                    found_support = True
-                    break
-                if found_support:
-                    continue
-                # Fallback: raw spectral SNR near the secondary line.
-                local_idx = np.where(np.abs(E - line_energy) <= support_window)[0]
-                if local_idx.size == 0:
-                    return False
-                local_y = np.asarray(spec[local_idx], dtype=float)
-                local_rel = int(np.argmax(local_y))
-                local_max_pos = int(local_idx[local_rel])
-                local_snr = float(spec[local_max_pos] / max(float(background_std), 1e-9))
-
-                # Secondary-line support can be accepted from a clear local
-                # maximum, even if it does not satisfy the stricter SNR gate.
-                has_local_max = True
-                if local_y.size >= 3:
-                    if local_rel <= 0 or local_rel >= int(local_y.size) - 1:
-                        has_local_max = False
-                    else:
-                        has_local_max = bool(
-                            local_y[local_rel] >= local_y[local_rel - 1]
-                            and local_y[local_rel] >= local_y[local_rel + 1]
-                        )
-
-                edge_baseline = float(
-                    np.median([local_y[0], local_y[-1], float(np.percentile(local_y, 30))])
-                )
-                relief_snr = float(
-                    (local_y[local_rel] - edge_baseline) / max(float(background_std), 1e-9)
-                )
-                local_bump_threshold = max(1.2, 0.45 * float(floor))
-
-                if local_snr < weak_bump_threshold and not (
-                    has_local_max and relief_snr >= local_bump_threshold
-                ):
-                    return False
             return True
 
         element_stats, line_evidence = {}, {}
@@ -2349,27 +2257,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         )
         possible_elements = set(candidate_elements)
 
-        def format_elements_with_lines(names):
-            items = []
-            for element in sorted(map(str, names)):
-                lines = sorted(map(str, final_matches_by_element.get(element, set())))
-                line_strs = [str(line) for line in lines]
-                items.append(f"{element} [{', '.join(line_strs)}]" if lines else f"{element}")
-            return ", ".join(items)
-
-        def format_saved(edge_filters):
-            if edge_filters is None:
-                return "None"
-            out = []
-            for element in sorted(map(str, edge_filters)):
-                selectors = edge_filters.get(element)
-                out.append(
-                    f"{element} [all]"
-                    if not selectors
-                    else f"{element} [{', '.join(sorted(map(str, selectors)))}]"
-                )
-            return "\n".join(out) if out else "None"
-
         plot_all_identified = set(
             el
             for el in (set(detected_elements) | set(candidate_elements))
@@ -2486,7 +2373,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                             print(f"Peak at {peak_energy} keV may come from the grid.")
                             break
 
-            def label_with_energy_and_ratio(label, detected_peak_intensity=None):
+            def label_with_energy_and_ratio(label):
                 # label is like 'Fe Ka', want to append (energy, ratio) from all_info and observed/expected
                 if not label or label == "-" or label == "Unmatched" or label == "Unknown":
                     return label
@@ -2534,7 +2421,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             if not any(lbl.lower() == best_label.lower() for lbl, _, _, _ in labels):
                 labels = [(best_label, 0.0, match[4], match[7])] + labels
 
-            def fmt(label, score=None):
+            def fmt(label):
                 label = (
                     f"{label}*"
                     if requested_elements and str(label).split()[0] in requested_elements
@@ -2542,49 +2429,22 @@ class Dataset3deds(Dataset3dspectroscopy):
                 )
                 return label
 
-            # Gather all intensities for this element for ratio calculation
-            all_element_intensities = {}
-            for ll in all_info.get(match[4], {}):
-                # Find the highest observed intensity for each line
-                obs = 0.0
-                for _, h, _, _, el, _, _, ln, _, _ in peak_matches:
-                    if el == match[4] and ln == ll:
-                        obs = max(obs, float(h))
-                weight = all_info.get(match[4], {}).get(ll, {}).get("weight", None)
-                try:
-                    weight = float(weight) if weight is not None else 0.0
-                except Exception:
-                    weight = 0.0
-                all_element_intensities[ll] = (obs, weight)
-
             remaining = [
                 (label, score, elem, line)
                 for label, score, elem, line in labels
                 if label.lower() != best_label.lower()
             ]
 
-            # For each label, show ratio for that line
-            def get_peak_intensity(elem, line):
-                obs = 0.0
-                for _, h, _, _, el, _, _, ln, _, _ in peak_matches:
-                    if el == elem and ln == line:
-                        obs = max(obs, float(h))
-                return obs
-
             table_rows.append(
                 (
                     peak_energy,
                     height,
                     snr,
-                    label_with_energy_and_ratio(fmt(best_label), detected_peak_intensity=height),
-                    label_with_energy_and_ratio(
-                        fmt(remaining[0][0]), detected_peak_intensity=height
-                    )
+                    label_with_energy_and_ratio(fmt(best_label)),
+                    label_with_energy_and_ratio(fmt(remaining[0][0]))
                     if len(remaining) > 0
                     else "-",
-                    label_with_energy_and_ratio(
-                        fmt(remaining[1][0]), detected_peak_intensity=height
-                    )
+                    label_with_energy_and_ratio(fmt(remaining[1][0]))
                     if len(remaining) > 1
                     else "-",
                 )

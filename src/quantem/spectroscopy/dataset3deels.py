@@ -184,9 +184,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return background_fit
 
-    def smooth_eels_rollingaverage(
-        self, roi=None, energy_range=None, ignore_range=None, mask=None, kernel_size=10
-    ):
+    def smooth_eels_rollingaverage(self, roi=None, energy_range=None, mask=None, kernel_size=10):
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
         energy_axis = E0 + dE * np.arange(self.shape[0])
@@ -225,9 +223,15 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         # Plot raw and smoothed mean spectra on the same set of axes
 
-        mean_spectrum_raw = self.calculate_mean_spectrum(roi, energy_range, ignore_range, mask)
+        mean_spectrum_raw = self.calculate_mean_spectrum(
+            roi=roi,
+            energy_range=energy_range,
+            mask=mask,
+        )
         mean_spectrum_smoothed = smoothed_data3d.calculate_mean_spectrum(
-            roi, energy_range, ignore_range, mask
+            roi=roi,
+            energy_range=energy_range,
+            mask=mask,
         )
 
         fig, ax = plt.subplots()
@@ -237,9 +241,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return smoothed_data3d
 
-    def measure_zlp_offset(
-        self, zlp_guess_x=None, fit_window=0.8, use_gaussian_fit=True, fit_to_plane=False
-    ):
+    def measure_zlp_offset(self, zlp_guess_x=None, fit_window=0.8, fit_to_plane=False):
         """
         Measure ZLP offset at each pixel position by using a guess of ZLP posfitting each spectrum to a Gaussian
         """
@@ -344,7 +346,11 @@ class Dataset3deels(Dataset3dspectroscopy):
         # Alternatively, a 2D array matching the x and y dimensions of the 3D dataset can be supplied as the value of zlp_shifts_array to skip this step.
         # If measure_offset is False and no 2D ZLP shifts array is provided, a scalar input for zlp_guess_x can be used to shift the energy axis at every scan position by that amount.
         if measure_offset:
-            zlp_array = self.measure_zlp_offset(zlp_guess_x, fit_window, fit_to_plane)
+            zlp_array = self.measure_zlp_offset(
+                zlp_guess_x=zlp_guess_x,
+                fit_window=fit_window,
+                fit_to_plane=fit_to_plane,
+            )
         elif zlp_shifts_array is not None:
             if zlp_shifts_array.shape == self.array.shape[1:3]:
                 zlp_array = zlp_shifts_array
@@ -531,7 +537,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             units=self.units,
         )
 
-    def correct_zlp_shift(ll, hl, approach="smooth", sigma=1.2):
+    def correct_zlp_shift(ll, hl):
         """
         Aligns ZLP jitter across the spatial map and synchronizes Dual-EELS pairs.
         """
