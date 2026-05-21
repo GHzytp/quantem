@@ -66,8 +66,8 @@ def _ddp_ptycho_worker(
     if rank == 0:
         torch.save(
             {
-                "obj": ptycho.obj_model._obj.data.cpu(),
-                "probe": ptycho.probe_model._probe.data.cpu(),
+                "obj_state": {k: v.cpu() for k, v in ptycho.obj_model.state_dict().items()},
+                "probe_state": {k: v.cpu() for k, v in ptycho.probe_model.state_dict().items()},
                 "iter_losses": ptycho._iter_losses,
                 "iter_val_losses": ptycho._iter_val_losses,
             },
@@ -320,6 +320,17 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         self.dset._set_targets(loss_type)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
+
+        # Compute the global scan count once — needed to keep loss scale consistent across world sizes.
+        # In single-GPU mode num_gpts is already global; in distributed mode each rank holds a shard,
+        # so we sum across ranks to get the exact total.
+        if _dist_world_size > 1 and dist.is_available() and dist.is_initialized():
+            n_local = torch.tensor(self.dset.num_gpts, device=self.device, dtype=torch.long)
+            dist.all_reduce(n_local, op=dist.ReduceOp.SUM)
+            global_n = int(n_local.item())
+        else:
+            global_n = self.dset.num_gpts
+
         batcher = SimpleBatcher(
             self.dset.num_gpts,
             self.batch_size,
@@ -350,6 +361,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     pred_intensities,
                     batch_indices,
                     loss_type=loss_type,
+                    global_n=global_n,
                 )
 
                 batch_soft_constraint_loss = self._soft_constraints()
@@ -399,7 +411,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         )
                         pred_intensities = self.detector_model.forward(overlap)
                         batch_val_loss, _ = self.error_estimate(
-                            pred_intensities, batch_indices, loss_type=loss_type
+                            pred_intensities, batch_indices, loss_type=loss_type, global_n=global_n
                         )
                         val_consistency_loss += batch_val_loss.item()
                         val_batches += 1
@@ -475,8 +487,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             )
             result = torch.load(result_path, map_location="cpu", weights_only=False)
 
-        self.obj_model._obj.data.copy_(result["obj"])
-        self.probe_model._probe.data.copy_(result["probe"])
+        self.obj_model.load_state_dict(result["obj_state"])
+        self.probe_model.load_state_dict(result["probe_state"])
         self._iter_losses.extend(result["iter_losses"])
         self._iter_val_losses.extend(result["iter_val_losses"])
         return self

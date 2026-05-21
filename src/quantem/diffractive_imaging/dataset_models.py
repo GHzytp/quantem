@@ -569,7 +569,6 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
         self._shard_start: int = start
         self._shard_end: int = end
-        self._global_num_gpts: int = n_total
         self._local_num_gpts: int = end - start
 
         sl = slice(start, end)

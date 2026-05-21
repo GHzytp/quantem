@@ -879,13 +879,25 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
 
     def _broadcast_parameters(self, src: int = 0) -> None:
-        """Broadcast obj and probe data from rank src to all other ranks."""
-        dist.broadcast(self.obj_model._obj.data, src=src)
-        dist.broadcast(self.probe_model._probe.data, src=src)
+        """Broadcast obj and probe parameters from rank src to all other ranks.
+
+        Uses .parameters() so it works for both pixelated and DIP/INR models.
+        """
+        for p in self.obj_model.parameters():
+            dist.broadcast(p.data, src=src)
+        for p in self.probe_model.parameters():
+            dist.broadcast(p.data, src=src)
 
     def _all_reduce_gradients(self) -> None:
-        """Average obj.grad and probe.grad across all ranks (call after backward, before step)."""
-        params = [p for p in [self.obj_model._obj, self.probe_model._probe] if p.grad is not None]
+        """Average obj and probe gradients across all ranks (call after backward, before step).
+
+        Uses .parameters() so it works for both pixelated and DIP/INR models.
+        """
+        params = [
+            p
+            for p in list(self.obj_model.parameters()) + list(self.probe_model.parameters())
+            if p.grad is not None
+        ]
         if params:
             all_reduce_params(*params)
 
@@ -927,6 +939,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        global_n: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         targets = self.dset.targets[batch_indices]
         if "amplitude" in loss_type:
@@ -935,10 +948,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             preds = pred_intensities
 
         diff = preds * self.dset.detector_mask - targets * self.dset.detector_mask
+        n = global_n if global_n is not None else self.dset.num_gpts
         if "l1" in loss_type:
-            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / n)
         elif "l2" in loss_type:
-            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / n)
         elif loss_type == "poisson":
             error = torch.sum(preds - targets * torch.log(preds + 1e-6))
         else:
