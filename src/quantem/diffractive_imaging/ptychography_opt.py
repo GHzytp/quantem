@@ -1,5 +1,5 @@
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from quantem.core import config
 from quantem.core.ml.optimizer_mixin import (
@@ -54,7 +54,7 @@ class PtychographyOpt(PtychographyBase):
         }
 
     @optimizer_params.setter
-    def optimizer_params(self, d: dict) -> None:
+    def optimizer_params(self, d: dict[str, Any] | list[str] | tuple[str, ...]) -> None:
         """
         Takes a dictionary mapping optimizable keys to either an ``OptimizerType``
         dataclass or a plain dict (with optional ``"name"``/``"type"`` and ``"lr"``
@@ -67,10 +67,9 @@ class PtychographyOpt(PtychographyBase):
         >>> ptycho.optimizer_params = {"object": {"name": "adam", "lr": 5e-3}}
         >>> ptycho.optimizer_params = ["object", "probe"]  # use all defaults
         """
-        if isinstance(d, (tuple, list)):
-            d = {k: {} for k in d}
+        _d: dict[str, Any] = {k: {} for k in d} if isinstance(d, (list, tuple)) else d
 
-        for k, v in d.items():
+        for k, v in _d.items():
             if isinstance(v, OptimizerType):
                 pass  # already a dataclass, pass through
             elif isinstance(v, dict):
@@ -85,11 +84,11 @@ class PtychographyOpt(PtychographyBase):
                 raise TypeError(f"Expected OptimizerType or dict for key '{k}', got {type(v)}")
 
             if k == "object":
-                self.obj_model.optimizer_params = v
+                self.obj_model.optimizer_params = v  # type: ignore[assignment]
             elif k == "probe":
-                self.probe_model.optimizer_params = v
+                self.probe_model.optimizer_params = v  # type: ignore[assignment]
             elif k == "dataset":
-                self.dset.optimizer_params = v
+                self.dset.optimizer_params = v  # type: ignore[assignment]
             else:
                 raise ValueError(
                     f"key to be optimized, {k}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
@@ -140,7 +139,7 @@ class PtychographyOpt(PtychographyBase):
         }
 
     @scheduler_params.setter
-    def scheduler_params(self, d: dict) -> None:
+    def scheduler_params(self, d: dict[str, Any] | list[str] | tuple[str, ...]) -> None:
         """
         Takes a dictionary mapping optimizable keys to either a ``SchedulerType``
         dataclass or a plain dict.  Keys not present in ``d`` are set to
@@ -151,10 +150,11 @@ class PtychographyOpt(PtychographyBase):
         >>> ptycho.scheduler_params = {"object": SchedulerParams.Plateau(factor=0.5)}
         >>> ptycho.scheduler_params = {"object": {"name": "plateau", "factor": 0.5}}
         """
+        _d: dict[str, Any] = {k: {} for k in d} if isinstance(d, (list, tuple)) else dict(d)
         for key in self.OPTIMIZABLE_VALS:
-            if key not in d:
-                d[key] = SchedulerParams.NoneScheduler()
-        for k, v in d.items():
+            if key not in _d:
+                _d[key] = SchedulerParams.NoneScheduler()
+        for k, v in _d.items():
             if k == "object":
                 self.obj_model.scheduler_params = v
             elif k == "probe":
@@ -167,7 +167,7 @@ class PtychographyOpt(PtychographyBase):
                 )
 
     @property
-    def schedulers(self) -> dict[str, "torch.optim.lr_scheduler._LRScheduler"]:
+    def schedulers(self) -> dict[str, "torch.optim.lr_scheduler.LRScheduler"]:
         """Get schedulers from all models."""
         schedulers = {}
         if self.obj_model.scheduler is not None:

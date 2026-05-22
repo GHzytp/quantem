@@ -8,6 +8,7 @@ can be used by diffractive_imaging without circular imports.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -51,11 +52,11 @@ def get_world_size() -> int:
     return 1
 
 
-def all_reduce_params(*params: torch.Tensor, op: dist.ReduceOp = dist.ReduceOp.AVG) -> None:
+def all_reduce_params(*params: torch.Tensor, op: Any = dist.ReduceOp.AVG) -> None:
     """Average the .grad tensors of the given parameters across all ranks in-place."""
     for p in params:
         if p.grad is not None:
-            _ = dist.all_reduce(p.grad, op=op)  # type: ignore[arg-type]
+            _ = dist.all_reduce(p.grad, op=op)
 
 
 def broadcast_params(*params: torch.Tensor, src: int = 0) -> None:

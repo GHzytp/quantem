@@ -85,10 +85,13 @@ def _ddp_ptycho_worker(
     dist.destroy_process_group()
 
 
-class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase):
+class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase):  # pyright: ignore[reportUnsafeMultipleInheritance]
     """
     A class for performing phase retrieval using the Ptychography algorithm.
     """
+
+    _autograd: bool = True
+    _dataset_metadata: "dict[str, Any] | None" = None
 
     @classmethod
     def from_models(
@@ -181,7 +184,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
     def _soft_constraints(self) -> torch.Tensor:
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
-        total_loss = torch.tensor(0, device=self.device, dtype=self._dtype_real)
+        total_loss = torch.tensor(0, device=self._single_device, dtype=self._dtype_real)
 
         obj_loss = self.obj_model.apply_soft_constraints(
             self.obj_model.obj, mask=self.obj_model.mask
@@ -204,9 +207,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self,
         num_iters: int = 0,
         reset: bool = False,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
-        constraints: dict = {},
+        optimizer_params: dict[str, Any] | None = None,
+        scheduler_params: dict[str, Any] | None = None,
+        constraints: dict[str, Any] = {},
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
@@ -231,7 +234,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self._check_preprocessed()
 
         # Determine effective device list: explicit arg takes priority, else fall back to stored.
-        devices_to_use = device if isinstance(device, list) else getattr(self, "_multi_gpu_devices", None)
+        devices_to_use = (
+            device if isinstance(device, list) else getattr(self, "_multi_gpu_devices", None)
+        )
 
         # Route to multi-GPU path
         if isinstance(devices_to_use, list) and not is_distributed_launch():
@@ -289,9 +294,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self,
         num_iters: int = 0,
         reset: bool = False,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
-        constraints: dict = {},
+        optimizer_params: dict[str, Any] | None = None,
+        scheduler_params: dict[str, Any] | None = None,
+        constraints: dict[str, Any] = {},
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
@@ -335,8 +340,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # In single-GPU mode num_gpts is already global; in distributed mode each rank holds a shard,
         # so we sum across ranks to get the exact total.
         if _dist_world_size > 1 and dist.is_available() and dist.is_initialized():
-            n_local = torch.tensor(self.dset.num_gpts, device=self.device, dtype=torch.long)
-            dist.all_reduce(n_local, op=dist.ReduceOp.SUM)
+            n_local = torch.tensor(
+                self.dset.num_gpts, device=self._single_device, dtype=torch.long
+            )
+            _ = dist.all_reduce(n_local, op=dist.ReduceOp.SUM)  # type: ignore[call-overload]
             global_n = int(n_local.item())
         else:
             global_n = self.dset.num_gpts
@@ -399,7 +406,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             # Average loss across ranks so rank-0 reports the global mean
             if _dist_world_size > 1:
                 loss_t = torch.tensor(
-                    [total_loss, consistency_loss], device=self.device, dtype=torch.float64
+                    [total_loss, consistency_loss], device=self._single_device, dtype=torch.float64
                 )
                 dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
                 total_loss, consistency_loss = loss_t[0].item(), loss_t[1].item()
@@ -494,7 +501,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             # forkserver: workers fork from a clean pre-started server (no inherited
             # CUDA, no Jupyter FDs).  Only plain Python scalars/strings cross the
             # process boundary, so tensor pickling is never triggered.
-            mp.start_processes(
+            mp.start_processes( # type: ignore 
                 _ddp_ptycho_worker,
                 args=(len(devices), ptycho_path, devices, recon_kwargs, result_path),
                 nprocs=len(devices),
@@ -585,12 +592,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             # scaling pixelated ad gradients to closer match analytic
             if isinstance(self.obj_model, ObjectPixelated):
                 obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
-                self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
+                if self.obj_model._obj.grad is not None:
+                    self.obj_model._obj.grad.mul_(obj_grad_scale)
 
             if isinstance(self.probe_model, ProbeParametric):
                 probe_grad_scale = np.sqrt(self.probe_model._mean_diffraction_intensity)
                 for par in self.probe_model.params:
-                    par.grad.mul_(probe_grad_scale)  # type:ignore
+                    if par.grad is not None:
+                        par.grad.mul_(probe_grad_scale)
 
         else:
             gradient = self.gradient_step(amplitudes, overlap)
@@ -713,7 +722,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # Add other common skips for ptychography objects
         skips = skip
 
-        current_device = self.device
+        _dev = self.device
+        current_device: str = f"cuda:{_dev[0]}" if isinstance(_dev, list) else _dev
         self.to("cpu")
 
         if self.verbose and verbose:
@@ -730,8 +740,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.to(current_device)  # TODO figure out why this isn't working for DDIP sometimes?
 
         # Clean up temporary metadata
-        if not save_raw_data and hasattr(self, "_dataset_metadata"):
-            delattr(self, "_dataset_metadata")
+        if not save_raw_data and self._dataset_metadata is not None:
+            self._dataset_metadata = None
 
     @classmethod
     def from_file(
@@ -773,7 +783,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         # If no dataset was provided, try to reload it from saved metadata
         if dset is None and auto_reload_dataset and not hasattr(ptycho, "dset"):
-            if hasattr(ptycho, "_dataset_metadata") and ptycho._dataset_metadata:
+            if ptycho._dataset_metadata is not None:
                 metadata = ptycho._dataset_metadata
                 file_path = metadata.get("file_path")
 
@@ -816,13 +826,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         elif dset is not None:
             dset._set_initial_scan_positions_px(ptycho.obj_padding_px)
             dset._set_patch_indices(ptycho.obj_padding_px)
-            if hasattr(ptycho, "_dataset_metadata") and ptycho._dataset_metadata:
+            if ptycho._dataset_metadata is not None:
                 metadata = ptycho._dataset_metadata
                 # preserve learned scan positions and descan shifts
                 if "learned_scan_positions_px" in metadata:
-                    dset.scan_positions_px.data = metadata["learned_scan_positions_px"]
+                    dset.scan_positions_px.data = metadata["learned_scan_positions_px"]  # type: ignore[assignment]
                 if "learned_descan_shifts" in metadata:
-                    dset.descan_shifts.data = metadata["learned_descan_shifts"]
+                    dset.descan_shifts.data = metadata["learned_descan_shifts"]  # type: ignore[assignment]
 
         # check if dset was attached to ptycho object
         if dset is not None:

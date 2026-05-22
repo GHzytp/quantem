@@ -95,6 +95,16 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise RuntimeError("the quantEM Ptychography module requires torch to be installed.")
 
         super().__init__()
+
+        # Pre-initialize private attributes so type checker sees them in __init__
+        self._verbose: int = 0
+        self._logger: LoggerPtychography | None = None
+        self._batch_size: int = 1
+        self._dset: DatasetModelType = dset
+        self._obj_model: ObjectModelType = obj_model
+        self._probe_model: ProbeModelType = probe_model
+        self._detector_model: DetectorModelType = detector_model
+
         self.verbose = verbose
         self.dset = dset
         self.device = device
@@ -109,7 +119,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._iter_losses: list[float] = []
         self._iter_val_losses: list[float] = []
         self._iter_recon_types: list[str] = []
-        self._iter_lrs: dict[str, list] = {}  # LRs/step_sizes across iterations
+        self._iter_lrs: dict[str, list[float]] = {}  # LRs/step_sizes across iterations
         self._snapshots: list[Snapshot] = []
         self._obj_padding_px = np.array([0, 0])
         self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
@@ -130,7 +140,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.detector_model = detector_model
         self.compute_propagator_arrays()
         self.logger = logger
-        self.to(self.device)
+        self.to(self._single_device)
 
     # region --- preprocessing ---
     ## hopefully will be able to remove some of thes preprocessing flags,
@@ -173,7 +183,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.roi_shape,
                 self.reciprocal_sampling,
                 self.dset.mean_diffraction_intensity,
-                device=self.device,
+                device=self._single_device,
             )
 
         # change obj_padding_px and whatever else needs to be changed
@@ -208,7 +218,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         batch_size = num_dps if max_batch_size is None else int(max_batch_size)
         probe_overlap = torch.zeros(
-            tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self.device
+            tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self._single_device
         )
         for start, end in generate_batches(num_dps, max_batch=batch_size):
             probe_overlap += sum_patches(
@@ -299,7 +309,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self._to_numpy(slice_thick)
 
     @slice_thicknesses.setter
-    def slice_thicknesses(self, val: float | Sequence | None) -> None:
+    def slice_thicknesses(self, val: float | Sequence[float] | None) -> None:
         self._obj_model.slice_thicknesses = val
         if hasattr(self, "_propagators"):  # propagators already set, update with new slices
             self.compute_propagator_arrays()
@@ -509,7 +519,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise TypeError(f"obj_model must be a ObjectModelType, got {type(model)}")
 
         # Set object shape
-        model.to(self.device)
+        model.to(self._single_device)
         self._obj_model = cast(ObjectModelType, model)
 
     @property
@@ -530,12 +540,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.roi_shape,
                 self.reciprocal_sampling,
                 self.dset.mean_diffraction_intensity,
-                device=self.device,
+                device=self._single_device,
             )
         else:
             # will be set in ptycho.preprocess after dset is preprocessed
             pass
-        self._probe_model.to(self.device)
+        self._probe_model.to(self._single_device)
 
     @property
     def constraints(self) -> dict[str, Any]:
@@ -600,7 +610,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     @property
     def device(self) -> str | list[int]:
         """Returns the active device: 'cuda:X'/'cpu' for single-GPU, or [gpu_ids] for multi-GPU."""
-        if getattr(self, "_multi_gpu_devices", None) is not None:
+        if self._multi_gpu_devices is not None:
             return self._multi_gpu_devices
         if hasattr(self, "_device"):
             return self._device
@@ -616,6 +626,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.to(dev)
             except AttributeError:
                 pass
+
+    @property
+    def _single_device(self) -> str:
+        """Single-device string for internal tensor operations. Always str, never a list."""
+        return self._device if hasattr(self, "_device") else str(config.get("device"))
 
     @property
     def _obj_dtype(self) -> "torch.dtype":
@@ -774,13 +789,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise TypeError(f"dtype should be string or torch.dtype, got {type(dtype)} {dtype}")
 
         if isinstance(array, np.ndarray):
-            t = torch.tensor(array.copy(), device=self.device, dtype=dt)
+            t = torch.tensor(array.copy(), device=self._single_device, dtype=dt)
         elif isinstance(array, torch.Tensor):
-            t = array.to(self.device)
+            t = array.to(self._single_device)
             if dt is not None:
                 t = t.type(dt)
         elif isinstance(array, (list, tuple)):
-            t = torch.tensor(array, device=self.device, dtype=dt)
+            t = torch.tensor(array, device=self._single_device, dtype=dt)
         else:
             raise TypeError(f"arr should be ndarray or Tensor, got {type(array)}")
         return t

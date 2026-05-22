@@ -32,21 +32,21 @@ class PtychoLite(Ptychography):
         *,
         # object settings
         num_slices: int = 1,
-        slice_thicknesses: float | Sequence | None = None,
+        slice_thicknesses: float | Sequence[float] | None = None,
         obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
         # probe settings
         num_probes: int = 1,
         energy: float | None = None,
         defocus: float | None = None,
         semiangle_cutoff: float | None = None,
-        polar_parameters: dict | None = None,
+        polar_parameters: dict[str, Any] | None = None,
         middle_focus: bool = False,
         vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
         initial_probe_weights: list[float] | np.ndarray | None = None,
         # preprocessing
         obj_padding_px: tuple[int, int] = (0, 0),
         # logging/device
-        log_dir: os.PathLike | str | None = None,
+        log_dir: os.PathLike[str] | str | None = None,
         log_prefix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = False,
@@ -166,7 +166,7 @@ class PtychoLite(Ptychography):
         )
         return ptycho
 
-    def reconstruct(  # type:ignore could do overloads but this is simpler...
+    def reconstruct(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         num_iters: int = 0,
         reset: bool = False,
@@ -178,7 +178,7 @@ class PtychoLite(Ptychography):
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
-        constraints: dict = {},  # TODO add constraints flags
+        constraints: dict[str, Any] = {},  # TODO add constraints flags
         store_iterations_every: int | None = None,
         device: "Literal['cpu', 'gpu'] | int | list[int] | None" = None,
         verbose: int | bool = True,
@@ -202,6 +202,8 @@ class PtychoLite(Ptychography):
         if not needs_dataset_optimizer and "dataset" in self.optimizers:
             self.remove_optimizer("dataset")
 
+        opt_params: dict[str, Any] | None
+        scheduler_params: dict[str, Any] | None
         if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
             opt_params = {
                 "object": {
@@ -236,8 +238,6 @@ class PtychoLite(Ptychography):
         else:
             opt_params = None
             scheduler_params = None
-
-        constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
             num_iters=num_iters,
@@ -283,7 +283,7 @@ class PtychoLite(Ptychography):
                 upgraded = cls._recursive_load_from_path(path)
                 return upgraded  # type: ignore[return-value]
 
-        return base  # type: ignore[return-value]
+        return base  # pyright: ignore[reportReturnType]
 
 
 class PtychoLiteDIP(Ptychography):
@@ -305,9 +305,9 @@ class PtychoLiteDIP(Ptychography):
         normalize_object_plotting: bool = True,
         # model settings
         cnn_num_layers: int = 3,
-        final_activation: str | Callable = nn.Identity(),
+        final_activation: "str | Callable[..., Any]" = nn.Identity(),
         # logging/device
-        log_dir: os.PathLike | str | None = None,
+        log_dir: os.PathLike[str] | str | None = None,
         log_prefix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = False,
@@ -407,7 +407,7 @@ class PtychoLiteDIP(Ptychography):
         )
         return ptycho
 
-    def reconstruct(  # type:ignore could do overloads but this is simpler...
+    def reconstruct(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         num_iters: int = 0,
         reset: bool = False,
@@ -419,9 +419,9 @@ class PtychoLiteDIP(Ptychography):
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
-        constraints: dict = {},  # TODO add constraints flags
+        constraints: dict[str, Any] = {},  # TODO add constraints flags
         store_iterations_every: int | None = None,
-        device: Literal["cpu", "gpu"] | None = None,
+        device: Literal["cpu", "gpu"] | int | list[int] | None = None,
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
@@ -443,6 +443,8 @@ class PtychoLiteDIP(Ptychography):
         if not needs_dataset_optimizer and "dataset" in self.optimizers:
             self.remove_optimizer("dataset")
 
+        opt_params: dict[str, Any] | None
+        scheduler_params: dict[str, Any] | None
         if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
             opt_params = {
                 "object": {
@@ -477,8 +479,6 @@ class PtychoLiteDIP(Ptychography):
         else:
             opt_params = None
             scheduler_params = None
-
-        constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
             num_iters=num_iters,
