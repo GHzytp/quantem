@@ -64,12 +64,20 @@ def _ddp_ptycho_worker(
     ptycho._reconstruct_inner(**recon_kwargs, _dist_rank=rank, _dist_world_size=world_size)
 
     if rank == 0:
+        obj_opt = ptycho.optimizers.get("object")
+        probe_opt = ptycho.optimizers.get("probe")
         torch.save(
             {
                 "obj_state": {k: v.cpu() for k, v in ptycho.obj_model.state_dict().items()},
                 "probe_state": {k: v.cpu() for k, v in ptycho.probe_model.state_dict().items()},
+                "obj_optimizer_params": ptycho.obj_model._optimizer_params,
+                "probe_optimizer_params": ptycho.probe_model._optimizer_params,
+                "obj_optimizer_state": obj_opt.state_dict() if obj_opt is not None else None,
+                "probe_optimizer_state": probe_opt.state_dict() if probe_opt is not None else None,
                 "iter_losses": ptycho._iter_losses,
                 "iter_val_losses": ptycho._iter_val_losses,
+                "iter_lrs": ptycho._iter_lrs,
+                "iter_recon_types": ptycho._iter_recon_types,
             },
             result_path,
         )
@@ -466,6 +474,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         systems (EINVAL from ftruncate).  Passing only a file path (a plain string)
         avoids that mechanism entirely.
         """
+        restore_device = f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu"
         self.to("cpu")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -487,10 +496,63 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             )
             result = torch.load(result_path, map_location="cpu", weights_only=False)
 
+        # --- model weights ---
         self.obj_model.load_state_dict(result["obj_state"])
         self.probe_model.load_state_dict(result["probe_state"])
-        self._iter_losses.extend(result["iter_losses"])
-        self._iter_val_losses.extend(result["iter_val_losses"])
+        self.to(restore_device)
+
+        # --- restore optimizer params (worker may have set/changed them) so that future
+        #     spawns (e.g. reset=True without optimizer_params) can re-init the optimizer ---
+        for model, key in (
+            (self.obj_model, "obj_optimizer_params"),
+            (self.probe_model, "probe_optimizer_params"),
+        ):
+            saved = result.get(key)
+            if saved is not None:
+                model._optimizer_params = saved
+
+        # Re-create optimizers on the restored device (main process never ran set_optimizers).
+        # set_optimizers() skips models whose _optimizer_params is NoneOptimizer.
+        self.set_optimizers()
+
+        # --- optimizer states (params and device must be set before loading) ---
+        for name, key in (("object", "obj_optimizer_state"), ("probe", "probe_optimizer_state")):
+            opt_state = result.get(key)
+            opt = self.optimizers.get(name)
+            if opt_state is not None and opt is not None:
+                opt.load_state_dict(opt_state)
+                # State tensors were saved on CPU; move them to restore_device
+                for state in opt.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(restore_device)
+
+        # --- iteration tracking ---
+        # When reset=True the worker ran reset_recon() internally, so its lists start from 0.
+        # When reset=False the worker inherited existing history, so its lists are [old...new...].
+        # n_before lets us take only the genuinely new tail in both cases.
+        n_before = len(self._iter_losses)
+        is_reset = recon_kwargs.get("reset", False)
+
+        if is_reset:
+            self._iter_losses.clear()
+            self._iter_val_losses.clear()
+            self._iter_lrs.clear()
+            self._iter_recon_types.clear()
+            self._iter_losses.extend(result["iter_losses"])
+            self._iter_val_losses.extend(result["iter_val_losses"])
+            for k, v in result.get("iter_lrs", {}).items():
+                self._iter_lrs[k] = list(v)
+            self._iter_recon_types.extend(result.get("iter_recon_types", []))
+        else:
+            self._iter_losses.extend(result["iter_losses"][n_before:])
+            self._iter_val_losses.extend(result["iter_val_losses"][n_before:])
+            for k, v in result.get("iter_lrs", {}).items():
+                if k not in self._iter_lrs:
+                    self._iter_lrs[k] = []
+                self._iter_lrs[k].extend(list(v)[n_before:])
+            self._iter_recon_types.extend(result.get("iter_recon_types", [])[n_before:])
+
         return self
 
     def _get_current_lrs(self) -> dict[str, float]:

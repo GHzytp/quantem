@@ -905,6 +905,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         dev, _id = config.validate_device(device)
         if dev != self.device:
             self._device = dev
+        # Sync each sub-model's own device tracker so their reset() uses the correct device
+        self.obj_model.device = dev
+        self.probe_model.device = dev
         self.obj_model.to(dev)
         self.probe_model.to(dev)
         self.dset.to(dev)
