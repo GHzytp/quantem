@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
@@ -11,6 +12,7 @@ import torch
 from tqdm.auto import tqdm
 
 from quantem.core.visualization import show_2d
+from quantem.diffractive_imaging.dataset_models import PtychographyDatasetBase
 
 
 @dataclass
@@ -134,6 +136,7 @@ def _build_ptychography_instance(constructors, resolved_kwargs):
 
     init_kwargs = resolved_kwargs.get("init", {}).copy()
     init_kwargs["verbose"] = False
+    _isolate_trial_dataset(init_kwargs)
 
     return constructors["ptychography_class"](
         obj_model=obj_model,
@@ -147,8 +150,29 @@ def _build_ptycholite_instance(constructors, resolved_kwargs):
     """Build PtychoLite instance."""
     init_kwargs = resolved_kwargs.get("init", {}).copy()
     init_kwargs["verbose"] = False
+    _isolate_trial_dataset(init_kwargs)
 
     return constructors["ptychography_class"](**init_kwargs)
+
+
+def _isolate_trial_dataset(init_kwargs: dict[str, Any]) -> None:
+    """Give each optimization trial a private mutable dataset model."""
+    dset = init_kwargs.get("dset")
+    if not isinstance(dset, PtychographyDatasetBase):
+        return
+
+    try:
+        dset = copy.deepcopy(dset)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not copy the ptychography dataset for an optimization trial. "
+            "Pass a dataset_constructor instead so each trial can build a fresh dataset."
+        ) from exc
+
+    dset.reset()
+    dset.zero_grad(set_to_none=True)
+    dset.reset_optimizer()
+    init_kwargs["dset"] = dset
 
 
 def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
