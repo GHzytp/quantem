@@ -101,6 +101,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.rng = rng
 
         # initializing default attributes
+        self._multi_gpu_devices: list[int] | None = None
         self._preprocessed: bool = False
         self._obj_padding_force_power2_level: int = 3
         self._store_snapshots: bool = False
@@ -597,12 +598,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     # region --- implicit class properties ---
 
     @property
-    def device(self) -> str:
-        """This should be of form 'cuda:X' or 'cpu', as defined by quantem.config"""
+    def device(self) -> str | list[int]:
+        """Returns the active device: 'cuda:X'/'cpu' for single-GPU, or [gpu_ids] for multi-GPU."""
+        if getattr(self, "_multi_gpu_devices", None) is not None:
+            return self._multi_gpu_devices
         if hasattr(self, "_device"):
             return self._device
-        else:
-            return config.get("device")
+        return config.get("device")
 
     @device.setter
     def device(self, device: str | int | None):
@@ -903,8 +905,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     def to(self, device: str | int | torch.device):
         dev, _id = config.validate_device(device)
-        if dev != self.device:
-            self._device = dev
+        self._device = dev
+        self._multi_gpu_devices = None
         # Sync each sub-model's own device tracker so their reset() uses the correct device
         self.obj_model.device = dev
         self.probe_model.device = dev

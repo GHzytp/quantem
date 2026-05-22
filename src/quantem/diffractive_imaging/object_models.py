@@ -1056,11 +1056,12 @@ class ObjectDIP(ObjectConstraints):
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,
-        device: str | None = None,  # allow overwriting of device
+        device: str | int | None = None,
         normalize_object_plotting: bool = True,
     ):
         if device is not None:
-            self.to(device)
+            dev, _ = config.validate_device(device)
+            self.to(dev)
 
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)

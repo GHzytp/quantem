@@ -230,25 +230,26 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         """
         self._check_preprocessed()
 
-        # Route to multi-GPU path when a list of device IDs is given
-        if isinstance(device, list):
+        # Determine effective device list: explicit arg takes priority, else fall back to stored.
+        devices_to_use = device if isinstance(device, list) else getattr(self, "_multi_gpu_devices", None)
+
+        # Route to multi-GPU path
+        if isinstance(devices_to_use, list) and not is_distributed_launch():
             if not autograd:
                 raise ValueError("Multi-GPU reconstruction requires autograd=True.")
-            if not is_distributed_launch():
-                return self._spawn_reconstruct(
-                    devices=device,
-                    num_iters=num_iters,
-                    reset=reset,
-                    optimizer_params=optimizer_params,
-                    scheduler_params=scheduler_params,
-                    constraints=constraints,
-                    batch_size=batch_size,
-                    store_snapshots=store_snapshots,
-                    store_snapshots_every=store_snapshots_every,
-                    autograd=autograd,
-                    loss_type=loss_type,
-                )
-            # torchrun: fall through — process group already initialised externally
+            return self._spawn_reconstruct(
+                devices=devices_to_use,
+                num_iters=num_iters,
+                reset=reset,
+                optimizer_params=optimizer_params,
+                scheduler_params=scheduler_params,
+                constraints=constraints,
+                batch_size=batch_size,
+                store_snapshots=store_snapshots,
+                store_snapshots_every=store_snapshots_every,
+                autograd=autograd,
+                loss_type=loss_type,
+            )
 
         # Handle torchrun distributed launch (RANK env var present)
         if is_distributed_launch():
@@ -302,7 +303,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         _dist_world_size: int = 1,
     ) -> Self:
         """Core reconstruction loop. Called by reconstruct() for all launch modes."""
-        self.batch_size = batch_size
+        if batch_size is not None:
+            self.batch_size = batch_size
         self.store_snapshot_every = store_snapshots_every
         if store_snapshots_every is not None and store_snapshots is None:
             self.store_snapshots = True
@@ -475,6 +477,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         avoids that mechanism entirely.
         """
         restore_device = f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu"
+        # Persist batch_size on the main process so it carries into the saved file and
+        # is remembered on future calls that omit batch_size.
+        bs = recon_kwargs.get("batch_size")
+        if bs is not None:
+            self.batch_size = bs
         self.to("cpu")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -553,6 +560,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 self._iter_lrs[k].extend(list(v)[n_before:])
             self._iter_recon_types.extend(result.get("iter_recon_types", [])[n_before:])
 
+        self._multi_gpu_devices = devices
         return self
 
     def _get_current_lrs(self) -> dict[str, float]:
