@@ -12,7 +12,10 @@ import torch
 from tqdm.auto import tqdm
 
 from quantem.core.visualization import show_2d
-from quantem.diffractive_imaging.dataset_models import PtychographyDatasetBase
+from quantem.diffractive_imaging.dataset_models import (
+    PtychographyDatasetBase,
+    PtychographyDatasetRaster,
+)
 
 
 @dataclass
@@ -161,18 +164,72 @@ def _isolate_trial_dataset(init_kwargs: dict[str, Any]) -> None:
     if not isinstance(dset, PtychographyDatasetBase):
         return
 
-    try:
-        dset = copy.deepcopy(dset)
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not copy the ptychography dataset for an optimization trial. "
-            "Pass a dataset_constructor instead so each trial can build a fresh dataset."
-        ) from exc
-
+    dset = _clone_ptychography_dataset(dset)
     dset.reset()
     dset.zero_grad(set_to_none=True)
     dset.reset_optimizer()
     init_kwargs["dset"] = dset
+
+
+def _clone_ptychography_dataset(dset: PtychographyDatasetBase) -> PtychographyDatasetBase:
+    """Clone a ptychography dataset without using torch Module deepcopy."""
+    if not isinstance(dset, PtychographyDatasetRaster):
+        raise RuntimeError(
+            "Could not copy the ptychography dataset for an optimization trial. "
+            "Pass a dataset_constructor instead so each trial can build a fresh dataset."
+        )
+
+    detector_mask = dset.detector_mask.detach().cpu().clone()
+    origin = np.array([0, 0, *dset.dset.origin[-2:]])
+    sampling = np.array([*dset.scan_sampling, *dset.detector_sampling])
+    units = [*dset.scan_units, *dset.detector_units]
+    cloned = PtychographyDatasetRaster.from_array(
+        array=dset.intensities_4d.copy(),
+        name=dset.dset.name,
+        origin=origin,
+        sampling=sampling,
+        units=units,
+        signal_units=dset.dset.signal_units,
+        detector_mask=detector_mask,
+        verbose=dset.verbose,
+        learn_descan=dset.learn_descan,
+        learn_scan_positions=dset.learn_scan_positions,
+    )
+    cloned.constraints = copy.deepcopy(dset.constraints)
+    cloned._preprocessing_params = copy.deepcopy(dset._preprocessing_params)
+    cloned.com_rotation_rad = dset.com_rotation_rad
+    if hasattr(dset, "_transpose"):
+        cloned.com_transpose = dset.com_transpose
+    if dset.probe_energy is not None:
+        cloned.probe_energy = dset.probe_energy
+
+    if not dset.preprocessed:
+        return cloned
+
+    cloned.diffraction_padding = dset.diffraction_padding.copy()
+    cloned.com_measured = dset.com_measured.copy()
+    cloned.com_fit = dset.com_fit.copy()
+    cloned.centered_amplitudes = dset.centered_amplitudes.detach().cpu().clone()
+    cloned.amplitudes = dset.amplitudes.detach().cpu().clone()
+    cloned.centered_intensities = dset.centered_intensities.detach().cpu().clone()
+    cloned.intensities = dset.intensities.detach().cpu().clone()
+    cloned.detector_mask = detector_mask
+    cloned.mean_diffraction_intensity = dset.mean_diffraction_intensity
+    if hasattr(dset, "mean_diffraction_amplitude"):
+        cloned.mean_diffraction_amplitude = dset.mean_diffraction_amplitude
+    cloned._pattern_crop_mask = copy.deepcopy(getattr(dset, "_pattern_crop_mask", None))
+    cloned._pattern_crop_mask_shape = copy.deepcopy(
+        getattr(dset, "_pattern_crop_mask_shape", dset.roi_shape)
+    )
+    cloned.initial_descan_shifts = dset.initial_descan_shifts.detach().cpu().clone()
+    cloned.initial_scan_positions_px = dset.initial_scan_positions_px.detach().cpu().clone()
+    cloned.descan_shifts = cloned.initial_descan_shifts.clone()
+    cloned.scan_positions_px = cloned.initial_scan_positions_px.clone()
+    cloned._patch_indices = dset.patch_indices.detach().cpu().clone()
+    cloned._last_patch_positions_px = cloned.scan_positions_px.detach().clone()
+    cloned._targets = dset.targets.detach().cpu().clone()
+    cloned._preprocessed = True
+    return cloned
 
 
 def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
