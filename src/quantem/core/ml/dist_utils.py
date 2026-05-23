@@ -63,3 +63,28 @@ def broadcast_params(*params: torch.Tensor, src: int = 0) -> None:
     """Broadcast .data of each parameter from rank src to all other ranks."""
     for p in params:
         _ = dist.broadcast(p.data, src=src)
+
+
+def worker_init_fn(worker_id: int) -> None:
+    """Hide CUDA from DataLoader workers so they only touch CPU-resident tensors."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
+def spawn_distributed_workers(
+    worker_fn, devices: list[int], *worker_args, start_method: str = "forkserver"
+) -> None:
+    """Launch one worker per device via torch.multiprocessing.start_processes.
+
+    worker_fn must be a module-level callable with signature
+    (rank, world_size, *worker_args) — matches the mp.start_processes contract,
+    which passes rank as the first arg automatically.
+    """
+    import torch.multiprocessing as mp
+
+    mp.start_processes( # type: ignore 
+        worker_fn,
+        args=(len(devices), *worker_args),
+        nprocs=len(devices),
+        join=True,
+        start_method=start_method,
+    )

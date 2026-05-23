@@ -896,26 +896,43 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
 
     def _broadcast_parameters(self, src: int = 0) -> None:
-        """Broadcast obj and probe parameters from rank src to all other ranks.
+        """Broadcast obj, probe, and dataset parameters from rank src to all other ranks.
 
-        Uses .parameters() so it works for both pixelated and DIP/INR models.
+        Uses .parameters() so it works for both pixelated and DIP/INR models. The dataset's
+        learnable params (scan positions / descan shifts) must also be broadcast: with the
+        DistributedSampler partitioning scan positions, the full position params are replicated
+        on every rank, so they must start identical and stay synchronized.
         """
         for p in self.obj_model.parameters():
             dist.broadcast(p.data, src=src)
         for p in self.probe_model.parameters():
             dist.broadcast(p.data, src=src)
+        for p in self.dset.get_optimization_parameters():
+            buf = p.data.contiguous()
+            dist.broadcast(buf, src=src)
+            p.data.copy_(buf)
 
     def _all_reduce_gradients(self) -> None:
-        """Average obj and probe gradients across all ranks (call after backward, before step).
+        """Average obj, probe, and dataset gradients across all ranks (call after backward,
+        before step).
 
-        Uses .parameters() so it works for both pixelated and DIP/INR models.
+        Uses .parameters() so it works for both pixelated and DIP/INR models. The dataset's
+        learnable params are included because each scan position's gradient is nonzero on
+        exactly one rank, so they must be reduced (AVG) to stay consistent across ranks.
         """
         params = [
             p
-            for p in list(self.obj_model.parameters()) + list(self.probe_model.parameters())
+            for p in (
+                list(self.obj_model.parameters())
+                + list(self.probe_model.parameters())
+                + list(self.dset.get_optimization_parameters())
+            )
             if p.grad is not None
         ]
         if params:
+            for p in params:
+                if p.grad is not None and not p.grad.is_contiguous():
+                    p.grad = p.grad.contiguous()
             all_reduce_params(*params)
 
     def to(self, device: str | int | torch.device):
@@ -956,12 +973,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self,
         pred_intensities: torch.Tensor,
         batch_indices: np.ndarray,
+        targets: torch.Tensor,
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
         global_n: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        targets = self.dset.targets[batch_indices]
         if "amplitude" in loss_type:
             preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
         else:

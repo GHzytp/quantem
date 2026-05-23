@@ -1,5 +1,4 @@
 from abc import abstractmethod
-from math import ceil
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -7,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.utils.data
 
 from quantem.core import config
 from quantem.core.datastructures.dataset3d import Dataset3d
@@ -29,7 +29,9 @@ Dataset models for ptychographic reconstruction.
 """
 
 
-class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
+class PtychographyDatasetBase(
+    AutoSerialize, OptimizerMixin, torch.nn.Module, torch.utils.data.Dataset
+):
     _token = object()
     _patch_indices: torch.Tensor
 
@@ -63,6 +65,11 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
         self.dset = dset
         self.verbose = verbose
+        # target_residency controls where loss targets live:
+        #   "device" (default) — targets are kept resident on the compute device (current behavior)
+        #   "cpu"              — targets live in CPU RAM and are streamed to the device per-batch,
+        #                        enabling datasets larger than a single GPU's VRAM
+        self.target_residency: Literal["device", "cpu"] = "device"
         self._preprocessed = False
         self._preprocessing_params = {}  # for serialization and reloading
         self._com_rotation_rad = 0  # default
@@ -86,7 +93,9 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._initial_scan_positions_px = torch.zeros_like(self._scan_positions_px)
         self._initial_descan_shifts = torch.zeros_like(self._descan_shifts)
 
-        self.register_buffer("_targets", torch.zeros(self.num_gpts, *self.roi_shape))
+        # _targets is a plain attribute (NOT a registered buffer) so that its device can be
+        # managed explicitly per target_residency; AutoSerialize does not serialize it either way.
+        self._targets = torch.zeros(self.num_gpts, *self.roi_shape)
         self.register_buffer(
             "_patch_indices", torch.zeros(self.num_gpts, *self.roi_shape, dtype=torch.int32)
         )
@@ -97,22 +106,31 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._probe_energy = None
 
     def get_optimization_parameters(self):
-        """Get the combined descan and scan position parameters for optimization."""
+        """Get the combined descan and scan position parameters for optimization.
+
+        Returns an empty list when neither learn flag is set; OptimizerMixin.set_optimizer
+        handles the empty-params case by removing the optimizer.
+        """
         params = []
         if self.learn_descan:
             params.append(self._descan_shifts)
         if self.learn_scan_positions:
             params.append(self._scan_positions_px)
-        if len(params) == 0:
-            raise RuntimeError(
-                "No parameters to optimize for dataset: learn_descan and learn_scan_positions are both False"
-            )
         return params
 
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device."""
         # Call parent's to() method to handle PyTorch's internal device management
         super().to(*args, **kwargs)
+        # _targets is a plain attribute, so nn.Module.to() does not move it; do so explicitly
+        # unless residency is "cpu" (in which case targets intentionally stay on CPU and are
+        # streamed to the device per-batch).
+        if (
+            getattr(self, "target_residency", "device") != "cpu"
+            and getattr(self, "_targets", None) is not None
+        ):
+            # After super().to(), self.device reflects the new device (it reads off a Parameter).
+            self._targets = self._targets.to(self.device)
         # Reconnect optimizer to parameters on the new device
         self.reconnect_optimizer_to_parameters()
         return self
@@ -229,16 +247,19 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ],
     ):
+        # When residency is "cpu", build targets on CPU so they can be streamed per-batch
+        # (and read by DataLoader workers); otherwise keep them resident on the compute device.
+        target_device = "cpu" if self.target_residency == "cpu" else self.device
         if "amplitude" in loss_type:
             if self.learn_descan and self.has_optimizer():
-                self._targets = self.amplitudes.clone().to(self.device)
+                self._targets = self.amplitudes.clone().to(target_device)
             else:
-                self._targets = self.centered_amplitudes.clone().to(self.device)
+                self._targets = self.centered_amplitudes.clone().to(target_device)
         elif "intensity" in loss_type or loss_type == "poisson":
             if self.learn_descan and self.has_optimizer():
-                self._targets = self.intensities.clone().to(self.device)
+                self._targets = self.intensities.clone().to(target_device)
             else:
-                self._targets = self.centered_intensities.clone().to(self.device)
+                self._targets = self.centered_intensities.clone().to(target_device)
         else:
             raise ValueError(f"Unknown loss type {loss_type}")
 
@@ -247,6 +268,21 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         return self._patch_indices
 
     # endregion --- buffers ---
+
+    # region --- torch.utils.data.Dataset interface ---
+    def __len__(self) -> int:
+        return self.num_gpts
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        """Return one sample for the DataLoader.
+
+        The target is returned as-is on whatever device target_residency dictates (CPU when
+        residency is "cpu" so DataLoader workers can read it). The integer index is collated
+        into a LongTensor by the default collate_fn.
+        """
+        return {"index": idx, "target": self._targets[idx]}
+
+    # endregion --- torch.utils.data.Dataset interface ---
 
     # region --- explicit properties (have setters) ---
     @property
@@ -404,8 +440,6 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
     @property
     def num_gpts(self) -> int:
-        if hasattr(self, "_local_num_gpts") and self._local_num_gpts is not None:
-            return self._local_num_gpts
         return int(self.dset.shape[0])
 
     @property
@@ -552,54 +586,6 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     def reset(self) -> None:
         self.descan_shifts = self.initial_descan_shifts.clone().to(self.device)
         self.scan_positions_px = self.initial_scan_positions_px.clone().to(self.device)
-
-    def shard(self, rank: int, world_size: int) -> None:
-        """Partition diffraction data across DDP ranks (call after preprocess, before to(device)).
-
-        Each rank retains a contiguous slice [start:end] of the N scan positions. The object
-        and probe are not touched — they remain full-size and are replicated on every GPU.
-        After sharding, num_gpts returns the local shard size.
-        """
-        if not self._preprocessed:
-            raise RuntimeError("shard() must be called after preprocess()")
-        n_total = int(self.dset.shape[0])
-        shard_size = ceil(n_total / world_size)
-        start = rank * shard_size
-        end = min(start + shard_size, n_total)
-
-        self._shard_start: int = start
-        self._shard_end: int = end
-        self._local_num_gpts: int = end - start
-
-        sl = slice(start, end)
-
-        # Slice preprocessed amplitude/intensity data (plain attributes, not buffers)
-        for attr in (
-            "_amplitudes",
-            "_centered_amplitudes",
-            "_centered_intensities",
-            "_intensities",
-        ):
-            if hasattr(self, attr):
-                setattr(self, attr, getattr(self, attr)[sl].clone())
-
-        # Re-register buffers with rank-local slices
-        self.register_buffer("_patch_indices", self._patch_indices[sl].clone())
-        self.register_buffer("_last_patch_positions_px", self._last_patch_positions_px[sl].clone())
-        # _targets will be rebuilt from the sliced amplitudes in _set_targets(); reset it here
-        self.register_buffer("_targets", self._targets[sl].clone())
-
-        # Replace learnable parameters with rank-local slices
-        self._scan_positions_px = nn.Parameter(
-            self._scan_positions_px.data[sl].clone(),
-            requires_grad=self.learn_scan_positions,
-        )
-        self._descan_shifts = nn.Parameter(
-            self._descan_shifts.data[sl].clone(),
-            requires_grad=self.learn_descan,
-        )
-        self._initial_scan_positions_px = self._initial_scan_positions_px[sl].clone()
-        self._initial_descan_shifts = self._initial_descan_shifts[sl].clone()
 
     # endregion --- class methods ---
 

@@ -1243,7 +1243,7 @@ class ObjectDIP(ObjectConstraints):
                 ],
                 cmap="magma",
                 cbar=True,
-                norm=[norm_angle, norm_angle, norm_abs, norm_abs], # type:ignore 
+                norm=[norm_angle, norm_angle, norm_abs, norm_abs],  # type:ignore
             )
         else:
             norm = None

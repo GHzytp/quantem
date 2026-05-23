@@ -4,37 +4,31 @@ import gc
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Self, Sequence, cast
+from typing import Any, Literal, Self, Sequence, cast
 from warnings import warn
 
 import numpy as np
+import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
-from quantem.core import config
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.dist_utils import (
     init_process_group,
     is_distributed_launch,
+    spawn_distributed_workers,
+    worker_init_fn,
 )
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
-from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
+from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
 from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
-
-if TYPE_CHECKING:
-    import torch
-    import torch.distributed as dist
-    import torch.multiprocessing as mp
-else:
-    if config.get("has_torch"):
-        import torch
-        import torch.distributed as dist
-        import torch.multiprocessing as mp
 
 
 def _ddp_ptycho_worker(
@@ -54,8 +48,9 @@ def _ddp_ptycho_worker(
     device_id = devices[rank]
     init_process_group(rank, world_size, backend="nccl" if torch.cuda.is_available() else "gloo")
 
-    ptycho = torch.load(ptycho_path, map_location="cpu", weights_only=False)
-    ptycho.dset.shard(rank, world_size)
+    # mmap=True so all workers share one memory-mapped RAM copy of the (potentially large,
+    # CPU-resident) state instead of each duplicating it.
+    ptycho = torch.load(ptycho_path, map_location="cpu", weights_only=False, mmap=True)
     ptycho.to(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
 
     if dist.is_available() and dist.is_initialized():
@@ -218,6 +213,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        num_workers: int = 0,
     ) -> Self:
         """Run iterative ptychography reconstruction.
 
@@ -254,6 +250,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 store_snapshots_every=store_snapshots_every,
                 autograd=autograd,
                 loss_type=loss_type,
+                num_workers=num_workers,
             )
 
         # Handle torchrun distributed launch (RANK env var present)
@@ -268,7 +265,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             local_rank = int(os.environ.get("LOCAL_RANK", rank))
             dev = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
             self.to(dev)
-            self.dset.shard(rank, world_size)
             self._broadcast_parameters(src=0)
         else:
             rank, world_size = 0, 1
@@ -286,9 +282,90 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             store_snapshots_every=store_snapshots_every,
             autograd=autograd,
             loss_type=loss_type,
+            num_workers=num_workers,
             _dist_rank=rank,
             _dist_world_size=world_size,
         )
+
+    def _build_dataloaders(
+        self,
+        train_indices: np.ndarray,
+        val_indices: np.ndarray,
+        world_size: int,
+        rank: int,
+        num_workers: int,
+    ) -> "tuple[DataLoader, DistributedSampler | None, DataLoader | None]":
+        """Build train + (optional) val DataLoaders for both single- and multi-GPU paths.
+
+        Mirrors the shape of ``DDPMixin.setup_dataloader`` but adapted to ptycho's device
+        contract (``str | list[int]``) and ptycho's precomputed ``val_mode`` index split.
+        ``world_size > 1`` uses ``DistributedSampler`` over a ``Subset``; ``world_size == 1``
+        uses ``shuffle=True`` with a seeded ``torch.Generator`` for run-to-run determinism.
+        ``__getitem__`` returns ``{"index": idx, ...}`` for the original dataset index, and
+        ``Subset[i]`` calls ``dataset[indices[i]]``, so ``batch["index"]`` is the original
+        dataset index under either branch.
+        """
+        pin_memory = self.dset.target_residency == "cpu" and str(self._single_device).startswith(
+            "cuda"
+        )
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "drop_last": False,
+        }
+        if num_workers > 0:
+            loader_kwargs.update(
+                multiprocessing_context="spawn",
+                persistent_workers=True,
+                worker_init_fn=worker_init_fn,
+            )
+
+        train_subset = torch.utils.data.Subset(self.dset, train_indices.tolist())
+        val_subset = (
+            torch.utils.data.Subset(self.dset, val_indices.tolist())
+            if len(val_indices) > 0
+            else None
+        )
+
+        if world_size > 1:
+            train_sampler = DistributedSampler(
+                train_subset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=int(self.rng.integers(0, 2**31 - 1)),
+                drop_last=False,
+            )
+            train_loader = torch.utils.data.DataLoader(
+                train_subset, sampler=train_sampler, **loader_kwargs
+            )
+            if val_subset is not None:
+                val_sampler = DistributedSampler(
+                    val_subset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
+                val_loader = torch.utils.data.DataLoader(
+                    val_subset, sampler=val_sampler, **loader_kwargs
+                )
+            else:
+                val_loader = None
+        else:
+            train_sampler = None
+            shuffle_gen = torch.Generator().manual_seed(int(self.rng.integers(0, 2**31 - 1)))
+            train_loader = torch.utils.data.DataLoader(
+                train_subset, shuffle=True, generator=shuffle_gen, **loader_kwargs
+            )
+            val_loader = (
+                torch.utils.data.DataLoader(val_subset, shuffle=False, **loader_kwargs)
+                if val_subset is not None
+                else None
+            )
+
+        return train_loader, train_sampler, val_loader
 
     def _reconstruct_inner(
         self,
@@ -304,6 +381,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        num_workers: int = 0,
         _dist_rank: int = 0,
         _dist_world_size: int = 1,
     ) -> Self:
@@ -336,34 +414,36 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.dset._set_targets(loss_type)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
 
-        # Compute the global scan count once — needed to keep loss scale consistent across world sizes.
-        # In single-GPU mode num_gpts is already global; in distributed mode each rank holds a shard,
-        # so we sum across ranks to get the exact total.
-        if _dist_world_size > 1 and dist.is_available() and dist.is_initialized():
-            n_local = torch.tensor(
-                self.dset.num_gpts, device=self._single_device, dtype=torch.long
-            )
-            _ = dist.all_reduce(n_local, op=dist.ReduceOp.SUM)  # type: ignore[call-overload]
-            global_n = int(n_local.item())
-        else:
-            global_n = self.dset.num_gpts
+        # Compute the global scan count once — needed to keep loss scale consistent across world
+        global_n = self.dset.num_gpts
 
-        batcher = SimpleBatcher(
+        train_indices, val_indices = compute_train_val_split(
             self.dset.num_gpts,
-            self.batch_size,
-            rng=self.rng,
-            val_ratio=self.val_ratio,
-            val_mode=self.val_mode,
+            self.val_ratio,
+            self.val_mode,
+            self.rng,
         )
+        train_loader, train_sampler, val_loader = self._build_dataloaders(
+            train_indices,
+            val_indices,
+            world_size=_dist_world_size,
+            rank=_dist_rank,
+            num_workers=num_workers,
+        )
+
         pbar = tqdm(range(num_iters), disable=not self.verbose or _dist_rank != 0)
 
         for a0 in pbar:
+            if _dist_world_size > 1 and train_sampler is not None:
+                train_sampler.set_epoch(a0)
             consistency_loss = 0.0
             total_loss = 0.0
             self._reset_iter_constraints()
 
-            for batch_indices in batcher:
+            for batch in train_loader:
                 self.zero_grad_all()
+                batch_indices = batch["index"].to(self._single_device)
+                targets = batch["target"].to(self._single_device, non_blocking=True)
                 patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
                     self.dset.forward(batch_indices, self.obj_padding_px)
                 )
@@ -377,6 +457,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 batch_consistency_loss, targets = self.error_estimate(
                     pred_intensities,
                     batch_indices,
+                    targets=targets,
                     loss_type=loss_type,
                     global_n=global_n,
                 )
@@ -399,7 +480,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 consistency_loss += batch_consistency_loss.item()
                 total_loss += batch_loss.item()
 
-            num_batches = len(batcher)
+            num_batches = len(train_loader)
             total_loss = total_loss / num_batches
             consistency_loss = consistency_loss / num_batches
 
@@ -413,11 +494,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
             # Validation pass (no gradient, no optimizer steps)
             val_loss = None
-            if batcher.has_validation:
+            if val_loader is not None:
                 val_consistency_loss = 0.0
                 val_batches = 0
                 with torch.no_grad():
-                    for batch_indices in batcher.iter_val():
+                    for batch in val_loader:
+                        batch_indices = batch["index"].to(self._single_device)
+                        targets = batch["target"].to(self._single_device, non_blocking=True)
                         patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
                             self.dset.forward(batch_indices, self.obj_padding_px)
                         )
@@ -428,12 +511,23 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         )
                         pred_intensities = self.detector_model.forward(overlap)
                         batch_val_loss, _ = self.error_estimate(
-                            pred_intensities, batch_indices, loss_type=loss_type, global_n=global_n
+                            pred_intensities,
+                            batch_indices,
+                            targets=targets,
+                            loss_type=loss_type,
+                            global_n=global_n,
                         )
                         val_consistency_loss += batch_val_loss.item()
                         val_batches += 1
                 if val_batches > 0:
                     val_loss = val_consistency_loss / val_batches
+                    # Average the val loss across ranks so rank-0 records the global mean
+                    if _dist_world_size > 1:
+                        val_t = torch.tensor(
+                            val_loss, device=self._single_device, dtype=torch.float64
+                        )
+                        dist.all_reduce(val_t, op=dist.ReduceOp.AVG)
+                        val_loss = val_t.item()
                     if _dist_rank == 0:
                         self._iter_val_losses.append(val_loss)
 
@@ -501,12 +595,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             # forkserver: workers fork from a clean pre-started server (no inherited
             # CUDA, no Jupyter FDs).  Only plain Python scalars/strings cross the
             # process boundary, so tensor pickling is never triggered.
-            mp.start_processes( # type: ignore 
+            spawn_distributed_workers(
                 _ddp_ptycho_worker,
-                args=(len(devices), ptycho_path, devices, recon_kwargs, result_path),
-                nprocs=len(devices),
-                join=True,
-                start_method="forkserver",
+                devices,
+                ptycho_path,
+                devices,
+                recon_kwargs,
+                result_path,
             )
             result = torch.load(result_path, map_location="cpu", weights_only=False)
 

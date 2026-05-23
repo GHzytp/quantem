@@ -612,6 +612,10 @@ class OptimizerMixin:
         elif isinstance(params, Generator):
             params = list(params)
 
+        if not params:
+            self.remove_optimizer()
+            return
+
         # Ensure parameters require gradients
         for p in params:
             p.requires_grad_(True)
