@@ -10,7 +10,6 @@ from warnings import warn
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
@@ -18,7 +17,6 @@ from quantem.core.ml.dist_utils import (
     init_process_group,
     is_distributed_launch,
     spawn_distributed_workers,
-    worker_init_fn,
 )
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
@@ -286,86 +284,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             _dist_rank=rank,
             _dist_world_size=world_size,
         )
-
-    def _build_dataloaders(
-        self,
-        train_indices: np.ndarray,
-        val_indices: np.ndarray,
-        world_size: int,
-        rank: int,
-        num_workers: int,
-    ) -> "tuple[DataLoader, DistributedSampler | None, DataLoader | None]":
-        """Build train + (optional) val DataLoaders for both single- and multi-GPU paths.
-
-        Mirrors the shape of ``DDPMixin.setup_dataloader`` but adapted to ptycho's device
-        contract (``str | list[int]``) and ptycho's precomputed ``val_mode`` index split.
-        ``world_size > 1`` uses ``DistributedSampler`` over a ``Subset``; ``world_size == 1``
-        uses ``shuffle=True`` with a seeded ``torch.Generator`` for run-to-run determinism.
-        ``__getitem__`` returns ``{"index": idx, ...}`` for the original dataset index, and
-        ``Subset[i]`` calls ``dataset[indices[i]]``, so ``batch["index"]`` is the original
-        dataset index under either branch.
-        """
-        pin_memory = self.dset.target_residency == "cpu" and str(self._single_device).startswith(
-            "cuda"
-        )
-        loader_kwargs: dict[str, Any] = {
-            "batch_size": self.batch_size,
-            "num_workers": num_workers,
-            "pin_memory": pin_memory,
-            "drop_last": False,
-        }
-        if num_workers > 0:
-            loader_kwargs.update(
-                multiprocessing_context="spawn",
-                persistent_workers=True,
-                worker_init_fn=worker_init_fn,
-            )
-
-        train_subset = torch.utils.data.Subset(self.dset, train_indices.tolist())
-        val_subset = (
-            torch.utils.data.Subset(self.dset, val_indices.tolist())
-            if len(val_indices) > 0
-            else None
-        )
-
-        if world_size > 1:
-            train_sampler = DistributedSampler(
-                train_subset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                seed=int(self.rng.integers(0, 2**31 - 1)),
-                drop_last=False,
-            )
-            train_loader = torch.utils.data.DataLoader(
-                train_subset, sampler=train_sampler, **loader_kwargs
-            )
-            if val_subset is not None:
-                val_sampler = DistributedSampler(
-                    val_subset,
-                    num_replicas=world_size,
-                    rank=rank,
-                    shuffle=False,
-                    drop_last=False,
-                )
-                val_loader = torch.utils.data.DataLoader(
-                    val_subset, sampler=val_sampler, **loader_kwargs
-                )
-            else:
-                val_loader = None
-        else:
-            train_sampler = None
-            shuffle_gen = torch.Generator().manual_seed(int(self.rng.integers(0, 2**31 - 1)))
-            train_loader = torch.utils.data.DataLoader(
-                train_subset, shuffle=True, generator=shuffle_gen, **loader_kwargs
-            )
-            val_loader = (
-                torch.utils.data.DataLoader(val_subset, shuffle=False, **loader_kwargs)
-                if val_subset is not None
-                else None
-            )
-
-        return train_loader, train_sampler, val_loader
 
     def _reconstruct_inner(
         self,
