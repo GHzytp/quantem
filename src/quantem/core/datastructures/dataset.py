@@ -142,7 +142,7 @@ class Dataset(AutoSerialize):
         Returns ``None`` for tensor-backed datasets. Use ``.tensor`` for the
         torch tensor, or ``.numpy()`` to materialize a numpy copy explicitly.
         """
-        return self._array
+        return getattr(self, "_array", None)
 
     @array.setter
     def array(self, value: NDArray) -> None:
@@ -154,11 +154,13 @@ class Dataset(AutoSerialize):
     @property
     def tensor(self) -> torch.Tensor:
         """Torch tensor backing the data. AttributeError if numpy-backed."""
-        if self._tensor is None:
+        # getattr handles AutoSerialize-restored instances (no __init__ run).
+        tensor = getattr(self, "_tensor", None)
+        if tensor is None:
             raise AttributeError(
                 f"Dataset '{self.name}' is numpy-backed; use Dataset.from_tensor() at construction."
             )
-        return self._tensor
+        return tensor
 
     @property
     def metadata(self) -> dict:
@@ -216,22 +218,27 @@ class Dataset(AutoSerialize):
     @property
     def shape(self) -> tuple[int, ...]:
         # Direct slot access (never triggers .array derive, which would force
-        # a full GPU->CPU copy on tensor-backed datasets).
-        return tuple((self._array if self._array is not None else self._tensor).shape)
+        # a full GPU->CPU copy on tensor-backed datasets). getattr handles
+        # AutoSerialize-restored instances (no __init__ run).
+        array = getattr(self, "_array", None)
+        return tuple((array if array is not None else self._tensor).shape)
 
     @property
     def ndim(self) -> int:
-        return (self._array if self._array is not None else self._tensor).ndim
+        array = getattr(self, "_array", None)
+        return (array if array is not None else self._tensor).ndim
 
     @property
     def dtype(self) -> DTypeLike:
-        return (self._array if self._array is not None else self._tensor).dtype
+        array = getattr(self, "_array", None)
+        return (array if array is not None else self._tensor).dtype
 
     @property
     def device(self) -> str:
         """``"cpu"`` for numpy-backed; torch device string for tensor-backed."""
-        if self._tensor is not None:
-            return str(self._tensor.device)
+        tensor = getattr(self, "_tensor", None)
+        if tensor is not None:
+            return str(tensor.device)
         return "cpu"
 
     def numpy(self) -> NDArray:
@@ -240,17 +247,19 @@ class Dataset(AutoSerialize):
         For numpy-backed datasets, returns ``self.array`` directly. For
         tensor-backed datasets, materializes a CPU copy via ``.detach().cpu().numpy()``.
         """
-        if self._array is not None:
-            return self._array
+        array = getattr(self, "_array", None)
+        if array is not None:
+            return array
         return self._tensor.detach().cpu().numpy()
 
     def to(self, device) -> Self:
         """Move the underlying tensor to ``device``. Raises if numpy-backed."""
-        if self._tensor is None:
+        tensor = getattr(self, "_tensor", None)
+        if tensor is None:
             raise AttributeError(
                 f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'."
             )
-        self._tensor = self._tensor.to(device)
+        self._tensor = tensor.to(device)
         return self
 
     # --- Summaries ---
