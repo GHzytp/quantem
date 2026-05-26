@@ -594,6 +594,8 @@ class ProbePixelated(ProbeConstraints):
     ):
         if isinstance(probe_array, np.ndarray):
             probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
+        else:
+            probe_array = probe_array.to(dtype=dtype, device=device)
         if probe_array.ndim == 3:
             if num_probes is None:
                 num_probes = probe_array.shape[0]
@@ -603,9 +605,7 @@ class ProbePixelated(ProbeConstraints):
                 )
         else:
             num_probes = 1 if num_probes is None else num_probes
-            probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
-            # probe_array = torch.tile(probe_array, (num_probes, 1, 1))
-            probe_array = torch.cat([probe_array] * num_probes, dim=0)
+            probe_array = torch.stack([probe_array] * num_probes, dim=0)
 
         probe_model = cls(
             num_probes=num_probes,
