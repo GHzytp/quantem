@@ -69,7 +69,7 @@ class PtychographyDatasetBase(
         #   "device" (default) — targets are kept resident on the compute device (current behavior)
         #   "cpu"              — targets live in CPU RAM and are streamed to the device per-batch,
         #                        enabling datasets larger than a single GPU's VRAM
-        self.target_residency: Literal["device", "cpu"] = "device"
+        self._target_residency: Literal["device", "cpu"] = "device"
         self._preprocessed = False
         self._preprocessing_params = {}  # for serialization and reloading
         self._com_rotation_rad = 0  # default
@@ -240,6 +240,18 @@ class PtychographyDatasetBase(
         if not self._preprocessed:
             raise ValueError("dset must be preprocessed before targets can be accessed")
         return self._targets
+
+    @property
+    def target_residency(self) -> Literal["device", "cpu"]:
+        """Where the loss targets live: ``"device"`` (resident, fastest) or
+        ``"cpu"`` (streamed per-batch, enables datasets larger than VRAM)."""
+        return self._target_residency
+
+    @target_residency.setter
+    def target_residency(self, value: str) -> None:
+        if value not in ("device", "cpu"):
+            raise ValueError(f"target_residency must be 'device' or 'cpu', got {value!r}")
+        self._target_residency = value
 
     def _set_targets(
         self,
