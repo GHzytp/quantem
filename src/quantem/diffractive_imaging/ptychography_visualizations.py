@@ -356,6 +356,7 @@ class PtychographyVisualizations(PtychographyBase):
         interval_type: Literal["quantile", "manual"] = "quantile",
         interval_scaling: Literal["each", "all"] = "each",
         max_width: int = 4,
+        return_fig: bool = False,
         **kwargs,
     ):
         """
@@ -372,13 +373,15 @@ class PtychographyVisualizations(PtychographyBase):
             The interval scaling to use for the colorbar, by default "each"
         max_width: int, optional
             The maximum width of the object slices, by default 4
+        return_fig: bool, optional
+            If True, return ``(fig, axs)`` for saving or further customization.
         **kwargs: dict, optional
             Additional arguments passed to show_2d
 
         Returns
         -------
-        None
-            The object slices are shown in a new figure
+        tuple | None
+            ``(fig, axs)`` if return_fig is True, otherwise None.
         """
         if obj is None:
             obj = self.obj_cropped
@@ -426,14 +429,18 @@ class PtychographyVisualizations(PtychographyBase):
         else:
             raise ValueError(f"Unknown interval type: {interval_type}")
 
-        show_2d(
+        fig, axs = show_2d(
             objs,
             title=titles,
             cmap=config.get("viz.phase_cmap"),
             norm=norm,
             cbar=cbar,
             scalebar=scalebars,
+            **kwargs,
         )
+        if return_fig:
+            return fig, axs
+        return None
 
     def plot_losses(self, figax: tuple | None = None, plot_lrs: bool = True):
         """
@@ -536,17 +543,20 @@ class PtychographyVisualizations(PtychographyBase):
             plt.tight_layout()
             plt.show()
 
-    def visualize(self, cbar: bool = True):
+    def visualize(self, cbar: bool = True, return_fig: bool = False):
         """
         Plot losses and show object and probe.
         Parameters
         ----------
         cbar: bool, optional
             Whether to show a colorbar, by default True
+        return_fig: bool, optional
+            If True, return ``(fig, axs)`` instead of calling ``plt.show()``.
 
         Returns
         -------
-        None
+        tuple | None
+            ``(fig, axs)`` if return_fig is True, otherwise None.
         """
         fig = plt.figure(figsize=(12, 6))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
@@ -562,7 +572,10 @@ class PtychographyVisualizations(PtychographyBase):
             fontsize=14,
             y=0.95,
         )
+        if return_fig:
+            return fig, (ax_top, axs_bot)
         plt.show()
+        return None
 
     def show_iters(
         self,
