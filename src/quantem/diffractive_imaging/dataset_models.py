@@ -661,7 +661,9 @@ class PtychographyDatasetBase(
 class DatasetConstraints(
     BaseConstraints[PtychoDatasetConstraintParams.Raster], PtychographyDatasetBase
 ):
-    DEFAULT_CONSTRAINTS: PtychoDatasetConstraintParams.Raster = PtychoDatasetConstraintParams.Raster()
+    DEFAULT_CONSTRAINTS: PtychoDatasetConstraintParams.Raster = (
+        PtychoDatasetConstraintParams.Raster()
+    )
 
     def apply_soft_constraints(self, descan_shifts: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()

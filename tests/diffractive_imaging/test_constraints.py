@@ -9,10 +9,10 @@ from quantem.diffractive_imaging import (
     ObjectPixelated,
     ProbePixelated,
     PtychoDatasetConstraintParams,
-    PtychoObjConstraintParams,
-    PtychoProbeConstraintParams,
     Ptychography,
     PtychographyDatasetRaster,
+    PtychoObjConstraintParams,
+    PtychoProbeConstraintParams,
 )
 
 N_SCAN = 8
@@ -135,11 +135,11 @@ class TestRoundtrip:
         assert ptycho.probe_model.constraints.tv_weight == 0.02
 
 
-# --- Reconstruct() kwargs and mutual exclusion --------------------------------
+# --- Reconstruct() with constraints= ------------------------------------------
 
 
 class TestReconstructKwargs:
-    def test_obj_constraints_kwarg_applied(self, ptycho):
+    def test_dataclass_leaf_applied(self, ptycho):
         from quantem.core.ml import OptimizerParams
 
         obj_c = PtychoObjConstraintParams.Raster(tv_weight_z=1.5)
@@ -147,29 +147,40 @@ class TestReconstructKwargs:
             num_iters=1,
             reset=True,
             optimizer_params={"object": OptimizerParams.Adam(lr=1e-2)},
-            obj_constraints=obj_c,
+            constraints={"object": obj_c},
             batch_size=4,
             device="cpu",
         )
         assert ptycho.obj_model.constraints.tv_weight_z == 1.5
 
-    def test_dict_kwarg_parsed(self, ptycho):
+    def test_dict_leaf_partial_update(self, ptycho):
         from quantem.core.ml import OptimizerParams
 
         ptycho.reconstruct(
             num_iters=1,
             reset=True,
             optimizer_params={"object": OptimizerParams.Adam(lr=1e-2)},
-            obj_constraints={"name": "raster", "surface_zero_weight": 0.7},
+            constraints={"object": {"surface_zero_weight": 0.7}},
             batch_size=4,
             device="cpu",
         )
         assert ptycho.obj_model.constraints.surface_zero_weight == 0.7
+        # other fields keep their defaults
+        assert ptycho.obj_model.constraints.positivity is True
 
-    def test_mutual_exclusion_with_legacy_dict(self, ptycho):
-        with pytest.raises(ValueError, match="provided via both"):
-            ptycho.reconstruct(
-                num_iters=0,
-                constraints={"object": {"tv_weight_z": 1.0}},
-                obj_constraints=PtychoObjConstraintParams.Raster(tv_weight_z=2.0),
-            )
+    def test_mixed_dataclass_and_dict_leaves(self, ptycho):
+        from quantem.core.ml import OptimizerParams
+
+        ptycho.reconstruct(
+            num_iters=1,
+            reset=True,
+            optimizer_params={"object": OptimizerParams.Adam(lr=1e-2)},
+            constraints={
+                "object": PtychoObjConstraintParams.Raster(tv_weight_xy=0.4),
+                "probe": {"center_probe": True},
+            },
+            batch_size=4,
+            device="cpu",
+        )
+        assert ptycho.obj_model.constraints.tv_weight_xy == 0.4
+        assert ptycho.probe_model.constraints.center_probe is True

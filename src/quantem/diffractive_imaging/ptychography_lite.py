@@ -9,22 +9,11 @@ import torch.nn as nn
 from quantem.core import config
 from quantem.core.datastructures import Dataset4dstem
 from quantem.core.ml.cnn import CNN2d
-from quantem.diffractive_imaging.dataset_models import (
-    PtychoDatasetConstraintsType,
-    PtychographyDatasetRaster,
-)
+from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import (
-    ObjectDIP,
-    ObjectPixelated,
-    PtychoObjConstraintsType,
-)
-from quantem.diffractive_imaging.probe_models import (
-    ProbeDIP,
-    ProbePixelated,
-    PtychoProbeConstraintsType,
-)
+from quantem.diffractive_imaging.object_models import ObjectDIP, ObjectPixelated
+from quantem.diffractive_imaging.probe_models import ProbeDIP, ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 
 
@@ -190,9 +179,6 @@ class PtychoLite(Ptychography):
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
         constraints: dict[str, Any] | None = None,
-        obj_constraints: dict | PtychoObjConstraintsType | None = None,
-        probe_constraints: dict | PtychoProbeConstraintsType | None = None,
-        dset_constraints: dict | PtychoDatasetConstraintsType | None = None,
         store_iterations_every: int | None = None,
         device: "Literal['cpu', 'gpu'] | int | list[int] | None" = None,
         verbose: int | bool = True,
@@ -259,9 +245,6 @@ class PtychoLite(Ptychography):
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
             constraints=constraints,
-            obj_constraints=obj_constraints,
-            probe_constraints=probe_constraints,
-            dset_constraints=dset_constraints,
             batch_size=batch_size,
             store_snapshots_every=store_iterations_every,
             device=device,
@@ -437,9 +420,6 @@ class PtychoLiteDIP(Ptychography):
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
         constraints: dict[str, Any] | None = None,
-        obj_constraints: dict | PtychoObjConstraintsType | None = None,
-        probe_constraints: dict | PtychoProbeConstraintsType | None = None,
-        dset_constraints: dict | PtychoDatasetConstraintsType | None = None,
         store_iterations_every: int | None = None,
         device: Literal["cpu", "gpu"] | int | list[int] | None = None,
         verbose: int | bool = True,
@@ -506,9 +486,6 @@ class PtychoLiteDIP(Ptychography):
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
             constraints=constraints,
-            obj_constraints=obj_constraints,
-            probe_constraints=probe_constraints,
-            dset_constraints=dset_constraints,
             batch_size=batch_size,
             store_snapshots_every=store_iterations_every,
             device=device,

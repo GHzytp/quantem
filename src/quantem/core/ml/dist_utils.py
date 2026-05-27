@@ -81,7 +81,7 @@ def spawn_distributed_workers(
     """
     import torch.multiprocessing as mp
 
-    mp.start_processes( # type: ignore 
+    mp.start_processes(  # type: ignore
         worker_fn,
         args=(len(devices), *worker_args),
         nprocs=len(devices),
