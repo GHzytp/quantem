@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.constraints import Constraints
 from quantem.core.ml.dist_utils import all_reduce_params, worker_init_fn
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
@@ -562,7 +563,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @constraints.setter
     def constraints(self, c: dict[str, Any]):
-        """Set constraints by forwarding to individual models."""
+        """Set constraints by forwarding to individual models.
+
+        Each leaf value may be either a plain ``dict`` (validated per-key against
+        the model's constraint dataclass) or a ``Constraints`` dataclass instance
+        (assigned wholesale to the model).
+        """
         constraint_handlers = {
             "object": self.obj_model,
             "probe": self.probe_model,
@@ -570,9 +576,16 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         }
 
         for key, value in c.items():
-            if key in constraint_handlers and isinstance(value, dict):
-                for subkey, subvalue in value.items():
-                    constraint_handlers[key].add_constraint(subkey, subvalue)
+            if key in constraint_handlers:
+                if isinstance(value, Constraints):
+                    constraint_handlers[key].constraints = value
+                elif isinstance(value, dict):
+                    constraint_handlers[key].constraints = value
+                else:
+                    raise TypeError(
+                        f"Constraints for '{key}' must be a dict or Constraints dataclass, "
+                        f"got {type(value).__name__}"
+                    )
             elif key == "detector" and isinstance(value, dict):
                 warn("Detector constraints not implemented, skipping")
             else:
@@ -1000,9 +1013,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 seed=int(self.rng.integers(0, 2**31 - 1)),
                 drop_last=False,
             )
-            train_loader = DataLoader(
-                train_subset, sampler=train_sampler, **loader_kwargs
-            )
+            train_loader = DataLoader(train_subset, sampler=train_sampler, **loader_kwargs)
             if val_subset is not None:
                 val_sampler = DistributedSampler(
                     val_subset,
@@ -1011,9 +1022,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                     shuffle=False,
                     drop_last=False,
                 )
-                val_loader = DataLoader(
-                    val_subset, sampler=val_sampler, **loader_kwargs
-                )
+                val_loader = DataLoader(val_subset, sampler=val_sampler, **loader_kwargs)
             else:
                 val_loader = None
         else:

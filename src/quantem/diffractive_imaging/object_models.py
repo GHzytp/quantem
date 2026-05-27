@@ -1,6 +1,7 @@
 import math
 from abc import abstractmethod
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Callable, Literal, Self, Sequence, cast
 from warnings import warn
 
@@ -13,6 +14,7 @@ from tqdm.auto import tqdm
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
+from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType, SchedulerType
 from quantem.core.utils.rng import RNGMixin
@@ -23,10 +25,103 @@ from quantem.core.utils.validators import (
 )
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.custom_normalizations import CustomNormalization
-from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import sum_patches
 
 object_type = Literal["potential", "pure_phase", "complex"]
+
+
+class PtychoObjConstraintParams:
+    """
+    Namespace class for ptychography object constraint dataclasses.
+
+    Tab-complete on ``PtychoObjConstraintParams`` in a notebook to discover the
+    available variants. Tab-complete inside a variant's constructor to see every
+    constraint field with its default value.
+
+    Variants
+    --------
+    Raster
+        Constraints for grid-based object representations (``ObjectPixelated`` and
+        ``ObjectDIP`` share this set today).
+    INR
+        Placeholder for the upcoming implicit-neural-representation object.
+
+    Examples
+    --------
+    >>> PtychoObjConstraintParams.Raster(tv_weight_z=5.0, identical_slices=True)
+    >>> PtychoObjConstraintParams.parse_dict({"name": "raster", "positivity": False})
+    """
+
+    @dataclass
+    class Raster(Constraints):
+        """Constraints for grid-based ptychography object models (Pixelated, DIP)."""
+
+        # hard constraints
+        positivity: bool = True
+        fix_potential_baseline: bool = False
+        fix_potential_baseline_factor: float = 1.0
+        identical_slices: bool = False
+        apply_fov_mask: bool = False
+        # filtering (treated as hard, applied post-update)
+        gaussian_sigma: float | None = None  # pixels
+        butterworth_order: int = 4
+        q_lowpass: float | None = None  # A^-1
+        q_highpass: float | None = None  # A^-1
+        # soft constraints
+        tv_weight_z: float = 0.0
+        tv_weight_xy: float = 0.0
+        surface_zero_weight: float = 0.0
+        _name: str = "raster"
+
+        soft_constraint_keys = ["tv_weight_z", "tv_weight_xy", "surface_zero_weight"]
+        hard_constraint_keys = [
+            "positivity",
+            "fix_potential_baseline",
+            "fix_potential_baseline_factor",
+            "identical_slices",
+            "apply_fov_mask",
+            "gaussian_sigma",
+            "butterworth_order",
+            "q_lowpass",
+            "q_highpass",
+        ]
+
+    @dataclass
+    class INR(Constraints):
+        """Placeholder for the upcoming ObjectINR variant. Not yet wired to a model."""
+
+        _name: str = "inr"
+
+        soft_constraint_keys = []
+        hard_constraint_keys = []
+
+    @classmethod
+    def parse_dict(cls, d: dict) -> "PtychoObjConstraintsType":
+        """Instantiate the appropriate Raster or INR dataclass from a config dict.
+
+        The dict must contain a ``'name'`` or ``'type'`` key (case-insensitive),
+        with value ``'raster'`` or ``'inr'``. All other keys are forwarded as
+        keyword arguments to the chosen dataclass.
+        """
+        d = dict(d)
+        name = d.pop("name", None) or d.pop("type", None)
+        if name is None:
+            raise ValueError("Must provide either 'name' or 'type' key")
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown object constraint type: {name}")
+        if name == "raster":
+            return cls.Raster(**d)
+        elif name == "inr":
+            return cls.INR(**d)
+        else:
+            raise ValueError(f"Unknown object constraint type: {name}")
+
+
+PtychoObjConstraintsType = PtychoObjConstraintParams.Raster | PtychoObjConstraintParams.INR
 
 """
 Currently all object models.obj are complex valued for "complex" or "pure_phase" object types,
@@ -271,37 +366,25 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         )
 
 
-class ObjectConstraints(BaseConstraints, ObjectBase):
-    DEFAULT_CONSTRAINTS = {
-        "positivity": True,
-        "fix_potential_baseline": False,
-        "fix_potential_baseline_factor": 1.0,
-        "identical_slices": False,
-        "apply_fov_mask": False,
-        "tv_weight_z": 0,
-        "tv_weight_xy": 0,
-        "surface_zero_weight": 0,
-        "gaussian_sigma": None,  # pixels
-        "butterworth_order": 4,
-        "q_lowpass": None,  # A^-1
-        "q_highpass": None,  # A^-1
-    }
+class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], ObjectBase):
+    DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.Raster = PtychoObjConstraintParams.Raster()
 
     def apply_hard_constraints(
         self, obj: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
+        c = self.constraints
         if self.obj_type in ["complex", "pure_phase"]:
             if self.obj_type == "complex":
                 amp = torch.clamp(torch.abs(obj), 0.0, 1.0)
             else:
                 amp = 1.0
             phase = obj.angle() - obj.angle().mean()
-            if mask is not None and self.constraints["apply_fov_mask"]:
+            if mask is not None and c.apply_fov_mask:
                 obj2 = amp * mask * torch.exp(1.0j * phase * mask)
             else:
                 obj2 = amp * torch.exp(1.0j * phase)
         else:  # potential
-            if self.constraints["fix_potential_baseline"]:
+            if c.fix_potential_baseline:
                 if mask is not None:
                     background = mask < 0.5 * mask.max()
                     if background.any():
@@ -311,29 +394,28 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 else:
                     offset = obj.min()
                 offset = offset.detach()
-                offset *= self.constraints["fix_potential_baseline_factor"]
+                offset *= c.fix_potential_baseline_factor
             else:
                 offset = 0
 
-            if self.constraints.get("positivity", True):
+            if c.positivity:
                 obj2 = torch.clamp(obj - offset, min=0.0)
             else:
                 obj2 = obj - offset
 
-        if self.constraints["apply_fov_mask"] and mask is not None:
+        if c.apply_fov_mask and mask is not None:
             obj2 *= mask
 
-        # want backwards compatibility for gaussian_sigma and q_lowpass/q_highpass, so use get
-        if self.constraints.get("gaussian_sigma") is not None:
-            obj2 = self.gaussian_blur_2d(obj2, sigma=self.constraints["gaussian_sigma"])
+        if c.gaussian_sigma is not None:
+            obj2 = self.gaussian_blur_2d(obj2, sigma=c.gaussian_sigma)
 
-        if any([self.constraints["q_lowpass"], self.constraints["q_highpass"]]):
+        if any([c.q_lowpass, c.q_highpass]):
             obj2 = self.butterworth_constraint(
                 obj2,
                 sampling=self.sampling,
             )
         if self.num_slices > 1:
-            if self.constraints["identical_slices"]:
+            if c.identical_slices:
                 with torch.no_grad():
                     obj2[:] = torch.mean(obj2, dim=0, keepdim=True)
 
@@ -352,7 +434,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
         surface_zero_loss = self.get_surface_zero_loss(
             obj,
-            weight=self.constraints["surface_zero_weight"],
+            weight=self.constraints.surface_zero_weight,
         )
         self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
         self.accumulate_constraint_losses()
@@ -364,8 +446,8 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         loss = self._get_zero_loss_tensor()
         if weights is None:
             w = (
-                self.constraints["tv_weight_z"],
-                self.constraints["tv_weight_xy"],
+                self.constraints.tv_weight_z,
+                self.constraints.tv_weight_xy,
             )
         elif isinstance(weights, (float, int)):
             if weights == 0:
@@ -489,9 +571,9 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
         """
 
-        q_lowpass = self.constraints["q_lowpass"]
-        q_highpass = self.constraints["q_highpass"]
-        butterworth_order = self.constraints["butterworth_order"]
+        q_lowpass = self.constraints.q_lowpass
+        q_highpass = self.constraints.q_highpass
+        butterworth_order = self.constraints.butterworth_order
 
         qx = torch.fft.fftfreq(tensor.shape[-2], sampling[0], device=tensor.device)
         qy = torch.fft.fftfreq(tensor.shape[-1], sampling[1], device=tensor.device)

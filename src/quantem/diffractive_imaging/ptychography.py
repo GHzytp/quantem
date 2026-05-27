@@ -18,15 +18,59 @@ from quantem.core.ml.dist_utils import (
     is_distributed_launch,
     spawn_distributed_workers,
 )
-from quantem.diffractive_imaging.dataset_models import DatasetModelType
+from quantem.diffractive_imaging.dataset_models import (
+    DatasetModelType,
+    PtychoDatasetConstraintParams,
+    PtychoDatasetConstraintsType,
+)
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
+from quantem.diffractive_imaging.object_models import (
+    ObjectModelType,
+    ObjectPixelated,
+    PtychoObjConstraintParams,
+    PtychoObjConstraintsType,
+)
+from quantem.diffractive_imaging.probe_models import (
+    ProbeModelType,
+    ProbeParametric,
+    PtychoProbeConstraintParams,
+    PtychoProbeConstraintsType,
+)
 from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
 from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
+
+
+def _merge_constraints(
+    constraints: dict[str, Any] | None,
+    obj_constraints: dict | PtychoObjConstraintsType | None,
+    probe_constraints: dict | PtychoProbeConstraintsType | None,
+    dset_constraints: dict | PtychoDatasetConstraintsType | None,
+) -> dict[str, Any]:
+    """Merge the legacy ``constraints`` dict with the new per-model kwargs.
+
+    Each new kwarg may be a plain dict (routed through the relevant ``parse_dict``)
+    or a Constraints dataclass instance. Passing the same model via both
+    ``constraints`` and a per-model kwarg raises ``ValueError``.
+    """
+    merged: dict[str, Any] = dict(constraints) if constraints else {}
+
+    def _set(slot: str, value, parser):
+        if value is None:
+            return
+        if slot in merged:
+            raise ValueError(
+                f"Constraints for '{slot}' provided via both `constraints=` and "
+                f"`{slot[:3]}_constraints=`; pass only one."
+            )
+        merged[slot] = parser(value) if isinstance(value, dict) else value
+
+    _set("object", obj_constraints, PtychoObjConstraintParams.parse_dict)
+    _set("probe", probe_constraints, PtychoProbeConstraintParams.parse_dict)
+    _set("dataset", dset_constraints, PtychoDatasetConstraintParams.parse_dict)
+    return merged
 
 
 def _ddp_ptycho_worker(
@@ -202,7 +246,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         reset: bool = False,
         optimizer_params: dict[str, Any] | None = None,
         scheduler_params: dict[str, Any] | None = None,
-        constraints: dict[str, Any] = {},
+        constraints: dict[str, Any] | None = None,
+        obj_constraints: dict | PtychoObjConstraintsType | None = None,
+        probe_constraints: dict | PtychoProbeConstraintsType | None = None,
+        dset_constraints: dict | PtychoDatasetConstraintsType | None = None,
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
@@ -221,11 +268,25 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
           - ``int``              — specific GPU index, e.g. ``device=2`` → cuda:2
           - ``list[int]``        — multi-GPU, e.g. ``device=[0,1,2,3]``
 
+        Constraints can be set in two equivalent ways:
+
+        - ``constraints={"object": {...}, "probe": {...}, "dataset": {...}}`` — legacy form;
+          each leaf may be a dict or a ``Constraints`` dataclass instance.
+        - ``obj_constraints=``, ``probe_constraints=``, ``dset_constraints=`` — new form;
+          each accepts a dict (parsed via the relevant ``parse_dict``) or a dataclass
+          instance like ``PtychoObjConstraintParams.Raster(...)``.
+
+        Passing the same model via both forms raises ``ValueError``.
+
         Multi-GPU (``device`` is a list) launches worker processes via ``mp.spawn`` when called
         from a notebook, or uses the existing distributed process group when launched with
         ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
         """
         self._check_preprocessed()
+
+        constraints = _merge_constraints(
+            constraints, obj_constraints, probe_constraints, dset_constraints
+        )
 
         # Determine effective device list: explicit arg takes priority, else fall back to stored.
         devices_to_use = (
@@ -291,7 +352,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         reset: bool = False,
         optimizer_params: dict[str, Any] | None = None,
         scheduler_params: dict[str, Any] | None = None,
-        constraints: dict[str, Any] = {},
+        constraints: dict[str, Any] | None = None,
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
@@ -314,7 +375,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         if reset:
             self.reset_recon()
-        self.constraints = constraints
+        if constraints:
+            self.constraints = constraints
 
         new_scheduler = reset
         if optimizer_params is not None:

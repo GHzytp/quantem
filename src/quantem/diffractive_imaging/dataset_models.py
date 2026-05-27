@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -12,6 +13,7 @@ from quantem.core import config
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.utils import electron_wavelength_angstrom, tqdmnd
 from quantem.core.utils.validators import (
@@ -21,12 +23,66 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
-from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import AffineTransform, fit_origin, shift_array
 
 """
 Dataset models for ptychographic reconstruction.
 """
+
+
+class PtychoDatasetConstraintParams:
+    """
+    Namespace class for ptychography dataset constraint dataclasses.
+
+    Tab-complete on ``PtychoDatasetConstraintParams`` in a notebook to discover the
+    available variants. Tab-complete inside a variant's constructor to see every
+    constraint field with its default value.
+
+    Variants
+    --------
+    Raster
+        Constraints for ``PtychographyDatasetRaster`` (descan TV penalty, descan
+        zero-out, scan position clipping and centering).
+    """
+
+    @dataclass
+    class Raster(Constraints):
+        """Constraints for raster-scan ptychography datasets."""
+
+        # hard constraints
+        descan_shifts_constant: bool = False
+        center_scan_positions: bool = False
+        clip_scan_positions: bool = True
+        # soft constraints
+        descan_tv_weight: float = 0.0
+        _name: str = "raster"
+
+        soft_constraint_keys = ["descan_tv_weight"]
+        hard_constraint_keys = [
+            "descan_shifts_constant",
+            "center_scan_positions",
+            "clip_scan_positions",
+        ]
+
+    @classmethod
+    def parse_dict(cls, d: dict) -> "PtychoDatasetConstraintsType":
+        d = dict(d)
+        name = d.pop("name", None) or d.pop("type", None)
+        if name is None:
+            raise ValueError("Must provide either 'name' or 'type' key")
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown dataset constraint type: {name}")
+        if name == "raster":
+            return cls.Raster(**d)
+        else:
+            raise ValueError(f"Unknown dataset constraint type: {name}")
+
+
+PtychoDatasetConstraintsType = PtychoDatasetConstraintParams.Raster
 
 
 class PtychographyDatasetBase(
@@ -602,24 +658,17 @@ class PtychographyDatasetBase(
     # endregion --- class methods ---
 
 
-class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
-    DEFAULT_CONSTRAINTS = {
-        "descan_tv_weight": 0.0,
-        "descan_shifts_constant": False,
-        "center_scan_positions": False,
-        "clip_scan_positions": True,
-    }
+class DatasetConstraints(
+    BaseConstraints[PtychoDatasetConstraintParams.Raster], PtychographyDatasetBase
+):
+    DEFAULT_CONSTRAINTS: PtychoDatasetConstraintParams.Raster = PtychoDatasetConstraintParams.Raster()
 
     def apply_soft_constraints(self, descan_shifts: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
 
-        if (
-            self.constraints.get("descan_tv_weight", 0) > 0
-            and self.learn_descan
-            and self.has_optimizer()
-        ):
-            tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints["descan_tv_weight"])
+        if self.constraints.descan_tv_weight > 0 and self.learn_descan and self.has_optimizer():
+            tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints.descan_tv_weight)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("descan_tv_weight", tv_loss)
 
@@ -639,23 +688,17 @@ class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
         self,
         descan: torch.Tensor,
     ) -> torch.Tensor:
-        if self.constraints["descan_shifts_constant"]:
+        if self.constraints.descan_shifts_constant:
             descan = torch.zeros_like(descan)
         return descan
 
     def apply_hard_constraints(self, obj_padding_px: np.ndarray | tuple) -> None:
-        # could clip positions here if needed
         positions = self.scan_positions_px
         obj_shape = torch.tensor(self._obj_shape_full_2d(obj_padding_px), device=positions.device)
-        if self.constraints.get(
-            "clip_scan_positions", self.DEFAULT_CONSTRAINTS["clip_scan_positions"]
-        ):
+        if self.constraints.clip_scan_positions:
             positions = torch.clamp(positions, min=torch.zeros_like(obj_shape), max=obj_shape - 1)
 
-        if self.constraints.get(
-            "center_scan_positions", self.DEFAULT_CONSTRAINTS["center_scan_positions"]
-        ):
-            # shift all positions uniformly so that the mean position is at the center of the object
+        if self.constraints.center_scan_positions:
             positions = positions - positions.mean(dim=0, keepdim=True)
             positions = positions + obj_shape / 2
 

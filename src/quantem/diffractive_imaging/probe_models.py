@@ -1,5 +1,6 @@
 from abc import abstractmethod
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Callable, Self, Union
 from warnings import warn
 
@@ -14,6 +15,7 @@ from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
+from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType, SchedulerType
 from quantem.core.utils.rng import RNGMixin
@@ -32,13 +34,78 @@ from quantem.diffractive_imaging.complex_probe import (
     POLAR_SYMBOLS,
     real_space_probe,
 )
-from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import (
     fourier_shift_expand,
     shift_array,
 )
 
 DeviceType = Union[str, torch.device, int]
+
+
+class PtychoProbeConstraintParams:
+    """
+    Namespace class for ptychography probe constraint dataclasses.
+
+    Tab-complete on ``PtychoProbeConstraintParams`` in a notebook to discover the
+    available variants. Tab-complete inside a variant's constructor to see every
+    constraint field with its default value.
+
+    Variants
+    --------
+    Raster
+        Constraints for grid-based probe representations (``ProbePixelated`` and
+        ``ProbeDIP`` share this set today).
+    Parametric
+        Placeholder for parametric probe models, where Gram-Schmidt orthogonalization
+        and pixel-domain TV are moot.
+    """
+
+    @dataclass
+    class Raster(Constraints):
+        """Constraints for grid-based ptychography probe models (Pixelated, DIP)."""
+
+        # hard constraints
+        orthogonalize_probe: bool = True
+        center_probe: bool = False
+        # soft constraints
+        tv_weight: float = 0.0
+        _name: str = "raster"
+
+        soft_constraint_keys = ["tv_weight"]
+        hard_constraint_keys = ["orthogonalize_probe", "center_probe"]
+
+    @dataclass
+    class Parametric(Constraints):
+        """Placeholder for parametric probe constraints. Not yet wired to a model."""
+
+        _name: str = "parametric"
+
+        soft_constraint_keys = []
+        hard_constraint_keys = []
+
+    @classmethod
+    def parse_dict(cls, d: dict) -> "PtychoProbeConstraintsType":
+        d = dict(d)
+        name = d.pop("name", None) or d.pop("type", None)
+        if name is None:
+            raise ValueError("Must provide either 'name' or 'type' key")
+        if isinstance(name, type):
+            name = name.__name__.lower()
+        elif isinstance(name, str):
+            name = name.lower()
+        else:
+            raise ValueError(f"Unknown probe constraint type: {name}")
+        if name == "raster":
+            return cls.Raster(**d)
+        elif name == "parametric":
+            return cls.Parametric(**d)
+        else:
+            raise ValueError(f"Unknown probe constraint type: {name}")
+
+
+PtychoProbeConstraintsType = (
+    PtychoProbeConstraintParams.Raster | PtychoProbeConstraintParams.Parametric
+)
 
 
 class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
@@ -427,13 +494,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return propagators
 
 
-class ProbeConstraints(BaseConstraints, ProbeBase):
-    DEFAULT_CONSTRAINTS = {
-        # "fix_probe": False,
-        "orthogonalize_probe": True,
-        "center_probe": False,
-        "tv_weight": 0.0,
-    }
+class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], ProbeBase):
+    DEFAULT_CONSTRAINTS: PtychoProbeConstraintParams.Raster = PtychoProbeConstraintParams.Raster()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -441,8 +503,8 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
     def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
-        if self.constraints["tv_weight"]:
-            loss_tv = self._probe_tv_constraint(probe, self.constraints["tv_weight"])
+        if self.constraints.tv_weight:
+            loss_tv = self._probe_tv_constraint(probe, self.constraints.tv_weight)
             self.add_soft_constraint_loss("tv_loss", loss_tv)
             loss = loss + loss_tv
 
@@ -450,11 +512,9 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         return loss
 
     def apply_hard_constraints(self, probe: torch.Tensor) -> torch.Tensor:
-        # if self.constraints["fix_probe"]:
-        #     return self.initial_probe
-        if self.constraints["orthogonalize_probe"]:
+        if self.constraints.orthogonalize_probe:
             probe = self._probe_orthogonalization_constraint(probe)
-        if self.constraints["center_probe"]:
+        if self.constraints.center_probe:
             probe = self._probe_center_of_mass_constraint(probe)
         return probe
 
