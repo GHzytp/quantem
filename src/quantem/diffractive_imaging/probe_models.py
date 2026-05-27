@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Self, Union
+from typing import Any, Callable, Self, Union, cast
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -15,7 +15,7 @@ from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
-from quantem.core.ml.constraints import BaseConstraints, Constraints
+from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType, SchedulerType
 from quantem.core.utils.rng import RNGMixin
@@ -62,7 +62,25 @@ class PtychoProbeConstraintParams:
 
     @dataclass
     class Raster(Constraints):
-        """Constraints for grid-based ptychography probe models (Pixelated, DIP)."""
+        """Constraints for grid-based ptychography probe models (``ProbePixelated``,
+        ``ProbeDIP``).
+
+        Attributes
+        ----------
+        orthogonalize_probe : bool, default ``True``
+            Mixed-state probe (``num_probes > 1``) only. After each update applies
+            Gram-Schmidt orthogonalization across the probe stack and then sorts
+            the resulting probes by total intensity (descending). For
+            ``num_probes == 1`` this is effectively a renormalization no-op.
+        center_probe : bool, default ``False``
+            Shifts the probe's intensity center-of-mass back to the array center
+            via a Fourier shift after each update. Useful when probe drift
+            competes with scan-position refinement; if both move freely the
+            reconstruction can wander while still fitting the diffraction data.
+        tv_weight : float, default ``0.0``
+            Soft penalty. Weight on the in-plane total-variation of the (complex)
+            probe; encourages smooth probe magnitude / phase.
+        """
 
         # hard constraints
         orthogonalize_probe: bool = True
@@ -76,7 +94,13 @@ class PtychoProbeConstraintParams:
 
     @dataclass
     class Parametric(Constraints):
-        """Placeholder for parametric probe constraints. Not yet wired to a model."""
+        """Placeholder for parametric probe constraints (``ProbeParametric``).
+
+        Parametric probes are pure functions of aberration / aperture coefficients,
+        so pixel-domain projections like ``orthogonalize_probe`` and ``tv_weight``
+        don't apply. Parametric-specific fields (e.g. bounds on individual
+        aberration coefficients) will land here when needed.
+        """
 
         _name: str = "parametric"
 
@@ -85,22 +109,13 @@ class PtychoProbeConstraintParams:
 
     @classmethod
     def parse_dict(cls, d: dict) -> "PtychoProbeConstraintsType":
-        d = dict(d)
-        name = d.pop("name", None) or d.pop("type", None)
-        if name is None:
-            raise ValueError("Must provide either 'name' or 'type' key")
-        if isinstance(name, type):
-            name = name.__name__.lower()
-        elif isinstance(name, str):
-            name = name.lower()
-        else:
-            raise ValueError(f"Unknown probe constraint type: {name}")
-        if name == "raster":
-            return cls.Raster(**d)
-        elif name == "parametric":
-            return cls.Parametric(**d)
-        else:
-            raise ValueError(f"Unknown probe constraint type: {name}")
+        """Instantiate the appropriate variant from a config dict.
+
+        The dict must contain a ``'name'`` or ``'type'`` key (case-insensitive),
+        with value ``'raster'`` or ``'parametric'``. All other keys are forwarded
+        as keyword arguments to the chosen dataclass.
+        """
+        return cast(PtychoProbeConstraintsType, parse_constraint_dict(cls, d, kind="probe"))
 
 
 PtychoProbeConstraintsType = (

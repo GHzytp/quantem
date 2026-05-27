@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
-from quantem.core.ml.constraints import BaseConstraints, Constraints
+from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType, SchedulerType
 from quantem.core.utils.rng import RNGMixin
@@ -54,7 +54,56 @@ class PtychoObjConstraintParams:
 
     @dataclass
     class Raster(Constraints):
-        """Constraints for grid-based ptychography object models (Pixelated, DIP)."""
+        """Constraints for grid-based ptychography object models (``ObjectPixelated``,
+        ``ObjectDIP``).
+
+        Fields are applied each iteration in two flavors: **hard** constraints
+        project / filter the object after the optimizer step; **soft** constraints
+        add a penalty term to the training loss.
+
+        Attributes
+        ----------
+        positivity : bool, default ``True``
+            Clamps the object to be non-negative after each update.
+            Only consulted when ``obj_type="potential"``; for ``"complex"`` /
+            ``"pure_phase"`` the amplitude is clamped to ``[0, 1]`` (or fixed to 1)
+            regardless of this flag.
+        fix_potential_baseline : bool, default ``False``
+            ``obj_type="potential"`` only. Subtracts an offset from the object so
+            background regions sit at zero. If an FOV mask is set the offset is
+            the mean of the background (``mask < 0.5 * mask.max()``); otherwise
+            it's ``obj.min()``.
+        fix_potential_baseline_factor : float, default ``1.0``
+            Scales the baseline offset. Values ``<1`` relax the anchoring
+            (subtract less of the background); ``>1`` over-correct.
+        identical_slices : bool, default ``False``
+            Multislice (``num_slices > 1``) only. Replaces every slice with the
+            mean across slices, forcing an effectively 2D object.
+        apply_fov_mask : bool, default ``False``
+            Multiplies the object by the precomputed FOV mask after each update.
+            Useful when the scan does not cover the full padded object area.
+        gaussian_sigma : float | None, default ``None``
+            Standard deviation (in pixels) of a 2D Gaussian blur applied to each
+            slice after each update. Smoothing prior; ``None`` disables.
+        butterworth_order : int, default ``4``
+            Order of the Butterworth filter used by ``q_lowpass`` / ``q_highpass``.
+        q_lowpass : float | None, default ``None``
+            Lowpass cutoff in inverse Angstroms. Fourier components above this
+            spatial frequency are suppressed via a Butterworth filter.
+        q_highpass : float | None, default ``None``
+            Highpass cutoff in inverse Angstroms. Components below this frequency
+            are suppressed; typically used to remove a slowly varying background.
+        tv_weight_z : float, default ``0.0``
+            Soft penalty. Weight on the depth-axis total-variation term in the
+            loss. Multislice (``num_slices > 1``) only.
+        tv_weight_xy : float, default ``0.0``
+            Soft penalty. Weight on the in-plane total-variation term;
+            encourages piecewise-smooth regions while preserving edges.
+        surface_zero_weight : float, default ``0.0``
+            Soft penalty pulling the first and last slices toward zero. Useful
+            for thick samples embedded in vacuum. Multislice only and requires
+            ``num_slices >= 3``.
+        """
 
         # hard constraints
         positivity: bool = True
@@ -88,7 +137,13 @@ class PtychoObjConstraintParams:
 
     @dataclass
     class INR(Constraints):
-        """Placeholder for the upcoming ObjectINR variant. Not yet wired to a model."""
+        """Placeholder for the upcoming ``ObjectINR`` variant.
+
+        INR-specific constraints (e.g. sparsity / TV penalties evaluated at
+        sampled coordinates) will land here when the model is implemented.
+        Until then this exists so ``parse_dict`` accepts ``"inr"`` and downstream
+        code can pattern-match on the variant.
+        """
 
         _name: str = "inr"
 
@@ -97,28 +152,13 @@ class PtychoObjConstraintParams:
 
     @classmethod
     def parse_dict(cls, d: dict) -> "PtychoObjConstraintsType":
-        """Instantiate the appropriate Raster or INR dataclass from a config dict.
+        """Instantiate the appropriate variant from a config dict.
 
         The dict must contain a ``'name'`` or ``'type'`` key (case-insensitive),
         with value ``'raster'`` or ``'inr'``. All other keys are forwarded as
         keyword arguments to the chosen dataclass.
         """
-        d = dict(d)
-        name = d.pop("name", None) or d.pop("type", None)
-        if name is None:
-            raise ValueError("Must provide either 'name' or 'type' key")
-        if isinstance(name, type):
-            name = name.__name__.lower()
-        elif isinstance(name, str):
-            name = name.lower()
-        else:
-            raise ValueError(f"Unknown object constraint type: {name}")
-        if name == "raster":
-            return cls.Raster(**d)
-        elif name == "inr":
-            return cls.INR(**d)
-        else:
-            raise ValueError(f"Unknown object constraint type: {name}")
+        return cast(PtychoObjConstraintsType, parse_constraint_dict(cls, d, kind="object"))
 
 
 PtychoObjConstraintsType = PtychoObjConstraintParams.Raster | PtychoObjConstraintParams.INR

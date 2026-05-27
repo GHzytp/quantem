@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,7 +13,7 @@ from quantem.core import config
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.ml.constraints import BaseConstraints, Constraints
+from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.utils import electron_wavelength_angstrom, tqdmnd
 from quantem.core.utils.validators import (
@@ -47,7 +47,28 @@ class PtychoDatasetConstraintParams:
 
     @dataclass
     class Raster(Constraints):
-        """Constraints for raster-scan ptychography datasets."""
+        """Constraints for raster-scan ptychography datasets (``PtychographyDatasetRaster``).
+
+        Attributes
+        ----------
+        descan_shifts_constant : bool, default ``False``
+            Forces all descan shifts to zero after each update. Useful when you
+            want to keep the descan optimizer in the parameter group but freeze
+            its effect.
+        center_scan_positions : bool, default ``False``
+            Shifts all scan positions uniformly so their mean sits at the object
+            center after each update. Prevents the reconstruction from
+            translating during long runs with ``lr_scan_positions > 0``.
+        clip_scan_positions : bool, default ``True``
+            Clamps scan positions to lie within ``[0, obj_shape - 1]`` after each
+            update. On by default to prevent positions from drifting off the
+            padded object during refinement.
+        descan_tv_weight : float, default ``0.0``
+            Soft penalty. Weight on the total-variation of the descan-shift
+            sequence (x and y averaged). Encourages smoothly varying descan, but
+            only contributes when ``learn_descan`` is on and the dataset has a
+            descan optimizer attached.
+        """
 
         # hard constraints
         descan_shifts_constant: bool = False
@@ -66,20 +87,13 @@ class PtychoDatasetConstraintParams:
 
     @classmethod
     def parse_dict(cls, d: dict) -> "PtychoDatasetConstraintsType":
-        d = dict(d)
-        name = d.pop("name", None) or d.pop("type", None)
-        if name is None:
-            raise ValueError("Must provide either 'name' or 'type' key")
-        if isinstance(name, type):
-            name = name.__name__.lower()
-        elif isinstance(name, str):
-            name = name.lower()
-        else:
-            raise ValueError(f"Unknown dataset constraint type: {name}")
-        if name == "raster":
-            return cls.Raster(**d)
-        else:
-            raise ValueError(f"Unknown dataset constraint type: {name}")
+        """Instantiate the appropriate variant from a config dict.
+
+        The dict must contain a ``'name'`` or ``'type'`` key (case-insensitive),
+        with value ``'raster'``. All other keys are forwarded as keyword
+        arguments to the chosen dataclass.
+        """
+        return cast(PtychoDatasetConstraintsType, parse_constraint_dict(cls, d, kind="dataset"))
 
 
 PtychoDatasetConstraintsType = PtychoDatasetConstraintParams.Raster

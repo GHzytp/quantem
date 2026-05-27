@@ -49,6 +49,47 @@ class Constraints(ABC):
         )
 
 
+def parse_constraint_dict(
+    namespace: type,
+    d: dict,
+    *,
+    kind: str = "constraint",
+) -> Constraints:
+    """Dispatch a config dict to one of ``namespace``'s nested ``Constraints`` variants.
+
+    ``namespace`` is a class with one or more nested ``@dataclass``\\ -decorated
+    ``Constraints`` subclasses. The dict must contain a ``"name"`` or ``"type"`` key
+    whose value (case-insensitive) matches one variant's ``_name`` field; the
+    remaining keys are forwarded as constructor kwargs to that variant.
+
+    ``kind`` is a short human-readable label ("object", "probe", "dataset", ...)
+    used only in error messages.
+    """
+    d = dict(d)
+    name = d.pop("name", None) or d.pop("type", None)
+    if name is None:
+        raise ValueError(f"Must provide either 'name' or 'type' key for {kind} constraints")
+    if isinstance(name, type):
+        name = name.__name__.lower()
+    elif isinstance(name, str):
+        name = name.lower()
+    else:
+        raise ValueError(f"Unknown {kind} constraint type: {name!r}")
+
+    variants: dict[str, type[Constraints]] = {}
+    for attr in vars(namespace).values():
+        if isinstance(attr, type) and issubclass(attr, Constraints) and attr is not Constraints:
+            variant_name = getattr(attr, "_name", None)
+            if isinstance(variant_name, str):
+                variants[variant_name.lower()] = attr
+
+    if name not in variants:
+        raise ValueError(
+            f"Unknown {kind} constraint type: {name!r}; expected one of {sorted(variants)}"
+        )
+    return variants[name](**d)
+
+
 C = TypeVar("C", bound=Constraints)
 
 
