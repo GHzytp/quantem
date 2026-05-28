@@ -14,6 +14,13 @@ class ReconstructionContext(BaseContext):
         - Pixelated reads ".volume"
         - INR reads ".coords" and recomputes via the model.
         - TensorDecomp reads ".coords" and ".pred" (and ".all densities")
+
+    Variable descriptions:
+    - volume: Reconstructed object (volume).
+    - coords: Used for INR reconstructions to provide the coordinates to the model.
+    - pred: Predicted values per coordinate position from the model.
+    - all_densities: Integrated densities per ray from the model.
+    - obj: Object model (INR, TensorDecomp, etc.).
     """
 
     volume: Optional[torch.Tensor] = None
