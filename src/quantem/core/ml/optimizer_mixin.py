@@ -536,9 +536,9 @@ class OptimizerMixin:
         """Initialize the optimizer mixin."""
         self._optimizer = None
         self._scheduler = None
-        self._optimizer_params: OptimizerType | dict[str, OptimizerType] = (
-            OptimizerParams.NoneOptimizer()
-        )
+        self._optimizer_params: dict[str, OptimizerType] = {
+            self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()
+        }
         self._scheduler_params: SchedulerType = SchedulerParams.NoneScheduler()
         # Don't call super().__init__() in mixin classes to avoid MRO issues
 
