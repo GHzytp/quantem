@@ -119,9 +119,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         The input window size should be 10-30% of the target edge energy.
         """
 
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
-        energy_axis = E0 + dE * np.arange(self.shape[0])
+        energy_axis = self.energy_axis
 
         if energy_range is not None:
             energy_range[0] = np.maximum(energy_range[0], energy_axis[0])
@@ -185,9 +183,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         return background_fit
 
     def smooth_eels_rollingaverage(self, roi=None, energy_range=None, mask=None, kernel_size=10):
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
-        energy_axis = E0 + dE * np.arange(self.shape[0])
+        energy_axis = self.energy_axis
 
         if energy_range is not None:
             energy_range[0] = np.maximum(energy_range[0], energy_axis[0])
@@ -241,7 +237,14 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return smoothed_data3d
 
-    def measure_zlp_offset(self, zlp_guess_x=None, fit_window=0.8, fit_to_plane=False):
+    def measure_zlp_offset(
+        self,
+        zlp_guess_x=None,
+        fit_window=0.8,
+        fit_to_plane=False,
+        median_filter_pixels=3,
+        fit_zlp=True,
+    ):
         """
         Measure ZLP offset at each pixel position by using a guess of ZLP posfitting each spectrum to a Gaussian
         """
@@ -254,11 +257,8 @@ class Dataset3deels(Dataset3dspectroscopy):
             x, y = M
             return (a * x) + (b * y) + c
 
-        n_energy, n_y, n_x = self.array.shape
-
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0])
-        energy_axis = E0 + np.arange(n_energy) * dE
+        _n_energy, n_y, n_x = self.array.shape
+        energy_axis = self.energy_axis
 
         # For each pixel, measure the zlp position by fitting a Gaussian to the measured zero-loss signal and taking its center as the zlp position.
 
@@ -267,45 +267,52 @@ class Dataset3deels(Dataset3dspectroscopy):
         for iy in range(n_y):
             for ix in range(n_x):
                 # Apply median filter to discount hot pixels that might spuriously produce the maximum intensity of the spectrum
-                spec_filt = median_filter(self.array[:, iy, ix], 3)
+                if median_filter_pixels > 0:
+                    spec_filt = median_filter(self.array[:, iy, ix], median_filter_pixels)
+                else:
+                    spec_filt = self.array[:, iy, ix]
 
-                # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
-                if zlp_guess_x is not None:
-                    zlp_crude_idx = int(np.argmin(np.abs(energy_axis - zlp_guess_x)))
+                if fit_zlp:
+                    # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
+                    if zlp_guess_x is not None:
+                        zlp_crude_idx = int(np.argmin(np.abs(energy_axis - zlp_guess_x)))
+                    else:
+                        zlp_crude_idx = int(np.argmax(spec_filt))
+
+                    mu0 = float(energy_axis[zlp_crude_idx])
+
+                    lo = mu0 - fit_window
+                    hi = mu0 + fit_window
+
+                    x_mask = (energy_axis >= lo) & (energy_axis <= hi)
+
+                    xw = energy_axis[x_mask]
+                    yw = spec_filt[x_mask]
+
+                    A0 = float(spec_filt[zlp_crude_idx])
+                    sigma0 = fit_window / 2
+
+                    p0 = (A0, mu0, sigma0)
+
+                    bounds = (
+                        (
+                            0.0,
+                            lo,
+                            1e-12,
+                        ),
+                        (
+                            np.inf,
+                            hi,
+                            np.inf,
+                        ),
+                    )
+
+                    popt, _ = curve_fit(_gaussian_fit, xw, yw, p0=p0, bounds=bounds)
+
+                    zlp_measured[iy, ix] = float(popt[1])
                 else:
                     zlp_crude_idx = int(np.argmax(spec_filt))
-
-                mu0 = float(energy_axis[zlp_crude_idx])
-
-                lo = mu0 - fit_window
-                hi = mu0 + fit_window
-
-                x_mask = (energy_axis >= lo) & (energy_axis <= hi)
-
-                xw = energy_axis[x_mask]
-                yw = spec_filt[x_mask]
-
-                A0 = float(spec_filt[zlp_crude_idx])
-                sigma0 = fit_window / 2
-
-                p0 = (A0, mu0, sigma0)
-
-                bounds = (
-                    (
-                        0.0,
-                        lo,
-                        1e-12,
-                    ),
-                    (
-                        np.inf,
-                        hi,
-                        np.inf,
-                    ),
-                )
-
-                popt, _ = curve_fit(_gaussian_fit, xw, yw, p0=p0, bounds=bounds)
-
-                zlp_measured[iy - 1, ix - 1] = float(popt[1])
+                    zlp_measured[iy, ix] = float(energy_axis[zlp_crude_idx])
 
         if fit_to_plane:
             # Fit a 2D plane to the array of measured ZLPs
@@ -340,6 +347,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         fit_window=0.8,
         measure_offset=True,
         fit_to_plane=True,
+        fit_zlp=True,
         return_3d_dataset=True,
     ):
         # Default behavior is to automatically call measure_zlp_offset to generate an array of ZLP shifts for each scan position.
@@ -350,63 +358,60 @@ class Dataset3deels(Dataset3dspectroscopy):
                 zlp_guess_x=zlp_guess_x,
                 fit_window=fit_window,
                 fit_to_plane=fit_to_plane,
+                fit_zlp=fit_zlp,
             )
         elif zlp_shifts_array is not None:
-            if zlp_shifts_array.shape == self.array.shape[1:3]:
-                zlp_array = zlp_shifts_array
-            else:
+            zlp_array = np.asarray(zlp_shifts_array, dtype=float)
+            if zlp_array.shape != self.array.shape[1:3]:
                 raise ValueError(
                     "Dimensions of input array for ZLP shifts do not match X and Y dimensions of 3D spectroscopy dataset."
                 )
         elif zlp_guess_x is not None:
-            zlp_array = np.ones(self.array.shape[1:3]) * zlp_guess_x
+            zlp_array = np.ones(self.array.shape[1:3], dtype=float) * zlp_guess_x
         else:
             raise ValueError(
                 "measure_offset was set to False and no input argument for ZLP shifts was provided."
             )
 
+        zlp_array = np.asarray(zlp_array, dtype=float)
+        if not np.all(np.isfinite(zlp_array)):
+            raise ValueError("ZLP shifts must contain only finite values.")
+
         # Initialize 3D array to populate with spectra aligned along the energy axis
-        corrected_array = np.zeros_like(self.array)
+        corrected_array = np.empty(self.array.shape, dtype=np.result_type(self.array.dtype, float))
 
         n_energy, n_y, n_x = self.array.shape
 
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0])
-        energy_axis = E0 + np.arange(n_energy) * dE
+        energy_axis = self.energy_axis
+        if np.all((zlp_array >= 0) & (zlp_array <= n_energy - 1)) and (
+            np.min(zlp_array) < energy_axis[0] or np.max(zlp_array) > energy_axis[-1]
+        ):
+            zlp_array = np.interp(zlp_array, np.arange(n_energy), energy_axis)
 
-        # Record the maximum positive shift to update the origin for the output aligned 3D dataset
-        max_shift = 0
-
-        # Apply the ZLP shift at each probe position, rounding to the nearest integer multiple of the sampling of the data
+        # Apply sub-channel ZLP shifts using 1D linear interpolation along the energy axis.
         for iy in range(n_y):
             for ix in range(n_x):
                 spec = self.array[:, iy, ix]
-                shift_binsampled = np.floor_divide(zlp_array[iy, ix], dE) * (-1)
-                shift_int = shift_binsampled.astype(np.int64)
-                if shift_binsampled < 0:
-                    spec_shifted = np.pad(
-                        spec[-shift_binsampled:],
-                        (0, -shift_int),
-                        mode="constant",
-                        constant_values=np.nan,
-                    )
-                else:
-                    spec_shifted = np.pad(
-                        spec, (shift_int, 0), mode="constant", constant_values=np.nan
-                    )[: len(spec)]
-                # Update maximum shift for origin correction
-                if shift_binsampled > max_shift:
-                    max_shift = shift_binsampled
-                corrected_array[:, iy, ix] = spec_shifted
-
-        # Update origin
-        new_origin = E0 + max_shift * dE
+                corrected_array[:, iy, ix] = np.interp(
+                    energy_axis + zlp_array[iy, ix],
+                    energy_axis,
+                    spec,
+                    left=np.nan,
+                    right=np.nan,
+                )
 
         # Remove all planes along energy axis containing NaN, to equalize spectra lengths across all scan positions
         mask = np.isnan(corrected_array).any(axis=(1, 2))
         aligned_data_3d = corrected_array[~mask]
+        new_Eaxis = energy_axis[~mask]
 
-        new_Eaxis = new_origin + np.arange(aligned_data_3d.shape[0]) * dE
+        if aligned_data_3d.shape[0] == 0:
+            raise ValueError(
+                "ZLP shifts leave no shared energy range after alignment. "
+                "Check that zlp_shifts_array is in energy units, not channel indices."
+            )
+
+        new_origin = float(new_Eaxis[0])
 
         # Calculate mean spectra before and after correction for plotting
         mean_spectrum_raw = self.array.mean(axis=(1, 2))
@@ -434,6 +439,7 @@ class Dataset3deels(Dataset3dspectroscopy):
                 origin=new_origin,
                 units=self.units,
             )
+        return aligned_data_3d
 
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
@@ -463,7 +469,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         dE = float(self.sampling[0])
         E0 = float(self.origin[0])
-        energy_axis = E0 + np.arange(n_energy) * dE
+        energy_axis = self.energy_axis
 
         # --- Build ZLP position map ---
         # For every pixel, find the energy where the ZLP sits.
