@@ -618,11 +618,11 @@ class OptimizerMixin:
         if opt_params is not None:
             self.optimizer_params = opt_params
 
-        if not self._optimizer_params:
+        if not self.optimizer_params:
             self._optimizer = None
             return
 
-        if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
+        if isinstance(self.optimizer_params, OptimizerParams.NoneOptimizer):
             self.remove_optimizer()
             return
 
@@ -633,11 +633,11 @@ class OptimizerMixin:
             for p in group["params"]:
                 p.requires_grad_(True)
         # Figure out which optimizer class to use
-        if isinstance(self._optimizer_params, dict):
+        if isinstance(self.optimizer_params, dict):
             # Per-group case: all groups must agree on the optimizer class,
             # and per-group hyperparameters are already baked into each dict
             # by get_optimization_parameters().
-            opt_specs = list(self._optimizer_params.values())
+            opt_specs = list(self.optimizer_params.values())
             if not opt_specs:
                 self._optimizer = None
                 return
@@ -651,8 +651,8 @@ class OptimizerMixin:
             self._optimizer = optimizer_cls(params) # type:ignore 
         else:
             # Single-optimizer case: splat global hyperparameters
-            optimizer_cls = self._optimizer_class_for(self._optimizer_params)
-            self._optimizer = optimizer_cls(params, **self._optimizer_params.params())
+            optimizer_cls = self._optimizer_class_for(self.optimizer_params)
+            self._optimizer = optimizer_cls(params, **self.optimizer_params.params())
 
     def _optimizer_class_for(self, opt_params) -> type[torch.optim.Optimizer]:
         match opt_params:
