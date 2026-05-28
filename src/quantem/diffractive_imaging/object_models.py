@@ -540,6 +540,9 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             "calculating TV loss for phase of complex object, "
             "phase wrapping may distort the gradient. Consider obj_type='pure_phase'."
         )
+        # TODO: amp and phase share `w` here. Consider splitting `tv_weight_xy`
+        # into separate amp/phase weights on PtychoObjConstraintParams.Raster
+        # so users can tune them independently for obj_type="complex".
         loss = loss + self._calc_tv_loss(ph, w)
         amp = array.abs()
         loss = loss + self._calc_tv_loss(amp, w)
