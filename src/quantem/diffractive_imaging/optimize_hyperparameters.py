@@ -867,7 +867,8 @@ class OptimizePtychography:
             if recon_obj.obj_type == "potential":
                 obj = np.abs(obj).sum(0)
             elif recon_obj.obj_type == "pure_phase":
-                obj = np.angle(obj).sum(0)
+                # pure_phase obj_cropped is a real phase array — plot directly
+                obj = obj.sum(0)
             else:
                 obj = np.angle(obj).sum(0)
 

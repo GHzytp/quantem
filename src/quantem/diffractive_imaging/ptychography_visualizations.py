@@ -70,12 +70,16 @@ class PtychographyVisualizations(PtychographyBase):
         ims = []
         titles = []
         cmaps = []
+        # obj_np dtype depends on obj_type:
+        #   potential  -> real values to plot directly
+        #   pure_phase -> real phase to plot directly (no np.angle wrap)
+        #   complex    -> complex; extract amp & phase via np.abs / np.angle
         if self.obj_type == "potential":
             ims.append(np.abs(obj_np).sum(0))
             titles.append(t + "Potential")
             cmaps.append(ph_cmap)
         elif self.obj_type == "pure_phase":
-            ims.append(np.angle(obj_np).sum(0))
+            ims.append(obj_np.sum(0))
             titles.append(t + "Pure Phase")
             cmaps.append(ph_cmap)
         else:
@@ -145,8 +149,14 @@ class PtychographyVisualizations(PtychographyBase):
             tukey(obj_np.shape[-2], tukey_alpha)[:, None]
             * tukey(obj_np.shape[-1], tukey_alpha)[None, :]
         )
+        # Build the complex transmission function and apply the spatial window:
+        #   potential  -> real values, plotted in real space
+        #   pure_phase -> real phase; transmission = exp(1j*phase)
+        #   complex    -> already complex transmission
         if self.obj_type == "potential":
             windowed_obj = obj_np.sum(0) * window_2d
+        elif self.obj_type == "pure_phase":
+            windowed_obj = np.exp(1j * obj_np.sum(0)) * window_2d
         else:
             windowed_obj = (
                 np.abs(obj_np).sum(0)
@@ -398,7 +408,7 @@ class PtychographyVisualizations(PtychographyBase):
             objs_flat = [np.abs(obj[i]) for i in range(len(obj))]
             titles_flat = [f"Potential {t_parts[i]}" for i in range(len(obj))]
         elif self.obj_type == "pure_phase":
-            objs_flat = [np.angle(obj[i]) for i in range(len(obj))]
+            objs_flat = [obj[i] for i in range(len(obj))]
             titles_flat = [f"Pure Phase {t_parts[i]}" for i in range(len(obj))]
         else:
             objs_flat = [np.angle(obj[i]) for i in range(len(obj))]
@@ -690,7 +700,7 @@ class PtychographyVisualizations(PtychographyBase):
                 all_titles.append(title_prefix + "Potential")
                 all_cmaps.append(ph_cmap)
             elif self.obj_type == "pure_phase":
-                all_images.append(np.angle(obj).sum(0))
+                all_images.append(obj.sum(0))
                 all_titles.append(title_prefix + "Phase")
                 all_cmaps.append(ph_cmap)
             else:  # complex
@@ -805,7 +815,7 @@ class PtychographyVisualizations(PtychographyBase):
                     row_titles.append(f"Iter {iteration} Potential")
                     row_cmaps.append(ph_cmap)
                 elif self.obj_type == "pure_phase":
-                    row_images.append(np.angle(obj).sum(0))
+                    row_images.append(obj.sum(0))
                     row_titles.append(f"Iter {iteration} Phase")
                     row_cmaps.append(ph_cmap)
                 else:  # complex

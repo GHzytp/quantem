@@ -326,8 +326,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
+        """Object array in its native representation per ``obj_type``:
+
+        - ``"complex"`` → complex ndarray (amp * exp(1j*phase)); phase recentered.
+        - ``"pure_phase"`` → real ndarray of phase values.
+        - ``"potential"`` → real ndarray of potential values.
+        """
         obj = self._to_numpy(self.obj_model.obj)
-        if self.obj_type in ["pure_phase", "complex"]:
+        if self.obj_type == "complex":
             ph = np.angle(obj)
             obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
         return obj
@@ -497,11 +503,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if cropped:
             snp2 = snp.copy()
             cropped_obj = self._crop_rotate_obj_fov(snp2["obj"])
-            # same logic as self.obj_cropped
-            if self.obj_type == "pure_phase":
-                ph = np.angle(cropped_obj)
-                cropped_obj = np.exp(1j * (ph - ph.mean()))
-            if self.obj_type in ["pure_phase", "complex"]:
+            # same logic as self.obj_cropped: only re-center for complex (which
+            # carries phase inside a complex tensor); pure_phase and potential
+            # are already real and recentered upstream.
+            if self.obj_type == "complex":
                 ph = np.angle(cropped_obj)
                 cropped_obj = np.abs(cropped_obj) * np.exp(1j * (ph - ph.mean()))
             snp2["obj"] = cropped_obj
@@ -661,8 +666,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj_cropped(self) -> np.ndarray:
+        """Cropped + FOV-rotated object, in its native representation.
+
+        - ``obj_type="complex"`` → complex array (amp * exp(1j*phase)); phase is
+          recentered to zero mean here as a defensive duplicate of
+          ``ObjectConstraints._apply_hard_complex``.
+        - ``obj_type="pure_phase"`` → real array of phase values (already
+          recentered upstream by ``_apply_hard_pure_phase``).
+        - ``obj_type="potential"`` → real array of potential values.
+        """
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
-        if self.obj_type in ["pure_phase", "complex"]:
+        if self.obj_type == "complex":
             ph = np.angle(cropped)
             cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
         return cropped

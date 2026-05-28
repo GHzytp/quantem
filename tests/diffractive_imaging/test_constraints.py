@@ -1,7 +1,10 @@
 """Tests for the ptychography constraint dataclass API."""
 
+import warnings
+
 import numpy as np
 import pytest
+import torch
 
 from quantem.core.datastructures import Dataset4dstem
 from quantem.diffractive_imaging import (
@@ -184,3 +187,103 @@ class TestReconstructKwargs:
         )
         assert ptycho.obj_model.constraints.tv_weight_xy == 0.4
         assert ptycho.probe_model.constraints.center_probe is True
+
+
+# --- Real-valued pure_phase representation -----------------------------------
+
+
+class TestPurePhaseRealValued:
+    def test_pure_phase_pixelated_obj_is_real(self):
+        obj = ObjectPixelated.from_uniform(obj_type="pure_phase", num_slices=1)
+        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        assert not obj._obj.is_complex(), f"pure_phase _obj should be real, got {obj._obj.dtype}"
+
+    def test_complex_pixelated_obj_is_complex(self):
+        obj = ObjectPixelated.from_uniform(obj_type="complex", num_slices=1)
+        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        assert obj._obj.is_complex()
+
+    def test_potential_pixelated_obj_is_real(self):
+        obj = ObjectPixelated.from_uniform(obj_type="potential", num_slices=1)
+        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        assert not obj._obj.is_complex()
+
+    def test_pure_phase_tv_emits_no_phase_warning(self):
+        obj = ObjectPixelated.from_uniform(obj_type="pure_phase", num_slices=1)
+        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        obj.constraints.tv_weight_xy = 0.1
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            obj.get_tv_loss(obj._obj)
+        phase_warnings = [w for w in caught if "phase wrapping" in str(w.message)]
+        assert not phase_warnings, (
+            f"pure_phase should not emit phase-wrap warning, got {phase_warnings}"
+        )
+
+    def test_complex_tv_still_emits_phase_warning(self):
+        obj = ObjectPixelated.from_uniform(obj_type="complex", num_slices=1)
+        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        obj.constraints.tv_weight_xy = 0.1
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            obj.get_tv_loss(obj._obj)
+        assert any("phase wrapping" in str(w.message) for w in caught), (
+            "complex obj_type should still emit phase-wrap warning"
+        )
+
+    def test_pure_phase_apply_hard_constraints_stays_real(self):
+        obj = ObjectPixelated.from_uniform(obj_type="pure_phase", num_slices=1)
+        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        out = obj.apply_hard_constraints(obj._obj)
+        assert not out.is_complex()
+
+
+# --- FOV-mask single application ---------------------------------------------
+
+
+class TestFovMaskSingleApplication:
+    def _make_obj(self, obj_type) -> ObjectPixelated:
+        obj = ObjectPixelated.from_uniform(obj_type=obj_type, num_slices=1)
+        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        obj.constraints.apply_fov_mask = True
+        # Force a non-trivial _obj so masking is observable
+        if obj_type == "complex":
+            obj._obj = torch.nn.Parameter(
+                torch.ones(1, 16, 16, dtype=torch.complex64) * (0.5 + 0.3j)
+            )
+        else:
+            obj._obj = torch.nn.Parameter(torch.full((1, 16, 16), 0.7))
+        return obj
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex", "potential"])
+    def test_mask_applied_once(self, obj_type):
+        obj = self._make_obj(obj_type)
+        # Half-mask: ones on the left, zeros on the right; if mask is applied
+        # twice the masked region squares the multiplication (no observable
+        # difference for 0/1 masks), so use a non-binary mask.
+        mask = torch.full((1, 16, 16), 0.5)
+        obj._mask = mask
+        out = obj.apply_hard_constraints(obj._obj, mask=mask)
+        # Verify nothing crashed and shape is preserved.
+        assert out.shape == obj._obj.shape
+        # If mask had been applied twice, |out| would scale by 0.5**2 = 0.25
+        # of the unmasked value; once it scales by 0.5. We compare to the
+        # per-obj-type expected post-constraint value.
+        if obj_type == "pure_phase":
+            # phase recentered to zero mean, then *= 0.5 mask
+            expected_mag = 0.0  # phase=constant -> recenter to 0 -> *0.5 = 0
+        elif obj_type == "potential":
+            # positivity clamp keeps 0.7, * 0.5 -> 0.35 (one application)
+            expected_mag = 0.35
+        else:  # complex
+            # amp clamp keeps 0.5+0.3j, * 0.5 -> magnitude 0.5 * |0.5+0.3j|
+            expected_mag = 0.5 * abs(0.5 + 0.3j)
+        # Sample the magnitude in the masked region
+        if out.is_complex():
+            sampled = out.abs().mean().item()
+        else:
+            sampled = out.abs().mean().item()
+        assert abs(sampled - expected_mag) < 1e-4, (
+            f"{obj_type}: expected mag ~{expected_mag}, got {sampled} "
+            f"(would be {expected_mag * 0.5} if mask were applied twice)"
+        )

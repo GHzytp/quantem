@@ -164,11 +164,14 @@ class PtychoObjConstraintParams:
 PtychoObjConstraintsType = PtychoObjConstraintParams.Raster | PtychoObjConstraintParams.INR
 
 """
-Currently all object models.obj are complex valued for "complex" or "pure_phase" object types,
-and real valued for "potential" object types. This could be changed to be always complex valued, 
-(after applying constraints) as currently the real-valued potential is made complex in get_obj_patches, 
-which will not be used for implicit NNs, which leads to an inconsistency. Leaving for now as I'm not 
-sure if this would lead to other issues, so a bit of testing will be needed.
+Object representation by obj_type:
+- "complex"    : _obj is complex (amplitude * exp(1j * phase))
+- "pure_phase" : _obj is a real, unwrapped phase array
+- "potential"  : _obj is a real potential array
+
+The forward boundary (`_get_obj_patches`) wraps real `_obj` to `exp(1j * _obj)` for
+both pure_phase and potential, so the rest of the forward model never has to
+branch on obj_type.
 """
 
 
@@ -220,10 +223,9 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
     @property
     def dtype(self) -> "torch.dtype":
-        if self.obj_type == "potential":
-            return getattr(torch, config.get("dtype_real"))
-        else:
+        if self.obj_type == "complex":
             return getattr(torch, config.get("dtype_complex"))
+        return getattr(torch, config.get("dtype_real"))
 
     @property
     def device(self) -> str:
@@ -413,53 +415,70 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         self, obj: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         c = self.constraints
-        if self.obj_type in ["complex", "pure_phase"]:
-            if self.obj_type == "complex":
-                amp = torch.clamp(torch.abs(obj), 0.0, 1.0)
-            else:
-                amp = 1.0
-            phase = obj.angle() - obj.angle().mean()
-            if mask is not None and c.apply_fov_mask:
-                obj2 = amp * mask * torch.exp(1.0j * phase * mask)
-            else:
-                obj2 = amp * torch.exp(1.0j * phase)
+        if self.obj_type == "complex":
+            obj2 = self._apply_hard_complex(obj, c)
+        elif self.obj_type == "pure_phase":
+            obj2 = self._apply_hard_pure_phase(obj, c)
         else:  # potential
-            if c.fix_potential_baseline:
-                if mask is not None:
-                    background = mask < 0.5 * mask.max()
-                    if background.any():
-                        offset = obj[background].mean()
-                    else:
-                        offset = obj.min()
+            obj2 = self._apply_hard_potential(obj, c, mask)
+        return self._apply_shared_hard(obj2, c, mask)
+
+    def _apply_hard_complex(
+        self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
+    ) -> torch.Tensor:
+        amp = torch.clamp(torch.abs(obj), 0.0, 1.0)
+        phase = obj.angle() - obj.angle().mean()
+        return amp * torch.exp(1.0j * phase)
+
+    def _apply_hard_pure_phase(
+        self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
+    ) -> torch.Tensor:
+        # phase stored directly as a real tensor; recenter to zero mean
+        return obj - obj.mean()
+
+    def _apply_hard_potential(
+        self,
+        obj: torch.Tensor,
+        c: PtychoObjConstraintParams.Raster,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if c.fix_potential_baseline:
+            if mask is not None:
+                background = mask < 0.5 * mask.max()
+                if background.any():
+                    offset = obj[background].mean()
                 else:
                     offset = obj.min()
-                offset = offset.detach()
-                offset *= c.fix_potential_baseline_factor
             else:
-                offset = 0
+                offset = obj.min()
+            offset = offset.detach()
+            offset = offset * c.fix_potential_baseline_factor
+        else:
+            offset = 0
 
-            if c.positivity:
-                obj2 = torch.clamp(obj - offset, min=0.0)
-            else:
-                obj2 = obj - offset
+        if c.positivity:
+            return torch.clamp(obj - offset, min=0.0)
+        return obj - offset
 
+    def _apply_shared_hard(
+        self,
+        obj: torch.Tensor,
+        c: PtychoObjConstraintParams.Raster,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
         if c.apply_fov_mask and mask is not None:
-            obj2 *= mask
+            obj = obj * mask
 
         if c.gaussian_sigma is not None:
-            obj2 = self.gaussian_blur_2d(obj2, sigma=c.gaussian_sigma)
+            obj = self.gaussian_blur_2d(obj, sigma=c.gaussian_sigma)
 
         if any([c.q_lowpass, c.q_highpass]):
-            obj2 = self.butterworth_constraint(
-                obj2,
-                sampling=self.sampling,
-            )
-        if self.num_slices > 1:
-            if c.identical_slices:
-                with torch.no_grad():
-                    obj2[:] = torch.mean(obj2, dim=0, keepdim=True)
+            obj = self.butterworth_constraint(obj, sampling=self.sampling)
 
-        return obj2
+        if self.num_slices > 1 and c.identical_slices:
+            with torch.no_grad():
+                obj[:] = torch.mean(obj, dim=0, keepdim=True)
+        return obj
 
     def apply_soft_constraints(
         self, obj: torch.Tensor, mask: torch.Tensor | None = None
@@ -484,38 +503,46 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         self, array: torch.Tensor, weights: None | tuple[float, float] = None
     ) -> torch.Tensor:
         loss = self._get_zero_loss_tensor()
+        w = self._resolve_tv_weights(weights)
+        if not any(w):
+            return loss
+
+        if self.obj_type == "complex":
+            return self._tv_complex(array, w)
+        # pure_phase and potential are both real tensors; phase wrapping is gone.
+        return self._calc_tv_loss(array, w)
+
+    def _resolve_tv_weights(
+        self, weights: None | tuple[float, float] | float | int
+    ) -> tuple[float, float]:
         if weights is None:
-            w = (
+            w: tuple[float, float] = (
                 self.constraints.tv_weight_z,
                 self.constraints.tv_weight_xy,
             )
         elif isinstance(weights, (float, int)):
-            if weights == 0:
-                return loss
-            w = (weights, weights)
+            w = (float(weights), float(weights))
         else:
             if len(weights) != 2:
                 raise ValueError(f"weights must be a tuple of length 2, got {weights}")
-            w = weights
-
-        if not any(w):
-            return loss
-
+            w = (float(weights[0]), float(weights[1]))
         if self.num_slices == 1:
-            w = (0, w[1])
+            w = (0.0, w[1])
+        return w
 
-        if array.is_complex():
-            ph = array.angle()
-            warn(
-                "calculating TV loss for phase, need to check phase wrapping. Easiest fix is scalar phase array."
-            )
-            loss = loss + self._calc_tv_loss(ph, w)
-            amp = array.abs()
-            if self.obj_type == "complex":
-                loss = loss + self._calc_tv_loss(amp, w)
-        else:
-            loss = loss + self._calc_tv_loss(array, w)
-
+    def _tv_complex(self, array: torch.Tensor, w: tuple[float, float]) -> torch.Tensor:
+        # complex objects carry information in both amplitude and phase. We
+        # still extract phase via angle() here, so the wrap warning stays —
+        # but only for obj_type == "complex".
+        loss = self._get_zero_loss_tensor()
+        ph = array.angle()
+        warn(
+            "calculating TV loss for phase of complex object, "
+            "phase wrapping may distort the gradient. Consider obj_type='pure_phase'."
+        )
+        loss = loss + self._calc_tv_loss(ph, w)
+        amp = array.abs()
+        loss = loss + self._calc_tv_loss(amp, w)
         return loss
 
     def _calc_tv_loss(self, array: torch.Tensor, weight: tuple[float, float]) -> torch.Tensor:
@@ -537,24 +564,27 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         self, array: torch.Tensor, weight: float | int = 0.0
     ) -> torch.Tensor:
         loss = self._get_zero_loss_tensor()
-        if weight == 0:
+        if weight == 0 or array.shape[0] < 3:
             return loss
-        if array.shape[0] < 3:
-            return loss
-        if array.is_complex():
-            ph = array.angle().abs()
-            if self.obj_type == "complex":
-                amp = array.abs()
-                loss = loss + weight * (torch.mean(1.0 - amp[0]) + torch.mean(1.0 - amp[-1]))
-            warn("calculating surface zero loss for phase, need to check phase wrapping.")
-            loss = loss + weight * (
-                torch.mean(torch.abs(ph[0] - ph[0].mean()))
-                + torch.mean(torch.abs(ph[-1] - ph[-1].mean()))
-            )
-        else:
-            loss = loss + weight * (
-                torch.mean(torch.abs(array[0])) + torch.mean(torch.abs(array[-1]))
-            )
+        if self.obj_type == "complex":
+            return self._surface_zero_complex(array, weight)
+        # pure_phase and potential: real array, penalize first/last slice magnitude
+        return loss + weight * (torch.mean(torch.abs(array[0])) + torch.mean(torch.abs(array[-1])))
+
+    def _surface_zero_complex(self, array: torch.Tensor, weight: float | int) -> torch.Tensor:
+        # complex: pull amp toward 1 (vacuum) at the surfaces, and phase toward its mean
+        loss = self._get_zero_loss_tensor()
+        amp = array.abs()
+        loss = loss + weight * (torch.mean(1.0 - amp[0]) + torch.mean(1.0 - amp[-1]))
+        ph = array.angle().abs()
+        warn(
+            "calculating surface zero loss for phase of complex object, "
+            "phase wrapping may distort the gradient. Consider obj_type='pure_phase'."
+        )
+        loss = loss + weight * (
+            torch.mean(torch.abs(ph[0] - ph[0].mean()))
+            + torch.mean(torch.abs(ph[-1] - ph[-1].mean()))
+        )
         return loss
 
     def gaussian_blur_2d(self, tensor, sigma=1.0):
@@ -637,8 +667,9 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
 
         tensor = tensor + tensor_mean
 
-        # Take real part for potential tensorects
-        if self.obj_type == "potential":
+        # FFT-based filter returns complex even for real inputs; cast back to real
+        # for any non-complex object type (pure_phase, potential).
+        if self.obj_type != "complex":
             tensor = tensor.real
 
         return tensor
@@ -774,20 +805,26 @@ class ObjectPixelated(ObjectConstraints):
             return
         init_shape = tuple(int(x) for x in shape)
         if self._initialize_mode == "uniform":
-            if self.obj_type in ["complex", "pure_phase"]:
+            if self.obj_type == "complex":
+                # amp=1, phase=0 -> complex ones
                 arr = torch.ones(init_shape) * torch.exp(1.0j * torch.zeros(init_shape))
             else:
+                # pure_phase (phase=0) and potential start as real zeros
                 arr = torch.zeros(init_shape)
         elif self._initialize_mode == "random":
             ph = (
                 torch.randn(init_shape, dtype=torch.float32, generator=self._rng_torch) - 0.5
             ) * 1e-6
-            if self.obj_type == "potential":
-                arr = ph
-            else:
+            if self.obj_type == "complex":
                 arr = torch.exp(1.0j * ph)
+            else:
+                # pure_phase stores phase directly; potential stores real values
+                arr = ph
         elif self._initialize_mode == "array":
             arr = self._initial_obj
+            if self.obj_type == "pure_phase" and arr.is_complex():
+                # Convert legacy complex initial_obj (amp*exp(1j*phase)) to bare phase
+                arr = arr.angle()
         else:
             raise ValueError(f"Invalid initialize mode: {self._initialize_mode}")
 
@@ -938,7 +975,7 @@ class ObjectDIP(ObjectConstraints):
             else:
                 model_dtype = "real"
 
-        if pixelated.obj_type == "pure_phase" and model_dtype == "real":
+        if pixelated.obj_type == "complex" and model_dtype == "real":
             obj = pixelated.obj.angle().clone().detach()
         else:
             obj = pixelated.obj.clone().detach()
@@ -956,9 +993,6 @@ class ObjectDIP(ObjectConstraints):
         obj_model.pretrain_target = obj
 
         return obj_model
-
-    # TODO add a from_params that sets the model input and target from params,
-    # will need to specify a shape as well, at least before pre-training (so just set here)
 
     @property
     def num_slices(self) -> int:
@@ -1099,9 +1133,8 @@ class ObjectDIP(ObjectConstraints):
     def obj(self):
         """get the full object"""
         obj = self.model(self._model_input)[0]
-        if self.obj_type == "pure_phase" and "complex" not in str(self.dtype):
-            # using a real-valued model for a pure-phase (complex) object
-            obj = torch.ones_like(obj) * torch.exp(1j * obj)
+        # pure_phase and potential stay real here; complex models output complex.
+        # _get_obj_patches wraps real -> exp(1j*obj) at the forward boundary.
         # TODO -- single channel 2D with identical slices, view as 3D num_slices
         return self.apply_hard_constraints(obj, mask=self.mask)
 
@@ -1258,8 +1291,6 @@ class ObjectDIP(ObjectConstraints):
 
             if apply_constraints:
                 output = self.apply_hard_constraints(self.model(model_input)[0])
-                if self.obj_type == "pure_phase":
-                    output = output.angle()
             else:
                 output = self.model(model_input)[0]
             loss: torch.Tensor = loss_fn(output, self.pretrain_target)
