@@ -553,7 +553,7 @@ class OptimizerMixin:
         return self._scheduler
 
     @property
-    def optimizer_params(self) -> OptimizerType | dict[str, OptimizerType]:
+    def optimizer_params(self) -> dict[str, OptimizerType]:
         """Get the optimizer parameters."""
         return self._optimizer_params
 
@@ -565,20 +565,21 @@ class OptimizerMixin:
 
     def _normalize_optimizer_params(
         self, params: OptimizerType | dict[str, Any]
-    ) -> OptimizerType | dict[str, OptimizerType]:
-        """Normalize input. Subclasses can override to validate keys."""
-        # dict-of-OptimizerType form (PPLR)
-        if isinstance(params, dict) and not self._is_single_optimizer_dict(params):
-            return {
-                k: v if isinstance(v, OptimizerType) else OptimizerParams.parse_dict(d=v)
-                for k, v in params.items()
-            }
-        # Single optimizer form (with dict shorthand like {"name": "adam", "lr": 1e-3})
-        if isinstance(params, dict):
-            params = OptimizerParams.parse_dict(d=params)
-        if not isinstance(params, OptimizerType):
+    ) -> dict[str, OptimizerType]:
+        """Normalize input to dict[str, OptimizerType]. Subclasses can override to validate keys."""
+        # Single optimizer, already an OptimizerType
+        if isinstance(params, OptimizerType):
+            return {self.DEFAULT_OPTIMIZER_KEY: params}
+        if not isinstance(params, dict):
             raise TypeError(f"optimizer_params must be OptimizerType or dict, got {type(params)}")
-        return params
+        # Single optimizer as dict shorthand, e.g. {"name": "adam", "lr": 1e-3}
+        if self._is_single_optimizer_dict(params):
+            return {self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.parse_dict(d=params)}
+        # dict-of-OptimizerType form (PPLR)
+        return {
+            k: v if isinstance(v, OptimizerType) else OptimizerParams.parse_dict(d=v)
+            for k, v in params.items()
+        }
 
     @staticmethod
     def _is_single_optimizer_dict(d: dict) -> bool:
