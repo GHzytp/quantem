@@ -55,6 +55,7 @@ class Dataset(AutoSerialize):
             )
         super().__init__()
         # Dual-slot storage: exactly one of (_array, _tensor) is set.
+        # TODO: remove dual-init guards once torch transition is complete.
         if array is None and tensor is None:
             raise ValueError("Provide either `array` (numpy) or `tensor` (torch).")
         if array is not None and tensor is not None:
@@ -229,37 +230,49 @@ class Dataset(AutoSerialize):
         return (array if array is not None else self._tensor).ndim
 
     @property
-    def dtype(self) -> DTypeLike:
+    def dtype(self) -> DTypeLike | torch.dtype:
         array = getattr(self, "_array", None)
         return (array if array is not None else self._tensor).dtype
 
     @property
     def device(self) -> str:
-        """``"cpu"`` for numpy-backed; torch device string for tensor-backed."""
-        tensor = getattr(self, "_tensor", None)
-        if tensor is not None:
-            return str(tensor.device)
-        return "cpu"
+        """Device string for the underlying storage. numpy 2.x ndarray and torch.Tensor
+        both expose ``.device`` (array-API convention), so this is uniform.
+        """
+        array = getattr(self, "_array", None)
+        return str((array if array is not None else self._tensor).device)
 
     def numpy(self) -> NDArray:
         """Return the data as a numpy array (mirrors ``torch.Tensor.numpy()``).
 
         For numpy-backed datasets, returns ``self.array`` directly. For
-        tensor-backed datasets, materializes a CPU copy via ``.detach().cpu().numpy()``.
+        tensor-backed datasets, materializes a read-only CPU copy via
+        ``.detach().cpu().numpy()``. ``flags.writeable=False`` so accidental
+        in-place writes raise instead of silently being lost (the copy is not
+        the tensor).
         """
         array = getattr(self, "_array", None)
         if array is not None:
             return array
-        return self._tensor.detach().cpu().numpy()
+        arr = self._tensor.detach().cpu().numpy()
+        arr.flags.writeable = False
+        return arr
 
     def to(self, device) -> Self:
-        """Move the underlying tensor to ``device``. Raises if numpy-backed."""
+        """Move the underlying tensor to ``device``. Raises if numpy-backed.
+
+        ``device`` is normalized via :func:`quantem.core.config.validate_device`
+        so values like ``"cuda"``, ``0``, ``"cuda:0"``, ``torch.device("cuda:0")``
+        all resolve to the same canonical device.
+        """
+        from quantem.core import config
         tensor = getattr(self, "_tensor", None)
         if tensor is None:
             raise AttributeError(
                 f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'."
             )
-        self._tensor = tensor.to(device)
+        dev, _ = config.validate_device(device)
+        self._tensor = tensor.to(dev)
         return self
 
     # --- Summaries ---

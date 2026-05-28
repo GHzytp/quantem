@@ -181,6 +181,8 @@ class Dataset4dstem(Dataset4d):
 
         For cupy / jax arrays, wrap with ``torch.from_dlpack(arr)`` first.
         """
+        # TODO: factor type + ndim checks into `ensure_valid_tensor(value, ndim=4)`
+        # in validators.py, matching `ensure_valid_array` pattern. Cuts bloat.
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(
                 f"from_tensor requires torch.Tensor, got {type(tensor).__name__}. "
