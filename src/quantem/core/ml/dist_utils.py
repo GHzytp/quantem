@@ -25,17 +25,29 @@ def init_process_group(
     backend: str = "nccl",
     master_addr: str = "127.0.0.1",
     master_port: str = "29500",
+    local_device: int | None = None,
 ) -> None:
-    """Initialize the distributed process group from within an mp.spawn worker."""
+    """Initialize the distributed process group from within an mp.spawn worker.
+
+    ``local_device`` is the physical CUDA device index this rank should bind to
+    (e.g. with ``GPU_IDS=[2, 3]``, rank 0 should get ``local_device=2``).
+    NCCL allocates communicator buffers on the *current* CUDA device at
+    ``init_process_group`` time, so the device must be set *before* that call
+    or the buffers will land on whichever device was current — typically
+    ``cuda:0``. Falling back to ``rank`` matches PyTorch's
+    ``LOCAL_RANK == device_index`` convention used by ``torchrun`` when each
+    process maps to a contiguous device starting at 0.
+    """
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = master_port
+    if backend == "nccl":
+        device_index = local_device if local_device is not None else rank
+        torch.cuda.set_device(device_index)
     dist.init_process_group(
         backend=backend,
         rank=rank,
         world_size=world_size,
     )
-    if backend == "nccl":
-        torch.cuda.set_device(rank)
 
 
 def get_rank() -> int:

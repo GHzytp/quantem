@@ -44,7 +44,16 @@ def _ddp_ptycho_worker(
     shared-memory tensor mechanism and fails in some Linux environments).
     """
     device_id = devices[rank]
-    init_process_group(rank, world_size, backend="nccl" if torch.cuda.is_available() else "gloo")
+    # Bind the CUDA device BEFORE init_process_group so NCCL allocates its
+    # communicator buffers on the correct GPU. Without this, NCCL grabs cuda:0
+    # at init time, stranding small per-rank buffers on GPUs the user didn't
+    # ask for.
+    init_process_group(
+        rank,
+        world_size,
+        backend="nccl" if torch.cuda.is_available() else "gloo",
+        local_device=device_id if torch.cuda.is_available() else None,
+    )
 
     # mmap=True so all workers share one memory-mapped RAM copy of the (potentially large,
     # CPU-resident) state instead of each duplicating it.
@@ -263,12 +272,16 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if is_distributed_launch():
             rank = int(os.environ["RANK"])
             world_size = int(os.environ["WORLD_SIZE"])
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
             if not torch.distributed.is_initialized():
+                # Bind the device BEFORE init_process_group so NCCL allocates
+                # its communicator buffers on the correct GPU.
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(local_rank)
                 torch.distributed.init_process_group(
                     backend="nccl" if torch.cuda.is_available() else "gloo",
                     init_method="env://",
                 )
-            local_rank = int(os.environ.get("LOCAL_RANK", rank))
             dev = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
             self.to(dev)
             self._broadcast_parameters(src=0)
