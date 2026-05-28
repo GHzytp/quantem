@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-T_ctx = TypeVar("T_ctx", bound=BaseContext)
 
 @dataclass
 class BaseContext(ABC):
@@ -15,6 +14,8 @@ class BaseContext(ABC):
     Constraints should contain a context object that contains all necessary data for the constraints to be applied.
     """
     pass
+
+T_ctx = TypeVar("T_ctx", bound=BaseContext)
 
 @dataclass(slots=False)
 class Constraints(ABC):

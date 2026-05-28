@@ -531,6 +531,7 @@ class OptimizerMixin:
     """
 
     DEFAULT_OPTIMIZER_TYPE = "adamw"
+    DEFAULT_OPTIMIZER_KEY = "default"
 
     def __init__(self):
         """Initialize the optimizer mixin."""
