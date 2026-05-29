@@ -624,9 +624,6 @@ class OptimizerMixin:
             self._optimizer = None
             return
 
-        if isinstance(self.optimizer_params, OptimizerParams.NoneOptimizer):
-            self.remove_optimizer()
-            return
 
         params = self.get_optimization_parameters()  # always list[dict]
 
@@ -634,14 +631,17 @@ class OptimizerMixin:
         for group in params:
             for p in group["params"]:
                 p.requires_grad_(True)
-        # Figure out which optimizer class to use
+        # Figure out which optimizer class to use 
         if isinstance(self.optimizer_params, dict):
             # Per-group case: all groups must agree on the optimizer class,
             # and per-group hyperparameters are already baked into each dict
             # by get_optimization_parameters().
-            opt_specs = list(self.optimizer_params.values())
+            opt_specs = [
+                spec for spec in self.optimizer_params.values()
+                if not isinstance(spec, OptimizerParams.NoneOptimizer)
+            ]
             if not opt_specs:
-                self._optimizer = None
+                self.remove_optimizer()
                 return
             optimizer_cls = self._optimizer_class_for(opt_specs[0])
             for spec in opt_specs[1:]:
@@ -650,12 +650,7 @@ class OptimizerMixin:
                         f"All parameter groups must use the same optimizer type, "
                         f"got {type(opt_specs[0]).__name__} and {type(spec).__name__}"
                     )
-            self._optimizer = optimizer_cls(params) # type:ignore 
-        else:
-            # Single-optimizer case: splat global hyperparameters
-            optimizer_cls = self._optimizer_class_for(self.optimizer_params)
-            self._optimizer = optimizer_cls(params, **self.optimizer_params.params())
-
+            self._optimizer = optimizer_cls(params, **opt_specs[0].params())
     def _optimizer_class_for(self, opt_params) -> type[torch.optim.Optimizer]:
         match opt_params:
             case OptimizerParams.Adam():
@@ -744,7 +739,7 @@ class OptimizerMixin:
     def remove_optimizer(self) -> None:
         """Remove the optimizer and scheduler."""
         self._optimizer = None
-        self._optimizer_params = OptimizerParams.NoneOptimizer()
+        self._optimizer_params = {self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()}
         self._scheduler = None
         self._scheduler_params = SchedulerParams.NoneScheduler()
 

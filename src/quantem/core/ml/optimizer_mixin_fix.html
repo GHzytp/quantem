@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OptimizerMixin — minimal fixes to complete the dict[str, OptimizerType] standardization</title>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#f6f8fa; --panel-2:#eef1f4; --ink:#1f2328; --muted:#656d76;
+    --rule:#d0d7de; --accent:#0969da; --good:#1a7f37; --bad:#cf222e; --warn:#9a6700;
+    --codebg:#f6f8fa; --addbg:#e6ffec; --addbar:#1a7f37; --delbg:#ffebe9; --delbar:#cf222e;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{ margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{ max-width:880px; margin:0 auto; padding:40px 24px 90px;}
+  header{ border-bottom:1px solid var(--rule); padding-bottom:20px; margin-bottom:8px;}
+  header h1{ font-size:26px; margin:0 0 6px; letter-spacing:-.3px;}
+  header .sub{ color:var(--muted); font-size:15px; margin:0;}
+  .meta{ margin-top:12px; font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:var(--muted);}
+  .meta b{color:var(--ink);}
+  h2{ font-size:20px; margin:40px 0 6px; padding-bottom:6px; border-bottom:1px solid var(--rule);}
+  h3{ font-size:16px; margin:24px 0 6px;}
+  p{ margin:.6em 0;}
+  code{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px;
+        background:var(--panel-2); padding:1.5px 5px; border-radius:5px;}
+  pre{ background:var(--codebg); border:1px solid var(--rule); border-radius:8px; padding:14px 16px;
+       overflow-x:auto; font-size:12.5px; line-height:1.5;
+       font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  pre code{ background:none; padding:0;}
+  .diff .l{ display:block; padding:0 8px; border-left:3px solid transparent; white-space:pre;}
+  .diff .add{ background:var(--addbg); border-left-color:var(--addbar);}
+  .diff .del{ background:var(--delbg); border-left-color:var(--delbar);}
+  .diff .ctx{ color:#1f2328;}
+  .cmt{color:#6e7781;}
+  .note{ border:1px solid var(--rule); border-left:4px solid var(--accent); background:var(--panel);
+         border-radius:0 8px 8px 0; padding:12px 16px; margin:16px 0;}
+  .note.good{ border-left-color:var(--good);} .note.warn{ border-left-color:var(--warn);} .note.bad{border-left-color:var(--bad);}
+  .note .tag{ font-weight:700; font-size:11.5px; letter-spacing:.4px; text-transform:uppercase; color:var(--accent);}
+  .note.good .tag{color:var(--good);} .note.warn .tag{color:var(--warn);} .note.bad .tag{color:var(--bad);}
+  table{ width:100%; border-collapse:collapse; margin:16px 0; font-size:14px;}
+  th,td{ text-align:left; padding:9px 12px; border:1px solid var(--rule); vertical-align:top;}
+  th{ background:var(--panel); font-size:12.5px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted);}
+  .tier{ display:inline-block; font:700 11px/1 ui-monospace,monospace; letter-spacing:.5px;
+         padding:3px 9px; border-radius:999px; color:#fff; margin-right:8px;}
+  .t-req{background:var(--bad);} .t-rec{background:var(--accent);} .t-opt{background:var(--muted);}
+  .effort{ font-size:12.5px; color:var(--muted); font-family:ui-monospace,monospace;}
+  .foot{ margin-top:50px; padding-top:14px; border-top:1px solid var(--rule); color:var(--muted); font-size:12.5px; text-align:center; font-family:ui-monospace,monospace;}
+  ul{margin:.5em 0;} li{margin:.2em 0;}
+  .kbd{font-family:ui-monospace,monospace; background:var(--panel-2); border:1px solid var(--rule); border-radius:4px; padding:1px 5px; font-size:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Completing the <code>dict[str, OptimizerType]</code> standardization</h1>
+    <p class="sub">Minimal, surgical fixes that keep your standardization goal intact and resolve the
+      Ptychography breakage.</p>
+    <div class="meta">
+      <b>FILE:</b> src/quantem/core/ml/optimizer_mixin.py &nbsp;·&nbsp;
+      <b>SCOPE:</b> consumer-side only &nbsp;·&nbsp;
+      <b>RISK:</b> low, localized
+    </div>
+  </header>
+
+  <h2>1. Diagnosis in one paragraph</h2>
+  <p>Your goal — <em>normalize everything to <code>dict[str, OptimizerType]</code></em> — is correct
+  and worth keeping. The standardization did not break Ptychography on its own. The breakage came
+  from a <strong>consumer that was never migrated to the new contract</strong>:
+  <code>set_optimizer</code>. It still branches on the <em>old</em> union shape (a bare
+  <code>OptimizerType</code> <em>or</em> a dict). After normalization always returns a dict, the two
+  branches that handled the bare-type cases became unreachable, and the surviving dict branch was
+  only a partial implementation — it never handled the <code>NoneOptimizer</code> sentinel and never
+  forwarded hyperparameters. The fix is therefore <strong>not</strong> to revert the standardization,
+  but to make that one dict branch self-sufficient.</p>
+
+  <div class="note">
+    <div class="tag">Why your change was necessary but not sufficient</div>
+    <p style="margin:.4em 0 0">A return type is a contract. Narrowing it from a union to a single
+    shape obligates every consumer that pattern-matches on the old shape to be updated in the same
+    change. The producer was migrated; one consumer was not.</p>
+  </div>
+
+  <h2>2. The two concrete symptoms</h2>
+  <table>
+    <tr><th>Symptom</th><th>Root cause in <code>set_optimizer</code></th></tr>
+    <tr>
+      <td><b>Crash:</b> <code>NotImplementedError: Unknown optimizer type: NoneOptimizer()</code></td>
+      <td>The dict branch passes a <code>NoneOptimizer</code> spec to
+      <code>_optimizer_class_for</code>, which has no case for it. The old guard that caught this
+      (<code>isinstance(..., NoneOptimizer)</code>) only matches a <em>bare</em> sentinel and is now
+      unreachable.</td>
+    </tr>
+    <tr>
+      <td><b>Silent:</b> configured <code>lr</code> ignored</td>
+      <td>The dict branch builds <code>optimizer_cls(params)</code> with no kwargs. The old branch
+      that splatted <code>**optimizer_params.params()</code> is the now-unreachable
+      <code>else</code>.</td>
+    </tr>
+  </table>
+
+  <h2>3. Recommended minimal change set</h2>
+  <p>Three changes, in priority order. <span class="tier t-req">REQUIRED</span> alone resolves the
+  crash <em>and</em> the silent <code>lr</code> bug.</p>
+
+  <h3><span class="tier t-req">REQUIRED</span>Make the dict branch self-sufficient <span class="effort">· ~6 lines, one method</span></h3>
+  <p>Filter out <code>NoneOptimizer</code> sentinels; if none remain, there is nothing to optimize.
+  Otherwise build the optimizer <strong>and forward the spec’s hyperparameters</strong>. This is the
+  smallest change that honors the new dict-only contract.</p>
+  <pre class="diff"><code><span class="l ctx">        if isinstance(self.optimizer_params, dict):</span>
+<span class="l del">-           opt_specs = list(self.optimizer_params.values())</span>
+<span class="l del">-           if not opt_specs:</span>
+<span class="l del">-               self._optimizer = None</span>
+<span class="l del">-               return</span>
+<span class="l add">+           opt_specs = [</span>
+<span class="l add">+               spec for spec in self.optimizer_params.values()</span>
+<span class="l add">+               if not isinstance(spec, OptimizerParams.NoneOptimizer)</span>
+<span class="l add">+           ]</span>
+<span class="l add">+           if not opt_specs:</span>
+<span class="l add">+               self.remove_optimizer()</span>
+<span class="l add">+               return</span>
+<span class="l ctx">            optimizer_cls = self._optimizer_class_for(opt_specs[0])</span>
+<span class="l ctx">            for spec in opt_specs[1:]:</span>
+<span class="l ctx">                if type(spec) is not type(opt_specs[0]):</span>
+<span class="l ctx">                    raise ValueError(...)</span>
+<span class="l del">-           self._optimizer = optimizer_cls(params)  # type:ignore</span>
+<span class="l add">+           self._optimizer = optimizer_cls(params, **opt_specs[0].params())</span></code></pre>
+  <div class="note good">
+    <div class="tag">What this buys you</div>
+    <p style="margin:.4em 0 0">The default <code>{"default": NoneOptimizer()}</code> now filters to
+    an empty list → <code>remove_optimizer()</code> → clean no-op (this is the path
+    <code>reset_recon()</code> walks). A real <code>{"default": Adam(lr=5e-3)}</code> now builds
+    <code>Adam(params, lr=5e-3, …)</code> with your hyperparameters restored.</p>
+  </div>
+  <div class="note warn">
+    <div class="tag">Note on PPLR</div>
+    <p style="margin:.4em 0 0">This splats <code>opt_specs[0]</code>’s hyperparameters across all
+    parameter groups. That is correct today because every model returns a single param group from
+    <code>get_optimization_parameters()</code>. True per-group LRs are a separate, larger piece of
+    work — see §5.</p>
+  </div>
+
+  <h3><span class="tier t-rec">RECOMMENDED</span>Keep <code>remove_optimizer</code> on-contract <span class="effort">· 1 line</span></h3>
+  <p>It currently stores a <em>bare</em> sentinel, breaking the “always a dict” invariant. It works
+  only because the value gets re-normalized on the next set. Store the dict form to keep the
+  invariant true end-to-end.</p>
+  <pre class="diff"><code><span class="l ctx">    def remove_optimizer(self) -> None:</span>
+<span class="l ctx">        self._optimizer = None</span>
+<span class="l del">-       self._optimizer_params = OptimizerParams.NoneOptimizer()</span>
+<span class="l add">+       self._optimizer_params = {self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()}</span>
+<span class="l ctx">        self._scheduler = None</span>
+<span class="l ctx">        self._scheduler_params = SchedulerParams.NoneScheduler()</span></code></pre>
+
+  <h3><span class="tier t-opt">OPTIONAL</span>Delete the now-dead branches <span class="effort">· removes ~7 lines</span></h3>
+  <p>Purely cosmetic, but it removes the misleading code that caused the confusion. With the dict
+  contract guaranteed, the bare-<code>NoneOptimizer</code> guard and the <code>else</code> branch can
+  never run. Removing them makes <code>set_optimizer</code> a single, honest path.</p>
+  <pre class="diff"><code><span class="l del">-       if isinstance(self.optimizer_params, OptimizerParams.NoneOptimizer):</span>
+<span class="l del">-           self.remove_optimizer()</span>
+<span class="l del">-           return</span>
+<span class="l ctx">        ...</span>
+<span class="l del">-       else:</span>
+<span class="l del">-           optimizer_cls = self._optimizer_class_for(self.optimizer_params)</span>
+<span class="l del">-           self._optimizer = optimizer_cls(params, **self.optimizer_params.params())</span></code></pre>
+  <p class="effort">If you keep these, no harm — they’re dead, not wrong. Removing them is about
+  readability, not correctness.</p>
+
+  <h2>4. Optional: align the container getters</h2>
+  <p><span class="tier t-opt">OPTIONAL</span> In <code>PtychographyOpt.optimizer_params</code> (and the
+  tomography equivalent) the filter <code>if not isinstance(params, NoneOptimizer)</code> no longer
+  fires, because <code>params</code> is now a dict. After the REQUIRED fix this is harmless — a
+  disabled model simply ends up with no optimizer — but if you want the getter to exclude disabled
+  models, check the inner specs instead.</p>
+  <pre class="diff"><code><span class="l del">-           if not isinstance(params, OptimizerParams.NoneOptimizer)</span>
+<span class="l add">+           if any(not isinstance(s, OptimizerParams.NoneOptimizer) for s in params.values())</span></code></pre>
+
+  <h2>5. What to leave for later (don’t scope-creep)</h2>
+  <ul>
+    <li><b>Real per-parameter LRs (PPLR).</b> The comment claiming hyperparameters are “baked into
+      each dict by <code>get_optimization_parameters()</code>” is aspirational — the implementations
+      return <code>[{"params": params}]</code> with no <code>lr</code>. Either implement keyed param
+      groups or update the comment. Not needed to fix the break.</li>
+    <li><b>Collapsing the three “no optimizer” spellings</b> (empty dict / <code>NoneOptimizer</code> /
+      <code>_optimizer = None</code>) into one. A nice tidy-up, but orthogonal to this incident.</li>
+  </ul>
+
+  <h2>6. Verification checklist</h2>
+  <table>
+    <tr><th>Step</th><th>Expected</th></tr>
+    <tr><td><code>ptycho.reconstruct(num_iters=1, reset=True, optimizer_params={"object": {"lr": 5e-3}})</code></td>
+        <td>No <code>NotImplementedError</code>; runs.</td></tr>
+    <tr><td>Inspect <code>ptycho.obj_model.optimizer.param_groups[0]["lr"]</code></td>
+        <td>Equals <code>5e-3</code>, not torch’s default.</td></tr>
+    <tr><td>A model left out of <code>optimizer_params</code></td>
+        <td><code>has_optimizer()</code> is <code>False</code>; not stepped.</td></tr>
+    <tr><td>Re-run with <code>reset=True</code></td>
+        <td>Default <code>NoneOptimizer</code> filters cleanly; no crash.</td></tr>
+  </table>
+
+  <div class="note good">
+    <div class="tag">Bottom line</div>
+    <p style="margin:.4em 0 0">Keep your standardization. Apply the one REQUIRED change (and ideally
+    the one-line RECOMMENDED change). That completes the migration the type-narrowing started, with a
+    change set small enough to read in a single diff.</p>
+  </div>
+
+  <p class="foot">
+    Read-only proposal · no source files modified ·
+    companions: optimizer_mixin_review.html · optimizer_refactor_incident.html · OPTIMIZER_PARAMS_FLOW.md
+  </p>
+
+</div>
+</body>
+</html>

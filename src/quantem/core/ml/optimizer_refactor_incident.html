@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Great Type Standardization — an incident report</title>
+<style>
+  :root{
+    --paper:#fbf7ef; --paper-2:#f3ecdd; --ink:#2b2723; --muted:#7a7163;
+    --rule:#e3d9c4; --accent:#c0552b; --accent-2:#1f6f6b; --good:#2f7a3e;
+    --bad:#b83227; --warn:#b67c14; --code:#2b2723; --codebg:#2a2520;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0; background:
+      repeating-linear-gradient(0deg, transparent, transparent 27px, rgba(192,85,43,.05) 27px, rgba(192,85,43,.05) 28px),
+      var(--paper);
+    color:var(--ink);
+    font:16px/1.7 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  .wrap{max-width:900px; margin:0 auto; padding:46px 24px 100px;}
+  .stamp{
+    display:inline-block; transform:rotate(-4deg);
+    border:3px double var(--accent); color:var(--accent);
+    padding:6px 16px; border-radius:6px; font:700 13px/1 "Courier New",monospace;
+    letter-spacing:2px; text-transform:uppercase; margin-bottom:18px;
+  }
+  header.hero{ border-bottom:3px solid var(--ink); padding-bottom:18px; margin-bottom:10px;}
+  header.hero h1{ font-size:34px; margin:.1em 0 .15em; line-height:1.15; letter-spacing:-.5px;}
+  header.hero .by{ color:var(--muted); font-style:italic; font-size:15px;}
+  .meta{ font:13px/1.5 "Courier New",monospace; color:var(--muted); margin-top:10px;}
+  .meta b{ color:var(--ink);}
+  h2{ font-size:24px; margin:46px 0 6px; }
+  h2 .act{ display:block; font:700 12px/1 "Courier New",monospace; letter-spacing:3px; text-transform:uppercase; color:var(--accent); margin-bottom:6px;}
+  h3{ font-size:18px; margin:26px 0 6px;}
+  p{ margin:.7em 0;}
+  .lead{ font-size:18.5px; }
+  em.k{ font-style:normal; background:rgba(192,85,43,.13); padding:0 4px; border-radius:3px;}
+  code{ font-family:"Courier New",ui-monospace,monospace; font-size:14px; background:var(--paper-2); padding:1px 5px; border-radius:4px; color:#5a3a2a;}
+  pre{ background:var(--codebg); color:#e9e2d4; border-radius:10px; padding:15px 17px; overflow-x:auto;
+       font-family:"Courier New",ui-monospace,monospace; font-size:13px; line-height:1.55; box-shadow:0 8px 24px rgba(0,0,0,.18);}
+  pre code{ background:none; color:inherit; padding:0; }
+  .cmt{color:#8c8472;font-style:italic;} .kw{color:#e0975b;} .str{color:#9bc28a;}
+  .fn{color:#7fc4c0;} .num{color:#d98b6a;} .del{color:#e8857d;} .add{color:#9bd17f;}
+  .card{ background:var(--paper-2); border:1px solid var(--rule); border-left:5px solid var(--accent-2);
+         border-radius:0 10px 10px 0; padding:14px 18px; margin:18px 0;}
+  .card.bad{ border-left-color:var(--bad);} .card.good{ border-left-color:var(--good);} .card.warn{border-left-color:var(--warn);}
+  .card .tag{ font:700 11px/1 "Courier New",monospace; letter-spacing:1.5px; text-transform:uppercase; color:var(--accent-2);}
+  .card.bad .tag{color:var(--bad);} .card.good .tag{color:var(--good);} .card.warn .tag{color:var(--warn);}
+  table{ width:100%; border-collapse:collapse; margin:16px 0; font-family:Georgia,serif; font-size:14.5px;}
+  th,td{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--rule); vertical-align:top;}
+  th{ background:var(--paper-2); font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);}
+  .yes{color:var(--good); font-weight:700;} .no{color:var(--bad); font-weight:700;}
+  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:16px;}
+  @media(max-width:740px){ .grid{grid-template-columns:1fr;} }
+  .panel{ border:1px solid var(--rule); border-radius:10px; padding:14px 16px; background:#fffdf8;}
+  .panel h4{ margin:0 0 8px; font:700 13px/1 "Courier New",monospace; letter-spacing:1px; text-transform:uppercase;}
+  .panel.old h4{ color:var(--muted);} .panel.new h4{ color:var(--accent);}
+  blockquote{ margin:22px 0; padding:8px 0 8px 20px; border-left:4px solid var(--accent);
+              font-style:italic; font-size:19px; color:#4a3f33;}
+  .tldr{ background:#fffdf8; border:2px dashed var(--accent); border-radius:12px; padding:18px 22px; margin:22px 0;}
+  .tldr b{ color:var(--accent);}
+  .foot{ margin-top:54px; padding-top:16px; border-top:1px solid var(--rule); color:var(--muted); font-size:13px; text-align:center; font-family:"Courier New",monospace;}
+  .num-badge{display:inline-block; width:24px;height:24px;line-height:24px;text-align:center;border-radius:50%;background:var(--accent);color:#fff;font:700 14px "Courier New",monospace;margin-right:6px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <span class="stamp">Incident · Post-Mortem</span>
+  <header class="hero">
+    <h1>The Great Type Standardization<br>that quietly cut the pipes</h1>
+    <div class="by">How changing one return type from
+      <code>OptimizerType&nbsp;|&nbsp;dict[str,&nbsp;OptimizerType]</code> to just
+      <code>dict[str,&nbsp;OptimizerType]</code> took out Ptychography.</div>
+    <div class="meta">
+      <b>FILE:</b> src/quantem/core/ml/optimizer_mixin.py &nbsp;·&nbsp;
+      <b>COMMIT:</b> 1bc1739 &nbsp;·&nbsp;
+      <b>SYMPTOM:</b> NotImplementedError: Unknown optimizer type: NoneOptimizer()
+    </div>
+  </header>
+
+  <div class="tldr">
+    <b>TL;DR —</b> The refactor changed what the <em class="k">producer</em>
+    (<code>_normalize_optimizer_params</code>) hands out, but not what the <em class="k">consumer</em>
+    (<code>set_optimizer</code>) was built to receive. A return type isn’t just a label — it’s a
+    <strong>contract about the shape of a value</strong>, and three different places had hand-rolled
+    branches that pattern-matched on the <em>old</em> shape. When the shape changed, two branches
+    became unreachable and the third — never fully finished — became the only road. It couldn’t carry
+    a <code>NoneOptimizer</code>, and it dropped your learning rate on the floor.
+  </div>
+
+  <h2><span class="act">Act I — The good intention</span>One type to rule them all</h2>
+  <p class="lead">Someone looked at this signature and felt a totally reasonable itch:</p>
+  <div class="grid">
+    <div class="panel old">
+      <h4>Before</h4>
+      <pre><code><span class="kw">def</span> <span class="fn">optimizer_params</span>(self) ->
+    OptimizerType | <span class="fn">dict</span>[str, OptimizerType]:
+    <span class="cmt"># could be a bare dataclass...</span>
+    <span class="cmt"># ...or a dict of them. Ugh, which is it?</span>
+    <span class="kw">return</span> self._optimizer_params</code></pre>
+    </div>
+    <div class="panel new">
+      <h4>After — “let’s standardize”</h4>
+      <pre><code><span class="kw">def</span> <span class="fn">optimizer_params</span>(self) ->
+    <span class="fn">dict</span>[str, OptimizerType]:
+    <span class="cmt"># always a dict now. cleaner!</span>
+    <span class="kw">return</span> self._optimizer_params</code></pre>
+    </div>
+  </div>
+  <p>The union type <code>A | B</code> is genuinely annoying: every reader, and every consumer, has
+  to ask <em>“ok, but which one is it <strong>this</strong> time?”</em> Collapsing it to a single
+  shape is the right instinct. The normalizer was dutifully rewritten so that <em>everything</em> —
+  a bare <code>Adam()</code>, a <code>{"name": "adam"}</code> shorthand, a list of keys — comes out
+  as a tidy <code>dict[str, OptimizerType]</code>.</p>
+
+  <div class="card good">
+    <div class="tag">What went right</div>
+    <p style="margin:.4em 0 0">The normalization itself is clean and correct. If you only read
+    <code>_normalize_optimizer_params</code>, the refactor looks like an unambiguous win.</p>
+  </div>
+
+  <h2><span class="act">Act II — The unspoken contract</span>A return type is a promise to strangers</h2>
+  <p>Here’s the thing the type hint hides: that value doesn’t stay home. It flows downstream into
+  <code>set_optimizer</code>, which — because Python has no real runtime types — does its own
+  <em class="k">hand-rolled type dispatch</em> with <code>isinstance</code> and an <code>else</code>:</p>
+
+  <pre><code><span class="kw">def</span> <span class="fn">set_optimizer</span>(self, opt_params):
+    ...
+    <span class="kw">if</span> <span class="fn">isinstance</span>(self.optimizer_params, OptimizerParams.NoneOptimizer):   <span class="cmt"># arm ➊</span>
+        self.<span class="fn">remove_optimizer</span>(); <span class="kw">return</span>
+
+    <span class="kw">if</span> <span class="fn">isinstance</span>(self.optimizer_params, <span class="fn">dict</span>):                          <span class="cmt"># arm ➋</span>
+        opt_specs = <span class="fn">list</span>(self.optimizer_params.values())
+        cls = self.<span class="fn">_optimizer_class_for</span>(opt_specs[<span class="num">0</span>])
+        self._optimizer = <span class="fn">cls</span>(params)
+    <span class="kw">else</span>:                                                                <span class="cmt"># arm ➌</span>
+        cls = self.<span class="fn">_optimizer_class_for</span>(self.optimizer_params)
+        self._optimizer = <span class="fn">cls</span>(params, **self.optimizer_params.<span class="fn">params</span>())</code></pre>
+
+  <p>Those three arms were designed for the <strong>old</strong> contract, where
+  <code>optimizer_params</code> could be either a bare dataclass <em>or</em> a dict. Each arm had a
+  job:</p>
+  <ul>
+    <li><b>➊</b> handle a bare <code>NoneOptimizer</code> sentinel → “turn the optimizer off.”</li>
+    <li><b>➋</b> handle the dict / per-parameter case.</li>
+    <li><b>➌</b> handle a bare optimizer dataclass → build it <em>and splat its hyperparameters</em>
+        (<code>**params()</code>, i.e. your <code>lr</code>).</li>
+  </ul>
+
+  <blockquote>Change the shape of the water, and pipes cut for the old shape stop carrying it —
+  even though nothing looks broken at the joint.</blockquote>
+
+  <h2><span class="act">Act III — The reachability collapse</span>Two arms die, one inherits everything</h2>
+  <p>Once the producer <em>always</em> returns a dict, watch what happens to the three arms:</p>
+
+  <table>
+    <tr><th>Arm</th><th>Matches when…</th><th>Old contract</th><th>New contract</th><th>Its old job now…</th></tr>
+    <tr>
+      <td><b>➊</b> bare <code>NoneOptimizer</code></td>
+      <td>value is a bare sentinel</td>
+      <td class="yes">reachable</td>
+      <td class="no">DEAD</td>
+      <td>…nobody turns the optimizer off anymore</td>
+    </tr>
+    <tr>
+      <td><b>➋</b> <code>isinstance(dict)</code></td>
+      <td>value is a dict</td>
+      <td class="yes">reachable</td>
+      <td class="yes">ALWAYS</td>
+      <td>…inherits ➊ and ➌’s jobs but does neither</td>
+    </tr>
+    <tr>
+      <td><b>➌</b> the <code>else</code></td>
+      <td>value is a bare dataclass</td>
+      <td class="yes">reachable</td>
+      <td class="no">DEAD</td>
+      <td>…the <code>**params()</code> splat (your <code>lr</code>!) is gone</td>
+    </tr>
+  </table>
+
+  <p>So <strong>every</strong> call now lands in arm ➋. And arm ➋ was only ever a partial
+  implementation — it builds <code>cls(params)</code> and trusts that the rest will sort itself out.
+  But it never learned the two jobs it just inherited:</p>
+
+  <div class="card bad">
+    <div class="tag">Failure 1 · the crash you saw</div>
+    <p style="margin:.4em 0 0">Arm ➋ pulls <code>opt_specs[0]</code> and asks
+    <code>_optimizer_class_for</code> for a torch class. When that spec is a <code>NoneOptimizer</code>
+    (the <strong>default</strong> state of every model), the <code>match</code> falls through to
+    <code>case _</code> → <code>NotImplementedError</code>. Arm ➊ used to catch this; arm ➊ is now
+    dead.</p>
+  </div>
+  <div class="card warn">
+    <div class="tag">Failure 2 · the silent one</div>
+    <p style="margin:.4em 0 0">Arm ➋ builds <code>cls(params)</code> with <strong>no
+    hyperparameters</strong>. Arm ➌ used to splat <code>**self.optimizer_params.params()</code> —
+    that’s where your <code>lr</code> came from. With ➌ dead, a perfectly valid <code>Adam(lr=5e-3)</code>
+    silently becomes <code>Adam()</code> at torch’s default LR. No error. Just wrong.</p>
+  </div>
+
+  <h2><span class="act">Act IV — Why Python smiled and said nothing</span></h2>
+  <p>If types were enforced, the compiler would have screamed: <em>“arm ➊ and arm ➌ can never
+  match a <code>dict[str, OptimizerType]</code> — delete them or fix them.”</em> But in Python:</p>
+  <ul>
+    <li>Type hints are <strong>decorative</strong>. Changing <code>-> dict[...]</code> changes
+        documentation, not behavior. Nothing re-checked the consumers.</li>
+    <li>A branch that never matches doesn’t raise — it just <strong>silently never runs</strong>.
+        Dead code is invisible until you go looking for it.</li>
+    <li>The one surviving arm <em>happened to not crash</em> on the common happy path (pass an
+        <code>Adam</code>, get an optimizer — just at the wrong LR), so casual testing looked fine.</li>
+  </ul>
+
+  <div class="card">
+    <div class="tag" style="color:var(--accent-2)">Why it detonated on <code>reset=True</code> specifically</div>
+    <p style="margin:.4em 0 0"><code>reconstruct(reset=True, optimizer_params=…)</code> calls
+    <code>reset_recon()</code> <strong>before</strong> it applies your params. At that instant every
+    model still holds its factory default — <code>{"default": NoneOptimizer()}</code>. So arm ➋ gets a
+    <code>NoneOptimizer</code> on the very first thing it touches (<code>obj_model</code>) and dies
+    immediately. The crash isn’t in your config; it’s baked into the default state the reset path
+    walks through.</p>
+  </div>
+
+  <h2><span class="act">Act V — The moral</span>Standardizing a type is a migration, not an edit</h2>
+  <p>“Just change the return type to <code>dict[str, OptimizerType]</code>” <em>felt</em> like a
+  one-line cleanup. But the return type was load-bearing: three consumer branches structurally
+  depended on the old union. Changing the producer without migrating those consumers left the system
+  in a half-converted state — new shape coming out, old shape expected downstream.</p>
+
+  <div class="grid">
+    <div class="panel old">
+      <h4>What was done</h4>
+      <p style="margin:.3em 0 0">✅ Producer (<code>_normalize_optimizer_params</code>) → always dict<br>
+      ✅ Type hint updated<br>
+      ❌ Consumer (<code>set_optimizer</code>) still speaks the old union<br>
+      ❌ <code>remove_optimizer</code> still writes a bare sentinel</p>
+    </div>
+    <div class="panel new">
+      <h4>What “done” actually required</h4>
+      <p style="margin:.3em 0 0">→ Collapse <code>set_optimizer</code> to one dict-only path<br>
+      → Teach that path to <em>filter</em> <code>NoneOptimizer</code> (arm ➊’s job)<br>
+      → Teach it to <em>splat hyperparameters</em> (arm ➌’s job)<br>
+      → Make every producer of the value (incl. <code>remove_optimizer</code>) honor the new shape</p>
+    </div>
+  </div>
+
+  <blockquote>The bug wasn’t the new type. The bug was believing the new type was the
+  <em>whole</em> change.</blockquote>
+
+  <div class="tldr">
+    <b>One sentence for the next reviewer:</b> when you narrow a return type from a union to a single
+    shape, grep every consumer that does <code>isinstance</code> / <code>match</code> on it — each
+    arm that handled a now-impossible case is either dead code to delete or a responsibility that
+    just silently moved somewhere it isn’t handled.
+  </div>
+
+  <p class="foot">
+    Read-only incident report · no source modified ·
+    companions: optimizer_mixin_review.html, OPTIMIZER_PARAMS_FLOW.md
+  </p>
+
+</div>
+</body>
+</html>
