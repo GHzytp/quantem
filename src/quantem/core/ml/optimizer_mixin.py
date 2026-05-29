@@ -219,7 +219,7 @@ class OptimizerParams:
             raise ValueError(f"Unknown optimizer type: {name.lower()}")
 
 
-OptimizerType = (
+OptimizerParamsType = (
     OptimizerParams.Adam
     | OptimizerParams.AdamW
     | OptimizerParams.SGD
@@ -537,7 +537,7 @@ class OptimizerMixin:
         """Initialize the optimizer mixin."""
         self._optimizer = None
         self._scheduler = None
-        self._optimizer_params: dict[str, OptimizerType] = {
+        self._optimizer_params: dict[str, OptimizerParamsType] = {
             self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()
         }
         self._scheduler_params: SchedulerType = SchedulerParams.NoneScheduler()
@@ -554,31 +554,31 @@ class OptimizerMixin:
         return self._scheduler
 
     @property
-    def optimizer_params(self) -> dict[str, OptimizerType]:
+    def optimizer_params(self) -> dict[str, OptimizerParamsType]:
         """Get the optimizer parameters."""
         return self._optimizer_params
 
     @optimizer_params.setter
     def optimizer_params(
-        self, params: OptimizerType | dict[str, OptimizerType] | dict[str, Any]
+        self, params: OptimizerParamsType | dict[str, OptimizerParamsType] | dict[str, Any]
     ) -> None:
         self._optimizer_params = self._normalize_optimizer_params(params)
 
     def _normalize_optimizer_params(
-        self, params: OptimizerType | dict[str, Any]
-    ) -> dict[str, OptimizerType]:
-        """Normalize input to dict[str, OptimizerType]. Subclasses can override to validate keys."""
-        # Single optimizer, already an OptimizerType
-        if isinstance(params, OptimizerType):
+        self, params: OptimizerParamsType | dict[str, Any]
+    ) -> dict[str, OptimizerParamsType]:
+        """Normalize input to dict[str, OptimizerParamsType]. Subclasses can override to validate keys."""
+        # Single optimizer, already an OptimizerParamsType
+        if isinstance(params, OptimizerParamsType):
             return {self.DEFAULT_OPTIMIZER_KEY: params}
         if not isinstance(params, dict):
-            raise TypeError(f"optimizer_params must be OptimizerType or dict, got {type(params)}")
+            raise TypeError(f"optimizer_params must be OptimizerParamsType or dict, got {type(params)}")
         # Single optimizer as dict shorthand, e.g. {"name": "adam", "lr": 1e-3}
         if self._is_single_optimizer_dict(params):
             return {self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.parse_dict(d=params)}
-        # dict-of-OptimizerType form (PPLR)
+        # dict-of-OptimizerParamsType form (PPLR)
         return {
-            k: v if isinstance(v, OptimizerType) else OptimizerParams.parse_dict(d=v)
+            k: v if isinstance(v, OptimizerParamsType) else OptimizerParams.parse_dict(d=v)
             for k, v in params.items()
         }
 
@@ -616,11 +616,11 @@ class OptimizerMixin:
         """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
-    def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
+    def set_optimizer(self, opt_params: OptimizerParamsType | dict | None = None) -> None:
         """
         Set the optimizer for this model, supporting per-parameter-group learning rates (PPLR).
 
-        ``optimizer_params`` is a ``dict[str, OptimizerType]`` keyed by parameter group. Each
+        ``optimizer_params`` is a ``dict[str, OptimizerParamsType]`` keyed by parameter group. Each
         group's spec is joined by key to the tensors returned by ``get_optimization_parameters()``
         and its hyperparameters are baked into the corresponding torch param group here. All
         groups must use the same optimizer class. If every group is a ``NoneOptimizer`` (or there

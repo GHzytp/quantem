@@ -1,3 +1,4 @@
+import warnings
 from abc import abstractmethod
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,7 @@ from quantem.core import config
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerParams
 from quantem.core.utils.utils import electron_wavelength_angstrom, tqdmnd
 from quantem.core.utils.validators import (
     validate_array,
@@ -127,6 +128,14 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
                 )
                 if on
             ]
+            if not learnable and not isinstance(spec, OptimizerParams.NoneOptimizer):
+                warnings.warn(
+                    f"{type(self).__name__}: an optimizer was requested but nothing is "
+                    "learnable (both learn_descan and learn_scan_positions are False); "
+                    "the optimizer will be removed. Enable learn_descan and/or "
+                    "learn_scan_positions to optimize.",
+                    stacklevel=2,
+                )
             return {key: replace(spec) for key in learnable} if learnable else {}
         return norm
 
