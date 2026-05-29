@@ -361,7 +361,8 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         raise NotImplementedError()
 
     @abstractmethod
-    def forward(self, patch_indices: torch.Tensor):
+    def forward(self, patch_indices: torch.Tensor, /):
+        # positional-only: implicit object models accept coordinates here instead of indices
         raise NotImplementedError()
 
     @abstractmethod
@@ -1497,7 +1498,7 @@ class ObjectDIP(ObjectConstraints):
         plt.show()
 
 
-class ObjectINR(ObjectConstraints):
+class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
     """Implicit (coordinate-queried) object model.
 
     Wraps an implicit neural representation (INR; an ``HSiren`` by default) that maps
@@ -1632,7 +1633,7 @@ class ObjectINR(ObjectConstraints):
         )
         # Zero the final linear layer so the INR outputs phase 0 everywhere (vacuum start).
         with torch.no_grad():
-            final_linear = model.net[-2]
+            final_linear = cast(nn.Linear, model.net[-2])
             final_linear.weight.zero_()
             if final_linear.bias is not None:
                 final_linear.bias.zero_()

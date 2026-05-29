@@ -898,7 +898,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.probe_model.reset()
         self.dset.reset()
         self.compute_propagator_arrays()
-        self.obj_model.constraints = self.obj_model.DEFAULT_CONSTRAINTS
+        # obj_model and its DEFAULT_CONSTRAINTS are correlated at runtime (each object type pairs
+        # with its own constraint dataclass), which the union type can't express.
+        self.obj_model.constraints = self.obj_model.DEFAULT_CONSTRAINTS  # pyright: ignore[reportAttributeAccessIssue]
         # detector reset if necessary
         self._iter_losses = []
         self._iter_val_losses = []

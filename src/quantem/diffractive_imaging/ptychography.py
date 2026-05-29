@@ -21,7 +21,7 @@ from quantem.core.ml.dist_utils import (
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
+from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
 from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
@@ -188,10 +188,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
         total_loss = torch.tensor(0, device=self._single_device, dtype=self._dtype_real)
 
-        if self.obj_model.is_implicit:
+        if isinstance(self.obj_model, ObjectINR):
             # Implicit objects evaluate soft constraints at sampled coordinates and don't
             # need the materialized grid (which would force full-grid inference each iter).
-            obj_loss = self.obj_model.apply_soft_constraints(None, mask=self.obj_model.mask)
+            obj_loss = self.obj_model.apply_soft_constraints(mask=self.obj_model.mask)
         else:
             obj_loss = self.obj_model.apply_soft_constraints(
                 self.obj_model.obj, mask=self.obj_model.mask
