@@ -528,6 +528,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # Set object shape
         model.to(self._single_device)
         self._obj_model = cast(ObjectModelType, model)
+        # Keep the dataset's forward path (coordinates vs. integer patch_indices) in sync with
+        # the object representation. Implicit objects are queried at continuous coordinates.
+        if hasattr(self, "_dset"):
+            self.dset.implicit_object = model.is_implicit
 
     @property
     def probe_model(self) -> ProbeModelType:

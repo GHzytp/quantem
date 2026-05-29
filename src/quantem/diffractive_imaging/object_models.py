@@ -15,6 +15,7 @@ from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
+from quantem.core.ml.inr import HSiren
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType, SchedulerType
 from quantem.core.utils.rng import RNGMixin
@@ -137,17 +138,30 @@ class PtychoObjConstraintParams:
 
     @dataclass
     class INR(Constraints):
-        """Placeholder for the upcoming ``ObjectINR`` variant.
+        """Constraints for the implicit (``ObjectINR``) object representation.
 
-        INR-specific constraints (e.g. sparsity / TV penalties evaluated at
-        sampled coordinates) will land here when the model is implemented.
-        Until then this exists so ``parse_dict`` accepts ``"inr"`` and downstream
-        code can pattern-match on the variant.
+        An INR has no grid to project, so the grid-based hard constraints of
+        ``Raster`` (positivity, filtering, FOV masking) do not apply. The
+        regularizers that do carry over are soft penalties evaluated at sampled
+        coordinates.
+
+        Attributes
+        ----------
+        tv_weight_z : float, default ``0.0``
+            Soft penalty. Weight on the depth-axis (``z``) total-variation term,
+            evaluated via finite differences at randomly sampled coordinates.
+            Multislice (``num_slices > 1``) only.
+        tv_weight_xy : float, default ``0.0``
+            Soft penalty. Weight on the in-plane (``y``, ``x``) total-variation
+            term, evaluated via finite differences at randomly sampled coordinates.
         """
 
+        # soft constraints (evaluated at sampled coordinates)
+        tv_weight_z: float = 0.0
+        tv_weight_xy: float = 0.0
         _name: str = "inr"
 
-        soft_constraint_keys = []
+        soft_constraint_keys = ["tv_weight_z", "tv_weight_xy"]
         hard_constraint_keys = []
 
     @classmethod
@@ -210,6 +224,17 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     @property
     def shape(self) -> tuple[int, int, int]:
         return self.obj.shape
+
+    @property
+    def is_implicit(self) -> bool:
+        """Whether this is an implicit (coordinate-queried) object representation.
+
+        Pixelated/DIP objects are grid-based and consume integer ``patch_indices``;
+        an implicit object (``ObjectINR``) instead consumes continuous coordinates,
+        which the paired dataset produces when this is True. Overridden to True by
+        implicit subclasses.
+        """
+        return False
 
     @property
     @abstractmethod
@@ -1472,28 +1497,570 @@ class ObjectDIP(ObjectConstraints):
         plt.show()
 
 
-# class ObjectImplicit(ObjectBase):
-#     """
-#     Object model for implicit objects. Importantly, the forward call from scan positions
-#     for this model will not require subpixel shifting of the object probe, as subpixel shifting
-#     will be done in the object model itself, so it is properly aligned around the probe positions
-#     """
+class ObjectINR(ObjectConstraints):
+    """Implicit (coordinate-queried) object model.
 
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self._obj = None
-#         self._obj_shape = None
-#         self._num_slices = None
+    Wraps an implicit neural representation (INR; an ``HSiren`` by default) that maps
+    normalized 3D coordinates ``(z, y, x)`` in ``[-1, 1]`` to the object's real phase
+    (``obj_type="pure_phase"``). Rather than gathering grid-aligned patches at integer
+    scan positions like ``ObjectPixelated``, the paired dataset produces continuous
+    per-patch ``(y, x)`` coordinates at the *true* (fractional) scan positions; this
+    model augments them with each slice's ``z`` coordinate, queries the INR, and returns
+    the complex transmission patches ``exp(1j * phase)``. Because the object is sampled
+    directly at the true position, the probe no longer needs subpixel shifting.
 
-#     def pretrain(self, *args, **kwargs):
+    Coordinate convention
+    ----------------------
+    Coordinates are normalized to ``[-1, 1]`` over the padded object extent (matching
+    ``torch.linspace(-1, 1, N)``). The ``z`` axis spans the slices: a single slice sits
+    at ``z = 0``; multislice z-positions come from the cumulative ``slice_thicknesses``,
+    mapped so the first slice is at ``-1`` and the last at ``+1``. Samples that fall
+    outside the object (``|y| > 1`` or ``|x| > 1``) are treated as vacuum (phase 0,
+    transmission 1) rather than wrapped toroidally as the pixelated path does.
+
+    Notes
+    -----
+    - Autograd-only: analytical gradients are not implemented (see ``backward``).
+    - Hard constraints have no grid to project; only the soft, coordinate-sampled TV
+      penalties of ``PtychoObjConstraintParams.INR`` apply.
+    """
+
+    DEFAULT_LRS = {
+        "object": 8e-6,
+        "tv_weight_z": 0,
+        "tv_weight_xy": 0,
+    }
+    DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.INR = PtychoObjConstraintParams.INR()
+
+    def __init__(
+        self,
+        model: "torch.nn.Module",
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        obj_type: object_type = "pure_phase",
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        _token: object | None = None,
+    ):
+        super().__init__(
+            device=device,
+            obj_type=obj_type,
+            rng=rng,
+            _token=_token,
+        )
+        if self.obj_type != "pure_phase":
+            raise NotImplementedError(
+                f"ObjectINR currently only supports obj_type='pure_phase', got '{self.obj_type}'. "
+                "Complex/potential INR objects are planned."
+            )
+        if num_slices < 1:
+            raise ValueError(f"num_slices must be greater than 0, got {num_slices}")
+        self._num_slices = int(num_slices)
+        self._model = model.to(self._device)
+        self.slice_thicknesses = slice_thicknesses
+        self._set_pretrained_weights(self._model)
+
+        # Padded object extent [num_slices, H, W]; set in _initialize_obj. Defines the
+        # [-1, 1] coordinate domain and the grid on which .obj is materialized.
+        self._obj_shape: tuple[int, int, int] | None = None
+        # Lazily materialized full-grid object (detached); invalidated each forward().
+        self._obj_cache: torch.Tensor | None = None
+        # Pretraining state (used by pretrain() / from_pixelated()).
+        self.register_buffer("_pretrain_target", torch.tensor([]))
+        self._pretrain_losses: list[float] = []
+        self._pretrain_lrs: list[float] = []
+
+    @classmethod
+    def from_inr(
+        cls,
+        model: "torch.nn.Module",
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        obj_type: object_type = "pure_phase",
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectINR":
+        """Create an ObjectINR from a user-supplied INR ``nn.Module``.
+
+        The model must map coordinates of shape ``(N, 3)`` (``z, y, x``) to a single
+        real output ``(N, 1)``.
+        """
+        return cls(
+            model=model,
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            obj_type=obj_type,
+            device=device,
+            rng=rng,
+            _token=cls._token,
+        )
+
+    @classmethod
+    def from_uniform(
+        cls,
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        hidden_features: int = 128,
+        hidden_layers: int = 3,
+        first_omega_0: float = 10.0,
+        hidden_omega_0: float = 10.0,
+        obj_type: object_type = "pure_phase",
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectINR":
+        """Create an ObjectINR backed by a default ``HSiren``, initialized to vacuum.
+
+        The HSiren's final layer is zero-initialized so the object starts as a flat,
+        phase-0 (vacuum) transmission, matching ``ObjectPixelated.from_uniform``.
+
+        Note
+        ----
+        ``first_omega_0`` / ``hidden_omega_0`` set the SIREN's frequency content and are the
+        most important knobs to tune (INRs are sensitive to this, more so than DIPs). The
+        default of ``10`` suits smooth phase objects; the SIREN image-fitting default of ``30``
+        is typically too high here (optimization stalls near vacuum), while objects with fine
+        features may want a larger value. Pair omega_0 with the object learning rate.
+        """
+        model = HSiren(
+            in_features=3,
+            out_features=1,
+            hidden_layers=hidden_layers,
+            hidden_features=hidden_features,
+            first_omega_0=first_omega_0,
+            hidden_omega_0=hidden_omega_0,
+            dtype=getattr(torch, config.get("dtype_real")),
+        )
+        # Zero the final linear layer so the INR outputs phase 0 everywhere (vacuum start).
+        with torch.no_grad():
+            final_linear = model.net[-2]
+            final_linear.weight.zero_()
+            if final_linear.bias is not None:
+                final_linear.bias.zero_()
+        return cls.from_inr(
+            model=model,
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            obj_type=obj_type,
+            device=device,
+            rng=rng,
+        )
+
+    @classmethod
+    def from_pixelated(
+        cls,
+        pixelated: "ObjectModelType",
+        hidden_features: int = 256,
+        hidden_layers: int = 3,
+        first_omega_0: float = 10.0,
+        hidden_omega_0: float = 10.0,
+        device: str | None = None,
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectINR":
+        """Create an ObjectINR matching a pixelated object, with it as the pretrain target.
+
+        The INR is built to the pixelated object's geometry (``num_slices``,
+        ``slice_thicknesses``, ``obj_type``, padded shape) and the current pixelated object is
+        stored as the pretrain target, so ``pretrain()`` warm-starts the INR to reproduce the
+        pixelated reconstruction -- mirroring ``ObjectDIP.from_pixelated`` + ``pretrain``.
+        """
+        if not (
+            isinstance(pixelated, ObjectPixelated) or "ObjectPixelated" in str(type(pixelated))
+        ):
+            raise ValueError(f"pixelated must be an ObjectPixelated, got {type(pixelated)}")
+        dev = pixelated.device if device is None else device
+        inr = cls.from_uniform(
+            num_slices=pixelated.num_slices,
+            slice_thicknesses=pixelated.slice_thicknesses,
+            obj_type=pixelated.obj_type,
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
+            first_omega_0=first_omega_0,
+            hidden_omega_0=hidden_omega_0,
+            device=dev,
+            rng=pixelated._rng_seed if rng is None else rng,
+        )
+        target = pixelated.obj.detach().to(dev)  # (num_slices, H, W) real phase
+        inr._obj_shape = tuple(int(x) for x in target.shape)  # type: ignore[assignment]
+        if pixelated._sampling is not None:
+            inr.sampling = pixelated.sampling
+        inr.pretrain_target = target
+        return inr
+
+    # region --- properties ---
+    @property
+    def is_implicit(self) -> bool:
+        return True
+
+    @property
+    def name(self) -> str:
+        return "ObjectINR"
+
+    @property
+    def num_slices(self) -> int:
+        return self._num_slices
+
+    @property
+    def model(self) -> "torch.nn.Module":
+        return self._model
+
+    @property
+    def params(self):
+        """optimization parameters"""
+        return self._model.parameters()
+
+    @property
+    def pretrained_weights(self) -> dict[str, torch.Tensor]:
+        return self._pretrained_weights
+
+    def _set_pretrained_weights(self, model: "torch.nn.Module") -> None:
+        self._pretrained_weights = deepcopy(model.state_dict())
+
+    @property
+    def pretrain_target(self) -> torch.Tensor:
+        """Target object (real phase, ``(num_slices, H, W)``) fitted by ``pretrain()``."""
+        return self._pretrain_target
+
+    @pretrain_target.setter
+    def pretrain_target(self, target: torch.Tensor | np.ndarray | None) -> None:
+        if target is None:
+            self._pretrain_target = torch.tensor([], device=self.device)
+            return
+        t = validate_tensor(
+            target,
+            name="pretrain_target",
+            ndim=3,
+            dtype=config.get("dtype_real"),
+            expand_dims=True,
+        )
+        self._pretrain_target = t.to(self.device)
+
+    @property
+    def pretrain_losses(self) -> np.ndarray:
+        return np.array(self._pretrain_losses)
+
+    @property
+    def pretrain_lrs(self) -> np.ndarray:
+        return np.array(self._pretrain_lrs)
+
+    @property
+    def _z_coords(self) -> torch.Tensor:
+        """Normalized z-coordinate of each slice in [-1, 1], shape (num_slices,)."""
+        real_dtype = getattr(torch, config.get("dtype_real"))
+        s = self.num_slices
+        if s == 1:
+            return torch.zeros(1, device=self.device, dtype=real_dtype)
+        thick = self._slice_thicknesses.to(self.device)  # (S-1,)
+        zeros = torch.zeros(1, device=self.device, dtype=real_dtype)
+        z_pos = torch.cat([zeros, torch.cumsum(thick, dim=0)])  # (S,)
+        total = z_pos[-1]
+        if total <= 0:
+            return torch.linspace(-1.0, 1.0, s, device=self.device, dtype=real_dtype)
+        return (z_pos / total) * 2.0 - 1.0
+
+    @property
+    def obj(self):
+        """Materialized full object on the padded grid (real phase for pure_phase).
+
+        Cold-path only (display / logging / serialization); the training loop queries
+        the INR directly via ``forward`` and does not touch this. Cached and invalidated
+        on each ``forward`` call.
+        """
+        if self._obj_cache is None:
+            raw = self._materialize_obj()
+            self._obj_cache = self.apply_hard_constraints(raw, mask=self.mask)
+        return self._obj_cache
+
+    # endregion --- properties ---
+
+    def _invalidate_obj_cache(self) -> None:
+        self._obj_cache = None
+
+    def _query_phase(self, coords_xy: torch.Tensor) -> torch.Tensor:
+        """Query the INR at normalized (y, x) coords for every slice.
+
+        ``coords_xy`` has shape ``(..., 2)`` (normalized row=y, col=x in [-1, 1]).
+        Returns phase of shape ``(num_slices, ...)``.
+        """
+        s = self.num_slices
+        lead = coords_xy.shape[:-1]
+        xy = coords_xy.reshape(-1, 2)  # (M, 2)
+        m = xy.shape[0]
+        z = self._z_coords  # (S,)
+        z_full = z.view(s, 1, 1).expand(s, m, 1)
+        xy_full = xy.view(1, m, 2).expand(s, m, 2)
+        coords3d = torch.cat([z_full, xy_full], dim=-1).reshape(-1, 3)  # (S*M, 3)
+        phase = self._model(coords3d).squeeze(-1).reshape(s, *lead)
+        return phase
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """Query the object at continuous per-patch coordinates.
+
+        ``coords`` has shape ``(batch, Hroi, Wroi, 2)``: normalized ``(y, x)`` positions
+        in ``[-1, 1]`` produced by the dataset at the true (fractional) scan positions.
+        Returns complex transmission patches of shape ``(num_slices, batch, Hroi, Wroi)``.
+        """
+        self._invalidate_obj_cache()
+        inside = (coords[..., 0].abs() <= 1.0) & (coords[..., 1].abs() <= 1.0)  # (batch, H, W)
+        phase = self._query_phase(coords)  # (S, batch, H, W)
+        phase = phase * inside.unsqueeze(0)  # off-object -> phase 0 (vacuum)
+        return torch.exp(1.0j * phase)
+
+    def _grid_coords_xy(self) -> torch.Tensor:
+        """Normalized ``(row, col)`` grid over the padded object, shape ``(H, W, 2)``."""
+        if self._obj_shape is None:
+            raise ValueError("ObjectINR shape not set, call _initialize_obj() first")
+        real_dtype = getattr(torch, config.get("dtype_real"))
+        _, h, w = (int(x) for x in self._obj_shape)
+        ys = torch.linspace(-1.0, 1.0, h, device=self.device, dtype=real_dtype)
+        xs = torch.linspace(-1.0, 1.0, w, device=self.device, dtype=real_dtype)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        return torch.stack([gy, gx], dim=-1)  # (H, W, 2)
+
+    def _materialize_obj(self) -> torch.Tensor:
+        with torch.no_grad():
+            phase = self._query_phase(self._grid_coords_xy())  # (S, H, W)
+        return phase
+
+    def pretrain(
+        self,
+        pretrain_target: torch.Tensor | np.ndarray | None = None,
+        num_iters: int = 200,
+        optimizer_params: "dict | OptimizerType | None" = None,
+        scheduler_params: "dict | SchedulerType | None" = None,
+        loss_fn: Callable | str = "l2",
+        device: str | int | None = None,
+        show: bool = True,
+        normalize_object_plotting: bool = True,
+    ) -> None:
+        """Warm-start the INR by fitting it to a target object (e.g. a pixelated recon).
+
+        Queries the INR on the full normalized grid and regresses it onto ``pretrain_target``
+        (a real ``(num_slices, H, W)`` phase array, typically the pixelated reconstruction set by
+        ``from_pixelated``). The fitted weights become the reset state, so a subsequent
+        ``reconstruct(reset=True)`` resumes from this warm start instead of vacuum. A learning-rate
+        scheduler is recommended (pass ``scheduler_params``) as INRs converge better with one.
+        """
+        if device is not None:
+            dev, _ = config.validate_device(device)
+            self.to(dev)
+        if pretrain_target is not None:
+            self.pretrain_target = pretrain_target
+        if self._pretrain_target is None or self._pretrain_target.numel() == 0:
+            raise ValueError(
+                "No pretrain target set; pass pretrain_target or use from_pixelated()."
+            )
+        if self._obj_shape is None:
+            self._obj_shape = tuple(int(x) for x in self._pretrain_target.shape)  # type: ignore[assignment]
+        if optimizer_params is not None:
+            self.set_optimizer(optimizer_params)
+        if scheduler_params is not None:
+            self.set_scheduler(scheduler_params, num_iters)
+        loss_module = get_loss_module(loss_fn, getattr(torch, config.get("dtype_real")))
+        self._pretrain(
+            num_iters, loss_module, show=show, normalize_object_plotting=normalize_object_plotting
+        )
+        self._set_pretrained_weights(self._model)
+        self._invalidate_obj_cache()
+
+    def _pretrain(
+        self,
+        num_iters: int,
+        loss_fn: Callable,
+        show: bool = False,
+        normalize_object_plotting: bool = True,
+    ) -> None:
+        optimizer = self.optimizer
+        if optimizer is None:
+            raise ValueError("Optimizer not set. Pass optimizer_params to pretrain().")
+        scheduler = self.scheduler
+        coords_xy = self._grid_coords_xy()
+        target = self._pretrain_target.to(self.device)
+        self._model.train()
+        pbar = tqdm(range(num_iters))
+        output = self._query_phase(coords_xy)
+        for _ in pbar:
+            optimizer.zero_grad()
+            output = self._query_phase(coords_xy)  # (S, H, W), differentiable
+            loss: torch.Tensor = loss_fn(output, target)
+            loss.backward()
+            optimizer.step()
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(loss.item())
+                else:
+                    scheduler.step()
+            self._pretrain_losses.append(loss.item())
+            self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
+            pbar.set_description(
+                f"Iter {len(self._pretrain_losses)}/{num_iters}, Loss: {loss.item():.3e}"
+            )
+        if show:
+            self.visualize_pretrain(output.detach(), normalize_object_plotting)
+
+    def visualize_pretrain(
+        self, pred_obj: torch.Tensor, normalize_object_plotting: bool = True
+    ) -> None:
+        """Plot the pretraining loss / learning-rate curves and the pred vs target object."""
+        import matplotlib.gridspec as gridspec
+
+        fig = plt.figure(figsize=(12, 6))
+        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
+        ax = fig.add_subplot(gs[0])
+        lines = []
+        lines.extend(
+            ax.semilogy(
+                np.arange(len(self._pretrain_losses)), self._pretrain_losses, c="k", label="loss"
+            )
+        )
+        ax.set_ylabel("Loss", color="k")
+        ax.tick_params(axis="y", which="both", colors="k")
+        ax.spines["left"].set_color("k")
+        ax.set_xlabel("Iterations")
+        nx = ax.twinx()
+        nx.spines["left"].set_visible(False)
+        lines.extend(
+            nx.semilogy(
+                np.arange(len(self._pretrain_lrs)),
+                self._pretrain_lrs,
+                c="tab:orange",
+                label="LR",
+            )
+        )
+        labs = [lin.get_label() for lin in lines]
+        nx.legend(lines, labs, loc="upper center")
+        nx.set_ylabel("LRs")
+
+        gs_bot = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[1])
+        axs_bot = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(2)])
+        target = self._pretrain_target
+        norm = None
+        if normalize_object_plotting:
+            target_mean = target.mean(0).cpu().detach().numpy()
+            target_norm = CustomNormalization(interval_type="quantile", data=target_mean)
+            norm = {
+                "interval_type": "manual",
+                "vmin": target_norm.vmin,
+                "vmax": target_norm.vmax,
+            }
+        show_2d(
+            [
+                pred_obj.mean(0).cpu().detach().numpy(),
+                target.mean(0).cpu().detach().numpy(),
+            ],
+            figax=(fig, axs_bot),
+            title=[f"Pred obj ({self.obj_type})", f"Target obj ({self.obj_type})"],
+            cmap="magma",
+            cbar=True,
+            norm=norm,
+        )
+        plt.suptitle(
+            f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
+            fontsize=14,
+            y=0.94,
+        )
+        plt.show()
+
+    def _initialize_obj(
+        self,
+        shape: tuple[int, int, int] | np.ndarray,
+        sampling: tuple[float, float] | np.ndarray | None = None,
+    ) -> None:
+        super()._initialize_obj(shape, sampling)
+        shape_t = tuple(int(x) for x in shape)
+        if shape_t[0] != self.num_slices:
+            raise ValueError(
+                f"shape[0] ({shape_t[0]}) does not match num_slices ({self.num_slices})"
+            )
+        self._obj_shape = shape_t  # type: ignore[assignment]
+        self._invalidate_obj_cache()
+
+    def reset(self) -> None:
+        """Reset the INR weights to their initial (pretrained) state."""
+        self._model.load_state_dict(deepcopy(self._pretrained_weights))
+        self._invalidate_obj_cache()
+
+    def to(self, *args, **kwargs):
+        """Move all relevant tensors to a different device."""
+        super().to(*args, **kwargs)
+        self._model = self._model.to(*args, **kwargs)
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self.device = device
+            self._rng_to_device(device)
+            self.reconnect_optimizer_to_parameters()
+        self._invalidate_obj_cache()
+        return self
+
+    # region --- constraints ---
+    def apply_hard_constraints(
+        self, raw: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Project the materialized object (display only).
+
+        Unlike the grid-based ``Raster`` constraints, an INR has nothing to clamp or
+        filter in place; for ``pure_phase`` we only recenter the phase to zero mean so
+        the displayed object matches the pixelated convention.
+        """
+        with torch.no_grad():
+            if self.obj_type == "pure_phase":
+                return raw - raw.mean()
+            return raw
+
+    def apply_soft_constraints(
+        self, obj: torch.Tensor | None = None, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Coordinate-sampled total-variation penalty.
+
+        The ``obj`` argument is accepted for interface parity with the grid-based object
+        models but ignored: TV is evaluated at randomly sampled coordinates so the
+        penalty is differentiable w.r.t. the INR weights without materializing the full
+        grid.
+        """
+        self.reset_soft_constraint_losses()
+        loss = self._get_zero_loss_tensor()
+        w_z = self.constraints.tv_weight_z if self.num_slices > 1 else 0.0
+        w_xy = self.constraints.tv_weight_xy
+        if w_z > 0 or w_xy > 0:
+            tv_loss = self._sampled_tv_loss(w_z, w_xy)
+            loss = loss + tv_loss
+            self.add_soft_constraint_loss("tv_loss", tv_loss)
+        self.accumulate_constraint_losses()
+        return loss
+
+    def _sampled_tv_loss(self, w_z: float, w_xy: float, num_samples: int = 4096) -> torch.Tensor:
+        """Finite-difference TV over (z, y, x) at randomly sampled coordinates."""
+        real_dtype = getattr(torch, config.get("dtype_real"))
+        coords_xy = (
+            torch.rand(
+                num_samples, 2, device=self.device, dtype=real_dtype, generator=self._rng_torch
+            )
+            * 2.0
+            - 1.0
+        )
+        phase = self._query_phase(coords_xy)  # (S, num_samples)
+        loss = self._get_zero_loss_tensor()
+        # finite-difference step ~ one pixel in normalized coords
+        if self._obj_shape is not None:
+            h = 2.0 / max(int(self._obj_shape[-1]), int(self._obj_shape[-2]))
+        else:
+            h = 1e-2
+        if w_xy > 0:
+            for axis in range(2):
+                offset = torch.zeros(2, device=self.device, dtype=real_dtype)
+                offset[axis] = h
+                shifted = self._query_phase(coords_xy + offset)
+                loss = loss + w_xy * torch.mean(torch.abs(shifted - phase))
+            loss = loss / 2
+        if w_z > 0 and self.num_slices > 1:
+            loss = loss + w_z * torch.mean(torch.abs(phase[1:] - phase[:-1]))
+        return loss
+
+    # endregion --- constraints ---
+
+    def backward(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"Analytical gradients are not implemented for {self.name}, use autograd=True"
+        )
 
 
-#     ### here the forward call will take the batch indices and create the appropriate
-#     ### input (which maybe is just the raw patch indices? tbd) for the implicit input
-#     ### so it will be parallelized inference across the batches rather than inference once
-#     ### and then patching that, like it will be for DIP
-
-# constraints are going to be tricky, specifically the TV and filtering if we want to allow
-# multiscale reconstructions
-
-ObjectModelType = ObjectPixelated | ObjectDIP  # | ObjectImplicit
+ObjectModelType = ObjectPixelated | ObjectDIP | ObjectINR

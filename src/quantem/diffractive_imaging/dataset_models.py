@@ -174,6 +174,10 @@ class PtychographyDatasetBase(
         self.detector_mask = detector_mask
         self._constraints = {}
         self._probe_energy = None
+        # Set by the ptychography wiring from obj_model.is_implicit. When True, forward()
+        # emits continuous per-patch coordinates instead of integer patch_indices (and zeroed
+        # fractional positions), so the probe is not subpixel-shifted.
+        self._implicit_object = False
 
     def get_optimization_parameters(self):
         """Get the combined descan and scan position parameters for optimization.
@@ -513,6 +517,20 @@ class PtychographyDatasetBase(
         return self._preprocessed
 
     @property
+    def implicit_object(self) -> bool:
+        """Whether the paired object model is an implicit (coordinate-queried) representation.
+
+        Set by the ptychography wiring from ``obj_model.is_implicit``. When True, ``forward``
+        emits continuous per-patch coordinates (instead of integer ``patch_indices``) along with
+        zeroed fractional positions, so the probe is not subpixel-shifted.
+        """
+        return self._implicit_object
+
+    @implicit_object.setter
+    def implicit_object(self, val: bool) -> None:
+        self._implicit_object = bool(val)
+
+    @property
     def shape(self) -> np.ndarray:
         return np.array(self.dset.shape)
 
@@ -664,6 +682,38 @@ class PtychographyDatasetBase(
         old_pos = torch.round(self._last_patch_positions_px)
         new_pos = torch.round(self.scan_positions_px)
         return not torch.equal(old_pos, new_pos)
+
+    def _scan_coords(
+        self, batch_indices: np.ndarray | torch.Tensor, obj_padding_px: np.ndarray | tuple
+    ) -> torch.Tensor:
+        """Continuous normalized ``(row, col)`` patch coordinates for implicit objects.
+
+        For each scan position (NOT rounded) we add the same integer ROI offsets used by
+        ``_set_patch_indices``, then normalize to ``[-1, 1]`` over the padded object extent
+        via ``idx / (N - 1) * 2 - 1`` (matching ``torch.linspace(-1, 1, N)``). Unlike
+        ``_set_patch_indices`` there is no modulo wrap: samples that fall outside the object
+        map outside ``[-1, 1]``, and the implicit object treats them as vacuum.
+
+        Because the un-rounded (fractional) position is baked into the coordinates here, the
+        probe is queried at zero fractional shift in this case.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(batch, Hroi, Wroi, 2)`` normalized ``(row, col)`` coordinates.
+        """
+        obj_shape = self._obj_shape_full_2d(obj_padding_px)
+        positions = self.scan_positions_px[batch_indices]  # (batch, 2), un-rounded
+        hroi, wroi = int(self.roi_shape[0]), int(self.roi_shape[1])
+        x_ind = torch.fft.fftfreq(hroi, d=1 / hroi).to(self.device)
+        y_ind = torch.fft.fftfreq(wroi, d=1 / wroi).to(self.device)
+        rows = positions[:, 0][:, None, None] + x_ind[None, :, None]  # (batch, Hroi, 1)
+        cols = positions[:, 1][:, None, None] + y_ind[None, None, :]  # (batch, 1, Wroi)
+        rows = rows.expand(-1, -1, wroi)
+        cols = cols.expand(-1, hroi, -1)
+        rows_n = rows / float(obj_shape[-2] - 1) * 2.0 - 1.0
+        cols_n = cols / float(obj_shape[-1] - 1) * 2.0 - 1.0
+        return torch.stack([rows_n, cols_n], dim=-1)  # (batch, Hroi, Wroi, 2)
 
     def reset(self) -> None:
         self.descan_shifts = self.initial_descan_shifts.clone().to(self.device)
@@ -1592,19 +1642,31 @@ class PtychographyDatasetRaster(DatasetConstraints):
         batch_indices: np.ndarray | torch.Tensor,
         obj_padding_px: np.ndarray | tuple,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Forward pass to compute the diffraction intensities from the object and scan positions."""
+        """Forward pass to compute the diffraction intensities from the object and scan positions.
+
+        The first return value is the object-query payload: integer ``patch_indices`` for a
+        grid-based object, or continuous normalized coordinates for an implicit object
+        (``implicit_object=True``). In the implicit case the fractional position is baked into
+        the coordinates, so the returned fractional shift is zero (the probe is not shifted).
+        """
         self.apply_hard_constraints(obj_padding_px)
         positions_px = self.scan_positions_px[batch_indices]
-        positions_px_fractional = positions_px - torch.round(positions_px)
-        with torch.no_grad():
-            if self.patch_indices_need_update():
-                self._set_patch_indices(obj_padding_px)
-        patch_indices = self.patch_indices[batch_indices]
         if self.learn_descan and self.has_optimizer():
             descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
         else:
             descan_shifts = None
-        return patch_indices, positions_px, positions_px_fractional, descan_shifts
+
+        if self._implicit_object:
+            patch_data = self._scan_coords(batch_indices, obj_padding_px)
+            positions_px_fractional = torch.zeros_like(positions_px)
+            return patch_data, positions_px, positions_px_fractional, descan_shifts
+
+        positions_px_fractional = positions_px - torch.round(positions_px)
+        with torch.no_grad():
+            if self.patch_indices_need_update():
+                self._set_patch_indices(obj_padding_px)
+        patch_data = self.patch_indices[batch_indices]
+        return patch_data, positions_px, positions_px_fractional, descan_shifts
 
 
 DatasetModelType = PtychographyDatasetRaster  # | PtychographyDatasetSpiral

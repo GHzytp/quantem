@@ -188,9 +188,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
         total_loss = torch.tensor(0, device=self._single_device, dtype=self._dtype_real)
 
-        obj_loss = self.obj_model.apply_soft_constraints(
-            self.obj_model.obj, mask=self.obj_model.mask
-        )
+        if self.obj_model.is_implicit:
+            # Implicit objects evaluate soft constraints at sampled coordinates and don't
+            # need the materialized grid (which would force full-grid inference each iter).
+            obj_loss = self.obj_model.apply_soft_constraints(None, mask=self.obj_model.mask)
+        else:
+            obj_loss = self.obj_model.apply_soft_constraints(
+                self.obj_model.obj, mask=self.obj_model.mask
+            )
         total_loss += obj_loss
 
         probe_loss = self.probe_model.apply_soft_constraints(self.probe_model.probe)
@@ -384,11 +389,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 self.zero_grad_all()
                 batch_indices = batch["index"].to(self._single_device)
                 targets = batch["target"].to(self._single_device, non_blocking=True)
-                patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
+                patch_data, _positions_px, positions_px_fractional, descan_shifts = (
                     self.dset.forward(batch_indices, self.obj_padding_px)
                 )
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
-                obj_patches = self.obj_model.forward(patch_indices)
+                obj_patches = self.obj_model.forward(patch_data)
                 propagated_probes, overlap = self.forward_operator(
                     obj_patches, shifted_probes, descan_shifts
                 )
@@ -411,7 +416,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     obj_patches,
                     propagated_probes,
                     overlap,
-                    patch_indices,
+                    patch_data,
                     targets,
                 )
                 if _dist_world_size > 1:
@@ -441,11 +446,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     for batch in val_loader:
                         batch_indices = batch["index"].to(self._single_device)
                         targets = batch["target"].to(self._single_device, non_blocking=True)
-                        patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
+                        patch_data, _positions_px, positions_px_fractional, descan_shifts = (
                             self.dset.forward(batch_indices, self.obj_padding_px)
                         )
                         shifted_probes = self.probe_model.forward(positions_px_fractional)
-                        obj_patches = self.obj_model.forward(patch_indices)
+                        obj_patches = self.obj_model.forward(patch_data)
                         _propagated_probes, overlap = self.forward_operator(
                             obj_patches, shifted_probes, descan_shifts
                         )
