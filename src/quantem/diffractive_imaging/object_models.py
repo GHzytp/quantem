@@ -388,6 +388,15 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return propagated
 
     def _get_obj_patches(self, obj_array, patch_indices):
+        """Forward boundary: wrap real obj to ``exp(1j * obj)`` and gather patches.
+
+        ``obj_array`` may be complex (``obj_type="complex"``) or real (``"pure_phase"``,
+        ``"potential"``). Real inputs are wrapped to the complex transmission
+        function ``exp(1j * obj_array)`` here, so the rest of the forward model
+        never has to branch on ``obj_type``. ``patch_indices`` is a
+        ``(num_gpts, Hroi, Wroi)`` int tensor of flattened-index lookups into the
+        2D padded object.
+        """
         if not obj_array.is_complex():  # potential or pure_phase DIP -> float
             obj_array2 = torch.exp(1.0j * obj_array)
         else:
@@ -412,16 +421,22 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
     DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.Raster = PtychoObjConstraintParams.Raster()
 
     def apply_hard_constraints(
-        self, obj: torch.Tensor, mask: torch.Tensor | None = None
+        self, raw: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
+        """
+        Apply hard constraints: range clamping and filtering. All hard constaints are applied in
+        place with torch.no_grad().
+        """
         c = self.constraints
-        if self.obj_type == "complex":
-            obj2 = self._apply_hard_complex(obj, c)
-        elif self.obj_type == "pure_phase":
-            obj2 = self._apply_hard_pure_phase(obj, c)
-        else:  # potential
-            obj2 = self._apply_hard_potential(obj, c, mask)
-        return self._apply_shared_hard(obj2, c, mask)
+        with torch.no_grad():
+            if self.obj_type == "complex":
+                constrained = self._apply_hard_complex(raw, c)
+            elif self.obj_type == "pure_phase":
+                constrained = self._apply_hard_pure_phase(raw, c)
+            else:  # potential
+                constrained = self._apply_hard_potential(raw, c, mask)
+            constrained = self._apply_shared_hard(constrained, c, mask)
+        return raw + (constrained - raw).detach()
 
     def _apply_hard_complex(
         self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
@@ -476,19 +491,24 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             obj = self.butterworth_constraint(obj, sampling=self.sampling)
 
         if self.num_slices > 1 and c.identical_slices:
-            with torch.no_grad():
-                obj[:] = torch.mean(obj, dim=0, keepdim=True)
+            # In-place mutation is safe because apply_hard_constraints is
+            # always called under outer torch.no_grad (see its docstring).
+            obj[:] = torch.mean(obj, dim=0, keepdim=True)
         return obj
 
     def apply_soft_constraints(
         self, obj: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
+        """Sum of the per-iteration soft penalties.
+
+        Returns a scalar tensor that is added to the data-fidelity loss before
+        ``backward()``. Individual contributions are also recorded via
+        ``add_soft_constraint_loss`` for logging.
+        """
         # reset recorded losses each call
         self.reset_soft_constraint_losses()
 
-        tv_loss = self.get_tv_loss(
-            obj,
-        )
+        tv_loss = self.get_tv_loss(obj)
         self.add_soft_constraint_loss("tv_loss", tv_loss)
 
         surface_zero_loss = self.get_surface_zero_loss(
@@ -502,6 +522,13 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
     def get_tv_loss(
         self, array: torch.Tensor, weights: None | tuple[float, float] = None
     ) -> torch.Tensor:
+        """Total-variation soft penalty on the object.
+
+        ``weights`` is a ``(z_weight, xy_weight)`` tuple. When ``None``, defaults
+        to ``(self.constraints.tv_weight_z, self.constraints.tv_weight_xy)``. A single
+        scalar is broadcast to both axes. The z weight is zeroed for
+        ``num_slices == 1``.
+        """
         loss = self._get_zero_loss_tensor()
         w = self._resolve_tv_weights(weights)
         if not any(w):
@@ -549,6 +576,12 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         return loss
 
     def _calc_tv_loss(self, array: torch.Tensor, weight: tuple[float, float]) -> torch.Tensor:
+        """Mean-|diff| TV on a real array. ``weight = (w_z, w_xy)``.
+
+        For a 3D ``(slices, H, W)`` array, dim 0 uses ``w_z`` and dims 1+2 use
+        ``w_xy``. The result is averaged over the number of axes that actually
+        contributed (i.e. had a non-zero weight).
+        """
         loss = self._get_zero_loss_tensor()
         calc_dim = 0
         for dim in range(array.ndim):
@@ -566,6 +599,13 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
     def get_surface_zero_loss(
         self, array: torch.Tensor, weight: float | int = 0.0
     ) -> torch.Tensor:
+        """Penalize the first and last slices to be near vacuum.
+
+        Real ``pure_phase`` / ``potential`` arrays: penalizes ``|array[0]|`` and
+        ``|array[-1]|`` directly. ``complex`` arrays pull amplitude toward 1
+        and phase toward its mean (see ``_surface_zero_complex``). A no-op for
+        single- or double-slice objects (``array.shape[0] < 3``).
+        """
         loss = self._get_zero_loss_tensor()
         if weight == 0 or array.shape[0] < 3:
             return loss
@@ -591,12 +631,16 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         return loss
 
     def gaussian_blur_2d(self, tensor, sigma=1.0):
-        """
-        Apply Gaussian blur along dimensions 2 and 3 of a 3D tensor.
+        """Separable 2D Gaussian blur over the last two dimensions.
 
-        Args:
-            tensor: Can be real or complex
-            sigma: Standard deviation for Gaussian kernel
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Real or complex, shape ``(slices, H, W)``. Complex inputs are
+            filtered as independent real/imag channels.
+        sigma : float
+            Standard deviation of the Gaussian kernel, in pixels. The
+            kernel size is ``2 * ceil(3 * sigma) + 1``.
         """
         kernel_size = int(2 * math.ceil(3 * sigma) + 1)
         if kernel_size % 2 == 0:
@@ -639,9 +683,21 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         tensor: torch.Tensor,
         sampling: tuple[float, float],
     ) -> torch.Tensor:
-        """
-        Butterworth filter used for low/high-pass filtering.
+        """Apply a Fourier-domain Butterworth low/high-pass to each 2D slice.
 
+        Reads ``q_lowpass``, ``q_highpass``, and ``butterworth_order`` off
+        ``self.constraints``. The DC component is subtracted before filtering
+        and added back so the mean is preserved.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Shape ``(slices, H, W)``. May be real or complex. Real inputs are
+            re-cast to real after the FFT round-trip when ``obj_type != "complex"``.
+        sampling : tuple[float, float]
+            ``(dy, dx)`` real-space sampling in Ångström per pixel. Sets the
+            inverse-Å scale of the Butterworth response; ``q_lowpass`` and
+            ``q_highpass`` are in *inverse Ångström (cycles / Å).
         """
 
         q_lowpass = self.constraints.q_lowpass
@@ -1072,21 +1128,6 @@ class ObjectDIP(ObjectConstraints):
 
         self._model_input = input_tensor.type(self.dtype).to(self.device)
 
-    # def _generate_model_input(self, mode: Literal["random", "zeros", "ones"]) -> None:
-    #     input_shape = (1, *self.shape)
-    #     # could support for 3D CNN models, single channel 2D with identical slices
-    #     if mode == "random":
-    #         inp = torch.randn(
-    #             input_shape, device=self.device, dtype=self.dtype, generator=self._rng_torch
-    #         )
-    #     elif mode == "zeros":
-    #         inp = torch.zeros(input_shape, device=self.device, dtype=self.dtype)
-    #     elif mode == "ones":
-    #         inp = torch.ones(input_shape, device=self.device, dtype=self.dtype)
-    #     else:
-    #         raise ValueError(f"Invalid mode: {mode} | must be one of: 'random', 'zeros', 'ones'")
-    #     self._model_input = inp
-
     @property
     def pretrain_target(self) -> torch.Tensor:
         """get the pretrain target"""
@@ -1135,15 +1176,12 @@ class ObjectDIP(ObjectConstraints):
     @property
     def obj(self):
         """get the full object"""
-        obj = self.model(self._model_input)[0]
-        # pure_phase and potential stay real here; complex models output complex.
-        # _get_obj_patches wraps real -> exp(1j*obj) at the forward boundary.
+        raw = self.model(self._model_input)[0]
         # TODO -- single channel 2D with identical slices, view as 3D num_slices
-        return self.apply_hard_constraints(obj, mask=self.mask)
+        return self.apply_hard_constraints(raw, mask=self.mask)
 
     @property
     def _obj(self):
-        # TODO -- single channel 2D with identical slices, view as 3D num_slices??
         return self.model(self._model_input)[0]
 
     def forward(self, patch_indices: torch.Tensor):
