@@ -232,13 +232,12 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     def name(self) -> str:
         raise NotImplementedError()
 
-    def get_optimization_parameters(self) -> list[dict[str, Any]]:
-        """Get the parameters that should be optimized for this model."""
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """Get the parameters that should be optimized for this model, keyed by group."""
         params = self.params
         if params is None:
-            return []
-        else:
-            return [{"params": params}] # compatible with PPLR
+            return {}
+        return {self.DEFAULT_OPTIMIZER_KEY: list(params)}
 
     def _propagate_array(
         self, array: "torch.Tensor", propagator_array: "torch.Tensor"

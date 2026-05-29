@@ -290,14 +290,12 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
         raise NotImplementedError
 
     # --- Helper Functions ---
-    def get_optimization_parameters(self) -> list[dict[str, Any]]:
-        """Default: wrap self.params in a single param group."""
-        if isinstance(self._optimizer_params, dict):
-            # Shouldn't happen for single-group models, but be defensive
-            opt = next(iter(self._optimizer_params.values()))
-        else:
-            opt = self._optimizer_params
-        return [{"params": list(self.params), **opt.params()}]
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """Default: a single param group keyed by DEFAULT_OPTIMIZER_KEY.
+
+        Hyperparameters are baked by ``set_optimizer``, not here — return only the tensors.
+        """
+        return {self.DEFAULT_OPTIMIZER_KEY: list(self.params)}
 
     @abstractmethod  # Each subclass should implement this.
     def to(self, device: str | torch.device):
@@ -1026,16 +1024,10 @@ class ObjectTensorDecomp(ObjectINR):
 
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self) -> list[dict[str, Any]]:
-        """PPLR: per-key param groups."""
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """PPLR: per-key param groups (hyperparameters are baked by set_optimizer)."""
         model = _unwrap(self.model)
-        assert isinstance(self._optimizer_params, dict), (
-            "ObjectTensorDecomp requires dict-form optimizer_params"
-        )
-        return [
-            {"params": model.get_params()[key], **self._optimizer_params[key].params()}
-            for key in model.param_keys
-        ]
+        return {key: list(model.get_params()[key]) for key in model.param_keys}
 
     def _normalize_optimizer_params(self, params):
         """ObjectTensorDecomp requires a dict matching model.param_keys."""

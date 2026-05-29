@@ -603,62 +603,87 @@ class OptimizerMixin:
     @abstractmethod
     def get_optimization_parameters(
         self,
-    ) -> "list[dict[str, Any]]":
+    ) -> "dict[str, list[torch.Tensor]]":
         """
-        Get the parameters that should be optimized for this model.
-        This could be replaced with just module.parameters(), but this allows for flexibility
-        in the future to allow for per parameter LRs. # NOTE: Cl 4/27/26 updated to iterable type-hint.
+        Get the parameters that should be optimized for this model, grouped by name.
+
+        Returns a mapping ``{group_key: [tensors]}``. The group keys MUST match the keys of
+        ``optimizer_params`` (the common single-group case uses ``DEFAULT_OPTIMIZER_KEY``).
+        ``set_optimizer`` joins each group to its optimizer spec by key and bakes the per-group
+        hyperparameters (``spec.params()``) into the torch param group — implementations return
+        only the tensors, NOT pre-baked hyperparameters. Return ``{}`` when there is nothing
+        to optimize.
         """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
     def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
         """
-        Set the optimizer for this model.
-        Currently supports single LR for all parameters, TODO allow for per parameter LRs by
-        updating get_optimization_parameters to return a list of parameters and their LRs.
+        Set the optimizer for this model, supporting per-parameter-group learning rates (PPLR).
+
+        ``optimizer_params`` is a ``dict[str, OptimizerType]`` keyed by parameter group. Each
+        group's spec is joined by key to the tensors returned by ``get_optimization_parameters()``
+        and its hyperparameters are baked into the corresponding torch param group here. All
+        groups must use the same optimizer class. If every group is a ``NoneOptimizer`` (or there
+        are no groups), the optimizer is removed.
         """
         if opt_params is not None:
             self.optimizer_params = opt_params
 
-        if not self.optimizer_params:
-            self._optimizer = None
+        # Single canonical "disable" path: drop NoneOptimizer sentinels and, if nothing is left,
+        # remove the optimizer. Done BEFORE get_optimization_parameters() because some models
+        # (e.g. the dataset model) raise / return nothing when there is nothing to optimize.
+        specs = {
+            key: spec
+            for key, spec in self.optimizer_params.items()
+            if not isinstance(spec, OptimizerParams.NoneOptimizer)
+        }
+        if not specs:
+            self.remove_optimizer()
             return
 
+        # All groups must agree on the optimizer class.
+        spec_list = list(specs.values())
+        for spec in spec_list[1:]:
+            if type(spec) is not type(spec_list[0]):
+                raise ValueError(
+                    f"All parameter groups must use the same optimizer type, "
+                    f"got {type(spec_list[0]).__name__} and {type(spec).__name__}"
+                )
 
-        params = self.get_optimization_parameters()  # always list[dict]
+        # Join specs to param groups by key; bake each group's hyperparameters here.
+        groups = self.get_optimization_parameters()  # dict[str, list[tensor]]
+        if set(groups) != set(specs):
+            raise ValueError(
+                f"optimizer_params keys {set(specs)} do not match parameter group keys "
+                f"{set(groups)} from {type(self).__name__}.get_optimization_parameters()"
+            )
 
-        # Ensure parameters require gradients
-        for group in params:
-            for p in group["params"]:
+        param_groups = []
+        for key, tensors in groups.items():
+            for p in tensors:
                 p.requires_grad_(True)
-        # Figure out which optimizer class to use 
-        if isinstance(self.optimizer_params, dict):
-            # Per-group case: all groups must agree on the optimizer class,
-            # and per-group hyperparameters are already baked into each dict
-            # by get_optimization_parameters().
-            opt_specs = [
-                spec for spec in self.optimizer_params.values()
-                if not isinstance(spec, OptimizerParams.NoneOptimizer)
-            ]
-            if not opt_specs:
-                self.remove_optimizer()
-                return
-            optimizer_cls = self._optimizer_class_for(opt_specs[0])
-            for spec in opt_specs[1:]:
-                if type(spec) is not type(opt_specs[0]):
-                    raise ValueError(
-                        f"All parameter groups must use the same optimizer type, "
-                        f"got {type(opt_specs[0]).__name__} and {type(spec).__name__}"
-                    )
-            self._optimizer = optimizer_cls(params, **opt_specs[0].params())
-    def _optimizer_class_for(self, opt_params) -> type[torch.optim.Optimizer]:
+            param_groups.append({"params": tensors, **specs[key].params()})
+        self._optimizer = self._build_optimizer(spec_list[0], param_groups)
+
+    def _build_optimizer(self, opt_params, param_groups) -> "torch.optim.Optimizer":
+        """Construct the torch optimizer for ``opt_params`` over pre-baked ``param_groups``.
+
+        ``param_groups`` already carry their per-group hyperparameters (see ``set_optimizer``),
+        so each group's ``lr`` etc. overrides the optimizer-level default. ``NoneOptimizer`` must
+        have been filtered out by the caller.
+        """
         match opt_params:
             case OptimizerParams.Adam():
-                return torch.optim.Adam
+                return torch.optim.Adam(param_groups)
             case OptimizerParams.AdamW():
-                return torch.optim.AdamW
+                return torch.optim.AdamW(param_groups)
             case OptimizerParams.SGD():
-                return torch.optim.SGD
+                return torch.optim.SGD(param_groups)
+            case OptimizerParams.NoneOptimizer():
+                raise ValueError(
+                    "NoneOptimizer must be filtered out before _build_optimizer; "
+                    "set_optimizer should have short-circuited to remove_optimizer()."
+                )
             case _:
                 raise NotImplementedError(f"Unknown optimizer type: {opt_params}")
 
@@ -674,7 +699,10 @@ class OptimizerMixin:
             return
 
         optimizer = self._optimizer
-        base_LR = optimizer.param_groups[0]["lr"]
+        # Schedulers scale every torch param group proportionally off its own initial_lr; this
+        # scalar only seeds scheduler config (e.g. min_lr, cyclic bounds). Use the max group LR
+        # as the representative (collapses to group 0 in the single-group case).
+        base_LR = max(pg["lr"] for pg in optimizer.param_groups)
         params = self._scheduler_params.params(base_LR, num_iter=num_iter)
         match self.scheduler_params:
             case SchedulerParams.NoneScheduler():
@@ -764,8 +792,8 @@ class OptimizerMixin:
             return
 
         # Ensure leaf params with grad
-        for group in new_groups:
-            for p in group["params"]:
+        for tensors in new_groups.values():
+            for p in tensors:
                 if not p.is_leaf:
                     raise ValueError("Non-leaf tensor in param group; build groups from leaves")
                 p.requires_grad_(True)
@@ -776,8 +804,8 @@ class OptimizerMixin:
         ]
 
         self._optimizer.param_groups.clear()
-        for group in new_groups:
-            self._optimizer.add_param_group(group)
+        for tensors in new_groups.values():
+            self._optimizer.add_param_group({"params": tensors})
 
         # Restore per-group hyperparameters by index
         for new_pg, old_pg in zip(self._optimizer.param_groups, old_hyperparams):

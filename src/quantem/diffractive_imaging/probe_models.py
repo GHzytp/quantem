@@ -94,13 +94,12 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if roi_shape is not None:
             self.roi_shape = roi_shape
 
-    def get_optimization_parameters(self) -> list[dict[str, Any]]:
-        """Get the parameters that should be optimized for this model."""
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """Get the parameters that should be optimized for this model, keyed by group."""
         params = self.params
         if params is None:
-            return []
-        else:
-            return [{"params": params}] # compatible with PPLR
+            return {}
+        return {self.DEFAULT_OPTIMIZER_KEY: list(params)}
 
     @property
     def learn_probe_tilt(self) -> bool:
