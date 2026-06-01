@@ -113,7 +113,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     def _normalize_optimizer_params(self, params):
         """Broadcast a single optimizer spec to the learnable descan/scan_position groups.
 
-        A single ``OptimizerType`` / single-optimizer dict (normalized to the ``"default"`` key)
+        A single ``OptimizerParamsType`` / single-optimizer dict (normalized to the ``"default"`` key)
         is fanned out to whichever groups are currently learnable, so the common single-LR caller
         keeps working. An explicit PPLR dict (keyed by ``descan``/``scan_positions``) passes through.
         """

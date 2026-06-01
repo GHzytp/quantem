@@ -514,7 +514,7 @@ class SchedulerParams:
             raise ValueError(f"Unknown scheduler type: {name}")
 
 
-SchedulerType = (
+SchedulerParamsType = (
     SchedulerParams.Plateau
     | SchedulerParams.Exponential
     | SchedulerParams.Cyclic
@@ -540,7 +540,7 @@ class OptimizerMixin:
         self._optimizer_params: dict[str, OptimizerParamsType] = {
             self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()
         }
-        self._scheduler_params: SchedulerType = SchedulerParams.NoneScheduler()
+        self._scheduler_params: SchedulerParamsType = SchedulerParams.NoneScheduler()
         # Don't call super().__init__() in mixin classes to avoid MRO issues
 
     @property
@@ -587,17 +587,17 @@ class OptimizerMixin:
         return "type" in d or "name" in d
 
     @property
-    def scheduler_params(self) -> SchedulerType:
+    def scheduler_params(self) -> SchedulerParamsType:
         """Get the scheduler parameters."""
         return self._scheduler_params
 
     @scheduler_params.setter
-    def scheduler_params(self, params: SchedulerType | dict):
+    def scheduler_params(self, params: SchedulerParamsType | dict):
         """Set the scheduler parameters."""
         if isinstance(params, dict):
             params = SchedulerParams.parse_dict(d=params)
-        if not isinstance(params, SchedulerType):
-            raise TypeError(f"scheduler parameters must be a SchedulerType, got {type(params)}")
+        if not isinstance(params, SchedulerParamsType):
+            raise TypeError(f"scheduler parameters must be a SchedulerParamsType, got {type(params)}")
         self._scheduler_params = params
 
     @abstractmethod
@@ -688,7 +688,7 @@ class OptimizerMixin:
                 raise NotImplementedError(f"Unknown optimizer type: {opt_params}")
 
     def set_scheduler(
-        self, scheduler_params: SchedulerType | dict | None = None, num_iter: int | None = None
+        self, scheduler_params: SchedulerParamsType | dict | None = None, num_iter: int | None = None
     ) -> None:
         """Set the scheduler for this model."""
         if scheduler_params is not None:

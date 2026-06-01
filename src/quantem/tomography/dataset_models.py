@@ -232,16 +232,13 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     # --- Optimization Parameters ---
 
-    def get_optimization_parameters(self) -> list[dict[str, Any]]:
+    def get_optimization_parameters(self) -> dict[str, list[torch.Tensor]]:
+        """Single param group keyed by DEFAULT_OPTIMIZER_KEY.
+
+        Hyperparameters are baked by ``set_optimizer``, not here — return only the tensors,
+        matching the ``dict[str, list[tensor]]`` contract the object models use.
         """
-        Get the parameters that should be optimized for this model,
-        wrapped in a single param group.
-        """
-        if isinstance(self._optimizer_params, dict):
-            opt = next(iter(self._optimizer_params.values()))
-        else:
-            opt = self._optimizer_params
-        return [{"params": list(self.parameters()), **opt.params()}]
+        return {self.DEFAULT_OPTIMIZER_KEY: list(self.parameters())}
 
     # --- Forward pass ---
     @abstractmethod
@@ -489,8 +486,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
         elif self.learn_tilt_axis:
             return torch.zeros_like(shifts), z1, z3
-        elif self.learn_shift and self.learn_tilt_axis:
-            return shifts, z1, z3
         else:
             return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
 

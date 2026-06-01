@@ -1,7 +1,7 @@
 import math
 from abc import abstractmethod
 from copy import deepcopy
-from typing import Any, Callable, Literal, Self, Sequence, cast
+from typing import Callable, Literal, Self, Sequence, cast
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -14,7 +14,11 @@ from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.loss_functions import get_loss_module
-from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType, SchedulerType
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerMixin,
+    OptimizerParamsType,
+    SchedulerParamsType,
+)
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.validators import (
     validate_arr_gt,
@@ -1047,8 +1051,8 @@ class ObjectDIP(ObjectConstraints):
         pretrain_target: torch.Tensor | None = None,
         reset: bool = False,
         num_iters: int = 100,
-        optimizer_params: dict | OptimizerType | None = None,
-        scheduler_params: dict | SchedulerType | None = None,
+        optimizer_params: dict | OptimizerParamsType | None = None,
+        scheduler_params: dict | SchedulerParamsType | None = None,
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,
