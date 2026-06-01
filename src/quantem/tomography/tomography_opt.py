@@ -2,7 +2,11 @@ from collections.abc import Mapping
 
 import torch
 
-from quantem.core.ml.optimizer_mixin import OptimizerParams, OptimizerType, SchedulerType
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerParams,
+    OptimizerParamsType,
+    SchedulerParamsType,
+)
 from quantem.tomography.tomography_base import TomographyBase
 
 
@@ -12,7 +16,7 @@ class TomographyOpt(TomographyBase):
     """
 
     OPTIMIZABLE_VALS = ["object", "pose"]
-    DEFAULT_OPTIMIZER_TYPE = "adam"
+    DEFAULT_OPTIMIZER_TYPE: OptimizerParamsType = OptimizerParams.Adam()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -27,7 +31,7 @@ class TomographyOpt(TomographyBase):
             raise ValueError(f"Unknown optimization key: {key}")
 
     @property
-    def optimizer_params(self) -> dict[str, OptimizerType]:
+    def optimizer_params(self) -> dict[str, OptimizerParamsType | dict[str, OptimizerParamsType]]:
         return {
             key: params
             for key, params in [
@@ -38,7 +42,7 @@ class TomographyOpt(TomographyBase):
         }
 
     @optimizer_params.setter
-    def optimizer_params(self, d: dict[str, OptimizerType] | dict[str, dict]):
+    def optimizer_params(self, d: dict[str, OptimizerParamsType] | dict[str, dict]):
         """Set the optimizer parameters."""
         if isinstance(d, (tuple, list)):
             d = {k: {} for k in d}
@@ -52,8 +56,8 @@ class TomographyOpt(TomographyBase):
             if k not in targets:
                 raise ValueError(f"Unknown optimization key: {k}")
 
-            if not isinstance(v, OptimizerType):
-                v = OptimizerParams.parse_dict(v)
+            # if not isinstance(v, OptimizerParamsType):
+            #     v = OptimizerParams.parse_dict(v)
 
             targets[k].optimizer_params = v
 
@@ -100,7 +104,7 @@ class TomographyOpt(TomographyBase):
             raise ValueError(f"Unknown optimization key: {key}")
 
     @property
-    def scheduler_params(self) -> dict[str, SchedulerType]:
+    def scheduler_params(self) -> dict[str, SchedulerParamsType]:
         """Returns the parameters used to set the schedulers."""
         return {
             "object": self.obj_model.scheduler_params,
@@ -136,7 +140,7 @@ class TomographyOpt(TomographyBase):
         return schedulers
 
     def set_schedulers(
-        self, params: Mapping[str, SchedulerType | dict], num_iter: int | None = None
+        self, params: Mapping[str, SchedulerParamsType | dict], num_iter: int | None = None
     ):
         for key, scheduler_params in params.items():
             if key == "object":
