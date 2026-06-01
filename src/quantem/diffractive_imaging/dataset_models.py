@@ -327,27 +327,25 @@ class PtychographyDatasetBase(
             raise ValueError(f"target_residency must be 'device' or 'cpu', got {value!r}")
         self._target_residency = value
 
-    def _set_targets(
-        self,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ],
-    ):
+    def _set_targets(self, target_space: Literal["amplitude", "intensity"]):
+        """Build the per-position targets in the given measurement space.
+
+        ``target_space`` is the space the data-fidelity criterion compares in (set from the
+        criterion's ``target_space``); the comparison itself lives in the criterion, not here.
+        """
         # When residency is "cpu", build targets on CPU so they can be streamed per-batch
         # (and read by DataLoader workers); otherwise keep them resident on the compute device.
         target_device = "cpu" if self.target_residency == "cpu" else self.device
-        if "amplitude" in loss_type:
-            if self.learn_descan and self.has_optimizer():
-                self._targets = self.amplitudes.clone().to(target_device)
-            else:
-                self._targets = self.centered_amplitudes.clone().to(target_device)
-        elif "intensity" in loss_type or loss_type == "poisson":
-            if self.learn_descan and self.has_optimizer():
-                self._targets = self.intensities.clone().to(target_device)
-            else:
-                self._targets = self.centered_intensities.clone().to(target_device)
+        learn_descan = self.learn_descan and self.has_optimizer()
+        if target_space == "amplitude":
+            source = self.amplitudes if learn_descan else self.centered_amplitudes
+        elif target_space == "intensity":
+            source = self.intensities if learn_descan else self.centered_intensities
         else:
-            raise ValueError(f"Unknown loss type {loss_type}")
+            raise ValueError(
+                f"target_space must be 'amplitude' or 'intensity', got {target_space!r}"
+            )
+        self._targets = source.clone().to(target_device)
 
     @property
     def patch_indices(self) -> torch.Tensor:
@@ -1177,7 +1175,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self._set_initial_scan_positions_px(obj_padding_px)
         self._set_patch_indices(obj_padding_px)
 
-        self._set_targets("l2_amplitude")
+        self._set_targets("amplitude")  # default space; criterion-driven space set in reconstruct
 
         self._preprocessed = True
         return

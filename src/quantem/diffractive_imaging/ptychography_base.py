@@ -32,6 +32,7 @@ from quantem.diffractive_imaging.detector_models import DetectorBase, DetectorMo
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType
 from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
+from quantem.diffractive_imaging.ptycho_losses import DataCriterion, get_data_criterion
 from quantem.diffractive_imaging.ptycho_utils import (
     AffineTransform,
     center_crop_arr,
@@ -77,6 +78,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     """
 
     _token = object()
+    # Default data-fidelity criterion (overridden per-instance from `loss_type` in reconstruct).
+    # Class-level so freshly-built and freshly-loaded objects always resolve a criterion.
+    _criterion: DataCriterion = get_data_criterion("l2_amplitude")
 
     def __init__(  # TODO prevent direct instantiation
         self,
@@ -244,6 +248,19 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         ):
             raise TypeError(f"dset should be a PtychographyDataset, got {type(new_dset)}")
         self._dset = new_dset
+
+    @property
+    def criterion(self) -> DataCriterion:
+        """Active data-fidelity criterion. Assign a registered name or a ``DataCriterion``.
+
+        Transient config (re-set from ``loss_type`` each ``reconstruct``, defaults to L2); not
+        serialized.
+        """
+        return self._criterion
+
+    @criterion.setter
+    def criterion(self, value: "str | DataCriterion") -> None:
+        self._criterion = get_data_criterion(value)
 
     @property
     def detector_model(self) -> DetectorModelType:
@@ -1084,26 +1101,24 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         pred_intensities: torch.Tensor,
         batch_indices: np.ndarray,
         targets: torch.Tensor,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ] = "l2_amplitude",
         global_n: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if "amplitude" in loss_type:
-            preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
+        """Data-fidelity loss for one batch via the active criterion (``self.criterion``).
+
+        Maps predictions into the criterion's measurement space (amplitude or intensity),
+        applies the detector mask, evaluates the criterion, and normalizes by the mean
+        diffraction intensity. Which comparison is used (L2/L1/smooth-L1/Poisson/S3IM/...) is
+        entirely the criterion's concern; see ``ptycho_losses``.
+        """
+        criterion = self.criterion
+        if criterion.target_space == "amplitude":
+            preds = torch.sqrt(pred_intensities + 1e-9)  # eps avoids diverging gradients at 0
         else:
             preds = pred_intensities
 
-        diff = preds * self.dset.detector_mask - targets * self.dset.detector_mask
+        mask = self.dset.detector_mask
         n = global_n if global_n is not None else self.dset.num_gpts
-        if "l1" in loss_type:
-            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / n)
-        elif "l2" in loss_type:
-            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / n)
-        elif loss_type == "poisson":
-            error = torch.sum(preds - targets * torch.log(preds + 1e-6))
-        else:
-            raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
+        error = criterion(preds * mask, targets * mask, n)
         loss = error / self.dset.mean_diffraction_intensity
         return loss, targets
 

@@ -23,6 +23,7 @@ from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
+from quantem.diffractive_imaging.ptycho_losses import DataCriterion
 from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
@@ -222,9 +223,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         store_snapshots_every: int | None = None,
         device: Literal["cpu", "gpu"] | int | list[int] | None = None,
         autograd: bool = True,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ] = "l2_amplitude",
+        loss_type: "str | DataCriterion" = "l2_amplitude",
         num_workers: int = 0,
     ) -> Self:
         """Run iterative ptychography reconstruction.
@@ -246,6 +245,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         Multi-GPU (``device`` is a list) launches worker processes via ``mp.spawn`` when called
         from a notebook, or uses the existing distributed process group when launched with
         ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
+        
+        ``loss_type`` selects the data-fidelity criterion: a registered name
+        (``"l2_amplitude"`` [default], ``"l1_amplitude"``, ``"l2_intensity"``, ``"l1_intensity"``,
+        ``"poisson"``, ``"smooth_l1_amplitude"``, ``"s3im_amplitude"``) or a ``DataCriterion``
+        instance for custom parameters (e.g. ``AmplitudeS3IM(lambda_s3im=0.5)``). See
+        ``ptycho_losses``.
+
         """
         self._check_preprocessed()
 
@@ -322,9 +328,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
         autograd: bool = True,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ] = "l2_amplitude",
+        loss_type: "str | DataCriterion" = "l2_amplitude",
         num_workers: int = 0,
         _dist_rank: int = 0,
         _dist_world_size: int = 1,
@@ -356,7 +360,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if new_scheduler:
             self.set_schedulers(self.scheduler_params, num_iter=num_iters)
 
-        self.dset._set_targets(loss_type)
+        self.criterion = loss_type  # resolve name/instance -> DataCriterion
+        self.dset._set_targets(self._criterion.target_space)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
 
         # Compute the global scan count once — needed to keep loss scale consistent across world
@@ -403,7 +408,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     pred_intensities,
                     batch_indices,
                     targets=targets,
-                    loss_type=loss_type,
                     global_n=global_n,
                 )
 
@@ -459,7 +463,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                             pred_intensities,
                             batch_indices,
                             targets=targets,
-                            loss_type=loss_type,
                             global_n=global_n,
                         )
                         val_consistency_loss += batch_val_loss.item()
@@ -741,6 +744,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if isinstance(skip, (str, type)):
             skip = [skip]
         skip = list(skip)
+        # The data-fidelity criterion is transient config (re-set each reconstruct); don't
+        # serialize it (avoids a dill fallback and keeps the archive model-agnostic).
+        skip.append("_criterion")
 
         # Always skip raw dataset data unless explicitly requested
         if not save_raw_data:
