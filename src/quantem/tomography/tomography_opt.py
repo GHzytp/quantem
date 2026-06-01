@@ -2,7 +2,7 @@ from collections.abc import Mapping
 
 import torch
 
-from quantem.core.ml.optimizer_mixin import OptimizerParams, OptimizerType, SchedulerType
+from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
 from quantem.tomography.tomography_base import TomographyBase
 
 
@@ -52,8 +52,8 @@ class TomographyOpt(TomographyBase):
             if k not in targets:
                 raise ValueError(f"Unknown optimization key: {k}")
 
-            if not isinstance(v, OptimizerType):
-                v = OptimizerParams.parse_dict(v)
+            # if not isinstance(v, OptimizerType):
+            #     v = OptimizerParams.parse_dict(v)
 
             targets[k].optimizer_params = v
 

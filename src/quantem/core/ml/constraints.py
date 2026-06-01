@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from quantem.tomography.tomography_context import ReconstructionContext
+
 
 @dataclass(slots=False)
 class Constraints(ABC):
@@ -86,14 +88,14 @@ class BaseConstraints(ABC):
 
     # --- Required methods tha tneeds to implemented in subclasses ---
     @abstractmethod
-    def apply_hard_constraints(self, *args, **kwargs) -> torch.Tensor:
+    def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
         """
         Apply hard constraints to the model.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def apply_soft_constraints(self, *args, **kwargs) -> torch.Tensor:
+    def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
         """
         Apply soft constraints to the model.
         """
