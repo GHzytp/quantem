@@ -5,9 +5,9 @@ from quantem.core import config
 from quantem.core.ml.optimizer_mixin import (
     OptimizerMixin,
     OptimizerParams,
-    OptimizerType,
+    OptimizerParamsType,
     SchedulerParams,
-    SchedulerType,
+    SchedulerParamsType,
 )
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 
@@ -28,7 +28,7 @@ class PtychographyOpt(PtychographyBase):
     """
 
     OPTIMIZABLE_VALS = ["object", "probe", "dataset"]
-    DEFAULT_OPTIMIZER_TYPE: OptimizerType = OptimizerParams.Adam()
+    DEFAULT_OPTIMIZER_TYPE: OptimizerParamsType = OptimizerParams.Adam()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -66,7 +66,7 @@ class PtychographyOpt(PtychographyBase):
     # region --- optimizer params ---
 
     @property
-    def optimizer_params(self) -> dict[str, OptimizerType]:
+    def optimizer_params(self) -> dict[str, OptimizerParamsType | dict[str, OptimizerParamsType]]:
         return {
             key: model.optimizer_params
             for key, model in self._models.items()
@@ -76,7 +76,7 @@ class PtychographyOpt(PtychographyBase):
     @optimizer_params.setter
     def optimizer_params(self, d: dict[str, Any] | list[str] | tuple[str, ...]) -> None:
         """
-        Takes a dictionary mapping optimizable keys to either an ``OptimizerType``
+        Takes a dictionary mapping optimizable keys to either an ``OptimizerParamsType``
         dataclass or a plain dict (with optional ``"name"``/``"type"`` and ``"lr"``
         keys). Missing ``"name"`` / ``"lr"`` are filled from ``DEFAULT_OPTIMIZER_TYPE``
         and ``_get_default_lr`` respectively.
@@ -90,8 +90,7 @@ class PtychographyOpt(PtychographyBase):
         _d: dict[str, Any] = {k: {} for k in d} if isinstance(d, (list, tuple)) else d
 
         for k, v in _d.items():
-            self._check_key(k)
-            if isinstance(v, OptimizerType):
+            if isinstance(v, OptimizerParamsType):
                 pass  # already a dataclass, pass through
             elif isinstance(v, dict):
                 if not v:
@@ -102,7 +101,7 @@ class PtychographyOpt(PtychographyBase):
                     if "lr" not in v:
                         v["lr"] = self._get_default_lr(k)
             else:
-                raise TypeError(f"Expected OptimizerType or dict for key '{k}', got {type(v)}")
+                raise TypeError(f"Expected OptimizerParamsType or dict for key '{k}', got {type(v)}")
 
             self._models[k].optimizer_params = v  # type: ignore[assignment]
 
@@ -144,14 +143,19 @@ class PtychographyOpt(PtychographyBase):
     # region --- schedulers ---
 
     @property
-    def scheduler_params(self) -> dict[str, SchedulerType]:
-        return {key: model.scheduler_params for key, model in self._models.items()}
+    def scheduler_params(self) -> dict[str, SchedulerParamsType]:
+        """Returns the parameters used to set the schedulers."""
+        return {
+            "object": self.obj_model.scheduler_params,
+            "probe": self.probe_model.scheduler_params,
+            "dataset": self.dset.scheduler_params,
+        }
 
     @scheduler_params.setter
     def scheduler_params(self, d: dict[str, Any] | list[str] | tuple[str, ...]) -> None:
         """
-        Takes a dictionary mapping optimizable keys to either a ``SchedulerType``
-        dataclass or a plain dict. Keys not present in ``d`` are set to
+        Takes a dictionary mapping optimizable keys to either a ``SchedulerParamsType``
+        dataclass or a plain dict.  Keys not present in ``d`` are set to
         ``SchedulerParams.NoneScheduler()`` (disables scheduling for that model).
 
         Examples
@@ -174,9 +178,8 @@ class PtychographyOpt(PtychographyBase):
             if model.scheduler is not None
         }
 
-    def set_schedulers(
-        self, params: dict[str, SchedulerType], num_iter: int | None = None
-    ) -> None:
+    def set_schedulers(self, params: dict[str, SchedulerParamsType], num_iter: int | None = None):
+        """Set schedulers for each model."""
         for key, scheduler_params in params.items():
             self._check_key(key)
             self._models[key].set_scheduler(scheduler_params, num_iter)
