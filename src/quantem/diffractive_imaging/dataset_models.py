@@ -1,5 +1,6 @@
+import warnings
 from abc import abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Self, cast
 
@@ -14,7 +15,7 @@ from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerParams
 from quantem.core.utils.utils import electron_wavelength_angstrom, tqdmnd
 from quantem.core.utils.validators import (
     validate_array,
@@ -105,7 +106,7 @@ class PtychographyDatasetBase(
     _token = object()
     _patch_indices: torch.Tensor
 
-    # TODO update optimizers and such to allow for different lrs for different parameters
+    # TODO make this a PPLR so different lrs can be used for different parameters
     DEFAULT_LRS = {
         "descan": 1e-3,
         "scan_positions": 1e-3,
@@ -179,18 +180,47 @@ class PtychographyDatasetBase(
         # fractional positions), so the probe is not subpixel-shifted.
         self._implicit_object = False
 
-    def get_optimization_parameters(self):
-        """Get the combined descan and scan position parameters for optimization.
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """Descan and scan-position parameters as separate PPLR groups.
 
-        Returns an empty list when neither learn flag is set; OptimizerMixin.set_optimizer
-        handles the empty-params case by removing the optimizer.
+        Returns one group per *learnable* parameter set; ``{}`` when neither is learnable
+        (``set_optimizer`` then short-circuits to removing the optimizer).
         """
-        params = []
+        groups: dict[str, list[torch.Tensor]] = {}
         if self.learn_descan:
-            params.append(self._descan_shifts)
+            groups["descan"] = [self._descan_shifts]
         if self.learn_scan_positions:
-            params.append(self._scan_positions_px)
-        return params
+            groups["scan_positions"] = [self._scan_positions_px]
+        return groups
+
+    def _normalize_optimizer_params(self, params):
+        """Broadcast a single optimizer spec to the learnable descan/scan_position groups.
+
+        A single ``OptimizerParamsType`` / single-optimizer dict (normalized to the ``"default"`` key)
+        is fanned out to whichever groups are currently learnable, so the common single-LR caller
+        keeps working. An explicit PPLR dict (keyed by ``descan``/``scan_positions``) passes through.
+        """
+        norm = super()._normalize_optimizer_params(params)
+        if set(norm) == {self.DEFAULT_OPTIMIZER_KEY}:
+            spec = norm[self.DEFAULT_OPTIMIZER_KEY]
+            learnable = [
+                key
+                for key, on in (
+                    ("descan", self.learn_descan),
+                    ("scan_positions", self.learn_scan_positions),
+                )
+                if on
+            ]
+            if not learnable and not isinstance(spec, OptimizerParams.NoneOptimizer):
+                warnings.warn(
+                    f"{type(self).__name__}: an optimizer was requested but nothing is "
+                    "learnable (both learn_descan and learn_scan_positions are False); "
+                    "the optimizer will be removed. Enable learn_descan and/or "
+                    "learn_scan_positions to optimize.",
+                    stacklevel=2,
+                )
+            return {key: replace(spec) for key in learnable} if learnable else {}
+        return norm
 
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device."""
@@ -792,12 +822,15 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self.scan_sampling = dset.sampling[:2]
         self.scan_units = dset.units[:2]
         self.gpts = dset.shape[:2]
-        self.intensities_4d = dset.array.copy()
+        # TODO remove after Dataset torch migration complete
+        dset_numpy = dset.array if dset.array is not None else dset.tensor.cpu().numpy()
+
+        self.intensities_4d = dset_numpy.copy()
 
         # convert to dataset3d
-        shp = dset.array.shape
+        shp = dset_numpy.shape
         dset3d = Dataset3d.from_array(
-            array=dset.array.reshape((shp[0] * shp[1], shp[2], shp[3])),
+            array=dset_numpy.reshape((shp[0] * shp[1], shp[2], shp[3])),
             name=dset.name,
             origin=[0, *dset.origin[2:]],
             sampling=[0, *dset.sampling[2:]],
@@ -1139,7 +1172,11 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 ),
                 modify_in_place=True,
             )
-            self.intensities_4d = self.dset.array.reshape(
+            # TODO remove after Dataset torch migration complete
+            dset_numpy = (
+                self.dset.array if self.dset.array is not None else self.dset.tensor.cpu().numpy()
+            )
+            self.intensities_4d = dset_numpy.reshape(
                 (*self.gpts, *padded_diffraction_intensities_shape)
             )
             self.detector_mask = torch.nn.functional.pad(

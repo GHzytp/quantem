@@ -958,10 +958,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             dist.broadcast(p.data, src=src)
         for p in self.probe_model.parameters():
             dist.broadcast(p.data, src=src)
-        for p in self.dset.get_optimization_parameters():
-            buf = p.data.contiguous()
-            dist.broadcast(buf, src=src)
-            p.data.copy_(buf)
+        for group in self.dset.get_optimization_parameters().values():
+            for p in group:
+                buf = p.data.contiguous()
+                dist.broadcast(buf, src=src)
+                p.data.copy_(buf)
 
     def _all_reduce_gradients(self) -> None:
         """Average obj, probe, and dataset gradients across all ranks (call after backward,
@@ -971,12 +972,15 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         learnable params are included because each scan position's gradient is nonzero on
         exactly one rank, so they must be reduced (AVG) to stay consistent across ranks.
         """
+        dset_params = [
+            p for group in self.dset.get_optimization_parameters().values() for p in group
+        ]
         params = [
             p
             for p in (
                 list(self.obj_model.parameters())
                 + list(self.probe_model.parameters())
-                + list(self.dset.get_optimization_parameters())
+                + dset_params
             )
             if p.grad is not None
         ]

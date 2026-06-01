@@ -10,6 +10,20 @@ from numpy.typing import NDArray
 from quantem.core import config
 
 
+@dataclass
+class BaseContext(ABC):
+    """
+    Context object bundling the data a constraint needs to be applied.
+
+    Tomography's ``ReconstructionContext`` subclasses this and is passed to its
+    ``apply_soft_constraints(ctx)`` overrides. Ptychography models instead pass
+    their tensors positionally, so the base ``apply_soft_constraints`` signature
+    stays ``*args, **kwargs`` to accommodate both domains.
+    """
+
+    pass
+
+
 @dataclass(slots=False)
 class Constraints(ABC):
     """
@@ -219,5 +233,9 @@ class BaseConstraints(ABC, Generic[C]):
     def apply_soft_constraints(self, *args, **kwargs) -> torch.Tensor:
         """
         Apply soft constraints to the model.
+
+        Signature is intentionally permissive: ptychography models override with
+        positional tensors (e.g. ``(obj, mask)``), while tomography models
+        override with a ``ReconstructionContext`` (``(ctx)``).
         """
         raise NotImplementedError
