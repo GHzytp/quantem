@@ -50,6 +50,22 @@ class TestObjConstraintParse:
         assert "positivity" in c.hard_constraint_keys
         assert "tv_vol" in c.soft_constraint_keys
 
+    def test_constraint_keys_are_real_fields(self):
+        """Regression: every soft/hard key must be an attribute, so __str__ never raises.
+
+        ``ObjINRConstraints`` previously listed ``tv_plane`` (a field it does not have), which
+        made ``str(constraints)`` blow up with AttributeError via ``Constraints.__str__``.
+        """
+        for cls in (
+            ObjConstraintParams.ObjPixelatedConstraints,
+            ObjConstraintParams.ObjINRConstraints,
+            ObjConstraintParams.ObjTensorDecompConstraints,
+        ):
+            c = cls()
+            for key in c.soft_constraint_keys + c.hard_constraint_keys:
+                assert hasattr(c, key), f"{cls.__name__} lists missing key {key!r}"
+            assert isinstance(str(c), str)  # must not raise
+
 
 class TestObjectPixelatedConstruction:
     def test_from_uniform_is_zeros(self):
@@ -98,7 +114,8 @@ class TestObjectPixelatedConstraints:
         assert torch.allclose(obj.obj, torch.full((4, 4, 4), 0.75))
 
     def test_tv_loss_scales_with_weight(self):
-        ctx = ReconstructionContext(obj=torch.rand(1, 1, 8, 8, 8))
+        # ctx.obj is the 3-D pixelated volume (D, H, W), matching ObjectPixelated._obj.
+        ctx = ReconstructionContext(obj=torch.rand(8, 8, 8))
         obj = ObjectPixelated.from_uniform(shape=(8, 8, 8), device="cpu")
         obj.constraints.tv_vol = 1.0
         loss1 = obj.get_tv_loss(ctx)
@@ -106,8 +123,27 @@ class TestObjectPixelatedConstraints:
         loss2 = obj.get_tv_loss(ctx)
         assert torch.isclose(loss2, 2.0 * loss1)
 
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (8, 8, 8),  # bare 3-D volume
+            (1, 8, 8, 8),  # obj_view layout [C=1, D, H, W]
+            (3, 8, 8, 8),  # multimodal [C, D, H, W] (e.g. 3 elemental channels)
+        ],
+    )
+    def test_tv_loss_rank_agnostic_finite_and_positive(self, shape):
+        """Regression: get_tv_loss takes TV over the trailing spatial dims for any leading
+        channel/batch axes -- not the old 5-D-only indexing. Supports multimodal [C, ...]."""
+        ctx = ReconstructionContext(obj=torch.rand(*shape))
+        obj = ObjectPixelated.from_uniform(shape=(8, 8, 8), device="cpu")
+        obj.constraints.tv_vol = 1.0
+        loss = obj.get_tv_loss(ctx)
+        assert loss.ndim == 0
+        assert torch.isfinite(loss)
+        assert loss > 0.0  # random volume has non-zero total variation
+
     def test_soft_constraint_zero_when_tv_off(self):
-        ctx = ReconstructionContext(obj=torch.rand(1, 1, 8, 8, 8))
+        ctx = ReconstructionContext(obj=torch.rand(8, 8, 8))
         obj = ObjectPixelated.from_uniform(shape=(8, 8, 8), device="cpu")
         obj.constraints.tv_vol = 0.0
         assert float(obj.apply_soft_constraints(ctx).detach()) == 0.0

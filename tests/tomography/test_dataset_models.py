@@ -95,6 +95,35 @@ class TestTomographyINRDataset:
         item = d[0]
         assert {"phi", "pixel_i", "pixel_j", "projection_idx", "target_value"} <= set(item.keys())
 
+    @pytest.mark.parametrize(
+        "learn_shift,learn_tilt_axis",
+        [(True, True), (True, False), (False, True), (False, False)],
+    )
+    def test_forward_gates_shift_and_tilt(self, learn_shift, learn_tilt_axis):
+        """``forward`` zeros the disabled component and passes the enabled one through.
+
+        Guards the gating after removing the unreachable duplicate branch: shifts are
+        controlled by ``learn_shift``; the z1/z3 Euler angles by ``learn_tilt_axis``.
+        """
+        d = TomographyINRDataset.from_data(
+            _stack(nang=5, n=12),
+            np.linspace(-60, 60, 5, dtype="f4"),
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+        )
+        d.to("cpu")
+        # Make every pose parameter non-zero so the gating is observable by value.
+        for p in (d.z1_params, d.z3_params, d.shifts_params):
+            p.data.fill_(1.0)
+        d._z1_ref = torch.ones_like(d._z1_ref)
+        d._z3_ref = torch.ones_like(d._z3_ref)
+        d._shifts_ref = torch.ones_like(d._shifts_ref)
+
+        shifts, z1, z3 = d.forward(None)
+        assert bool(shifts.any()) == learn_shift
+        assert bool(z1.any()) == learn_tilt_axis
+        assert bool(z3.any()) == learn_tilt_axis
+
 
 class TestTomographyINRPretrainDataset:
     def test_len_and_getitem(self):

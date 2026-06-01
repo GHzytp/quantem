@@ -112,6 +112,54 @@ class TestOptimizerParams:
         assert len(tomo.optimizers["object"].param_groups) == 3
         assert "pose" in tomo.optimizers
 
+    def test_step_optimizers_steps_each_once(self, torch_device, monkeypatch):
+        """Regression: with object+pose, each optimizer must step exactly once per call.
+
+        ``step_optimizers`` previously looped over both keys and stepped *both* optimizers on
+        every pass, so each took two Adam steps per batch.
+        """
+        tomo = _inr_tomography(torch_device)
+        tomo.optimizer_params = {
+            "object": OptimizerParams.Adam(lr=1e-3),
+            "pose": OptimizerParams.Adam(lr=1e-2),
+        }
+        tomo.set_optimizers()
+        assert set(tomo.optimizers.keys()) == {"object", "pose"}  # both optimizers live
+
+        counts = {"object": 0, "pose": 0}
+        monkeypatch.setattr(
+            tomo.obj_model,
+            "step_optimizer",
+            lambda: counts.__setitem__("object", counts["object"] + 1),
+        )
+        monkeypatch.setattr(
+            tomo.dset, "step_optimizer", lambda: counts.__setitem__("pose", counts["pose"] + 1)
+        )
+        tomo.step_optimizers()
+        assert counts == {"object": 1, "pose": 1}
+
+    def test_zero_grad_all_zeros_each_once(self, torch_device, monkeypatch):
+        """Companion to the step regression: zero_grad_all must touch each optimizer once."""
+        tomo = _inr_tomography(torch_device)
+        tomo.optimizer_params = {
+            "object": OptimizerParams.Adam(lr=1e-3),
+            "pose": OptimizerParams.Adam(lr=1e-2),
+        }
+        tomo.set_optimizers()
+        counts = {"object": 0, "pose": 0}
+        monkeypatch.setattr(
+            tomo.obj_model,
+            "zero_optimizer_grad",
+            lambda: counts.__setitem__("object", counts["object"] + 1),
+        )
+        monkeypatch.setattr(
+            tomo.dset,
+            "zero_optimizer_grad",
+            lambda: counts.__setitem__("pose", counts["pose"] + 1),
+        )
+        tomo.zero_grad_all()
+        assert counts == {"object": 1, "pose": 1}
+
 
 @requires_torch
 class TestSchedulerParams:
@@ -141,3 +189,10 @@ class TestSchedulerParams:
         tomo = _inr_tomography(torch_device)
         with pytest.raises(TypeError):
             tomo.obj_model.scheduler_params = 123
+
+    def test_setter_does_not_mutate_caller_dict(self, torch_device):
+        """Regression: the setter must not inject missing keys into the caller's dict."""
+        tomo = _inr_tomography(torch_device)
+        d = {"object": SchedulerParams.CosineAnnealing(T_max=10)}
+        tomo.scheduler_params = d
+        assert set(d.keys()) == {"object"}  # "pose" must not have been added to the input

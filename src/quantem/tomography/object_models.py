@@ -101,7 +101,7 @@ class ObjConstraintParams:
         sparsity: float = 0.0
         _name: str = "obj_inr"
 
-        soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity"]
+        soft_constraint_keys = ["tv_vol", "sparsity"]
         hard_constraint_keys = ["positivity", "shrinkage"]
 
     @dataclass
@@ -436,12 +436,16 @@ class ObjectPixelated(ObjectConstraints):
     # --- Defining the TV loss ---
     def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
         assert ctx.obj is not None, "ObjectPixelated requires ctx.obj to be set"
-        tv_d = torch.pow(ctx.obj[:, :, 1:, :, :] - ctx.obj[:, :, :-1, :, :], 2).sum()
-        tv_h = torch.pow(ctx.obj[:, :, :, 1:, :] - ctx.obj[:, :, :, :-1, :], 2).sum()
-        tv_w = torch.pow(ctx.obj[:, :, :, :, 1:] - ctx.obj[:, :, :, :, :-1], 2).sum()
+        # TV over the three trailing spatial dims, leaving any leading channel/batch axes
+        # intact. Works for a 3-D volume, obj_view's [1, D, H, W], and a multimodal
+        # [C, D, H, W] (channels = elemental compositions), matching the INR / tensor-decomp
+        # convention where the object carries a leading channel dimension.
+        tv_d = torch.pow(ctx.obj[..., 1:, :, :] - ctx.obj[..., :-1, :, :], 2).sum()
+        tv_h = torch.pow(ctx.obj[..., :, 1:, :] - ctx.obj[..., :, :-1, :], 2).sum()
+        tv_w = torch.pow(ctx.obj[..., :, :, 1:] - ctx.obj[..., :, :, :-1], 2).sum()
         tv_loss = tv_d + tv_h + tv_w
 
-        return tv_loss * self.constraints.tv_vol / (torch.prod(torch.tensor(ctx.obj.shape)))
+        return tv_loss * self.constraints.tv_vol / ctx.obj.numel()
 
     # --- Helper Functions ---
     def to(self, device: str | torch.device):
@@ -934,7 +938,7 @@ class ObjectTensorDecomp(ObjectINR):
         Gets the summed total variational loss for the tensor decomposition model.
 
         _get_plane_tv_loss: Total-variation across the planes.
-        _get_volume_tv_loss: Isotropic volume TV 
+        _get_volume_tv_loss: Isotropic volume TV
         """
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
