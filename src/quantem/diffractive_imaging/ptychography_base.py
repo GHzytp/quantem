@@ -78,9 +78,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     """
 
     _token = object()
-    # Default data-fidelity criterion (overridden per-instance from `loss_type` in reconstruct).
-    # Class-level so freshly-built and freshly-loaded objects always resolve a criterion.
-    _criterion: DataCriterion = get_data_criterion("l2_amplitude")
 
     def __init__(  # TODO prevent direct instantiation
         self,
@@ -110,6 +107,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._obj_model: ObjectModelType = obj_model
         self._probe_model: ProbeModelType = probe_model
         self._detector_model: DetectorModelType = detector_model
+        # Data-fidelity criterion (transient; re-set from `loss_type` in reconstruct). Not
+        # serialized (skipped on save), so the getter lazily re-defaults it on loaded objects.
+        self._criterion: DataCriterion = get_data_criterion("l2_amplitude")
 
         self.verbose = verbose
         self.dset = dset
@@ -253,9 +253,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def criterion(self) -> DataCriterion:
         """Active data-fidelity criterion. Assign a registered name or a ``DataCriterion``.
 
-        Transient config (re-set from ``loss_type`` each ``reconstruct``, defaults to L2); not
-        serialized.
+        Transient config (re-set from ``loss_type`` each ``reconstruct``); not serialized, so it
+        lazily re-defaults to L2 on a loaded object (where ``__init__`` did not run).
         """
+        if getattr(self, "_criterion", None) is None:
+            self._criterion = get_data_criterion("l2_amplitude")
         return self._criterion
 
     @criterion.setter

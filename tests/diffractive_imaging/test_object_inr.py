@@ -262,6 +262,38 @@ class TestObjectINRUnit:
         with pytest.raises(NotImplementedError):
             ObjectINR.from_uniform(num_slices=1, obj_type="complex")
 
+    def test_potential_obj_type(self):
+        """`potential` is real-valued like `pure_phase` but uses a non-negative output activation
+        (softplus) to enforce the positivity / min-value constraint."""
+        obj = ObjectINR.from_uniform(num_slices=1, obj_type="potential", hidden_features=32, rng=0)
+        obj._initialize_obj((1, 16, 16))
+        assert obj.obj_type == "potential"
+        assert not obj.dtype.is_complex  # real-valued object
+        patches = obj.forward(torch.rand(3, 4, 4, 2) * 2 - 1)
+        assert patches.shape == (1, 3, 4, 4) and patches.is_complex()
+        # train a few steps so the potential is non-uniform, then check positivity holds
+        opt = torch.optim.Adam(obj.model.parameters(), lr=1e-2)
+        coords = torch.rand(2, 6, 6, 2) * 2 - 1
+        for _ in range(5):
+            opt.zero_grad()
+            obj.forward(coords).imag.sum().backward()
+            opt.step()
+        materialized = obj.obj
+        assert materialized.shape == (1, 16, 16) and not materialized.is_complex()
+        assert float(materialized.min()) >= 0.0  # softplus enforces non-negative potential
+
+    def test_from_pixelated_with_model(self):
+        """from_pixelated can wrap a directly-passed INR model (like ObjectDIP.from_pixelated)."""
+        from quantem.core.ml.inr import HSiren
+
+        h = w = 16
+        pix = ObjectPixelated.from_array(initial_obj=torch.zeros(1, h, w), obj_type="pure_phase")
+        pix._initialize_obj((1, h, w), sampling=(1.0, 1.0))
+        my_model = HSiren(in_features=3, out_features=1, hidden_features=16, hidden_layers=2)
+        inr = ObjectINR.from_pixelated(pix, model=my_model)
+        assert inr.model is my_model
+        assert tuple(inr.pretrain_target.shape) == (1, h, w)
+
     def test_from_pixelated_pretrain(self):
         """from_pixelated + pretrain warm-starts the INR to reproduce a pixelated object."""
         h = w = 32

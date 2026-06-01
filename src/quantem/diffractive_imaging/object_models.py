@@ -1502,8 +1502,9 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
     """Implicit (coordinate-queried) object model.
 
     Wraps an implicit neural representation (INR; an ``HSiren`` by default) that maps
-    normalized 3D coordinates ``(z, y, x)`` in ``[-1, 1]`` to the object's real phase
-    (``obj_type="pure_phase"``). Rather than gathering grid-aligned patches at integer
+    normalized 3D coordinates ``(z, y, x)`` in ``[-1, 1]`` to a real-valued object — the phase
+    for ``obj_type="pure_phase"`` or the potential for ``obj_type="potential"``, both wrapped to
+    the complex transmission ``exp(1j * value)``. Rather than gathering grid-aligned patches at integer
     scan positions like ``ObjectPixelated``, the paired dataset produces continuous
     per-patch ``(y, x)`` coordinates at the *true* (fractional) scan positions; this
     model augments them with each slice's ``z`` coordinate, queries the INR, and returns
@@ -1549,10 +1550,10 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
             rng=rng,
             _token=_token,
         )
-        if self.obj_type != "pure_phase":
+        if self.obj_type == "complex":
             raise NotImplementedError(
-                f"ObjectINR currently only supports obj_type='pure_phase', got '{self.obj_type}'. "
-                "Complex/potential INR objects are planned."
+                "ObjectINR does not support obj_type='complex' yet (planned); use 'pure_phase' "
+                "or 'potential' (both real-valued, wrapped to exp(1j * value))."
             )
         if num_slices < 1:
             raise ValueError(f"num_slices must be greater than 0, got {num_slices}")
@@ -1606,13 +1607,21 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         first_omega_0: float = 10.0,
         hidden_omega_0: float = 10.0,
         obj_type: object_type = "pure_phase",
+        final_activation: str | Callable | None = None,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
     ) -> "ObjectINR":
         """Create an ObjectINR backed by a default ``HSiren``, initialized to vacuum.
 
-        The HSiren's final layer is zero-initialized so the object starts as a flat,
-        phase-0 (vacuum) transmission, matching ``ObjectPixelated.from_uniform``.
+        The HSiren's final layer is zero-initialized so the object starts uniform (a
+        diffraction-equivalent vacuum), matching ``ObjectPixelated.from_uniform``.
+
+        ``final_activation`` sets the output nonlinearity. When ``None`` (default) it is chosen
+        from ``obj_type``: ``"identity"`` for ``pure_phase``, and ``"softplus"`` for
+        ``potential`` -- a non-negative activation enforces the potential's positivity (min-value)
+        constraint directly at the output (use ``"relu"`` for a hard floor). With the zeroed final
+        layer the potential starts uniform (``softplus(0) = ln 2``), which is just a global phase
+        and hence diffraction-equivalent to vacuum.
 
         Note
         ----
@@ -1622,6 +1631,8 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         is typically too high here (optimization stalls near vacuum), while objects with fine
         features may want a larger value. Pair omega_0 with the object learning rate.
         """
+        if final_activation is None:
+            final_activation = "softplus" if obj_type == "potential" else "identity"
         model = HSiren(
             in_features=3,
             out_features=1,
@@ -1629,9 +1640,10 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
             hidden_features=hidden_features,
             first_omega_0=first_omega_0,
             hidden_omega_0=hidden_omega_0,
+            final_activation=final_activation,
             dtype=getattr(torch, config.get("dtype_real")),
         )
-        # Zero the final linear layer so the INR outputs phase 0 everywhere (vacuum start).
+        # Zero the final linear layer so the INR output is uniform at init (vacuum / global phase).
         with torch.no_grad():
             final_linear = cast(nn.Linear, model.net[-2])
             final_linear.weight.zero_()
@@ -1650,6 +1662,7 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
     def from_pixelated(
         cls,
         pixelated: "ObjectModelType",
+        model: "torch.nn.Module | None" = None,
         hidden_features: int = 256,
         hidden_layers: int = 3,
         first_omega_0: float = 10.0,
@@ -1663,24 +1676,41 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         ``slice_thicknesses``, ``obj_type``, padded shape) and the current pixelated object is
         stored as the pretrain target, so ``pretrain()`` warm-starts the INR to reproduce the
         pixelated reconstruction -- mirroring ``ObjectDIP.from_pixelated`` + ``pretrain``.
+
+        Pass ``model`` to wrap a custom INR ``nn.Module`` directly (mapping ``(N, 3)`` coords to
+        ``(N, 1)``), as with ``ObjectDIP.from_pixelated`` -- handy for testing architectures. When
+        ``model`` is ``None`` a default zero-initialized ``HSiren`` is built from the
+        ``hidden_features`` / ``hidden_layers`` / ``omega_0`` args (with a positivity activation
+        for ``potential``); when a ``model`` is given those args and the activation are its own.
         """
         if not (
             isinstance(pixelated, ObjectPixelated) or "ObjectPixelated" in str(type(pixelated))
         ):
             raise ValueError(f"pixelated must be an ObjectPixelated, got {type(pixelated)}")
         dev = pixelated.device if device is None else device
-        inr = cls.from_uniform(
-            num_slices=pixelated.num_slices,
-            slice_thicknesses=pixelated.slice_thicknesses,
-            obj_type=pixelated.obj_type,
-            hidden_features=hidden_features,
-            hidden_layers=hidden_layers,
-            first_omega_0=first_omega_0,
-            hidden_omega_0=hidden_omega_0,
-            device=dev,
-            rng=pixelated._rng_seed if rng is None else rng,
-        )
-        target = pixelated.obj.detach().to(dev)  # (num_slices, H, W) real phase
+        seed = pixelated._rng_seed if rng is None else rng
+        if model is not None:
+            inr = cls.from_inr(
+                model=model,
+                num_slices=pixelated.num_slices,
+                slice_thicknesses=pixelated.slice_thicknesses,
+                obj_type=pixelated.obj_type,
+                device=dev,
+                rng=seed,
+            )
+        else:
+            inr = cls.from_uniform(
+                num_slices=pixelated.num_slices,
+                slice_thicknesses=pixelated.slice_thicknesses,
+                obj_type=pixelated.obj_type,
+                hidden_features=hidden_features,
+                hidden_layers=hidden_layers,
+                first_omega_0=first_omega_0,
+                hidden_omega_0=hidden_omega_0,
+                device=dev,
+                rng=seed,
+            )
+        target = pixelated.obj.detach().to(dev)  # (num_slices, H, W) real phase / potential
         inr._obj_shape = tuple(int(x) for x in target.shape)  # type: ignore[assignment]
         if pixelated._sampling is not None:
             inr.sampling = pixelated.sampling
@@ -1998,9 +2028,10 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
     ) -> torch.Tensor:
         """Project the materialized object (display only).
 
-        Unlike the grid-based ``Raster`` constraints, an INR has nothing to clamp or
-        filter in place; for ``pure_phase`` we only recenter the phase to zero mean so
-        the displayed object matches the pixelated convention.
+        Unlike the grid-based ``Raster`` constraints, an INR has nothing to clamp or filter in
+        place. For ``pure_phase`` we recenter the phase to zero mean (a global-phase gauge) so the
+        displayed object matches the pixelated convention; ``potential`` is returned as-is (the INR
+        constraint set has no positivity/baseline fields — potential is left unconstrained).
         """
         with torch.no_grad():
             if self.obj_type == "pure_phase":
