@@ -95,6 +95,17 @@ class TestRadonBehaviour:
         corr = np.corrcoef(disk.numpy().ravel(), rec.numpy().ravel())[0, 1]
         assert corr > 0.9
 
+    def test_default_theta_roundtrip_is_consistent(self):
+        """radon and iradon must share an angle convention when ``theta`` is defaulted.
+
+        iradon's default previously included the 180-degree endpoint while radon's did not,
+        so a default-theta round-trip sampled mismatched angles.
+        """
+        disk = _disk(64, 32, 28, 10)
+        rec = iradon_torch(radon_torch(disk), filter_name="ramp")  # both default theta
+        corr = np.corrcoef(disk.numpy().ravel(), rec.numpy().ravel())[0, 1]
+        assert corr > 0.9
+
 
 class TestRadonVsSkimage:
     """Loose cross-check against scikit-image's reference implementation."""

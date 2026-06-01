@@ -143,7 +143,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.set_optimizers()
                 if scheduler_params is not None:
                     self.scheduler_params = scheduler_params
-                    self.set_schedulers(self.scheduler_params)
+                    self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
             self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
                 self.setup_dataloader(

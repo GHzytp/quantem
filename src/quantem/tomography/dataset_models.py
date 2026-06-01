@@ -486,8 +486,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
         elif self.learn_tilt_axis:
             return torch.zeros_like(shifts), z1, z3
-        elif self.learn_shift and self.learn_tilt_axis:
-            return shifts, z1, z3
         else:
             return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
 
