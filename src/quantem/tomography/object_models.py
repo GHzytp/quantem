@@ -1033,7 +1033,7 @@ class ObjectTensorDecomp(ObjectINR):
         """ObjectTensorDecomp requires a dict matching model.param_keys."""
         if not isinstance(params, dict) or self._is_single_optimizer_dict(params):
             raise TypeError(
-                f"ObjectTensorDecomp requires dict[str, OptimizerType] keyed by "
+                f"ObjectTensorDecomp requires dict[str, OptimizerParamsType] keyed by "
                 f"param_keys; got {type(params)}"
             )
         model = _unwrap(self.model)
