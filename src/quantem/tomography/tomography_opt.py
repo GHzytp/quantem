@@ -27,7 +27,7 @@ class TomographyOpt(TomographyBase):
             raise ValueError(f"Unknown optimization key: {key}")
 
     @property
-    def optimizer_params(self) -> dict[str, OptimizerType]:
+    def optimizer_params(self) -> dict[str, OptimizerType | dict[str, OptimizerType]]:
         return {
             key: params
             for key, params in [

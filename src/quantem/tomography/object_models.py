@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, Optional
+from typing import Any, Callable, Generator, Optional, cast
 
 import numpy as np
 import torch
@@ -200,8 +200,8 @@ ObjConstraintsType = (
 def _unwrap(model: nn.Module | nn.parallel.DistributedDataParallel) -> PlanarDecompositionModel:
     """Unwrap a DistributedDataParallel model to get the underlying module ONLY for tensor decomposition models."""
     if isinstance(model, nn.parallel.DistributedDataParallel):
-        return model.module
-    return model
+        return cast(PlanarDecompositionModel, model.module)
+    return cast(PlanarDecompositionModel, model)
 
 
 class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
@@ -290,14 +290,12 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
         raise NotImplementedError
 
     # --- Helper Functions ---
-    def get_optimization_parameters(self) -> list[dict[str, Any]]:
-        """Default: wrap self.params in a single param group."""
-        if isinstance(self._optimizer_params, dict):
-            # Shouldn't happen for single-group models, but be defensive
-            opt = next(iter(self._optimizer_params.values()))
-        else:
-            opt = self._optimizer_params
-        return [{"params": list(self.params), **opt.params()}]
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """Default: a single param group keyed by DEFAULT_OPTIMIZER_KEY.
+
+        Hyperparameters are baked by ``set_optimizer``, not here — return only the tensors.
+        """
+        return {self.DEFAULT_OPTIMIZER_KEY: list(self.params)}
 
     @abstractmethod  # Each subclass should implement this.
     def to(self, device: str | torch.device):
@@ -932,6 +930,12 @@ class ObjectTensorDecomp(ObjectINR):
     # TV Losses
 
     def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        """
+        Gets the summed total variational loss for the tensor decomposition model.
+
+        _get_plane_tv_loss: Total-variation across the planes.
+        _get_volume_tv_loss: Isotropic volume TV 
+        """
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.tensor(0.0, device=ctx.pred.device)
@@ -940,6 +944,9 @@ class ObjectTensorDecomp(ObjectINR):
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
+        """
+        Gets the total-variation across the planes.
+        """
         is_tilted = self.model.tilted
         per_level = []
 
@@ -1017,16 +1024,10 @@ class ObjectTensorDecomp(ObjectINR):
 
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self) -> list[dict[str, Any]]:
-        """PPLR: per-key param groups."""
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """PPLR: per-key param groups (hyperparameters are baked by set_optimizer)."""
         model = _unwrap(self.model)
-        assert isinstance(self._optimizer_params, dict), (
-            "ObjectTensorDecomp requires dict-form optimizer_params"
-        )
-        return [
-            {"params": model.get_params()[key], **self._optimizer_params[key].params()}
-            for key in model.param_keys
-        ]
+        return {key: list(model.get_params()[key]) for key in model.param_keys}
 
     def _normalize_optimizer_params(self, params):
         """ObjectTensorDecomp requires a dict matching model.param_keys."""

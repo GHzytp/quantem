@@ -668,9 +668,9 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         Loads the learned parameters from a file.
         """
         data = torch.load(path)
-        self._z1_params = nn.Parameter(data["z1"])
-        self._z3_params = nn.Parameter(data["z3"])
-        self._shifts_params = nn.Parameter(data["shifts"])
+        self._z1_params = nn.Parameter(data["z1"]).to(self.device)
+        self._z3_params = nn.Parameter(data["z3"]).to(self.device)
+        self._shifts_params = nn.Parameter(data["shifts"]).to(self.device)
         if self.optimizer is not None:
             self.reconnect_optimizer_to_parameters()
 
