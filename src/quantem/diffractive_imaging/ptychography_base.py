@@ -107,8 +107,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._obj_model: ObjectModelType = obj_model
         self._probe_model: ProbeModelType = probe_model
         self._detector_model: DetectorModelType = detector_model
-        # Data-fidelity criterion (transient; re-set from `loss_type` in reconstruct). Not
-        # serialized (skipped on save), so the getter lazily re-defaults it on loaded objects.
         self._criterion: DataCriterion = get_data_criterion("l2_amplitude")
 
         self.verbose = verbose

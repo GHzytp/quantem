@@ -1528,7 +1528,7 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
     """
 
     DEFAULT_LRS = {
-        "object": 8e-6,
+        "object": 1e-3,
         "tv_weight_z": 0,
         "tv_weight_xy": 0,
     }
