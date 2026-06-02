@@ -1,37 +1,90 @@
 import contextlib
 import copy
 import gc
+import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self, Sequence, cast
+from typing import Any, Literal, Self, Sequence, cast
 from warnings import warn
 
 import numpy as np
+import torch
+import torch.distributed as dist
 from tqdm.auto import tqdm
 
-from quantem.core import config
 from quantem.core.io.serialize import load as autoserialize_load
+from quantem.core.ml.dist_utils import (
+    init_process_group,
+    is_distributed_launch,
+    spawn_distributed_workers,
+)
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
-from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
+from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
 from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
 
-if TYPE_CHECKING:
-    import torch
-else:
-    if config.get("has_torch"):
-        import torch
+
+def _ddp_ptycho_worker(
+    rank: int,
+    world_size: int,
+    ptycho_path: str,
+    devices: list[int],
+    recon_kwargs: dict[str, Any],
+    result_path: str,
+) -> None:
+    """Module-level worker for mp.start_processes — must live at module scope to be picklable.
+
+    Receives a file path rather than the Ptychography object directly so that no
+    large tensors cross the process boundary via pickle (which triggers PyTorch's
+    shared-memory tensor mechanism and fails in some Linux environments).
+    """
+    device_id = devices[rank]
+    init_process_group(rank, world_size, backend="nccl" if torch.cuda.is_available() else "gloo")
+
+    # mmap=True so all workers share one memory-mapped RAM copy of the (potentially large,
+    # CPU-resident) state instead of each duplicating it.
+    ptycho = torch.load(ptycho_path, map_location="cpu", weights_only=False, mmap=True)
+    ptycho.to(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+
+    if dist.is_available() and dist.is_initialized():
+        ptycho._broadcast_parameters(src=0)
+
+    ptycho._reconstruct_inner(**recon_kwargs, _dist_rank=rank, _dist_world_size=world_size)
+
+    if rank == 0:
+        obj_opt = ptycho.optimizers.get("object")
+        probe_opt = ptycho.optimizers.get("probe")
+        torch.save(
+            {
+                "obj_state": {k: v.cpu() for k, v in ptycho.obj_model.state_dict().items()},
+                "probe_state": {k: v.cpu() for k, v in ptycho.probe_model.state_dict().items()},
+                "obj_optimizer_params": ptycho.obj_model._optimizer_params,
+                "probe_optimizer_params": ptycho.probe_model._optimizer_params,
+                "obj_optimizer_state": obj_opt.state_dict() if obj_opt is not None else None,
+                "probe_optimizer_state": probe_opt.state_dict() if probe_opt is not None else None,
+                "iter_losses": ptycho._iter_losses,
+                "iter_val_losses": ptycho._iter_val_losses,
+                "iter_lrs": ptycho._iter_lrs,
+                "iter_recon_types": ptycho._iter_recon_types,
+            },
+            result_path,
+        )
+
+    dist.destroy_process_group()
 
 
-class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase):
+class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase):  # pyright: ignore[reportUnsafeMultipleInheritance]
     """
     A class for performing phase retrieval using the Ptychography algorithm.
     """
+
+    _autograd: bool = True
+    _dataset_metadata: "dict[str, Any] | None" = None
 
     @classmethod
     def from_models(
@@ -124,7 +177,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
     def _soft_constraints(self) -> torch.Tensor:
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
-        total_loss = torch.tensor(0, device=self.device, dtype=self._dtype_real)
+        total_loss = torch.tensor(0, device=self._single_device, dtype=self._dtype_real)
 
         obj_loss = self.obj_model.apply_soft_constraints(
             self.obj_model.obj, mask=self.obj_model.mask
@@ -147,30 +200,112 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self,
         num_iters: int = 0,
         reset: bool = False,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
-        constraints: dict = {},
+        optimizer_params: dict[str, Any] | None = None,
+        scheduler_params: dict[str, Any] | None = None,
+        constraints: dict[str, Any] = {},
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
-        device: Literal["cpu", "gpu"] | None = None,
+        device: Literal["cpu", "gpu"] | int | list[int] | None = None,
         autograd: bool = True,
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        num_workers: int = 0,
     ) -> Self:
-        """
-        reason for having a single reconstruct() is so that updating things like constraints
-        or recon_types only happens in one place, reason for having separate reoconstruction_
-        methods would be to simplify the flags for this and not have to include all
+        """Run iterative ptychography reconstruction.
 
+        ``device`` accepts:
+          - ``None``             — keep current device
+          - ``"cpu"`` / ``"gpu"`` — existing string form
+          - ``int``              — specific GPU index, e.g. ``device=2`` → cuda:2
+          - ``list[int]``        — multi-GPU, e.g. ``device=[0,1,2,3]``
+
+        Multi-GPU (``device`` is a list) launches worker processes via ``mp.spawn`` when called
+        from a notebook, or uses the existing distributed process group when launched with
+        ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
         """
-        # TODO maybe make an "process args" method that handles things like:
-        # mode, store_iterations, device,
         self._check_preprocessed()
-        if device is not None:
-            self.to(device)
-        self.batch_size = batch_size
+
+        # Determine effective device list: explicit arg takes priority, else fall back to stored.
+        devices_to_use = (
+            device if isinstance(device, list) else getattr(self, "_multi_gpu_devices", None)
+        )
+
+        # Route to multi-GPU path
+        if isinstance(devices_to_use, list) and not is_distributed_launch():
+            if not autograd:
+                raise ValueError("Multi-GPU reconstruction requires autograd=True.")
+            return self._spawn_reconstruct(
+                devices=devices_to_use,
+                num_iters=num_iters,
+                reset=reset,
+                optimizer_params=optimizer_params,
+                scheduler_params=scheduler_params,
+                constraints=constraints,
+                batch_size=batch_size,
+                store_snapshots=store_snapshots,
+                store_snapshots_every=store_snapshots_every,
+                autograd=autograd,
+                loss_type=loss_type,
+                num_workers=num_workers,
+            )
+
+        # Handle torchrun distributed launch (RANK env var present)
+        if is_distributed_launch():
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    backend="nccl" if torch.cuda.is_available() else "gloo",
+                    init_method="env://",
+                )
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+            dev = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+            self.to(dev)
+            self._broadcast_parameters(src=0)
+        else:
+            rank, world_size = 0, 1
+            if device is not None and not isinstance(device, list):
+                self.to(device)
+
+        return self._reconstruct_inner(
+            num_iters=num_iters,
+            reset=reset,
+            optimizer_params=optimizer_params,
+            scheduler_params=scheduler_params,
+            constraints=constraints,
+            batch_size=batch_size,
+            store_snapshots=store_snapshots,
+            store_snapshots_every=store_snapshots_every,
+            autograd=autograd,
+            loss_type=loss_type,
+            num_workers=num_workers,
+            _dist_rank=rank,
+            _dist_world_size=world_size,
+        )
+
+    def _reconstruct_inner(
+        self,
+        num_iters: int = 0,
+        reset: bool = False,
+        optimizer_params: dict[str, Any] | None = None,
+        scheduler_params: dict[str, Any] | None = None,
+        constraints: dict[str, Any] = {},
+        batch_size: int | None = None,
+        store_snapshots: bool | None = None,
+        store_snapshots_every: int | None = None,
+        autograd: bool = True,
+        loss_type: Literal[
+            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
+        ] = "l2_amplitude",
+        num_workers: int = 0,
+        _dist_rank: int = 0,
+        _dist_world_size: int = 1,
+    ) -> Self:
+        """Core reconstruction loop. Called by reconstruct() for all launch modes."""
+        if batch_size is not None:
+            self.batch_size = batch_size
         self.store_snapshot_every = store_snapshots_every
         if store_snapshots_every is not None and store_snapshots is None:
             self.store_snapshots = True
@@ -196,22 +331,37 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         self.dset._set_targets(loss_type)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
-        batcher = SimpleBatcher(
+
+        # Compute the global scan count once — needed to keep loss scale consistent across world
+        global_n = self.dset.num_gpts
+
+        train_indices, val_indices = compute_train_val_split(
             self.dset.num_gpts,
-            self.batch_size,
-            rng=self.rng,
-            val_ratio=self.val_ratio,
-            val_mode=self.val_mode,
+            self.val_ratio,
+            self.val_mode,
+            self.rng,
         )
-        pbar = tqdm(range(num_iters), disable=not self.verbose)
+        train_loader, train_sampler, val_loader = self._build_dataloaders(
+            train_indices,
+            val_indices,
+            world_size=_dist_world_size,
+            rank=_dist_rank,
+            num_workers=num_workers,
+        )
+
+        pbar = tqdm(range(num_iters), disable=not self.verbose or _dist_rank != 0)
 
         for a0 in pbar:
+            if _dist_world_size > 1 and train_sampler is not None:
+                train_sampler.set_epoch(a0)
             consistency_loss = 0.0
             total_loss = 0.0
             self._reset_iter_constraints()
 
-            for batch_indices in batcher:
+            for batch in train_loader:
                 self.zero_grad_all()
+                batch_indices = batch["index"].to(self._single_device)
+                targets = batch["target"].to(self._single_device, non_blocking=True)
                 patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
                     self.dset.forward(batch_indices, self.obj_padding_px)
                 )
@@ -225,7 +375,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 batch_consistency_loss, targets = self.error_estimate(
                     pred_intensities,
                     batch_indices,
+                    targets=targets,
                     loss_type=loss_type,
+                    global_n=global_n,
                 )
 
                 batch_soft_constraint_loss = self._soft_constraints()
@@ -240,21 +392,33 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     patch_indices,
                     targets,
                 )
+                if _dist_world_size > 1:
+                    self._all_reduce_gradients()
                 self.step_optimizers()
                 consistency_loss += batch_consistency_loss.item()
                 total_loss += batch_loss.item()
 
-            num_batches = len(batcher)
+            num_batches = len(train_loader)
             total_loss = total_loss / num_batches
             consistency_loss = consistency_loss / num_batches
 
+            # Average loss across ranks so rank-0 reports the global mean
+            if _dist_world_size > 1:
+                loss_t = torch.tensor(
+                    [total_loss, consistency_loss], device=self._single_device, dtype=torch.float64
+                )
+                dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
+                total_loss, consistency_loss = loss_t[0].item(), loss_t[1].item()
+
             # Validation pass (no gradient, no optimizer steps)
             val_loss = None
-            if batcher.has_validation:
+            if val_loader is not None:
                 val_consistency_loss = 0.0
                 val_batches = 0
                 with torch.no_grad():
-                    for batch_indices in batcher.iter_val():
+                    for batch in val_loader:
+                        batch_indices = batch["index"].to(self._single_device)
+                        targets = batch["target"].to(self._single_device, non_blocking=True)
                         patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
                             self.dset.forward(batch_indices, self.obj_padding_px)
                         )
@@ -265,23 +429,36 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         )
                         pred_intensities = self.detector_model.forward(overlap)
                         batch_val_loss, _ = self.error_estimate(
-                            pred_intensities, batch_indices, loss_type=loss_type
+                            pred_intensities,
+                            batch_indices,
+                            targets=targets,
+                            loss_type=loss_type,
+                            global_n=global_n,
                         )
                         val_consistency_loss += batch_val_loss.item()
                         val_batches += 1
                 if val_batches > 0:
                     val_loss = val_consistency_loss / val_batches
-                    self._iter_val_losses.append(val_loss)
+                    # Average the val loss across ranks so rank-0 records the global mean
+                    if _dist_world_size > 1:
+                        val_t = torch.tensor(
+                            val_loss, device=self._single_device, dtype=torch.float64
+                        )
+                        dist.all_reduce(val_t, op=dist.ReduceOp.AVG)
+                        val_loss = val_t.item()
+                    if _dist_rank == 0:
+                        self._iter_val_losses.append(val_loss)
 
-            self._record_iter(total_loss)  # TODO record val loss as well
+            if _dist_rank == 0:
+                self._record_iter(total_loss)  # TODO record val loss as well
 
             # Step schedulers with current loss
             self.step_schedulers(total_loss)
 
-            if self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
+            if _dist_rank == 0 and self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
                 self._store_current_iter_snapshot()
 
-            if self.logger is not None:
+            if _dist_rank == 0 and self.logger is not None:
                 self.logger.log_iter(
                     self.obj_model,
                     self.probe_model,
@@ -292,19 +469,118 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     self._get_current_lrs(),
                 )
 
-            if val_loss is not None:
-                pbar.set_description(
-                    f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
-                )
-            else:
-                pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
+            if _dist_rank == 0:
+                if val_loss is not None:
+                    pbar.set_description(
+                        f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
+                    )
+                else:
+                    pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
 
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if hasattr(torch, "mps") and torch.backends.mps.is_available():
             torch.mps.empty_cache()
         gc.collect()
 
+        return self
+
+    def _spawn_reconstruct(self, devices: list[int], **recon_kwargs) -> Self:
+        """Notebook multi-GPU: spawn one worker process per device via forkserver.
+
+        State is saved to a temp file so that no tensors cross the process boundary
+        via pickle.  PyTorch's ForkingPickler automatically moves all CPU tensors to
+        shared memory when pickling for multiprocessing, which fails on some Linux
+        systems (EINVAL from ftruncate).  Passing only a file path (a plain string)
+        avoids that mechanism entirely.
+        """
+        restore_device = f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu"
+        # Persist batch_size on the main process so it carries into the saved file and
+        # is remembered on future calls that omit batch_size.
+        bs = recon_kwargs.get("batch_size")
+        if bs is not None:
+            self.batch_size = bs
+        self.to("cpu")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            ptycho_path = str(tmpdir_path / "ptycho_state.pt")
+            result_path = str(tmpdir_path / "result.pt")
+
+            torch.save(self, ptycho_path, pickle_protocol=4)
+
+            # forkserver: workers fork from a clean pre-started server (no inherited
+            # CUDA, no Jupyter FDs).  Only plain Python scalars/strings cross the
+            # process boundary, so tensor pickling is never triggered.
+            spawn_distributed_workers(
+                _ddp_ptycho_worker,
+                devices,
+                ptycho_path,
+                devices,
+                recon_kwargs,
+                result_path,
+            )
+            result = torch.load(result_path, map_location="cpu", weights_only=False)
+
+        # --- model weights ---
+        self.obj_model.load_state_dict(result["obj_state"])
+        self.probe_model.load_state_dict(result["probe_state"])
+        self.to(restore_device)
+
+        # --- restore optimizer params (worker may have set/changed them) so that future
+        #     spawns (e.g. reset=True without optimizer_params) can re-init the optimizer ---
+        for model, key in (
+            (self.obj_model, "obj_optimizer_params"),
+            (self.probe_model, "probe_optimizer_params"),
+        ):
+            saved = result.get(key)
+            if saved is not None:
+                model._optimizer_params = saved
+
+        # Re-create optimizers on the restored device (main process never ran set_optimizers).
+        # set_optimizers() skips models whose _optimizer_params is NoneOptimizer.
+        self.set_optimizers()
+
+        # --- optimizer states (params and device must be set before loading) ---
+        for name, key in (("object", "obj_optimizer_state"), ("probe", "probe_optimizer_state")):
+            opt_state = result.get(key)
+            opt = self.optimizers.get(name)
+            if opt_state is not None and opt is not None:
+                opt.load_state_dict(opt_state)
+                # State tensors were saved on CPU; move them to restore_device
+                for state in opt.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(restore_device)
+
+        # --- iteration tracking ---
+        # When reset=True the worker ran reset_recon() internally, so its lists start from 0.
+        # When reset=False the worker inherited existing history, so its lists are [old...new...].
+        # n_before lets us take only the genuinely new tail in both cases.
+        n_before = len(self._iter_losses)
+        is_reset = recon_kwargs.get("reset", False)
+
+        if is_reset:
+            self._iter_losses.clear()
+            self._iter_val_losses.clear()
+            self._iter_lrs.clear()
+            self._iter_recon_types.clear()
+            self._iter_losses.extend(result["iter_losses"])
+            self._iter_val_losses.extend(result["iter_val_losses"])
+            for k, v in result.get("iter_lrs", {}).items():
+                self._iter_lrs[k] = list(v)
+            self._iter_recon_types.extend(result.get("iter_recon_types", []))
+        else:
+            self._iter_losses.extend(result["iter_losses"][n_before:])
+            self._iter_val_losses.extend(result["iter_val_losses"][n_before:])
+            for k, v in result.get("iter_lrs", {}).items():
+                if k not in self._iter_lrs:
+                    self._iter_lrs[k] = []
+                self._iter_lrs[k].extend(list(v)[n_before:])
+            self._iter_recon_types.extend(result.get("iter_recon_types", [])[n_before:])
+
+        self._multi_gpu_devices = devices
         return self
 
     def _get_current_lrs(self) -> dict[str, float]:
@@ -329,12 +605,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             # scaling pixelated ad gradients to closer match analytic
             if isinstance(self.obj_model, ObjectPixelated):
                 obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
-                self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
+                if self.obj_model._obj.grad is not None:
+                    self.obj_model._obj.grad.mul_(obj_grad_scale)
 
             if isinstance(self.probe_model, ProbeParametric):
                 probe_grad_scale = np.sqrt(self.probe_model._mean_diffraction_intensity)
                 for par in self.probe_model.params:
-                    par.grad.mul_(probe_grad_scale)  # type:ignore
+                    if par.grad is not None:
+                        par.grad.mul_(probe_grad_scale)
 
         else:
             gradient = self.gradient_step(amplitudes, overlap)
@@ -457,7 +735,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # Add other common skips for ptychography objects
         skips = skip
 
-        current_device = self.device
+        _dev = self.device
+        current_device: str = f"cuda:{_dev[0]}" if isinstance(_dev, list) else _dev
         self.to("cpu")
 
         if self.verbose and verbose:
@@ -474,8 +753,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.to(current_device)  # TODO figure out why this isn't working for DDIP sometimes?
 
         # Clean up temporary metadata
-        if not save_raw_data and hasattr(self, "_dataset_metadata"):
-            delattr(self, "_dataset_metadata")
+        if not save_raw_data and self._dataset_metadata is not None:
+            self._dataset_metadata = None
 
     @classmethod
     def from_file(
@@ -517,7 +796,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         # If no dataset was provided, try to reload it from saved metadata
         if dset is None and auto_reload_dataset and not hasattr(ptycho, "dset"):
-            if hasattr(ptycho, "_dataset_metadata") and ptycho._dataset_metadata:
+            if ptycho._dataset_metadata is not None:
                 metadata = ptycho._dataset_metadata
                 file_path = metadata.get("file_path")
 
@@ -560,13 +839,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         elif dset is not None:
             dset._set_initial_scan_positions_px(ptycho.obj_padding_px)
             dset._set_patch_indices(ptycho.obj_padding_px)
-            if hasattr(ptycho, "_dataset_metadata") and ptycho._dataset_metadata:
+            if ptycho._dataset_metadata is not None:
                 metadata = ptycho._dataset_metadata
                 # preserve learned scan positions and descan shifts
                 if "learned_scan_positions_px" in metadata:
-                    dset.scan_positions_px.data = metadata["learned_scan_positions_px"]
+                    dset.scan_positions_px.data = metadata["learned_scan_positions_px"]  # type: ignore[assignment]
                 if "learned_descan_shifts" in metadata:
-                    dset.descan_shifts.data = metadata["learned_descan_shifts"]
+                    dset.descan_shifts.data = metadata["learned_descan_shifts"]  # type: ignore[assignment]
 
         # check if dset was attached to ptycho object
         if dset is not None:

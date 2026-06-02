@@ -117,6 +117,51 @@ class SimpleBatcher:
         return int(ceil(len(self.val_indices) / self.batch_size)) if self.has_validation else 0
 
 
+def compute_train_val_split(
+    num: int,
+    val_ratio: float,
+    val_mode: Literal["grid", "random"],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the train/validation index split.
+
+    Returns ``(train_indices, val_indices)`` as int numpy arrays. ``val_mode="grid"``
+    selects every k-th index (with ``k = round(1/val_ratio)``, inverted when
+    ``val_ratio > 0.5``); ``"random"`` selects a seeded ``rng.permutation`` slice.
+    """
+    indices = np.arange(num)
+    if val_ratio < 0 or val_ratio >= 1:
+        val_ratio = 0.0
+    n_val = int(round(len(indices) * val_ratio))
+    if n_val <= 0:
+        return indices, np.asarray([], dtype=int)
+
+    if val_mode == "random":
+        # Random unique selection for validation
+        perm = rng.permutation(indices)
+        val_indices = perm[:n_val]
+        train_indices = np.setdiff1d(indices, val_indices, assume_unique=False)
+    else:  # grid/regular selection: every k-th index
+        if val_ratio <= 0.5:
+            k = max(1, int(round(1.0 / val_ratio)))
+            invert = False
+        else:
+            k = max(1, int(round(1.0 / (1.0 - val_ratio))))
+            invert = True
+
+        grid_sel = indices[::k]
+        if len(grid_sel) > n_val:
+            grid_sel = grid_sel[:n_val]
+        if invert:
+            train_indices = grid_sel
+            val_indices = np.setdiff1d(indices, grid_sel, assume_unique=False)
+        else:
+            val_indices = grid_sel
+            train_indices = np.setdiff1d(indices, val_indices, assume_unique=False)
+
+    return np.asarray(train_indices, dtype=int), np.asarray(val_indices, dtype=int)
+
+
 @overload
 def fourier_shift_expand(
     array: np.ndarray, positions: np.ndarray, expand_dim: bool = True
@@ -136,7 +181,7 @@ def fourier_shift_expand(
     if af.is_complex(array):
         return shifted_array
     else:
-        return shifted_array.real # type:ignore ## will be numeric so this should be safe 
+        return shifted_array.real  # type:ignore ## will be numeric so this should be safe
 
 
 @overload

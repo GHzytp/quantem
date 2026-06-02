@@ -4,9 +4,12 @@ from warnings import warn
 import numpy as np
 import scipy.ndimage as ndi
 import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.dist_utils import all_reduce_params, worker_init_fn
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
     electron_wavelength_angstrom,
@@ -93,12 +96,23 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise RuntimeError("the quantEM Ptychography module requires torch to be installed.")
 
         super().__init__()
+
+        # Pre-initialize private attributes so type checker sees them in __init__
+        self._verbose: int = 0
+        self._logger: LoggerPtychography | None = None
+        self._batch_size: int = 1
+        self._dset: DatasetModelType = dset
+        self._obj_model: ObjectModelType = obj_model
+        self._probe_model: ProbeModelType = probe_model
+        self._detector_model: DetectorModelType = detector_model
+
         self.verbose = verbose
         self.dset = dset
         self.device = device
         self.rng = rng
 
         # initializing default attributes
+        self._multi_gpu_devices: list[int] | None = None
         self._preprocessed: bool = False
         self._obj_padding_force_power2_level: int = 3
         self._store_snapshots: bool = False
@@ -106,7 +120,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._iter_losses: list[float] = []
         self._iter_val_losses: list[float] = []
         self._iter_recon_types: list[str] = []
-        self._iter_lrs: dict[str, list] = {}  # LRs/step_sizes across iterations
+        self._iter_lrs: dict[str, list[float]] = {}  # LRs/step_sizes across iterations
         self._snapshots: list[Snapshot] = []
         self._obj_padding_px = np.array([0, 0])
         self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
@@ -127,7 +141,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.detector_model = detector_model
         self.compute_propagator_arrays()
         self.logger = logger
-        self.to(self.device)
+        self.to(self._single_device)
 
     # region --- preprocessing ---
     ## hopefully will be able to remove some of thes preprocessing flags,
@@ -170,7 +184,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.roi_shape,
                 self.reciprocal_sampling,
                 self.dset.mean_diffraction_intensity,
-                device=self.device,
+                device=self._single_device,
             )
 
         # change obj_padding_px and whatever else needs to be changed
@@ -205,7 +219,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         batch_size = num_dps if max_batch_size is None else int(max_batch_size)
         probe_overlap = torch.zeros(
-            tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self.device
+            tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self._single_device
         )
         for start, end in generate_batches(num_dps, max_batch=batch_size):
             probe_overlap += sum_patches(
@@ -296,7 +310,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self._to_numpy(slice_thick)
 
     @slice_thicknesses.setter
-    def slice_thicknesses(self, val: float | Sequence | None) -> None:
+    def slice_thicknesses(self, val: float | Sequence[float] | None) -> None:
         self._obj_model.slice_thicknesses = val
         if hasattr(self, "_propagators"):  # propagators already set, update with new slices
             self.compute_propagator_arrays()
@@ -506,7 +520,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise TypeError(f"obj_model must be a ObjectModelType, got {type(model)}")
 
         # Set object shape
-        model.to(self.device)
+        model.to(self._single_device)
         self._obj_model = cast(ObjectModelType, model)
 
     @property
@@ -527,12 +541,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.roi_shape,
                 self.reciprocal_sampling,
                 self.dset.mean_diffraction_intensity,
-                device=self.device,
+                device=self._single_device,
             )
         else:
             # will be set in ptycho.preprocess after dset is preprocessed
             pass
-        self._probe_model.to(self.device)
+        self._probe_model.to(self._single_device)
 
     @property
     def constraints(self) -> dict[str, Any]:
@@ -595,12 +609,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     # region --- implicit class properties ---
 
     @property
-    def device(self) -> str:
-        """This should be of form 'cuda:X' or 'cpu', as defined by quantem.config"""
+    def device(self) -> str | list[int]:
+        """Returns the active device: 'cuda:X'/'cpu' for single-GPU, or [gpu_ids] for multi-GPU."""
+        if self._multi_gpu_devices is not None:
+            return self._multi_gpu_devices
         if hasattr(self, "_device"):
             return self._device
-        else:
-            return config.get("device")
+        return config.get("device")
 
     @device.setter
     def device(self, device: str | int | None):
@@ -612,6 +627,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.to(dev)
             except AttributeError:
                 pass
+
+    @property
+    def _single_device(self) -> str:
+        """Single-device string for internal tensor operations. Always str, never a list."""
+        return self._device if hasattr(self, "_device") else str(config.get("device"))
 
     @property
     def _obj_dtype(self) -> "torch.dtype":
@@ -770,13 +790,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise TypeError(f"dtype should be string or torch.dtype, got {type(dtype)} {dtype}")
 
         if isinstance(array, np.ndarray):
-            t = torch.tensor(array.copy(), device=self.device, dtype=dt)
+            t = torch.tensor(array.copy(), device=self._single_device, dtype=dt)
         elif isinstance(array, torch.Tensor):
-            t = array.to(self.device)
+            t = array.to(self._single_device)
             if dt is not None:
                 t = t.type(dt)
         elif isinstance(array, (list, tuple)):
-            t = torch.tensor(array, device=self.device, dtype=dt)
+            t = torch.tensor(array, device=self._single_device, dtype=dt)
         else:
             raise TypeError(f"arr should be ndarray or Tensor, got {type(array)}")
         return t
@@ -876,16 +896,143 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             intensities = np.abs(probe) ** 2
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
 
+    def _broadcast_parameters(self, src: int = 0) -> None:
+        """Broadcast obj, probe, and dataset parameters from rank src to all other ranks.
+
+        Uses .parameters() so it works for both pixelated and DIP/INR models. The dataset's
+        learnable params (scan positions / descan shifts) must also be broadcast: with the
+        DistributedSampler partitioning scan positions, the full position params are replicated
+        on every rank, so they must start identical and stay synchronized.
+        """
+        for p in self.obj_model.parameters():
+            dist.broadcast(p.data, src=src)
+        for p in self.probe_model.parameters():
+            dist.broadcast(p.data, src=src)
+        for group in self.dset.get_optimization_parameters().values():
+            for p in group:
+                buf = p.data.contiguous()
+                dist.broadcast(buf, src=src)
+                p.data.copy_(buf)
+
+    def _all_reduce_gradients(self) -> None:
+        """Average obj, probe, and dataset gradients across all ranks (call after backward,
+        before step).
+
+        Uses .parameters() so it works for both pixelated and DIP/INR models. The dataset's
+        learnable params are included because each scan position's gradient is nonzero on
+        exactly one rank, so they must be reduced (AVG) to stay consistent across ranks.
+        """
+        dset_params = [
+            p for group in self.dset.get_optimization_parameters().values() for p in group
+        ]
+        params = [
+            p
+            for p in (
+                list(self.obj_model.parameters())
+                + list(self.probe_model.parameters())
+                + dset_params
+            )
+            if p.grad is not None
+        ]
+        if params:
+            for p in params:
+                if p.grad is not None and not p.grad.is_contiguous():
+                    p.grad = p.grad.contiguous()
+            all_reduce_params(*params)
+
     def to(self, device: str | int | torch.device):
         dev, _id = config.validate_device(device)
-        if dev != self.device:
-            self._device = dev
+        self._device = dev
+        self._multi_gpu_devices = None
+        # Sync each sub-model's own device tracker so their reset() uses the correct device
+        self.obj_model.device = dev
+        self.probe_model.device = dev
         self.obj_model.to(dev)
         self.probe_model.to(dev)
         self.dset.to(dev)
         self._obj_fov_mask = self._to_torch(self._obj_fov_mask)
         self._propagators = self._to_torch(self._propagators)
         self._rng_to_device(dev)
+
+    def _build_dataloaders(
+        self,
+        train_indices: np.ndarray,
+        val_indices: np.ndarray,
+        world_size: int,
+        rank: int,
+        num_workers: int,
+    ) -> "tuple[DataLoader, DistributedSampler | None, DataLoader | None]":
+        """Build train + (optional) val DataLoaders for both single- and multi-GPU paths.
+
+        Mirrors the shape of ``DDPMixin.setup_dataloader`` but adapted to ptycho's device
+        contract (``str | list[int]``) and ptycho's precomputed ``val_mode`` index split.
+        ``world_size > 1`` uses ``DistributedSampler`` over a ``Subset``; ``world_size == 1``
+        uses ``shuffle=True`` with a seeded ``torch.Generator`` for run-to-run determinism.
+        ``__getitem__`` returns ``{"index": idx, ...}`` for the original dataset index, and
+        ``Subset[i]`` calls ``dataset[indices[i]]``, so ``batch["index"]`` is the original
+        dataset index under either branch.
+        """
+        pin_memory = self.dset.target_residency == "cpu" and str(self._single_device).startswith(
+            "cuda"
+        )
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "drop_last": False,
+        }
+        if num_workers > 0:
+            loader_kwargs.update(
+                multiprocessing_context="spawn",
+                persistent_workers=True,
+                worker_init_fn=worker_init_fn,
+            )
+
+        train_subset = torch.utils.data.Subset(self.dset, train_indices.tolist())
+        val_subset = (
+            torch.utils.data.Subset(self.dset, val_indices.tolist())
+            if len(val_indices) > 0
+            else None
+        )
+
+        if world_size > 1:
+            train_sampler = DistributedSampler(
+                train_subset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=int(self.rng.integers(0, 2**31 - 1)),
+                drop_last=False,
+            )
+            train_loader = DataLoader(
+                train_subset, sampler=train_sampler, **loader_kwargs
+            )
+            if val_subset is not None:
+                val_sampler = DistributedSampler(
+                    val_subset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
+                val_loader = DataLoader(
+                    val_subset, sampler=val_sampler, **loader_kwargs
+                )
+            else:
+                val_loader = None
+        else:
+            train_sampler = None
+            shuffle_gen = torch.Generator().manual_seed(int(self.rng.integers(0, 2**31 - 1)))
+            train_loader = DataLoader(
+                train_subset, shuffle=True, generator=shuffle_gen, **loader_kwargs
+            )
+            val_loader = (
+                DataLoader(val_subset, shuffle=False, **loader_kwargs)
+                if val_subset is not None
+                else None
+            )
+
+        return train_loader, train_sampler, val_loader
 
     # endregion
 
@@ -911,21 +1058,23 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self,
         pred_intensities: torch.Tensor,
         batch_indices: np.ndarray,
+        targets: torch.Tensor,
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        global_n: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        targets = self.dset.targets[batch_indices]
         if "amplitude" in loss_type:
             preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
         else:
             preds = pred_intensities
 
         diff = preds * self.dset.detector_mask - targets * self.dset.detector_mask
+        n = global_n if global_n is not None else self.dset.num_gpts
         if "l1" in loss_type:
-            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / n)
         elif "l2" in loss_type:
-            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / n)
         elif loss_type == "poisson":
             error = torch.sum(preds - targets * torch.log(preds + 1e-6))
         else:
