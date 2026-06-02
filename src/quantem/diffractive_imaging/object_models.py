@@ -1735,9 +1735,9 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         return self._model
 
     @property
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
-        return self._model.parameters()
+        return list(self._model.parameters())
 
     @property
     def pretrained_weights(self) -> dict[str, torch.Tensor]:
@@ -1856,8 +1856,8 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         self,
         pretrain_target: torch.Tensor | np.ndarray | None = None,
         num_iters: int = 200,
-        optimizer_params: "dict | OptimizerType | None" = None,
-        scheduler_params: "dict | SchedulerType | None" = None,
+        optimizer_params: "dict | OptimizerParamsType | None" = None,
+        scheduler_params: "dict | SchedulerParamsType | None" = None,
         loss_fn: Callable | str = "l2",
         device: str | int | None = None,
         show: bool = True,
