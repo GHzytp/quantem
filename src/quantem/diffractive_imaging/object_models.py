@@ -354,7 +354,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             ndim=3,
             expand_dims=True,
         )
-        self._mask = mask.to(self.device).expand(self.num_slices, -1, -1)
+        self._mask = mask.to(self.device).expand(self.num_slices, -1, -1).contiguous()
 
     @property
     @abstractmethod
@@ -1073,7 +1073,7 @@ class ObjectDIP(ObjectConstraints):
             num_slices=pixelated.num_slices,
             slice_thicknesses=pixelated.slice_thicknesses,
             input_noise_std=input_noise_std,
-            device=pixelated.device,
+            device=device,
             obj_type=pixelated.obj_type,
             rng=pixelated._rng_seed,
         )

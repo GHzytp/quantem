@@ -299,7 +299,9 @@ class PtychoLiteDIP(Ptychography):
         cls,
         ptycholite: PtychoLite,
         pretrain_iters: int | None = None,
-        pretrain_lr: float = 1e-3,
+        pretrain_object_lr: float | None = None,
+        pretrain_probe_lr: float = 1e-3,
+        pretrain_lr: float | None = None,
         pretrain_probe: bool = True,
         pretrain_object: bool = True,
         normalize_object_plotting: bool = True,
@@ -311,11 +313,15 @@ class PtychoLiteDIP(Ptychography):
         log_prefix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = False,
-        device: Literal["cpu", "gpu", "cuda"] = "cpu",
+        device: str | int | torch.device = "cpu",
         verbose: int | bool = True,
     ) -> Self:
-        if device == "gpu":
-            device = "cuda"
+        if pretrain_object_lr is None:
+            pretrain_object_lr = 1e-3 if pretrain_lr is None else pretrain_lr
+        elif pretrain_lr is not None and pretrain_lr != pretrain_object_lr:
+            raise ValueError("Got conflicting values for pretrain_lr and pretrain_object_lr.")
+
+        device, _ = config.validate_device(device)
         # Object model
         obj_dip = CNN2d(
             in_channels=ptycholite.obj_model.num_slices,
@@ -352,14 +358,14 @@ class PtychoLiteDIP(Ptychography):
                     num_iters=pretrain_iters,
                     optimizer_params={
                         "name": "adamw",
-                        "lr": pretrain_lr,
+                        "lr": pretrain_object_lr,
                     },
                     scheduler_params={
                         "name": "plateau",
                         "factor": 0.5,
                     },
                     apply_constraints=False,
-                    device=config.get("device"),
+                    device=device,
                     normalize_object_plotting=normalize_object_plotting,
                 )
             if pretrain_probe:
@@ -368,7 +374,7 @@ class PtychoLiteDIP(Ptychography):
                     num_iters=pretrain_iters,
                     optimizer_params={
                         "name": "adamw",
-                        "lr": 1e-3,
+                        "lr": pretrain_probe_lr,
                     },
                     scheduler_params={
                         "name": "plateau",
