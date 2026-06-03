@@ -52,6 +52,22 @@ class PtychographyOpt(PtychographyBase):
                 f"key to be optimized, {key}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
             )
 
+    @staticmethod
+    def _is_pplr_dict(v: dict) -> bool:
+        """Detect a nested per-parameter-group (PPLR) optimizer spec.
+
+        A PPLR dict maps parameter-group keys (e.g. ``"grids"``/``"sigma_net"`` for
+        ``ObjectTensorDecomp``) to per-group ``OptimizerParamsType`` or dict specs — as opposed
+        to a single-optimizer shorthand like ``{"name": "adam", "lr": 1e-3}``. Such dicts are
+        passed through to the owning model untouched so its ``_normalize_optimizer_params`` can
+        validate the keys against ``param_keys``.
+        """
+        return (
+            len(v) > 0
+            and not OptimizerMixin._is_single_optimizer_dict(v)
+            and all(isinstance(val, (OptimizerParamsType, dict)) for val in v.values())
+        )
+
     def _get_default_lr(self, key: str) -> float:
         """Get default learning rate for a given optimization key."""
         if key == "object":
@@ -92,6 +108,8 @@ class PtychographyOpt(PtychographyBase):
         for k, v in _d.items():
             if isinstance(v, OptimizerParamsType):
                 pass  # already a dataclass, pass through
+            elif isinstance(v, dict) and self._is_pplr_dict(v):
+                pass  # nested per-parameter-group (PPLR) spec -> pass through untouched
             elif isinstance(v, dict):
                 if not v:
                     v = replace(self.DEFAULT_OPTIMIZER_TYPE, lr=self._get_default_lr(k))
@@ -101,7 +119,9 @@ class PtychographyOpt(PtychographyBase):
                     if "lr" not in v:
                         v["lr"] = self._get_default_lr(k)
             else:
-                raise TypeError(f"Expected OptimizerParamsType or dict for key '{k}', got {type(v)}")
+                raise TypeError(
+                    f"Expected OptimizerParamsType or dict for key '{k}', got {type(v)}"
+                )
 
             self._models[k].optimizer_params = v  # type: ignore[assignment]
 

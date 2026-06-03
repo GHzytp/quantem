@@ -169,6 +169,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
     """
     K-Planes model adapted from Fridovich-Keil et al., https://arxiv.org/abs/2301.10241
     """
+
     def __init__(
         self,
         # Grid parameters
@@ -176,7 +177,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         input_coords_dims: int = 3,
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
-        multiscale_res_multipliers: Optional[Sequence[int]] = None,
+        multiscale_res_multipliers: Optional[Sequence[float]] = None,
         concat_features: bool = True,
         density_activation: Callable = lambda x: F.softplus(
             x - 1
@@ -208,7 +209,22 @@ class KPlanes(PPLR, TensorDecompositionModel):
             self.grids.append(plane)
             self.feature_dim += self.M_features
 
-        # Network head
+        # Network head (single linear when not hybrid; small ReLU MLP when hybrid)
+        self._build_sigma_net(use_hybrid_mlp, hybrid_hidden_dim, hybrid_num_layers)
+
+    def _build_sigma_net(
+        self,
+        use_hybrid_mlp: bool,
+        hybrid_hidden_dim: int,
+        hybrid_num_layers: int,
+    ) -> None:
+        """Build the decoder head mapping concatenated grid features -> density.
+
+        ``use_hybrid_mlp=True`` builds a small ReLU MLP; otherwise a single linear
+        "explicit" decoder. Both init the final layer small (``weight ~ N(0, 0.01**2)``,
+        ``bias=0``) so the density starts near zero. Called after ``self.feature_dim``
+        is finalized.
+        """
         if use_hybrid_mlp:
             hybrid_hidden_dim = int(hybrid_hidden_dim)
             hybrid_num_layers = int(hybrid_num_layers)
@@ -233,6 +249,11 @@ class KPlanes(PPLR, TensorDecompositionModel):
             nn.init.zeros_(out.bias)
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
+        else:
+            # Single-linear "explicit" decoder. Small init -> density ~ 0 initially.
+            self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
+            nn.init.normal_(self.sigma_net.weight, std=0.01)
+            nn.init.zeros_(self.sigma_net.bias)
 
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""

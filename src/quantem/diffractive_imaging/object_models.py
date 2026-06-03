@@ -17,8 +17,10 @@ from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.inr import HSiren
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.models.kplanes import CPTilted, KPlanes, KPlanesTILTED, KPlanesType
 from quantem.core.ml.optimizer_mixin import (
     OptimizerMixin,
+    OptimizerParams,
     OptimizerParamsType,
     SchedulerParamsType,
 )
@@ -2095,4 +2097,288 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         )
 
 
-ObjectModelType = ObjectPixelated | ObjectDIP | ObjectINR
+class ObjectTensorDecomp(ObjectINR):
+    """Implicit object model backed by a tensor-decomposition network (K-Planes family).
+
+    A thin subclass of :class:`ObjectINR` that swaps the SIREN for a tensor-decomposition model
+    from :mod:`quantem.core.ml.models.kplanes` — plain :class:`KPlanes`, the tilted
+    :class:`KPlanesTILTED` (T learned SO(3) rotations), or the :class:`CPTilted` bottleneck.
+    Because these consume the same ``(N, 3)`` ``(z, y, x)`` coordinates and return ``(N, 1)``,
+    every coordinate-query path of ``ObjectINR`` (``forward``, ``_query_phase``, materialization,
+    sampled-TV soft constraints, ``pretrain``) is reused unchanged; only the optimizer wiring
+    differs.
+
+    These models expose multiple parameter groups (``grids``/``sigma_net``, plus ``so3`` for the
+    tilted variants), so the model uses per-parameter-group learning rates (PPLR):
+    ``optimizer_params`` must be a dict keyed by ``model.param_keys`` (see
+    :meth:`get_optimization_parameters` / :meth:`_normalize_optimizer_params`), e.g.
+    ``{"grids": OptimizerParams.Adam(lr=1e-2), "sigma_net": OptimizerParams.Adam(lr=1e-3)}``.
+
+    The object grid is treated as a 3D ``(z, y, x)`` volume with ``z`` the slice axis: a single
+    slice is queried at ``z = 0`` (the in-plane K-plane already provides the 2D feature grid),
+    multislice spans ``z`` via the slice thicknesses. A model's ``resolution`` is the
+    *feature-plane* resolution, set by the user and decoupled from the padded object grid (which
+    comes from ``_initialize_obj``).
+
+    Notes
+    -----
+    - The ``density_activation`` must be a picklable ``nn.Module`` (``nn.Identity`` for
+      ``pure_phase``, ``nn.Softplus`` for ``potential``); a bare lambda will break ``save()``
+      because AutoSerialize pickles the whole module. ``from_uniform`` sets this automatically;
+      ``from_model`` warns otherwise.
+    - K-Planes converge from scratch, but ``from_pixelated`` + ``pretrain`` can still warm-start
+      the grid to a pixelated reconstruction (cheap, useful for finding hyperparameters quickly).
+    """
+
+    DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.INR = PtychoObjConstraintParams.INR()
+
+    @classmethod
+    def from_model(
+        cls,
+        model: KPlanesType,
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        obj_type: object_type = "pure_phase",
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectTensorDecomp":
+        """Wrap a user-built tensor-decomposition model as a ptychography object model.
+
+        ``model`` is a :class:`KPlanes`, :class:`KPlanesTILTED`, or :class:`CPTilted` mapping
+        ``(N, 3)`` ``(z, y, x)`` coordinates to ``(N, 1)`` and exposing the PPLR interface
+        (``param_keys`` / ``get_params``).
+        """
+        if not isinstance(model, (KPlanes, CPTilted)):  # KPlanesTILTED is a KPlanes subclass
+            raise TypeError(
+                f"model must be a KPlanes/KPlanesTILTED/CPTilted instance, got {type(model)}"
+            )
+        activation = getattr(model, "density_activation", None)
+        if activation is not None and not isinstance(activation, nn.Module):
+            warn(
+                "KPlanes.density_activation is a plain callable (e.g. a lambda); saving this "
+                "object will fail because AutoSerialize pickles the whole module. Use an "
+                "nn.Module activation (nn.Identity for pure_phase, nn.Softplus for potential), "
+                "e.g. via ObjectTensorDecomp.from_uniform.",
+                stacklevel=2,
+            )
+        obj = cls(
+            model=model,
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            obj_type=obj_type,
+            device=device,
+            rng=rng,
+            _token=cls._token,
+        )
+        obj.to(device)
+        return obj
+
+    @classmethod
+    def from_uniform(  # pyright: ignore[reportIncompatibleMethodOverride]  # KPlanes factory, intentionally diverges from ObjectINR.from_uniform
+        cls,
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        M_features: int = 16,
+        resolution: Sequence[int] = (64, 64, 64),
+        multiscale_res_multipliers: Sequence[float] | None = (0.25, 0.5, 1.0),
+        use_hybrid_mlp: bool = False,
+        hybrid_hidden_dim: int = 64,
+        hybrid_num_layers: int = 2,
+        tilted: bool = False,
+        T: int = 4,
+        obj_type: object_type = "pure_phase",
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectTensorDecomp":
+        """Build a default K-Planes-backed object, initialized to vacuum.
+
+        ``tilted=False`` builds a plain :class:`KPlanes`; ``tilted=True`` builds a
+        :class:`KPlanesTILTED` with ``T`` learned SO(3) rotations. The decoder's final layer is
+        zeroed so the object starts uniform (a global phase, diffraction-equivalent to vacuum),
+        matching ``ObjectINR.from_uniform``. ``density_activation`` is chosen from ``obj_type``:
+        ``nn.Identity`` for ``pure_phase`` (phase may be negative) and ``nn.Softplus`` for
+        ``potential`` (non-negative). ``resolution`` is the feature-plane resolution ``(z, y, x)``
+        and is independent of the reconstructed object grid; for multislice set ``resolution[0]``
+        to span the slices.
+        """
+        density_activation: nn.Module = nn.Softplus() if obj_type == "potential" else nn.Identity()
+        ms = list(multiscale_res_multipliers) if multiscale_res_multipliers is not None else None
+        model: KPlanesType
+        if tilted:
+            model = KPlanesTILTED(
+                M_features=M_features,
+                resolution=resolution,
+                multiscale_res_multipliers=ms,
+                density_activation=density_activation,
+                T=T,
+                use_hybrid_mlp=use_hybrid_mlp,
+                hybrid_hidden_dim=hybrid_hidden_dim,
+                hybrid_num_layers=hybrid_num_layers,
+            )
+        else:
+            model = KPlanes(
+                M_features=M_features,
+                resolution=resolution,
+                multiscale_res_multipliers=ms,
+                density_activation=density_activation,
+                use_hybrid_mlp=use_hybrid_mlp,
+                hybrid_hidden_dim=hybrid_hidden_dim,
+                hybrid_num_layers=hybrid_num_layers,
+            )
+        # Zero the final decoder layer so the object starts at vacuum (global phase).
+        with torch.no_grad():
+            final_linear = (
+                model.sigma_net[-1]
+                if isinstance(model.sigma_net, nn.Sequential)
+                else model.sigma_net
+            )
+            final_linear = cast(nn.Linear, final_linear)
+            final_linear.weight.zero_()
+            if final_linear.bias is not None:
+                final_linear.bias.zero_()
+        return cls.from_model(
+            model,
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            obj_type=obj_type,
+            device=device,
+            rng=rng,
+        )
+
+    @property
+    def name(self) -> str:
+        return "ObjectTensorDecomp"
+
+    @property
+    def model(self) -> KPlanesType:
+        return cast(KPlanesType, self._model)
+
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """PPLR: one param group per ``model.param_keys`` (hyperparameters baked by set_optimizer)."""
+        model = self.model
+        groups = model.get_params()
+        return {key: list(groups[key]) for key in model.param_keys}
+
+    def _normalize_optimizer_params(self, params):
+        """Require a dict keyed by ``model.param_keys`` (PPLR); reject single-optimizer specs.
+
+        The framework's "disabled" sentinel — a bare ``NoneOptimizer`` or a dict whose values
+        are all ``NoneOptimizer`` (e.g. the ``{"default": NoneOptimizer()}`` set at init / by
+        ``remove_optimizer`` and replayed through ``reset_optimizer`` on ``reconstruct(reset=True)``)
+        — is passed straight to the base normalizer so the optimizer can be cleanly disabled
+        without matching ``param_keys``.
+        """
+        if isinstance(params, OptimizerParams.NoneOptimizer) or (
+            isinstance(params, dict)
+            and len(params) > 0
+            and all(isinstance(v, OptimizerParams.NoneOptimizer) for v in params.values())
+        ):
+            return super()._normalize_optimizer_params(params)
+        if not isinstance(params, dict) or self._is_single_optimizer_dict(params):
+            raise TypeError(
+                f"{type(self).__name__} requires dict[str, OptimizerParamsType] keyed by "
+                f"param_keys {self.model.param_keys}; got {type(params)}"
+            )
+        expected = set(self.model.param_keys)
+        got = set(params.keys())
+        if got != expected:
+            raise ValueError(
+                f"optimizer_params keys must match model.param_keys: got {got}, expected {expected}"
+            )
+        return super()._normalize_optimizer_params(params)
+
+    @classmethod
+    def from_pixelated(  # pyright: ignore[reportIncompatibleMethodOverride]  # K-Planes factory, intentionally diverges from ObjectINR.from_pixelated
+        cls,
+        pixelated: "ObjectModelType",
+        model: KPlanesType | None = None,
+        M_features: int = 16,
+        resolution: Sequence[int] = (128, 128, 128),
+        multiscale_res_multipliers: Sequence[float] | None = (0.25, 0.5, 1.0),
+        use_hybrid_mlp: bool = False,
+        tilted: bool = False,
+        T: int = 4,
+        device: str | None = None,
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectTensorDecomp":
+        """Build a K-Planes object matching a pixelated object, with it as the pretrain target.
+
+        Mirrors :meth:`ObjectINR.from_pixelated`: the K-Planes model is built to the pixelated
+        object's geometry (``num_slices``, ``slice_thicknesses``, ``obj_type``, padded shape) and
+        the current pixelated object is stored as the pretrain target, so ``pretrain()``
+        warm-starts the grid to reproduce the pixelated reconstruction. Pass ``model`` to wrap a
+        custom tensor-decomposition ``nn.Module`` directly; otherwise one is built from the
+        ``M_features`` / ``resolution`` / ``tilted`` / ``T`` args.
+        """
+        if not (
+            isinstance(pixelated, ObjectPixelated) or "ObjectPixelated" in str(type(pixelated))
+        ):
+            raise ValueError(f"pixelated must be an ObjectPixelated, got {type(pixelated)}")
+        dev = pixelated.device if device is None else device
+        seed = pixelated._rng_seed if rng is None else rng
+        if model is not None:
+            obj = cls.from_model(
+                model=model,
+                num_slices=pixelated.num_slices,
+                slice_thicknesses=pixelated.slice_thicknesses,
+                obj_type=pixelated.obj_type,
+                device=dev,
+                rng=seed,
+            )
+        else:
+            obj = cls.from_uniform(
+                num_slices=pixelated.num_slices,
+                slice_thicknesses=pixelated.slice_thicknesses,
+                M_features=M_features,
+                resolution=resolution,
+                multiscale_res_multipliers=multiscale_res_multipliers,
+                use_hybrid_mlp=use_hybrid_mlp,
+                tilted=tilted,
+                T=T,
+                obj_type=pixelated.obj_type,
+                device=dev,
+                rng=seed,
+            )
+        target = pixelated.obj.detach().to(dev)  # (num_slices, H, W) real phase / potential
+        obj._obj_shape = tuple(int(x) for x in target.shape)  # type: ignore[assignment]
+        if pixelated._sampling is not None:
+            obj.sampling = pixelated.sampling
+        obj.pretrain_target = target
+        return obj
+
+    def pretrain(
+        self,
+        pretrain_target: torch.Tensor | np.ndarray | None = None,
+        num_iters: int = 200,
+        optimizer_params: "dict | OptimizerParamsType | None" = None,
+        scheduler_params: "dict | SchedulerParamsType | None" = None,
+        loss_fn: Callable | str = "l2",
+        device: str | int | None = None,
+        show: bool = True,
+        normalize_object_plotting: bool = True,
+    ) -> None:
+        """Warm-start the K-Planes grid by regressing it onto a target object (PPLR).
+
+        Same direct grid->target regression as ``ObjectINR.pretrain`` (no forward model), but
+        ``optimizer_params`` is PPLR-keyed. When ``None`` it defaults to per-group Adam
+        (``grids`` lr 1e-2, others 1e-3) so pretraining works out of the box; the fitted weights
+        become the ``reset()`` state.
+        """
+        if optimizer_params is None:
+            optimizer_params = {
+                key: OptimizerParams.Adam(lr=1e-2 if key == "grids" else 1e-3)
+                for key in self.model.param_keys
+            }
+        super().pretrain(
+            pretrain_target=pretrain_target,
+            num_iters=num_iters,
+            optimizer_params=optimizer_params,
+            scheduler_params=scheduler_params,
+            loss_fn=loss_fn,
+            device=device,
+            show=show,
+            normalize_object_plotting=normalize_object_plotting,
+        )
+
+
+ObjectModelType = ObjectPixelated | ObjectDIP | ObjectINR | ObjectTensorDecomp
