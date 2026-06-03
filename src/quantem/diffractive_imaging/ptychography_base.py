@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.constraints import Constraints
 from quantem.core.ml.dist_utils import all_reduce_params, worker_init_fn
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
@@ -325,8 +326,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
+        """Object array in its native representation per ``obj_type``:
+
+        - ``"complex"`` → complex ndarray (amp * exp(1j*phase)); phase recentered.
+        - ``"pure_phase"`` → real ndarray of phase values.
+        - ``"potential"`` → real ndarray of potential values.
+        """
         obj = self._to_numpy(self.obj_model.obj)
-        if self.obj_type in ["pure_phase", "complex"]:
+        if self.obj_type == "complex":
             ph = np.angle(obj)
             obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
         return obj
@@ -496,11 +503,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if cropped:
             snp2 = snp.copy()
             cropped_obj = self._crop_rotate_obj_fov(snp2["obj"])
-            # same logic as self.obj_cropped
-            if self.obj_type == "pure_phase":
-                ph = np.angle(cropped_obj)
-                cropped_obj = np.exp(1j * (ph - ph.mean()))
-            if self.obj_type in ["pure_phase", "complex"]:
+            # same logic as self.obj_cropped: only re-center for complex (which
+            # carries phase inside a complex tensor); pure_phase and potential
+            # are already real and recentered upstream.
+            if self.obj_type == "complex":
                 ph = np.angle(cropped_obj)
                 cropped_obj = np.abs(cropped_obj) * np.exp(1j * (ph - ph.mean()))
             snp2["obj"] = cropped_obj
@@ -562,7 +568,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @constraints.setter
     def constraints(self, c: dict[str, Any]):
-        """Set constraints by forwarding to individual models."""
+        """Set constraints by forwarding to individual models.
+
+        Each leaf value may be either a plain ``dict`` (validated per-key against
+        the model's constraint dataclass) or a ``Constraints`` dataclass instance
+        (assigned wholesale to the model).
+        """
         constraint_handlers = {
             "object": self.obj_model,
             "probe": self.probe_model,
@@ -570,9 +581,16 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         }
 
         for key, value in c.items():
-            if key in constraint_handlers and isinstance(value, dict):
-                for subkey, subvalue in value.items():
-                    constraint_handlers[key].add_constraint(subkey, subvalue)
+            if key in constraint_handlers:
+                if isinstance(value, Constraints):
+                    constraint_handlers[key].constraints = value
+                elif isinstance(value, dict):
+                    constraint_handlers[key].constraints = value
+                else:
+                    raise TypeError(
+                        f"Constraints for '{key}' must be a dict or Constraints dataclass, "
+                        f"got {type(value).__name__}"
+                    )
             elif key == "detector" and isinstance(value, dict):
                 warn("Detector constraints not implemented, skipping")
             else:
@@ -648,8 +666,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj_cropped(self) -> np.ndarray:
+        """Cropped + FOV-rotated object, in its native representation.
+
+        - ``obj_type="complex"`` → complex array (amp * exp(1j*phase)); phase is
+          recentered to zero mean here as a defensive duplicate of
+          ``ObjectConstraints._apply_hard_complex``.
+        - ``obj_type="pure_phase"`` → real array of phase values (already
+          recentered upstream by ``_apply_hard_pure_phase``).
+        - ``obj_type="potential"`` → real array of potential values.
+        """
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
-        if self.obj_type in ["pure_phase", "complex"]:
+        if self.obj_type == "complex":
             ph = np.angle(cropped)
             cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
         return cropped
@@ -1004,9 +1031,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 seed=int(self.rng.integers(0, 2**31 - 1)),
                 drop_last=False,
             )
-            train_loader = DataLoader(
-                train_subset, sampler=train_sampler, **loader_kwargs
-            )
+            train_loader = DataLoader(train_subset, sampler=train_sampler, **loader_kwargs)
             if val_subset is not None:
                 val_sampler = DistributedSampler(
                     val_subset,
@@ -1015,9 +1040,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                     shuffle=False,
                     drop_last=False,
                 )
-                val_loader = DataLoader(
-                    val_subset, sampler=val_sampler, **loader_kwargs
-                )
+                val_loader = DataLoader(val_subset, sampler=val_sampler, **loader_kwargs)
             else:
                 val_loader = None
         else:

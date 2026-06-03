@@ -178,7 +178,7 @@ class PtychoLite(Ptychography):
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
-        constraints: dict[str, Any] = {},  # TODO add constraints flags
+        constraints: dict[str, Any] | None = None,
         store_iterations_every: int | None = None,
         device: "Literal['cpu', 'gpu'] | int | list[int] | None" = None,
         verbose: int | bool = True,
@@ -419,7 +419,7 @@ class PtychoLiteDIP(Ptychography):
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
-        constraints: dict[str, Any] = {},  # TODO add constraints flags
+        constraints: dict[str, Any] | None = None,
         store_iterations_every: int | None = None,
         device: Literal["cpu", "gpu"] | int | list[int] | None = None,
         verbose: int | bool = True,

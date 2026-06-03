@@ -44,7 +44,16 @@ def _ddp_ptycho_worker(
     shared-memory tensor mechanism and fails in some Linux environments).
     """
     device_id = devices[rank]
-    init_process_group(rank, world_size, backend="nccl" if torch.cuda.is_available() else "gloo")
+    # Bind the CUDA device BEFORE init_process_group so NCCL allocates its
+    # communicator buffers on the correct GPU. Without this, NCCL grabs cuda:0
+    # at init time, stranding small per-rank buffers on GPUs the user didn't
+    # ask for.
+    init_process_group(
+        rank,
+        world_size,
+        backend="nccl" if torch.cuda.is_available() else "gloo",
+        local_device=device_id if torch.cuda.is_available() else None,
+    )
 
     # mmap=True so all workers share one memory-mapped RAM copy of the (potentially large,
     # CPU-resident) state instead of each duplicating it.
@@ -202,7 +211,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         reset: bool = False,
         optimizer_params: dict[str, Any] | None = None,
         scheduler_params: dict[str, Any] | None = None,
-        constraints: dict[str, Any] = {},
+        constraints: dict[str, Any] | None = None,
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
@@ -220,6 +229,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
           - ``"cpu"`` / ``"gpu"`` — existing string form
           - ``int``              — specific GPU index, e.g. ``device=2`` → cuda:2
           - ``list[int]``        — multi-GPU, e.g. ``device=[0,1,2,3]``
+
+        ``constraints`` is a dict keyed by ``"object"``, ``"probe"``, ``"dataset"``
+        (any subset). Each leaf may be:
+
+        - a ``Constraints`` dataclass instance (e.g. ``PtychoObjConstraintParams.Raster(...)``),
+          which replaces that model's constraint state wholesale, or
+        - a plain ``dict`` of field-name -> value, which does a per-key partial update
+          on the existing constraint state.
 
         Multi-GPU (``device`` is a list) launches worker processes via ``mp.spawn`` when called
         from a notebook, or uses the existing distributed process group when launched with
@@ -255,12 +272,16 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if is_distributed_launch():
             rank = int(os.environ["RANK"])
             world_size = int(os.environ["WORLD_SIZE"])
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
             if not torch.distributed.is_initialized():
+                # Bind the device BEFORE init_process_group so NCCL allocates
+                # its communicator buffers on the correct GPU.
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(local_rank)
                 torch.distributed.init_process_group(
                     backend="nccl" if torch.cuda.is_available() else "gloo",
                     init_method="env://",
                 )
-            local_rank = int(os.environ.get("LOCAL_RANK", rank))
             dev = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
             self.to(dev)
             self._broadcast_parameters(src=0)
@@ -291,7 +312,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         reset: bool = False,
         optimizer_params: dict[str, Any] | None = None,
         scheduler_params: dict[str, Any] | None = None,
-        constraints: dict[str, Any] = {},
+        constraints: dict[str, Any] | None = None,
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
@@ -314,7 +335,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         if reset:
             self.reset_recon()
-        self.constraints = constraints
+        if constraints:
+            self.constraints = constraints
 
         new_scheduler = reset
         if optimizer_params is not None:

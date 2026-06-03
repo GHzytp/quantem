@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
-from typing import Any, Callable, Self, Union
+from dataclasses import dataclass
+from typing import Any, Callable, Self, Union, cast
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -14,6 +15,7 @@ from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
+from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import (
     OptimizerMixin,
@@ -36,13 +38,93 @@ from quantem.diffractive_imaging.complex_probe import (
     POLAR_SYMBOLS,
     real_space_probe,
 )
-from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import (
     fourier_shift_expand,
     shift_array,
 )
 
 DeviceType = Union[str, torch.device, int]
+
+
+class PtychoProbeConstraintParams:
+    """
+    Namespace class for ptychography probe constraint dataclasses.
+
+    Tab-complete on ``PtychoProbeConstraintParams`` in a notebook to discover the
+    available variants. Tab-complete inside a variant's constructor to see every
+    constraint field with its default value.
+
+    Variants
+    --------
+    Raster
+        Constraints for grid-based probe representations (``ProbePixelated`` and
+        ``ProbeDIP`` share this set today).
+    Parametric
+        Placeholder for parametric probe models, where Gram-Schmidt orthogonalization
+        and pixel-domain TV are moot.
+    """
+
+    @dataclass
+    class Raster(Constraints):
+        """Constraints for grid-based ptychography probe models (``ProbePixelated``,
+        ``ProbeDIP``).
+
+        Attributes
+        ----------
+        orthogonalize_probe : bool, default ``True``
+            Mixed-state probe (``num_probes > 1``) only. After each update applies
+            Gram-Schmidt orthogonalization across the probe stack and then sorts
+            the resulting probes by total intensity (descending). For
+            ``num_probes == 1`` this is effectively a renormalization no-op.
+        center_probe : bool, default ``False``
+            Shifts the probe's intensity center-of-mass back to the array center
+            via a Fourier shift after each update. Useful when probe drift
+            competes with scan-position refinement; if both move freely the
+            reconstruction can wander while still fitting the diffraction data.
+        tv_weight : float, default ``0.0``
+            Soft penalty. Weight on the in-plane total-variation of the (complex)
+            probe; encourages smooth probe magnitude / phase.
+        """
+
+        # hard constraints
+        orthogonalize_probe: bool = True
+        center_probe: bool = False
+        # soft constraints
+        tv_weight: float = 0.0
+        _name: str = "raster"
+
+        soft_constraint_keys = ["tv_weight"]
+        hard_constraint_keys = ["orthogonalize_probe", "center_probe"]
+
+    @dataclass
+    class Parametric(Constraints):
+        """Placeholder for parametric probe constraints (``ProbeParametric``).
+
+        Parametric probes are pure functions of aberration / aperture coefficients,
+        so pixel-domain projections like ``orthogonalize_probe`` and ``tv_weight``
+        don't apply. Parametric-specific fields (e.g. bounds on individual
+        aberration coefficients) will land here when needed.
+        """
+
+        _name: str = "parametric"
+
+        soft_constraint_keys = []
+        hard_constraint_keys = []
+
+    @classmethod
+    def parse_dict(cls, d: dict) -> "PtychoProbeConstraintsType":
+        """Instantiate the appropriate variant from a config dict.
+
+        The dict must contain a ``'name'`` or ``'type'`` key (case-insensitive),
+        with value ``'raster'`` or ``'parametric'``. All other keys are forwarded
+        as keyword arguments to the chosen dataclass.
+        """
+        return cast(PtychoProbeConstraintsType, parse_constraint_dict(cls, d, kind="probe"))
+
+
+PtychoProbeConstraintsType = (
+    PtychoProbeConstraintParams.Raster | PtychoProbeConstraintParams.Parametric
+)
 
 
 class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
@@ -427,13 +509,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return propagators
 
 
-class ProbeConstraints(BaseConstraints, ProbeBase):
-    DEFAULT_CONSTRAINTS = {
-        # "fix_probe": False,
-        "orthogonalize_probe": True,
-        "center_probe": False,
-        "tv_weight": 0.0,
-    }
+class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], ProbeBase):
+    DEFAULT_CONSTRAINTS: PtychoProbeConstraintParams.Raster = PtychoProbeConstraintParams.Raster()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -441,8 +518,8 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
     def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
-        if self.constraints["tv_weight"]:
-            loss_tv = self._probe_tv_constraint(probe, self.constraints["tv_weight"])
+        if self.constraints.tv_weight:
+            loss_tv = self._probe_tv_constraint(probe, self.constraints.tv_weight)
             self.add_soft_constraint_loss("tv_loss", loss_tv)
             loss = loss + loss_tv
 
@@ -450,11 +527,9 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         return loss
 
     def apply_hard_constraints(self, probe: torch.Tensor) -> torch.Tensor:
-        # if self.constraints["fix_probe"]:
-        #     return self.initial_probe
-        if self.constraints["orthogonalize_probe"]:
+        if self.constraints.orthogonalize_probe:
             probe = self._probe_orthogonalization_constraint(probe)
-        if self.constraints["center_probe"]:
+        if self.constraints.center_probe:
             probe = self._probe_center_of_mass_constraint(probe)
         return probe
 
