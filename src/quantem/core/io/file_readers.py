@@ -206,11 +206,12 @@ def read_3d_spectroscopy(
             )
 
     imported_axes = imported_data["axes"]
-    axis_order = (0, 1, 2) if file_type == "digitalmicrograph" else (2, 0, 1)
+    # axis_order = (0, 1, 2) if file_type == "digitalmicrograph" else (2, 0, 1)
+    axis_order = (1, 2, 0) if file_type == "digitalmicrograph" else (0, 1, 2)
     array = (
-        imported_data["data"]
+        imported_data["data"].transpose(axis_order)
         if file_type == "digitalmicrograph"
-        else imported_data["data"].transpose(axis_order)
+        else imported_data["data"]
     )
     ordered_axes = [imported_axes[idx] for idx in axis_order]
     sampling = [ax.get("scale", 1) for ax in ordered_axes]

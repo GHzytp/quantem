@@ -130,7 +130,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             )[0]
             energy_axis = energy_axis[indices]
         else:
-            indices = np.arange(self.shape[0])
+            indices = np.arange(self.shape[2])
 
         # Check that input window size is between 10% and 30%
 
@@ -153,7 +153,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         window_minE = (target_edge - 5) - target_edge * (window_size / 100)
         window_maxE = target_edge - 5
 
-        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
+        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[2]
 
         window_E = energy_axis[window_indices]
         window_I = spectrum[window_indices]
@@ -194,9 +194,9 @@ class Dataset3deels(Dataset3dspectroscopy):
             )[0]
             energy_axis = energy_axis[indices]
         else:
-            indices = np.arange(self.shape[0])
+            indices = np.arange(self.shape[2])
 
-        array3d_subrange = self.array[indices, :, :]
+        array3d_subrange = self.array[:, :, indices]
 
         kernel = np.ones(kernel_size) / kernel_size
 
@@ -204,11 +204,11 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         array3d_smoothed = np.zeros(array3d_subrange.shape)
 
-        for kk in range(array3d_subrange.shape[1]):
-            for ll in range(array3d_subrange.shape[2]):
-                probe_spectrum = self.array[:, kk, ll]
+        for kk in range(array3d_subrange.shape[0]):
+            for ll in range(array3d_subrange.shape[1]):
+                probe_spectrum = self.array[kk, ll, :]
                 spectrum_smoothed = np.convolve(probe_spectrum, kernel, mode="same")
-                array3d_smoothed[:, kk, ll] = spectrum_smoothed
+                array3d_smoothed[kk, ll, :] = spectrum_smoothed
 
         smoothed_data3d = Dataset3deels.from_array(
             array=array3d_smoothed,
@@ -257,20 +257,20 @@ class Dataset3deels(Dataset3dspectroscopy):
             x, y = M
             return (a * x) + (b * y) + c
 
-        _n_energy, n_y, n_x = self.array.shape
+        n_x, n_y, _n_energy = self.array.shape
         energy_axis = self.energy_axis
 
         # For each pixel, measure the zlp position by fitting a Gaussian to the measured zero-loss signal and taking its center as the zlp position.
 
-        zlp_measured = np.zeros((n_y, n_x))
+        zlp_measured = np.zeros((n_x, n_y))
 
         for iy in range(n_y):
             for ix in range(n_x):
                 # Apply median filter to discount hot pixels that might spuriously produce the maximum intensity of the spectrum
                 if median_filter_pixels > 0:
-                    spec_filt = median_filter(self.array[:, iy, ix], median_filter_pixels)
+                    spec_filt = median_filter(self.array[ix, iy, :], median_filter_pixels)
                 else:
-                    spec_filt = self.array[:, iy, ix]
+                    spec_filt = self.array[ix, iy, :]
 
                 if fit_zlp:
                     # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
@@ -309,10 +309,10 @@ class Dataset3deels(Dataset3dspectroscopy):
 
                     popt, _ = curve_fit(_gaussian_fit, xw, yw, p0=p0, bounds=bounds)
 
-                    zlp_measured[iy, ix] = float(popt[1])
+                    zlp_measured[ix, iy] = float(popt[1])
                 else:
                     zlp_crude_idx = int(np.argmax(spec_filt))
-                    zlp_measured[iy, ix] = float(energy_axis[zlp_crude_idx])
+                    zlp_measured[ix, iy] = float(energy_axis[zlp_crude_idx])
 
         if fit_to_plane:
             # Fit a 2D plane to the array of measured ZLPs
@@ -324,7 +324,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             popt, _ = curve_fit(_plane_fit_2d, xdata_unpacked, ydata_unpacked)
 
             zlp_plane_1d = _plane_fit_2d(xdata_unpacked, popt[0], popt[1], popt[2])
-            zlp_plane_2d = zlp_plane_1d.reshape(n_y, n_x)
+            zlp_plane_2d = zlp_plane_1d.reshape(n_x, n_y)
 
             show_2d(
                 [zlp_measured, zlp_plane_2d],
@@ -362,12 +362,12 @@ class Dataset3deels(Dataset3dspectroscopy):
             )
         elif zlp_shifts_array is not None:
             zlp_array = np.asarray(zlp_shifts_array, dtype=float)
-            if zlp_array.shape != self.array.shape[1:3]:
+            if zlp_array.shape != self.array.shape[0:2]:
                 raise ValueError(
                     "Dimensions of input array for ZLP shifts do not match X and Y dimensions of 3D spectroscopy dataset."
                 )
         elif zlp_guess_x is not None:
-            zlp_array = np.ones(self.array.shape[1:3], dtype=float) * zlp_guess_x
+            zlp_array = np.ones(self.array.shape[0:2], dtype=float) * zlp_guess_x
         else:
             raise ValueError(
                 "measure_offset was set to False and no input argument for ZLP shifts was provided."
@@ -380,7 +380,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         # Initialize 3D array to populate with spectra aligned along the energy axis
         corrected_array = np.empty(self.array.shape, dtype=np.result_type(self.array.dtype, float))
 
-        n_energy, n_y, n_x = self.array.shape
+        n_x, n_y, n_energy = self.array.shape
 
         energy_axis = self.energy_axis
         if np.all((zlp_array >= 0) & (zlp_array <= n_energy - 1)) and (
@@ -391,9 +391,9 @@ class Dataset3deels(Dataset3dspectroscopy):
         # Apply sub-channel ZLP shifts using 1D linear interpolation along the energy axis.
         for iy in range(n_y):
             for ix in range(n_x):
-                spec = self.array[:, iy, ix]
-                corrected_array[:, iy, ix] = np.interp(
-                    energy_axis + zlp_array[iy, ix],
+                spec = self.array[ix, iy, :]
+                corrected_array[ix, iy, :] = np.interp(
+                    energy_axis + zlp_array[ix, iy],
                     energy_axis,
                     spec,
                     left=np.nan,
@@ -401,11 +401,11 @@ class Dataset3deels(Dataset3dspectroscopy):
                 )
 
         # Remove all planes along energy axis containing NaN, to equalize spectra lengths across all scan positions
-        mask = np.isnan(corrected_array).any(axis=(1, 2))
-        aligned_data_3d = corrected_array[~mask]
+        mask = np.isnan(corrected_array).any(axis=(0, 1))
+        aligned_data_3d = corrected_array[:, :, ~mask]
         new_Eaxis = energy_axis[~mask]
 
-        if aligned_data_3d.shape[0] == 0:
+        if aligned_data_3d.shape[2] == 0:
             raise ValueError(
                 "ZLP shifts leave no shared energy range after alignment. "
                 "Check that zlp_shifts_array is in energy units, not channel indices."
@@ -414,8 +414,8 @@ class Dataset3deels(Dataset3dspectroscopy):
         new_origin = float(new_Eaxis[0])
 
         # Calculate mean spectra before and after correction for plotting
-        mean_spectrum_raw = self.array.mean(axis=(1, 2))
-        mean_spectrum_corrected = aligned_data_3d.mean(axis=(1, 2))
+        mean_spectrum_raw = self.array.mean(axis=(0, 1))
+        mean_spectrum_corrected = aligned_data_3d.mean(axis=(0, 1))
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
         ax1.plot(energy_axis, mean_spectrum_raw, label="Raw mean spectrum", color="r")
@@ -604,13 +604,13 @@ class Dataset3deels(Dataset3dspectroscopy):
         """
         # 1. Extract Energy and Mean Spectrum
         data = dataset.array
-        mean_spec = np.mean(data, axis=(1, 2))
+        mean_spec = np.mean(data, axis=(0, 1))
 
         # Use built-in energy axis if available, else generate from metadata
         if hasattr(dataset, "energy_axis"):
             energy = dataset.energy_axis
         else:
-            energy = dataset.origin[0] + np.arange(dataset.shape[0]) * dataset.sampling[0]
+            energy = dataset.origin[2] + np.arange(dataset.shape[2]) * dataset.sampling[2]
 
         # 2. Find indices for the windows
         zlp_idx = (
@@ -812,16 +812,16 @@ class Dataset3deels(Dataset3dspectroscopy):
         Dual-EELS Picker with starting coordinates.
         """
         # 1. Setup Data
-        sum_ll = np.sum(ll.array, axis=0)
-        sum_hl = np.sum(hl.array, axis=0)
-        energy_ll = ll.origin[0] + np.arange(ll.shape[0]) * ll.sampling[0]
-        energy_hl = hl.origin[0] + np.arange(hl.shape[0]) * hl.sampling[0]
+        sum_ll = np.sum(ll.array, axis=2)
+        sum_hl = np.sum(hl.array, axis=2)
+        energy_ll = ll.origin[2] + np.arange(ll.shape[2]) * ll.sampling[2]
+        energy_hl = hl.origin[2] + np.arange(hl.shape[2]) * hl.sampling[2]
 
         # 2. Handle Initial Coordinates
         if coords is not None:
             cx, cy = coords
         else:
-            cx, cy = ll.shape[2] // 2, ll.shape[1] // 2
+            cx, cy = ll.shape[0] // 2, ll.shape[1] // 2
 
         # 3. Create Figure
         fig, axes = plt.subplots(2, 2, figsize=(14, 9))
@@ -837,15 +837,15 @@ class Dataset3deels(Dataset3dspectroscopy):
         (marker_hl,) = ax_map_hl.plot(cx, cy, "r+", ms=15, mew=2)
 
         # Plot Initial Spectra
-        (line_ll,) = ax_spec_ll.plot(energy_ll, ll.array[:, cy, cx], color="tab:blue")
-        (line_hl,) = ax_spec_hl.plot(energy_hl, hl.array[:, cy, cx], color="tab:red")
+        (line_ll,) = ax_spec_ll.plot(energy_ll, ll.array[cx, cy, :], color="tab:blue")
+        (line_hl,) = ax_spec_hl.plot(energy_hl, hl.array[cx, cy, :], color="tab:red")
 
         def update_plots(x, y):
             marker_ll.set_data([x], [y])
             marker_hl.set_data([x], [y])
 
-            new_ll = ll.array[:, y, x]
-            new_hl = hl.array[:, y, x]
+            new_ll = ll.array[x, y, :]
+            new_hl = hl.array[x, y, :]
             line_ll.set_ydata(new_ll)
             line_hl.set_ydata(new_hl)
 
@@ -860,7 +860,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         def on_click(event):
             if event.inaxes in [ax_map_ll, ax_map_hl]:
                 ix, iy = int(round(event.xdata)), int(round(event.ydata))
-                if 0 <= ix < ll.shape[2] and 0 <= iy < ll.shape[1]:
+                if 0 <= ix < ll.shape[0] and 0 <= iy < ll.shape[1]:
                     update_plots(ix, iy)
 
         fig.canvas.mpl_connect("button_press_event", on_click)
@@ -903,11 +903,11 @@ class Dataset3deels(Dataset3dspectroscopy):
             The figure object for further manipulation or saving.
         """
         data = dataset.array
-        energy = dataset.origin[0] + np.arange(data.shape[0]) * dataset.sampling[0]
+        energy = dataset.origin[2] + np.arange(data.shape[2]) * dataset.sampling[2]
 
-        mean_spec = np.mean(data, axis=(1, 2))
+        mean_spec = np.mean(data, axis=(0, 1))
         zlp_pos = energy[np.argmax(mean_spec)]
-        sum_img = np.sum(data, axis=0)
+        sum_img = np.sum(data, axis=2)
 
         fig = plt.figure(figsize=(14, 9))
         gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.2)
@@ -953,12 +953,12 @@ class Dataset3deels(Dataset3dspectroscopy):
         Uses scipy.stats for Gaussian fitting.
         """
         data = dataset.array
-        energy = dataset.origin[0] + np.arange(data.shape[0]) * dataset.sampling[0]
+        energy = dataset.origin[2] + np.arange(data.shape[2]) * dataset.sampling[2]
 
         # 1. Mask and find peak per pixel
         search_mask = (energy > -2.0) & (energy < 2.0)
         search_energies = energy[search_mask]
-        peak_indices = np.argmax(data[search_mask, :, :], axis=0)
+        peak_indices = np.argmax(data[:, :, search_mask], axis=2)
         zlp_map = search_energies[peak_indices]
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))

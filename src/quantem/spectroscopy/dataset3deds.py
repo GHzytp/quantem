@@ -496,9 +496,14 @@ class Dataset3deds(Dataset3dspectroscopy):
         mask = (self.energy_axis[:, None] > energies[None, :] - width) & (
             self.energy_axis[:, None] < energies[None, :] + width
         )
-        n, h, w = self.array.shape
+        # n, h, w = self.array.shape
+        # maps = (mask.astype(self.array.dtype).T @ self.array.reshape(n, -1)).reshape(
+        #    mask.shape[1], h, w
+        # )
+
+        w, h, n = self.array.shape
         maps = (mask.astype(self.array.dtype).T @ self.array.reshape(n, -1)).reshape(
-            mask.shape[1], h, w
+            w, h, mask.shape[1]
         )
 
         self._spectrum_images = {
@@ -1005,7 +1010,8 @@ class Dataset3deds(Dataset3dspectroscopy):
             energy_range=energy_range,
             mask=mask,
         )
-        E = float(self.origin[0]) + float(self.sampling[0]) * np.arange(self.shape[0])
+
+        E = float(self.origin[2]) + float(self.sampling[2]) * np.arange(self.shape[2])
 
         # Keep the energy axis aligned with calculate_mean_spectrum filtering.
         if mask is not None:
