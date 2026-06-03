@@ -327,7 +327,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             ndim=3,
             expand_dims=True,
         )
-        self._mask = mask.to(self.device).expand(self.num_slices, -1, -1)
+        self._mask = mask.to(self.device).expand(self.num_slices, -1, -1).contiguous()
 
     @property
     @abstractmethod
