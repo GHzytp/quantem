@@ -1045,7 +1045,7 @@ class ObjectDIP(ObjectConstraints):
             num_slices=pixelated.num_slices,
             slice_thicknesses=pixelated.slice_thicknesses,
             input_noise_std=input_noise_std,
-            device=pixelated.device,
+            device=device,
             obj_type=pixelated.obj_type,
             rng=pixelated._rng_seed,
         )
