@@ -3,7 +3,7 @@ Tensor Decomposition Methods for INR-based reconstructions
 """
 
 import itertools
-from typing import Callable, Optional, Sequence
+from typing import Callable, Literal, Sequence, cast
 
 # import tinycudann as tcnn
 import torch
@@ -177,7 +177,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         input_coords_dims: int = 3,
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
-        multiscale_res_multipliers: Optional[Sequence[float]] = None,
+        multiscale_res_multipliers: Sequence[float] | None = None,
         concat_features: bool = True,
         density_activation: Callable = lambda x: F.softplus(
             x - 1
@@ -191,7 +191,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         Assume coords are [-1, 1] in each dimension.
         """
         super().__init__()
-        self._td_type = "kplanes"
+        self.td_type = "kplanes"
         self.grid_dimensions = grid_dimensions
         self.input_coords_dims = input_coords_dims
         self.M_features = M_features
@@ -280,24 +280,8 @@ class KPlanes(PPLR, TensorDecompositionModel):
         return ["grids", "sigma_net"]
 
     @property
-    def td_type(self) -> str:
-        return self._td_type
-
-    @td_type.setter
-    def td_type(self, td_type: str):
-        if not isinstance(td_type, str):
-            raise TypeError("td_type must be a string")
-        self._td_type = td_type
-
-    @property
     def tilted(self) -> bool:
         return False
-
-    @tilted.setter
-    def tilted(self, tilted: bool):
-        if not isinstance(tilted, bool):
-            raise TypeError("tilted must be a boolean")
-        self._tilted = tilted
 
     @property
     def grids(self) -> torch.nn.ParameterList:
@@ -416,18 +400,18 @@ class KPlanesTILTED(KPlanes):
         input_coords_dims: int = 3,
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
-        multiscale_res_multipliers: Optional[Sequence[float]] = None,
+        multiscale_res_multipliers: Sequence[float] | None = None,
         density_activation: Callable = lambda x: F.softplus(x - 1),
         # TILTED parameters
         T: int = 4,
-        tau_init: str = "random",
+        tau_init: Literal["random", "identity"] = "random",
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
         hybrid_num_layers: int = 2,
         so3_param_type: str = "r9svd",
     ):
-        self._td_type = "tilted"
+        self.td_type = "tilted"
         if input_coords_dims != 3:
             raise NotImplementedError("KPlanesTILTED is implemented for 3D only.")
         if T < 1:
@@ -552,7 +536,7 @@ class KPlanesTILTED(KPlanes):
         -------
         torch.Tensor of shape (T, 3, 3)
         """
-        return self.so3.M.detach().cpu().clone()
+        return cast(torch.Tensor, self.so3.M).detach().cpu().clone()
 
     def load_tau_state(self, M: torch.Tensor) -> None:
         """
@@ -572,7 +556,8 @@ class KPlanesTILTED(KPlanes):
                 f"Make sure T matches between phase 1 and phase 2."
             )
         with torch.no_grad():
-            self.so3.M.copy_(M.to(self.so3.M.device))
+            so3_M = cast(torch.Tensor, self.so3.M)
+            so3_M.copy_(M.to(so3_M.device))
 
     # ------------------------------------------------------------------
     # Pretty print
@@ -586,7 +571,9 @@ class KPlanesTILTED(KPlanes):
             f"num_scales={len(self.multiscale_res_multipliers)}"
         )
 
-    def set_so3_param_type(self, so3_param_type: str, init: str = "rand") -> None:
+    def set_so3_param_type(
+        self, so3_param_type: str, init: Literal["random", "identity"] = "random"
+    ) -> None:
         """
         Set the SO3 parameterization type.
 
@@ -681,14 +668,14 @@ class CPTilted(PPLR, TensorDecompositionModel):
         self,
         C: int = 4,  # channels per transform per scale
         resolution: Sequence[int] = (128, 128, 128),
-        multiscale_res_multipliers: Optional[Sequence[int]] = None,
+        multiscale_res_multipliers: Sequence[float] | None = None,
         T: int = 4,
-        tau_init: str = "random",
+        tau_init: Literal["random", "identity"] = "random",
         density_activation: Callable = lambda x: F.softplus(x - 1),
         so3_param_type: str = "r9svd",
     ):
         super().__init__()
-        self._td_type = "cp_tilted"
+        self.td_type = "cp_tilted"
         self.T = T
         self.C = C
         self.multiscale_res_multipliers = list(multiscale_res_multipliers or [1])
@@ -738,12 +725,8 @@ class CPTilted(PPLR, TensorDecompositionModel):
     def param_keys(self):
         return ["grids", "sigma_net", "so3"]
 
-    @property
-    def td_type(self) -> str:
-        return self._td_type
-
     def extract_tau_state(self) -> torch.Tensor:
-        return self.so3.M.detach().clone()
+        return cast(torch.Tensor, self.so3.M).detach().clone()
 
     @property
     def tilted(self) -> bool:

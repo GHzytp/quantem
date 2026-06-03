@@ -340,7 +340,7 @@ class TestObjectTensorDecompUnit:
 
     def test_from_model_rejects_non_kplanes(self):
         with pytest.raises(TypeError):
-            ObjectTensorDecomp.from_model(nn.Linear(3, 1), num_slices=1)
+            ObjectTensorDecomp.from_model(nn.Linear(3, 1), num_slices=1)  # pyright: ignore[reportArgumentType]
 
     def test_tilted_from_uniform(self):
         """tilted=True builds a KPlanesTILTED with an extra `so3` param group."""
@@ -362,6 +362,7 @@ class TestObjectTensorDecompUnit:
         # vacuum init holds for the tilted decoder too
         assert torch.allclose(patches, torch.ones_like(patches), atol=1e-6)
         obj.set_optimizer({k: OptimizerParams.Adam(lr=1e-2) for k in obj.model.param_keys})
+        assert obj.optimizer is not None
         assert len(obj.optimizer.param_groups) == 3
 
     def test_from_model_accepts_cptilted(self):
@@ -450,6 +451,7 @@ class TestPPLRPassthrough:
         assert "name" not in params["object"] and "lr" not in params["object"]
         # optimizer has the two named groups with the requested LRs
         opt = ptycho.obj_model.optimizer
+        assert opt is not None
         assert len(opt.param_groups) == 2
         assert sorted(pg["lr"] for pg in opt.param_groups) == [_LR_SIGMA, _LR_GRIDS]
 
@@ -483,7 +485,9 @@ class TestObjectTensorDecompReconstruction:
         losses = np.array(ptycho._iter_losses)
         assert np.isfinite(losses).all()
         # the object optimizer still has its two PPLR groups after the reset cycle
-        assert len(ptycho.obj_model.optimizer.param_groups) == 2
+        opt = ptycho.obj_model.optimizer
+        assert opt is not None
+        assert len(opt.param_groups) == 2
 
     def test_tilted_reconstruct_runs(self):
         """A tilted K-Planes object reconstructs end-to-end with a 3-group PPLR optimizer."""
@@ -564,7 +568,9 @@ class TestObjectTensorDecompReconstruction:
             batch_size=200,
         )
         # one cosine schedule drives both param groups; both LRs have decayed below their start
-        lrs = sorted(pg["lr"] for pg in ptycho.obj_model.optimizer.param_groups)
+        opt = ptycho.obj_model.optimizer
+        assert opt is not None
+        lrs = sorted(pg["lr"] for pg in opt.param_groups)
         assert lrs[0] < _LR_SIGMA and lrs[1] < _LR_GRIDS
 
     def test_save_load_roundtrip(self, tmp_path):
