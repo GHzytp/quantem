@@ -502,8 +502,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         # )
 
         w, h, n = self.array.shape
-        maps = (mask.astype(self.array.dtype).T @ self.array.reshape(n, -1)).reshape(
-            w, h, mask.shape[1]
+        maps = (mask.astype(self.array.dtype).T @ self.array.reshape(-1, n).transpose()).reshape(
+            mask.shape[1], w, h
         )
 
         self._spectrum_images = {
@@ -565,7 +565,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 axis=1,
             )
             selector_masks[selector] = mask
-            integrated_maps[selector] = arr[mask].sum(axis=0)
+            integrated_maps[selector] = arr[mask].sum(axis=1)
 
         if show:
             cmap = kwargs.pop("cmap", "magma")
