@@ -273,6 +273,119 @@ class PtychographyVisualizations(PtychographyBase):
 
         show_2d(probes, title=titles, scalebar=scalebar, **kwargs)
 
+    def show_probe_top_bottom(
+        self,
+        probe: np.ndarray | None = None,
+        snapshot_iter: int | None = None,
+        probe_index: int | None = 0,
+        quantity: Literal["intensity", "amplitude", "phase"] = "intensity",
+        fftshift: bool = True,
+        return_arrays: bool = False,
+        **kwargs,
+    ):
+        """
+        Show the real-space probe at the top and bottom object surfaces.
+
+        The bottom surface probe is computed by propagating the reconstructed
+        probe through the multislice free-space propagators only. The reconstructed
+        object is not applied.
+
+        Parameters
+        ----------
+        probe : np.ndarray | None, optional
+            Probe array to show. If None, the current reconstructed probe is used.
+        snapshot_iter : int | None, optional
+            Snapshot iteration to show. If None, the final/current probe is shown.
+        probe_index : int | None, optional
+            Probe mode index to show. If None, mixed-state modes are summed
+            incoherently as intensity.
+        quantity : {"intensity", "amplitude", "phase"}, optional
+            Quantity to display for a single probe mode, by default "intensity".
+        fftshift : bool, optional
+            Whether to center the real-space probe for display.
+        return_arrays : bool, optional
+            If True, return the displayed top and bottom arrays in addition to
+            the figure and axes.
+        **kwargs
+            Additional arguments passed to show_2d.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)`` by default, or ``(fig, axs, arrays)`` if
+            return_arrays is True.
+        """
+        if probe is None:
+            if snapshot_iter is not None:
+                if snapshot_iter < 0:
+                    snapshot_iter = len(self.snapshots) + snapshot_iter
+                snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
+                probe = snp["probe"]
+            else:
+                probe = self.probe
+        else:
+            probe = self._to_numpy(probe)
+            if probe.ndim == 2:
+                probe = probe[None, ...]
+
+        self.compute_propagator_arrays()
+
+        top = probe.copy()
+        bottom = top.copy()
+        for prop in self._to_numpy(self.propagators):
+            bottom = np.fft.ifft2(np.fft.fft2(bottom) * prop)
+
+        if probe_index is None:
+            if quantity != "intensity":
+                raise ValueError("probe_index=None is only supported for quantity='intensity'")
+            top_img = np.sum(np.abs(top) ** 2, axis=0)
+            bottom_img = np.sum(np.abs(bottom) ** 2, axis=0)
+            label = "Summed Probe Intensity"
+            cmap = kwargs.pop("cmap", "magma")
+        else:
+            if probe_index < 0 or probe_index >= top.shape[0]:
+                raise ValueError(
+                    f"probe_index must be between 0 and {top.shape[0] - 1}, got {probe_index}"
+                )
+            top_probe = top[probe_index]
+            bottom_probe = bottom[probe_index]
+
+            if quantity == "intensity":
+                top_img = np.abs(top_probe) ** 2
+                bottom_img = np.abs(bottom_probe) ** 2
+                cmap = kwargs.pop("cmap", "magma")
+            elif quantity == "amplitude":
+                top_img = np.abs(top_probe)
+                bottom_img = np.abs(bottom_probe)
+                cmap = kwargs.pop("cmap", "gray")
+            elif quantity == "phase":
+                top_img = np.angle(top_probe)
+                bottom_img = np.angle(bottom_probe)
+                cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
+            else:
+                raise ValueError(
+                    f"quantity must be 'intensity', 'amplitude', or 'phase', got {quantity}"
+                )
+            label = f"Probe {probe_index + 1} {quantity.capitalize()}"
+
+        if fftshift:
+            top_img = np.fft.fftshift(top_img)
+            bottom_img = np.fft.fftshift(bottom_img)
+
+        scalebar = [{"sampling": self.sampling[0], "units": "Å"}, None]
+        titles = [f"Top Surface {label}", f"Bottom Surface {label}"]
+
+        fig, axs = show_2d(
+            [top_img, bottom_img],
+            title=titles,
+            cmap=cmap,
+            scalebar=scalebar,
+            **kwargs,
+        )
+        if return_arrays:
+            return fig, axs, {"top": top_img, "bottom": bottom_img}
+        return fig, axs
+
     def show_fourier_probe(self, probe: np.ndarray | None = None):
         """
         Show the Fourier transform of the probe.
