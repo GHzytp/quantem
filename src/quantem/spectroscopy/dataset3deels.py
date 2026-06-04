@@ -16,9 +16,9 @@ class Dataset3deels(Dataset3dspectroscopy):
     """An EELS dataset class that inherits from Dataset3dspectroscopy.
 
     This class represents a scanning transmission electron microscopy (STEM) dataset,
-    where the data consists of a 3D array with dimensions (energy, scan_y, scan_x).
-    The first dimension represents the energy, while the latter
-    two dimensions represent real space sampling.
+    where the data consists of a 3D array with dimensions (scan_y, scan_x, energy).
+    The first two dimensions represent real space sampling, while the last dimension
+    represents the energy axis.
 
     """
 
