@@ -565,7 +565,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 axis=1,
             )
             selector_masks[selector] = mask
-            integrated_maps[selector] = arr[mask].sum(axis=1)
+            integrated_maps[selector] = arr[:, :, mask].sum(axis=2)
 
         if show:
             cmap = kwargs.pop("cmap", "magma")
@@ -880,8 +880,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         mask=None,
         show_text=True,
         floor=None,
-        snr_quantile_floor=None,
-        snr_min=None,
         snr_threshold=None,
         distance_threshold_for_sample=0.05,
         grid_peaks=None,
@@ -932,10 +930,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             Minimum signal-to-noise ratio for a peak to be displayed.  If
             ``None``, estimated from robust middle quantiles (roughly between
             the 30th and 60th percentile of peak SNRs).
-        snr_quantile_floor : float | None, optional
-            Deprecated alias for *floor*.
-        snr_min : float | None, optional
-            Deprecated alias for *floor*.
         snr_threshold : float | None, optional
             SNR above which a peak match counts as "strong" evidence for an
             element.  If ``None``, estimated automatically.
@@ -1011,7 +1005,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             mask=mask,
         )
 
-        E = float(self.origin[2]) + float(self.sampling[2]) * np.arange(self.shape[2])
+        E = np.asarray(self.energy_axis, dtype=float)
 
         # Keep the energy axis aligned with calculate_mean_spectrum filtering.
         if mask is not None:
@@ -1053,11 +1047,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         if not np.isfinite(background_std) or background_std <= 0:
             background_std = 1.0
 
-        if floor is None and snr_quantile_floor is not None:
-            floor = snr_quantile_floor
-        if floor is None and snr_min is not None:
-            floor = snr_min
-
         # Collapse shoulder peaks before SNR filtering.
         # Two adjacent peaks are treated as one if they are very close in energy
         # and the valley between them is shallow relative to the smaller peak.
@@ -1071,7 +1060,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                     np.asarray(widths, dtype=float),
                 )
 
-            energy_gap_limit = max(6.0 * float(self.sampling[0]), 0.14)
+            energy_gap_limit = max(6.0 * float(self.sampling[2]), 0.14)
             min_valley_relief = 0.35
             min_height_ratio = 0.45
 
@@ -1144,7 +1133,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         def _local_noise_std(pk_idx):
             # Use local baseline variability so narrow doublets are not lost
             # when a wide energy range inflates global noise estimates.
-            local_window = max(0.24, 12.0 * float(self.sampling[0]))
+            local_window = max(0.24, 12.0 * float(self.sampling[2]))
             mask_local = np.abs(E - float(E[int(pk_idx)])) <= local_window
             if int(np.count_nonzero(mask_local)) < 9:
                 return float(background_std)
@@ -1223,7 +1212,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             return float(offset) + float(amp) * np.exp(-0.5 * ((x - float(mu)) / sigma) ** 2)
 
         def _fit_local_gaussian(pk_idx):
-            window = max(0.18, 10.0 * float(self.sampling[0]))
+            window = max(0.18, 10.0 * float(self.sampling[2]))
             x0 = float(E[pk_idx])
             mask_local = np.abs(E - x0) <= window
             if int(np.count_nonzero(mask_local)) < 7:
@@ -1237,9 +1226,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             baseline = float(np.percentile(y_local, 20))
             peak_val = float(spec[pk_idx])
             amp0 = max(peak_val - baseline, 1e-9)
-            sigma0 = max(0.04, 2.0 * float(self.sampling[0]))
+            sigma0 = max(0.04, 2.0 * float(self.sampling[2]))
 
-            lo_sigma = max(1.5 * float(self.sampling[0]), 0.010)
+            lo_sigma = max(1.5 * float(self.sampling[2]), 0.010)
             hi_sigma = 0.18
             bounds = (
                 [0.0, x0 - 0.06, lo_sigma, baseline - abs(amp0)],
@@ -1297,7 +1286,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 continue
             if fit["amp_snr"] < max(2.0, 0.75 * float(floor)):
                 continue
-            if fit["sigma"] < max(1.5 * float(self.sampling[0]), 0.010) or fit["sigma"] > 0.18:
+            if fit["sigma"] < max(1.5 * float(self.sampling[2]), 0.010) or fit["sigma"] > 0.18:
                 continue
             gauss_components.append(fit)
 
@@ -1352,7 +1341,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         # This prevents over-detecting pseudo-peaks on the flanks of broad peaks.
         if len(display_peaks_with_prom) > 1 and not gaussian_validated:
             by_energy = sorted(display_peaks_with_prom, key=lambda item: item[2])
-            shoulder_window = max(8.0 * float(self.sampling[0]), 0.22)
+            shoulder_window = max(8.0 * float(self.sampling[2]), 0.22)
             weak_snr_ratio = 0.45
             weak_prom_ratio = 0.65
             local_prom_floor = max(3.5, 1.10 * float(floor))
@@ -1444,7 +1433,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 )
             )
 
-        energy_min = float(np.min(E)) if len(E) else float(self.origin[0])
+        energy_min = float(np.min(E)) if len(E) else float(self.origin[2])
         energy_max = float(np.max(E)) if len(E) else energy_min
 
         def observable_shells_for_element(element):
@@ -1485,7 +1474,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 return True
 
             _, target_energy, _ = strongest
-            support_window = max(float(tolerance), 3.0 * float(self.sampling[0]), 0.04)
+            support_window = max(float(tolerance), 3.0 * float(self.sampling[2]), 0.04)
 
             for _, _, peak_energy, _ in display_peaks:
                 dist_to_target = abs(float(peak_energy) - float(target_energy))
@@ -2666,8 +2655,6 @@ class Dataset3deds(Dataset3dspectroscopy):
                 "display_peaks": display_peaks,
                 "peak_matches": peak_matches,
                 "floor": floor,
-                "snr_quantile_floor": floor,
-                "snr_min": floor,
                 "snr_threshold": snr_threshold,
             }
         return fig, (ax_img, ax_spec)
@@ -2837,12 +2824,12 @@ class Dataset3deds(Dataset3dspectroscopy):
         if energy_range is not None:
             ind = (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
             energy_axis = energy_axis[ind]
-            spectra = spectra[ind]
+            spectra = spectra[:, :, ind]
         else:
             energy_range = [float(energy_axis.min().item()), float(energy_axis.max().item())]
 
         print("fitting spectrum globally")
-        spectrum_raw = spectra.sum((-1, -2))
+        spectrum_raw = spectra.sum((0, 1))
         mean_fit = self._fit_mean_model_pytorch(
             energy_axis=energy_axis,
             spectrum_raw=spectrum_raw,
@@ -3124,14 +3111,14 @@ class Dataset3deds(Dataset3dspectroscopy):
         if energy_range is not None:
             ind = (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
             energy_axis = energy_axis[ind]
-            spectra = spectra[ind]
+            spectra = spectra[:, :, ind]
         else:
             energy_range = [float(energy_axis.min().item()), float(energy_axis.max().item())]
 
         if fit_mean_only:
             if verbose:
                 print("fitting spectrum globally")
-            spectrum_raw = spectra.sum((-1, -2))
+            spectrum_raw = spectra.sum((0, 1))
             mean_fit = self._fit_mean_model_pytorch(
                 energy_axis=energy_axis,
                 spectrum_raw=spectrum_raw,
@@ -3229,9 +3216,9 @@ class Dataset3deds(Dataset3dspectroscopy):
                 "fit_range": energy_range,
             }
 
-        n_energy, n_y, n_x = spectra.shape
+        n_y, n_x, n_energy = spectra.shape
         n_pixels = n_y * n_x
-        spectra_flat = spectra.permute(1, 2, 0).reshape(n_pixels, n_energy)
+        spectra_flat = spectra.reshape(n_pixels, n_energy)
 
         total_counts = spectra_flat.sum(dim=1)
         valid_pixel_mask = total_counts >= float(min_total_counts)
@@ -3556,7 +3543,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         if energy_axis is None:
             energy_axis = np.asarray(self.energy_axis, dtype=float)
             if energy_axis.shape != spectrum.shape:
-                energy_axis = float(self.origin[0]) + float(self.sampling[0]) * np.arange(
+                energy_axis = float(self.origin[2]) + float(self.sampling[2]) * np.arange(
                     spectrum.size, dtype=float
                 )
         else:

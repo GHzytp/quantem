@@ -153,7 +153,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         window_minE = (target_edge - 5) - target_edge * (window_size / 100)
         window_maxE = target_edge - 5
 
-        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[2]
+        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
 
         window_E = energy_axis[window_indices]
         window_I = spectrum[window_indices]
@@ -206,14 +206,16 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         for kk in range(array3d_subrange.shape[0]):
             for ll in range(array3d_subrange.shape[1]):
-                probe_spectrum = self.array[kk, ll, :]
+                probe_spectrum = array3d_subrange[kk, ll, :]
                 spectrum_smoothed = np.convolve(probe_spectrum, kernel, mode="same")
                 array3d_smoothed[kk, ll, :] = spectrum_smoothed
 
+        output_origin = np.array(self.origin, dtype=float, copy=True)
+        output_origin[2] = energy_axis[0]
         smoothed_data3d = Dataset3deels.from_array(
             array=array3d_smoothed,
             sampling=self.sampling,
-            origin=energy_axis[0],
+            origin=output_origin,
             units=self.units,
         )
 
@@ -465,11 +467,9 @@ class Dataset3deels(Dataset3dspectroscopy):
             New dataset with corrected energy calibration.
         """
 
-        n_energy, n_y, n_x = self.array.shape
+        n_y, n_x, n_energy = self.array.shape
 
-        dE = float(self.sampling[0])
-        E0 = float(self.origin[0])
-        energy_axis = self.energy_axis
+        energy_axis = np.asarray(self.energy_axis, dtype=float)
 
         # --- Build ZLP position map ---
         # For every pixel, find the energy where the ZLP sits.
@@ -483,20 +483,20 @@ class Dataset3deels(Dataset3dspectroscopy):
         zlp_map = np.zeros((n_y, n_x))
 
         if center_guess is not None:
-            guess_index = int(round((center_guess - E0) / dE))
+            guess_index = int(np.argmin(np.abs(energy_axis - center_guess)))
             lo = max(guess_index - search_window, 0)
             hi = min(guess_index + search_window + 1, n_energy)
 
         for iy in range(n_y):
             for ix in range(n_x):
-                spectrum = median_filter(self.array[:, iy, ix], size=3)
+                spectrum = median_filter(self.array[iy, ix, :], size=3)
 
                 if center_guess is None:
                     peak_index = np.argmax(spectrum)
                 else:
                     peak_index = lo + np.argmax(spectrum[lo:hi])
 
-                zlp_map[iy, ix] = E0 + peak_index * dE
+                zlp_map[iy, ix] = energy_axis[peak_index]
 
         # --- Fit a 2D plane to the ZLP map ---
         # The plane equation is: zlp_energy(y, x) = a*y + b*x + c
@@ -528,12 +528,12 @@ class Dataset3deels(Dataset3dspectroscopy):
                 shifted_energy = energy_axis - shift
                 interpolator = interp1d(
                     shifted_energy,
-                    self.array[:, iy, ix],
+                    self.array[iy, ix, :],
                     kind="linear",
                     bounds_error=False,
                     fill_value=0.0,
                 )
-                corrected_array[:, iy, ix] = interpolator(energy_axis)
+                corrected_array[iy, ix, :] = interpolator(energy_axis)
 
         return Dataset3deels.from_array(
             array=corrected_array,
@@ -550,7 +550,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         print(f"QuantEM: Aligning {ll.name} and syncing {hl.name}...")
 
         # 1. Map the drift via argmax
-        zlp_indices = np.argmax(ll.array, axis=0)
+        zlp_indices = np.argmax(ll.array, axis=2)
         ref_idx = int(np.median(zlp_indices))
         shifts = zlp_indices - ref_idx
 
@@ -558,8 +558,8 @@ class Dataset3deels(Dataset3dspectroscopy):
         ll.calibrate_zero_loss_peak()
 
         # 3. Synchronize High-Loss energy origin based on median shift
-        shift_ev = np.median(shifts) * ll.sampling[0]
-        hl.origin[0] -= shift_ev
+        shift_ev = np.median(shifts) * ll.sampling[2]
+        hl.origin[2] -= shift_ev
 
         print("QuantEM: Alignment and Dual-EELS sync complete.")
         return ll, hl, shifts
@@ -569,17 +569,16 @@ class Dataset3deels(Dataset3dspectroscopy):
         Calculates the ZLP shift per pixel and plots the absolute deviation from 0.0 eV.
         """
         data = dataset.array
-        n_e = data.shape[0]
 
         # Generate energy axis
-        energies = dataset.origin[0] + np.arange(n_e) * dataset.sampling[0]
+        energies = np.asarray(dataset.energy_axis, dtype=float)
 
         # Mask energy window for peak finding
         mask = (energies > search_window[0]) & (energies < search_window[1])
         search_energies = energies[mask]
 
         # Calculate peak map and absolute deviation
-        peak_indices = np.argmax(data[mask, :, :], axis=0)
+        peak_indices = np.argmax(data[:, :, mask], axis=2)
         zlp_map_ev = search_energies[peak_indices]
         absolute_shift = np.abs(zlp_map_ev)
 
@@ -608,7 +607,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         # Use built-in energy axis if available, else generate from metadata
         if hasattr(dataset, "energy_axis"):
-            energy = dataset.energy_axis
+            energy = np.asarray(dataset.energy_axis, dtype=float)
         else:
             energy = dataset.origin[2] + np.arange(dataset.shape[2]) * dataset.sampling[2]
 
@@ -665,8 +664,8 @@ class Dataset3deels(Dataset3dspectroscopy):
         print(f"QuantEM: Calculating thickness for {dataset.name}...")
 
         # 1. Vectorized Integration
-        I_zlp = np.sum(data[z_start : z_end + 1, :, :], axis=0)
-        I_total = np.sum(data[t_start : t_end + 1, :, :], axis=0)
+        I_zlp = np.sum(data[:, :, z_start : z_end + 1], axis=2)
+        I_total = np.sum(data[:, :, t_start : t_end + 1], axis=2)
 
         # 2. Log-Ratio Calculation (with epsilon to avoid log(0))
         epsilon = 1e-10
@@ -814,8 +813,8 @@ class Dataset3deels(Dataset3dspectroscopy):
         # 1. Setup Data
         sum_ll = np.sum(ll.array, axis=2)
         sum_hl = np.sum(hl.array, axis=2)
-        energy_ll = ll.origin[2] + np.arange(ll.shape[2]) * ll.sampling[2]
-        energy_hl = hl.origin[2] + np.arange(hl.shape[2]) * hl.sampling[2]
+        energy_ll = np.asarray(ll.energy_axis, dtype=float)
+        energy_hl = np.asarray(hl.energy_axis, dtype=float)
 
         # 2. Handle Initial Coordinates
         if coords is not None:
@@ -903,7 +902,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             The figure object for further manipulation or saving.
         """
         data = dataset.array
-        energy = dataset.origin[2] + np.arange(data.shape[2]) * dataset.sampling[2]
+        energy = np.asarray(dataset.energy_axis, dtype=float)
 
         mean_spec = np.mean(data, axis=(0, 1))
         zlp_pos = energy[np.argmax(mean_spec)]
@@ -924,11 +923,11 @@ class Dataset3deels(Dataset3dspectroscopy):
         ax2 = fig.add_subplot(gs[0, 1])
         # Take a 5x5 grid for better representation than 3x3
         yy, xx = np.meshgrid(
+            np.linspace(0, data.shape[0] - 1, 5, dtype=int),
             np.linspace(0, data.shape[1] - 1, 5, dtype=int),
-            np.linspace(0, data.shape[2] - 1, 5, dtype=int),
         )
         for y, x in zip(yy.flatten(), xx.flatten()):
-            ax2.plot(energy, data[:, y, x], alpha=0.3, lw=0.5)
+            ax2.plot(energy, data[y, x, :], alpha=0.3, lw=0.5)
         ax2.set_title("Spatial Variation (Grid Samples)")
 
         # 3. Map
@@ -953,7 +952,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         Uses scipy.stats for Gaussian fitting.
         """
         data = dataset.array
-        energy = dataset.origin[2] + np.arange(data.shape[2]) * dataset.sampling[2]
+        energy = np.asarray(dataset.energy_axis, dtype=float)
 
         # 1. Mask and find peak per pixel
         search_mask = (energy > -2.0) & (energy < 2.0)
