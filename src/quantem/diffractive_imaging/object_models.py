@@ -144,31 +144,47 @@ class PtychoObjConstraintParams:
 
     @dataclass
     class INR(Constraints):
-        """Constraints for the implicit (``ObjectINR``) object representation.
+        """Constraints for the implicit (``ObjectINR`` / ``ObjectTensorDecomp``) object.
 
-        An INR has no grid to project, so the grid-based hard constraints of
-        ``Raster`` (positivity, filtering, FOV masking) do not apply. The
-        regularizers that do carry over are soft penalties evaluated at sampled
-        coordinates.
+        An implicit object has no grid to clamp/filter in place, so the grid-based hard
+        constraints of ``Raster`` do not apply directly. Instead: positivity is a **soft**
+        penalty evaluated at sampled coordinates (keeps the network output linear so a
+        zero-background ``potential`` fits without the vanishing/dead gradients of a
+        softplus/relu output activation), and the potential baseline is a **display gauge** on
+        the materialized object (a constant potential offset is a global phase, i.e.
+        diffraction-invariant).
 
         Attributes
         ----------
         tv_weight_z : float, default ``0.0``
-            Soft penalty. Weight on the depth-axis (``z``) total-variation term,
-            evaluated via finite differences at randomly sampled coordinates.
-            Multislice (``num_slices > 1``) only.
+            Soft penalty. Depth-axis (``z``) total variation, finite-differenced at randomly
+            sampled coordinates. Multislice (``num_slices > 1``) only.
         tv_weight_xy : float, default ``0.0``
-            Soft penalty. Weight on the in-plane (``y``, ``x``) total-variation
-            term, evaluated via finite differences at randomly sampled coordinates.
+            Soft penalty. In-plane (``y``, ``x``) total variation at sampled coordinates.
+        positivity_weight : float, default ``0.0``
+            Soft penalty. Weight on ``mean(relu(-value))`` at sampled coordinates -- drives the
+            ``potential`` non-negative. ``obj_type="potential"`` only; ignored otherwise. Scale it
+            relative to the data-loss magnitude; increase if negativity persists.
+        fix_potential_baseline : bool, default ``False``
+            ``obj_type="potential"`` only. Subtracts a background offset from the *materialized*
+            object so background sits at zero (then clamps >= 0). Display gauge only -- it does not
+            perturb the reconstruction (the forward queries the network directly), mirroring the
+            ``Raster`` constraint of the same name.
+        fix_potential_baseline_factor : float, default ``1.0``
+            Scales the subtracted baseline offset (``<1`` relaxes the anchoring).
         """
 
         # soft constraints (evaluated at sampled coordinates)
         tv_weight_z: float = 0.0
         tv_weight_xy: float = 0.0
+        positivity_weight: float = 0.0
+        # hard / display constraints (applied to the materialized object only)
+        fix_potential_baseline: bool = False
+        fix_potential_baseline_factor: float = 1.0
         _name: str = "inr"
 
-        soft_constraint_keys = ["tv_weight_z", "tv_weight_xy"]
-        hard_constraint_keys = []
+        soft_constraint_keys = ["tv_weight_z", "tv_weight_xy", "positivity_weight"]
+        hard_constraint_keys = ["fix_potential_baseline", "fix_potential_baseline_factor"]
 
     @classmethod
     def parse_dict(cls, d: dict) -> "PtychoObjConstraintsType":
@@ -1618,12 +1634,12 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         The HSiren's final layer is zero-initialized so the object starts uniform (a
         diffraction-equivalent vacuum), matching ``ObjectPixelated.from_uniform``.
 
-        ``final_activation`` sets the output nonlinearity. When ``None`` (default) it is chosen
-        from ``obj_type``: ``"identity"`` for ``pure_phase``, and ``"softplus"`` for
-        ``potential`` -- a non-negative activation enforces the potential's positivity (min-value)
-        constraint directly at the output (use ``"relu"`` for a hard floor). With the zeroed final
-        layer the potential starts uniform (``softplus(0) = ln 2``), which is just a global phase
-        and hence diffraction-equivalent to vacuum.
+        ``final_activation`` sets the output nonlinearity. The default (``None``) is ``"identity"``
+        for both ``pure_phase`` and ``potential``: enforcing positivity at the output (softplus /
+        relu) makes a zero-background potential hard to fit (vanishing / dead gradients), so for
+        ``potential`` positivity is instead the soft ``positivity_weight`` constraint. With the
+        zeroed final layer the object starts at 0 (vacuum). Pass ``final_activation="softplus"`` to
+        opt back into output-activation positivity.
 
         Note
         ----
@@ -1634,7 +1650,7 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         features may want a larger value. Pair omega_0 with the object learning rate.
         """
         if final_activation is None:
-            final_activation = "softplus" if obj_type == "potential" else "identity"
+            final_activation = "identity"
         model = HSiren(
             in_features=3,
             out_features=1,
@@ -2032,12 +2048,23 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
 
         Unlike the grid-based ``Raster`` constraints, an INR has nothing to clamp or filter in
         place. For ``pure_phase`` we recenter the phase to zero mean (a global-phase gauge) so the
-        displayed object matches the pixelated convention; ``potential`` is returned as-is (the INR
-        constraint set has no positivity/baseline fields — potential is left unconstrained).
+        displayed object matches the pixelated convention. For ``potential``, if
+        ``fix_potential_baseline`` is set, subtract a background offset (mask background mean, else
+        the global min) scaled by ``fix_potential_baseline_factor`` and clamp ``>= 0`` -- a display
+        gauge (a constant potential offset is a global phase, hence diffraction-invariant), so it
+        does not affect the reconstruction. Positivity *during* the reconstruction is the soft
+        ``positivity_weight`` penalty, not a projection here.
         """
         with torch.no_grad():
             if self.obj_type == "pure_phase":
                 return raw - raw.mean()
+            if self.constraints.fix_potential_baseline:
+                if mask is not None and mask.numel() and (mask < 0.5 * mask.max()).any():
+                    offset = raw[mask < 0.5 * mask.max()].mean()
+                else:
+                    offset = raw.amin()
+                offset = offset * self.constraints.fix_potential_baseline_factor
+                return torch.clamp(raw - offset, min=0.0)
             return raw
 
     def apply_soft_constraints(
@@ -2058,8 +2085,30 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
             tv_loss = self._sampled_tv_loss(w_z, w_xy)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("tv_loss", tv_loss)
+        w_pos = self.constraints.positivity_weight
+        if w_pos > 0 and self.obj_type == "potential":
+            pos_loss = self._sampled_positivity_loss(w_pos)
+            loss = loss + pos_loss
+            self.add_soft_constraint_loss("positivity_loss", pos_loss)
         self.accumulate_constraint_losses()
         return loss
+
+    def _sampled_positivity_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
+        """Differentiable positivity penalty for ``potential``: ``weight * mean(relu(-value))`` at
+        random coordinates. Keeps the network output linear (identity activation), so a
+        zero-background potential fits without the vanishing (softplus) / dead (relu) gradients of
+        an output activation; negative regions get a constant linear restoring force toward 0.
+        """
+        real_dtype = getattr(torch, config.get("dtype_real"))
+        coords_xy = (
+            torch.rand(
+                num_samples, 2, device=self.device, dtype=real_dtype, generator=self._rng_torch
+            )
+            * 2.0
+            - 1.0
+        )
+        value = self._query_phase(coords_xy)  # (S, num_samples) -- the queried potential
+        return weight * torch.relu(-value).mean()
 
     def _sampled_tv_loss(self, w_z: float, w_xy: float, num_samples: int = 4096) -> torch.Tensor:
         """Finite-difference TV over (z, y, x) at randomly sampled coordinates."""
@@ -2194,14 +2243,15 @@ class ObjectTensorDecomp(ObjectINR):
 
         ``tilted=False`` builds a plain :class:`KPlanes`; ``tilted=True`` builds a
         :class:`KPlanesTILTED` with ``T`` learned SO(3) rotations. The decoder's final layer is
-        zeroed so the object starts uniform (a global phase, diffraction-equivalent to vacuum),
-        matching ``ObjectINR.from_uniform``. ``density_activation`` is chosen from ``obj_type``:
-        ``nn.Identity`` for ``pure_phase`` (phase may be negative) and ``nn.Softplus`` for
-        ``potential`` (non-negative). ``resolution`` is the feature-plane resolution ``(z, y, x)``
-        and is independent of the reconstructed object grid; for multislice set ``resolution[0]``
-        to span the slices.
+        zeroed so the object starts at 0 (vacuum), matching ``ObjectINR.from_uniform``. The decoder
+        is **identity**-activated for both ``pure_phase`` and ``potential``: a softplus/relu output
+        activation makes a zero-background potential hard to fit (vanishing/dead gradients), so for
+        ``potential`` enforce positivity with the soft ``positivity_weight`` constraint instead (use
+        ``from_model`` with an ``nn.Softplus`` activation to opt back in). ``resolution`` is the
+        feature-plane resolution ``(z, y, x)`` and is independent of the reconstructed object grid;
+        for multislice set ``resolution[0]`` to span the slices.
         """
-        density_activation: nn.Module = nn.Softplus() if obj_type == "potential" else nn.Identity()
+        density_activation: nn.Module = nn.Identity()
         ms = list(multiscale_res_multipliers) if multiscale_res_multipliers is not None else None
         model: KPlanesType
         if tilted:

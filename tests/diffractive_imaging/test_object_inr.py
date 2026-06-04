@@ -262,10 +262,16 @@ class TestObjectINRUnit:
         with pytest.raises(NotImplementedError):
             ObjectINR.from_uniform(num_slices=1, obj_type="complex")
 
-    def test_potential_obj_type(self):
-        """`potential` is real-valued like `pure_phase` but uses a non-negative output activation
-        (softplus) to enforce the positivity / min-value constraint."""
-        obj = ObjectINR.from_uniform(num_slices=1, obj_type="potential", hidden_features=32, rng=0)
+    def test_potential_obj_type_softplus_opt_in(self):
+        """`potential` is real-valued; the default activation is now identity, but passing
+        ``final_activation="softplus"`` opts back into output-activation positivity (min >= 0)."""
+        obj = ObjectINR.from_uniform(
+            num_slices=1,
+            obj_type="potential",
+            final_activation="softplus",
+            hidden_features=32,
+            rng=0,
+        )
         obj._initialize_obj((1, 16, 16))
         assert obj.obj_type == "potential"
         assert not obj.dtype.is_complex  # real-valued object
@@ -281,6 +287,40 @@ class TestObjectINRUnit:
         materialized = obj.obj
         assert materialized.shape == (1, 16, 16) and not materialized.is_complex()
         assert float(materialized.min()) >= 0.0  # softplus enforces non-negative potential
+
+    def test_potential_identity_default_and_positivity_penalty(self):
+        """Default ``potential`` activation is identity (vacuum is exactly 0); the soft
+        ``positivity_weight`` penalty drives a forced-negative potential non-negative."""
+        obj = ObjectINR.from_uniform(num_slices=1, obj_type="potential", hidden_features=32, rng=0)
+        obj._initialize_obj((1, 24, 24))
+        # identity + zeroed final layer -> vacuum is exactly 0 (not softplus(0) = ln 2)
+        assert float(obj._materialize_obj().abs().max()) == pytest.approx(0.0, abs=1e-6)
+        # force the whole potential negative via the (zero-weight) final-layer bias
+        with torch.no_grad():
+            obj.model.net[-2].bias.fill_(-0.5) # type:ignore 
+        assert float(obj._materialize_obj().min()) == pytest.approx(-0.5, abs=1e-3)
+        obj.constraints = {"positivity_weight": 1.0}
+        assert float(obj._sampled_positivity_loss(1.0)) == pytest.approx(0.5, abs=0.05)
+        opt = torch.optim.Adam(obj.model.parameters(), lr=1e-2)
+        for _ in range(80):
+            opt.zero_grad()
+            obj.apply_soft_constraints().backward()
+            opt.step()
+        assert float(obj._materialize_obj().min()) > -1e-2  # driven non-negative
+
+    def test_fix_potential_baseline_gauge(self):
+        """``fix_potential_baseline`` subtracts the background offset from the materialized
+        potential (display gauge; the reconstruction forward path is unaffected)."""
+        obj = ObjectINR.from_uniform(num_slices=1, obj_type="potential", hidden_features=32, rng=0)
+        obj._initialize_obj((1, 16, 16))
+        with torch.no_grad():
+            obj.model.net[-2].bias.fill_(1.0) # type:ignore  # constant +1 background
+        raw = obj._materialize_obj()
+        assert float(raw.min()) == pytest.approx(1.0, abs=0.2)
+        obj.constraints = {"fix_potential_baseline": True}
+        disp = obj.apply_hard_constraints(raw, mask=obj.mask)
+        assert float(disp.min()) == pytest.approx(0.0, abs=1e-3)  # background pinned to 0
+        assert float(disp.min()) >= 0.0  # clamped non-negative
 
     def test_from_pixelated_with_model(self):
         """from_pixelated can wrap a directly-passed INR model (like ObjectDIP.from_pixelated)."""

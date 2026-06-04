@@ -408,19 +408,25 @@ class TestObjectTensorDecompUnit:
         kp.reset()
         assert _corr_to_pix(kp.obj[0].detach().cpu().numpy()) > 0.9
 
-    def test_potential_obj_type_positive(self):
+    def test_potential_identity_default_and_positivity_penalty(self):
+        """Potential K-Planes uses an identity decoder by default (softplus/relu fit zero-background
+        potentials poorly); the inherited soft positivity penalty drives it non-negative instead."""
         obj = self._obj(obj_type="potential", resolution=(16, 16, 16))
         obj._initialize_obj((1, 16, 16))
         assert obj.obj_type == "potential"
-        opt = torch.optim.Adam(obj.model.parameters(), lr=1e-2)
-        coords = torch.rand(2, 6, 6, 2) * 2 - 1
-        for _ in range(5):
+        assert isinstance(obj.model.density_activation, nn.Identity)  # identity, not softplus
+        # force the whole potential negative via the (zero-weight) decoder bias
+        with torch.no_grad():
+            obj.model.sigma_net.bias.fill_(-0.5) # type:ignore 
+        assert float(obj._materialize_obj().min()) == pytest.approx(-0.5, abs=1e-3)
+        obj.constraints = {"positivity_weight": 1.0}
+        assert float(obj._sampled_positivity_loss(1.0)) == pytest.approx(0.5, abs=0.05)
+        opt = torch.optim.Adam(obj.model.parameters(), lr=2e-2)
+        for _ in range(100):
             opt.zero_grad()
-            obj.forward(coords).imag.sum().backward()
+            obj.apply_soft_constraints().backward()
             opt.step()
-        materialized = obj.obj
-        assert materialized.shape == (1, 16, 16) and not materialized.is_complex()
-        assert float(materialized.min()) >= 0.0  # softplus enforces non-negative potential
+        assert float(obj._materialize_obj().min()) > -1e-2  # driven non-negative
 
 
 # --------------------------------------------------------------------------- #

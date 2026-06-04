@@ -85,6 +85,12 @@ def _ddp_ptycho_worker(
             result_path,
         )
 
+    # Synchronize before teardown so every rank finishes 
+    if dist.is_available() and dist.is_initialized():
+        if torch.cuda.is_available():
+            dist.barrier(device_ids=[device_id])
+        else:
+            dist.barrier()
     dist.destroy_process_group()
 
 
@@ -245,7 +251,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         Multi-GPU (``device`` is a list) launches worker processes via ``mp.spawn`` when called
         from a notebook, or uses the existing distributed process group when launched with
         ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
-        
+
         ``loss_type`` selects the data-fidelity criterion: a registered name
         (``"l2_amplitude"`` [default], ``"l1_amplitude"``, ``"l2_intensity"``, ``"l1_intensity"``,
         ``"poisson"``, ``"smooth_l1_amplitude"``, ``"s3im_amplitude"``) or a ``DataCriterion``
