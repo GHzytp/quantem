@@ -239,7 +239,7 @@ class Upsample2dBlock(nn.Module):
         return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.method == "transpose":
+        if getattr(self, "method", "transpose") == "transpose":
             if self.scale_factor == 2:
                 assert self.upsample2x is not None
                 x = self.upsample2x(x)
@@ -532,7 +532,7 @@ class Upsample3dBlock(nn.Module):
         return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.method == "transpose":
+        if getattr(self, "method", "transpose") == "transpose":
             assert self.upsample is not None
             x = self.upsample(x)
         else:

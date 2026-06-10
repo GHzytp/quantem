@@ -511,6 +511,7 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             else:
                 offset = obj.min()
             offset = offset.detach()
+            # offset = max(0, offset.detach()) # TODO figure out instability
             offset = offset * c.fix_potential_baseline_factor
         else:
             offset = 0

@@ -69,14 +69,21 @@ def _ddp_ptycho_worker(
     if rank == 0:
         obj_opt = ptycho.optimizers.get("object")
         probe_opt = ptycho.optimizers.get("probe")
+        dset_opt = ptycho.optimizers.get("dataset")
         torch.save(
             {
                 "obj_state": {k: v.cpu() for k, v in ptycho.obj_model.state_dict().items()},
                 "probe_state": {k: v.cpu() for k, v in ptycho.probe_model.state_dict().items()},
+                # Dataset learnable params (scan positions / descan) are optimized and all-reduced
+                # in the workers; ship them back so the main process keeps the refinement.
+                "dset_scan_positions_px": ptycho.dset._scan_positions_px.detach().cpu(),
+                "dset_descan_shifts": ptycho.dset._descan_shifts.detach().cpu(),
                 "obj_optimizer_params": ptycho.obj_model._optimizer_params,
                 "probe_optimizer_params": ptycho.probe_model._optimizer_params,
+                "dset_optimizer_params": ptycho.dset._optimizer_params,
                 "obj_optimizer_state": obj_opt.state_dict() if obj_opt is not None else None,
                 "probe_optimizer_state": probe_opt.state_dict() if probe_opt is not None else None,
+                "dset_optimizer_state": dset_opt.state_dict() if dset_opt is not None else None,
                 "iter_losses": ptycho._iter_losses,
                 "iter_val_losses": ptycho._iter_val_losses,
                 "iter_lrs": ptycho._iter_lrs,
@@ -85,7 +92,7 @@ def _ddp_ptycho_worker(
             result_path,
         )
 
-    # Synchronize before teardown so every rank finishes 
+    # Synchronize before teardown so every rank finishes
     if dist.is_available() and dist.is_initialized():
         if torch.cuda.is_available():
             dist.barrier(device_ids=[device_id])
@@ -260,6 +267,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         """
         self._check_preprocessed()
+
+        if constraints:
+            self.constraints = constraints
 
         # Determine effective device list: explicit arg takes priority, else fall back to stored.
         devices_to_use = (
@@ -564,11 +574,20 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.probe_model.load_state_dict(result["probe_state"])
         self.to(restore_device)
 
+        # --- dataset learnable params (scan positions / descan), refined in the workers ---
+        dset_positions = result.get("dset_scan_positions_px")
+        if dset_positions is not None:
+            self.dset._scan_positions_px.data = dset_positions.to(restore_device)
+        dset_descan = result.get("dset_descan_shifts")
+        if dset_descan is not None:
+            self.dset._descan_shifts.data = dset_descan.to(restore_device)
+
         # --- restore optimizer params (worker may have set/changed them) so that future
         #     spawns (e.g. reset=True without optimizer_params) can re-init the optimizer ---
         for model, key in (
             (self.obj_model, "obj_optimizer_params"),
             (self.probe_model, "probe_optimizer_params"),
+            (self.dset, "dset_optimizer_params"),
         ):
             saved = result.get(key)
             if saved is not None:
@@ -579,7 +598,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.set_optimizers()
 
         # --- optimizer states (params and device must be set before loading) ---
-        for name, key in (("object", "obj_optimizer_state"), ("probe", "probe_optimizer_state")):
+        for name, key in (
+            ("object", "obj_optimizer_state"),
+            ("probe", "probe_optimizer_state"),
+            ("dataset", "dset_optimizer_state"),
+        ):
             opt_state = result.get(key)
             opt = self.optimizers.get(name)
             if opt_state is not None and opt is not None:
