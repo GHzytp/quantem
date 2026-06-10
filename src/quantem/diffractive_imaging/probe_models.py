@@ -236,7 +236,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return self._probe_params
 
     @probe_params.setter
-    def probe_params(self, params: dict[str, Any] = {}):
+    def probe_params(self, params: dict[str, Any]):
         validate_dict_keys(
             params,
             [*self.DEFAULT_PROBE_PARAMS.keys(), *POLAR_SYMBOLS, *POLAR_ALIASES.keys()],

@@ -1103,7 +1103,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def error_estimate(
         self,
         pred_intensities: torch.Tensor,
-        batch_indices: np.ndarray,
         targets: torch.Tensor,
         global_n: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:

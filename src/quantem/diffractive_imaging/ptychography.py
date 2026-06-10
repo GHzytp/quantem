@@ -234,7 +234,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
-        device: Literal["cpu", "gpu"] | int | list[int] | None = None,
+        device: str | int | list[int] | None = None,
         autograd: bool = True,
         loss_type: "str | DataCriterion" = "l2_amplitude",
         num_workers: int = 0,
@@ -422,7 +422,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
                 batch_consistency_loss, targets = self.error_estimate(
                     pred_intensities,
-                    batch_indices,
                     targets=targets,
                     global_n=global_n,
                 )
@@ -477,7 +476,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         pred_intensities = self.detector_model.forward(overlap)
                         batch_val_loss, _ = self.error_estimate(
                             pred_intensities,
-                            batch_indices,
                             targets=targets,
                             global_n=global_n,
                         )
