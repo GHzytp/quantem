@@ -442,7 +442,7 @@ class PtychographyVisualizations(PtychographyBase):
         fig, axs = show_2d(
             objs,
             title=titles,
-            cmap=config.get("viz.phase_cmap"),
+            cmap=kwargs.pop("cmap", config.get("viz.phase_cmap")),
             norm=norm,
             cbar=cbar,
             scalebar=scalebars,
