@@ -62,10 +62,13 @@ class L1(DataCriterion):
 
 
 class Poisson(DataCriterion):
+    """Poisson negative log-likelihood in intensity space (up to a pred-independent constant)."""
+
     target_space: TargetSpace = "intensity"
 
     def __call__(self, preds: torch.Tensor, targets: torch.Tensor, n: int) -> torch.Tensor:
-        return torch.sum(preds - targets * torch.log(preds + 1e-6))
+        nll = torch.sum(preds - targets * torch.log(preds + 1e-6))
+        return nll / _global_scale(preds, n)
 
 
 class AmplitudeSmoothL1(DataCriterion):
@@ -113,6 +116,12 @@ class AmplitudeS3IM(DataCriterion):
     this captures structural relationships a per-pixel loss misses. It is used as an auxiliary
     term on top of an MSE term (both mean-reduced here, so ``lambda`` ~ O(1) balances them). The
     SSIM passes make this notably more expensive than L2 — keep ``repeats`` modest.
+
+    Note: both terms are **mean**-reduced. A mean is already batch-size independent (no
+    ``_global_scale`` rescale needed), so this criterion is well-behaved across batch sizes and
+    multi-GPU. It does, however, sit on a different absolute scale than the sum-based criteria
+    (``L2``/``L1``/Poisson, which rescale to a full-dataset sum), so learning rates do **not**
+    transfer between ``s3im_amplitude`` and those losses — retune the LR when switching.
     """
 
     target_space: TargetSpace = "amplitude"
