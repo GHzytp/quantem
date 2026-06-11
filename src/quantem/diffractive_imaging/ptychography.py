@@ -441,6 +441,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 if _dist_world_size > 1:
                     self._all_reduce_gradients()
                 self.step_optimizers()
+                # Post-step parameter projection (only for positivity_mode="shrink")
+                self.obj_model.project_parameters()
                 consistency_loss += batch_consistency_loss.item()
                 total_loss += batch_loss.item()
 

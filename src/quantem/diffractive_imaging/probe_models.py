@@ -873,7 +873,7 @@ class ProbePixelated(ProbeConstraints):
         elif isinstance(vp, np.ndarray):
             vp2 = vp.astype(config.get("dtype_real"))
         elif isinstance(vp, (Dataset4dstem, Dataset2d)):
-            vp2 = vp.array
+            vp2 = cast(np.ndarray, vp.array) # TODO when finished Dataset->torch fix here
         elif isinstance(vp, torch.Tensor):
             vp2 = vp.cpu().detach().numpy()
         else:
@@ -1067,7 +1067,7 @@ class ProbeParametric(ProbeConstraints):
         elif isinstance(vp, np.ndarray):
             vp2 = vp.astype(config.get("dtype_real"))
         elif isinstance(vp, (Dataset4dstem, Dataset2d)):
-            vp2 = vp.array
+            vp2 = cast(np.ndarray, vp.array) # TODO when finished Dataset->torch fix here
         else:
             raise NotImplementedError(f"Unknown vacuum probe type: {type(vp)}")
 

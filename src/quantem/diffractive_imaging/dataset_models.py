@@ -52,10 +52,11 @@ class PtychoDatasetConstraintParams:
 
         Attributes
         ----------
-        descan_shifts_constant : bool, default ``False``
+        descan_shifts_zero : bool, default ``False``
             Forces all descan shifts to zero after each update. Useful when you
             want to keep the descan optimizer in the parameter group but freeze
-            its effect.
+            its effect. (Distinct from ``learn_descan=False``, which holds descan
+            at its fitted value rather than zeroing it.)
         center_scan_positions : bool, default ``False``
             Shifts all scan positions uniformly so their mean sits at the object
             center after each update. Prevents the reconstruction from
@@ -72,7 +73,7 @@ class PtychoDatasetConstraintParams:
         """
 
         # hard constraints
-        descan_shifts_constant: bool = False
+        descan_shifts_zero: bool = False
         center_scan_positions: bool = False
         clip_scan_positions: bool = True
         # soft constraints
@@ -81,7 +82,7 @@ class PtychoDatasetConstraintParams:
 
         soft_constraint_keys = ["descan_tv_weight"]
         hard_constraint_keys = [
-            "descan_shifts_constant",
+            "descan_shifts_zero",
             "center_scan_positions",
             "clip_scan_positions",
         ]
@@ -782,7 +783,7 @@ class DatasetConstraints(
         self,
         descan: torch.Tensor,
     ) -> torch.Tensor:
-        if self.constraints.descan_shifts_constant:
+        if self.constraints.descan_shifts_zero:
             descan = torch.zeros_like(descan)
         return descan
 

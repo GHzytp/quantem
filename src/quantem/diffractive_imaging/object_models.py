@@ -114,6 +114,14 @@ class PtychoObjConstraintParams:
 
         # hard constraints
         positivity: bool = True
+        # positivity_mode selects HOW positivity is enforced for obj_type="potential":
+        #   "clamp"  -- straight-through clamp(obj, 0) in the forward (default). Cheap display
+        #               gauge: it does NOT move the _obj parameter, only how it is shown/used.
+        #   "shrink" -- proximal per-slice shrinkage on the _obj parameter post-step: subtract
+        #               fix_potential_baseline_factor * (per-slice background) then clamp >= 0.
+        #               Per-slice keeps it on the diffraction-invariant gauge (loss-neutral for
+        #               multislice) and self-limits as the background -> 0. ObjectPixelated only.
+        positivity_mode: Literal["clamp", "shrink"] = "clamp"
         fix_potential_baseline: bool = False
         fix_potential_baseline_factor: float = 1.0
         identical_slices: bool = False
@@ -132,6 +140,7 @@ class PtychoObjConstraintParams:
         soft_constraint_keys = ["tv_weight_z", "tv_weight_xy", "surface_zero_weight"]
         hard_constraint_keys = [
             "positivity",
+            "positivity_mode",
             "fix_potential_baseline",
             "fix_potential_baseline_factor",
             "identical_slices",
@@ -391,6 +400,15 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     def reset(self):
         raise NotImplementedError()
 
+    def project_parameters(self) -> None:
+        """In-place hard projection of the underlying parameters after an optimizer step.
+
+        No-op by default. ``ObjectPixelated`` overrides this to enforce
+        ``positivity_mode="shrink"`` (proximal per-slice background shrinkage on the potential
+        grid). Called once per optimizer step from the reconstruction loop.
+        """
+        return
+
     @abstractmethod
     def _initialize_obj(
         self,
@@ -501,24 +519,38 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         c: PtychoObjConstraintParams.Raster,
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        if c.fix_potential_baseline:
-            if mask is not None:
-                background = mask < 0.5 * mask.max()
-                if background.any():
-                    offset = obj[background].mean()
-                else:
-                    offset = obj.min()
-            else:
-                offset = obj.min()
-            offset = offset.detach()
-            # offset = max(0, offset.detach()) # TODO figure out instability
-            offset = offset * c.fix_potential_baseline_factor
-        else:
-            offset = 0
-
+        # "shrink" manages the _obj parameter directly in project_parameters() (post-step), so the
+        # forward just passes the (already non-negative) parameter through.
+        if c.positivity_mode == "shrink":
+            return obj
+        offset = self._potential_baseline_offset(obj, c, mask)
+        obj = obj - offset
+        # "clamp" clamps here; the apply_hard_constraints wrapper makes it a straight-through op
+        # (the forward/display is non-negative but the _obj parameter is left untouched).
         if c.positivity:
-            return torch.clamp(obj - offset, min=0.0)
-        return obj - offset
+            return torch.clamp(obj, min=0.0)
+        return obj
+
+    def _potential_baseline_offset(
+        self,
+        obj: torch.Tensor,
+        c: PtychoObjConstraintParams.Raster,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor | float:
+        """Background offset subtracted by ``fix_potential_baseline`` (``0`` when disabled).
+
+        Estimated from the FOV-mask background mean (else the global min), detached, and scaled by
+        ``fix_potential_baseline_factor``.
+        """
+        if not c.fix_potential_baseline:
+            return 0.0
+        # mask is an empty tensor (not None) when no FOV mask is set, so guard on numel().
+        if mask is not None and mask.numel() and (mask < 0.5 * mask.max()).any():
+            offset = obj[mask < 0.5 * mask.max()].mean()
+        else:
+            offset = obj.min()
+        offset = offset.detach()
+        return offset * c.fix_potential_baseline_factor
 
     def _apply_shared_hard(
         self,
@@ -894,6 +926,35 @@ class ObjectPixelated(ObjectConstraints):
     def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
         return [self._obj]
+
+    def project_parameters(self) -> None:
+        """Post-step proximal shrinkage of the potential grid parameter, for
+        ``positivity_mode="shrink"`` (``obj_type="potential"`` with ``positivity=True``); a no-op
+        otherwise.
+
+        Subtracts a per-slice background offset (``fix_potential_baseline_factor * per-slice
+        background``) from ``_obj`` then clamps ``>= 0``. Unlike the straight-through ``clamp`` mode
+        this moves ``_obj`` itself, so the reconstruction (not just the display) is shrunk toward a
+        zero background. Per-slice keeps it on the diffraction-invariant gauge (loss-neutral for
+        multislice), and the offset shrinks with the background so it self-limits at zero.
+        """
+        c = self.constraints
+        if not (self.obj_type == "potential" and c.positivity and c.positivity_mode == "shrink"):
+            return
+        with torch.no_grad():
+            bg = self._per_slice_background(self._obj, self.mask)
+            offset = (c.fix_potential_baseline_factor * bg.clamp_min(0.0)).view(-1, 1, 1)
+            self._obj.data = (self._obj.data - offset).clamp_min(0.0)
+
+    def _per_slice_background(self, obj: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Per-slice background level, shape ``[num_slices]``: the FOV-mask background mean when a
+        mask is set, else a robust per-slice 10th percentile."""
+        s = obj.shape[0]
+        flat = obj.reshape(s, -1)
+        if mask is not None and mask.numel() and (mask < 0.5 * mask.max()).any():
+            bg = (mask < 0.5 * mask.max()).reshape(s, -1).to(obj.dtype)
+            return (flat * bg).sum(1) / bg.sum(1).clamp_min(1.0)
+        return torch.quantile(flat, 0.1, dim=1)
 
     @property
     def initial_obj(self):
