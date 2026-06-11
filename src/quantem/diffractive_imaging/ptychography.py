@@ -21,8 +21,9 @@ from quantem.core.ml.dist_utils import (
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
+from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
+from quantem.diffractive_imaging.ptycho_losses import DataCriterion
 from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
@@ -68,14 +69,21 @@ def _ddp_ptycho_worker(
     if rank == 0:
         obj_opt = ptycho.optimizers.get("object")
         probe_opt = ptycho.optimizers.get("probe")
+        dset_opt = ptycho.optimizers.get("dataset")
         torch.save(
             {
                 "obj_state": {k: v.cpu() for k, v in ptycho.obj_model.state_dict().items()},
                 "probe_state": {k: v.cpu() for k, v in ptycho.probe_model.state_dict().items()},
+                # Dataset learnable params (scan positions / descan) are optimized and all-reduced
+                # in the workers; ship them back so the main process keeps the refinement.
+                "dset_scan_positions_px": ptycho.dset._scan_positions_px.detach().cpu(),
+                "dset_descan_shifts": ptycho.dset._descan_shifts.detach().cpu(),
                 "obj_optimizer_params": ptycho.obj_model._optimizer_params,
                 "probe_optimizer_params": ptycho.probe_model._optimizer_params,
+                "dset_optimizer_params": ptycho.dset._optimizer_params,
                 "obj_optimizer_state": obj_opt.state_dict() if obj_opt is not None else None,
                 "probe_optimizer_state": probe_opt.state_dict() if probe_opt is not None else None,
+                "dset_optimizer_state": dset_opt.state_dict() if dset_opt is not None else None,
                 "iter_losses": ptycho._iter_losses,
                 "iter_val_losses": ptycho._iter_val_losses,
                 "iter_lrs": ptycho._iter_lrs,
@@ -84,6 +92,12 @@ def _ddp_ptycho_worker(
             result_path,
         )
 
+    # Synchronize before teardown so every rank finishes
+    if dist.is_available() and dist.is_initialized():
+        if torch.cuda.is_available():
+            dist.barrier(device_ids=[device_id])
+        else:
+            dist.barrier()
     dist.destroy_process_group()
 
 
@@ -188,9 +202,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
         total_loss = torch.tensor(0, device=self._single_device, dtype=self._dtype_real)
 
-        obj_loss = self.obj_model.apply_soft_constraints(
-            self.obj_model.obj, mask=self.obj_model.mask
-        )
+        if isinstance(self.obj_model, ObjectINR):
+            # Implicit objects evaluate soft constraints at sampled coordinates and don't
+            # need the materialized grid (which would force full-grid inference each iter).
+            obj_loss = self.obj_model.apply_soft_constraints(mask=self.obj_model.mask)
+        else:
+            obj_loss = self.obj_model.apply_soft_constraints(
+                self.obj_model.obj, mask=self.obj_model.mask
+            )
         total_loss += obj_loss
 
         probe_loss = self.probe_model.apply_soft_constraints(self.probe_model.probe)
@@ -215,11 +234,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         batch_size: int | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
-        device: Literal["cpu", "gpu"] | int | list[int] | None = None,
+        device: str | int | list[int] | None = None,
         autograd: bool = True,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ] = "l2_amplitude",
+        loss_type: "str | DataCriterion" = "l2_amplitude",
         num_workers: int = 0,
     ) -> Self:
         """Run iterative ptychography reconstruction.
@@ -241,8 +258,18 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         Multi-GPU (``device`` is a list) launches worker processes via ``mp.spawn`` when called
         from a notebook, or uses the existing distributed process group when launched with
         ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
+
+        ``loss_type`` selects the data-fidelity criterion: a registered name
+        (``"l2_amplitude"`` [default], ``"l1_amplitude"``, ``"l2_intensity"``, ``"l1_intensity"``,
+        ``"poisson"``, ``"smooth_l1_amplitude"``, ``"s3im_amplitude"``) or a ``DataCriterion``
+        instance for custom parameters (e.g. ``AmplitudeS3IM(lambda_s3im=0.5)``). See
+        ``ptycho_losses``.
+
         """
         self._check_preprocessed()
+
+        if constraints:
+            self.constraints = constraints
 
         # Determine effective device list: explicit arg takes priority, else fall back to stored.
         devices_to_use = (
@@ -317,9 +344,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
         autograd: bool = True,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ] = "l2_amplitude",
+        loss_type: "str | DataCriterion" = "l2_amplitude",
         num_workers: int = 0,
         _dist_rank: int = 0,
         _dist_world_size: int = 1,
@@ -351,7 +376,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if new_scheduler:
             self.set_schedulers(self.scheduler_params, num_iter=num_iters)
 
-        self.dset._set_targets(loss_type)
+        self.criterion = loss_type  # resolve name/instance -> DataCriterion
+        self.dset._set_targets(self._criterion.target_space)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
 
         # Compute the global scan count once — needed to keep loss scale consistent across world
@@ -384,11 +410,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 self.zero_grad_all()
                 batch_indices = batch["index"].to(self._single_device)
                 targets = batch["target"].to(self._single_device, non_blocking=True)
-                patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
+                patch_data, _positions_px, positions_px_fractional, descan_shifts = (
                     self.dset.forward(batch_indices, self.obj_padding_px)
                 )
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
-                obj_patches = self.obj_model.forward(patch_indices)
+                obj_patches = self.obj_model.forward(patch_data)
                 propagated_probes, overlap = self.forward_operator(
                     obj_patches, shifted_probes, descan_shifts
                 )
@@ -396,9 +422,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
                 batch_consistency_loss, targets = self.error_estimate(
                     pred_intensities,
-                    batch_indices,
                     targets=targets,
-                    loss_type=loss_type,
                     global_n=global_n,
                 )
 
@@ -411,12 +435,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     obj_patches,
                     propagated_probes,
                     overlap,
-                    patch_indices,
+                    patch_data,
                     targets,
                 )
                 if _dist_world_size > 1:
                     self._all_reduce_gradients()
                 self.step_optimizers()
+                # Post-step parameter projection (only for positivity_mode="shrink")
+                self.obj_model.project_parameters()
                 consistency_loss += batch_consistency_loss.item()
                 total_loss += batch_loss.item()
 
@@ -441,20 +467,18 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     for batch in val_loader:
                         batch_indices = batch["index"].to(self._single_device)
                         targets = batch["target"].to(self._single_device, non_blocking=True)
-                        patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
+                        patch_data, _positions_px, positions_px_fractional, descan_shifts = (
                             self.dset.forward(batch_indices, self.obj_padding_px)
                         )
                         shifted_probes = self.probe_model.forward(positions_px_fractional)
-                        obj_patches = self.obj_model.forward(patch_indices)
+                        obj_patches = self.obj_model.forward(patch_data)
                         _propagated_probes, overlap = self.forward_operator(
                             obj_patches, shifted_probes, descan_shifts
                         )
                         pred_intensities = self.detector_model.forward(overlap)
                         batch_val_loss, _ = self.error_estimate(
                             pred_intensities,
-                            batch_indices,
                             targets=targets,
-                            loss_type=loss_type,
                             global_n=global_n,
                         )
                         val_consistency_loss += batch_val_loss.item()
@@ -550,11 +574,20 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.probe_model.load_state_dict(result["probe_state"])
         self.to(restore_device)
 
+        # --- dataset learnable params (scan positions / descan), refined in the workers ---
+        dset_positions = result.get("dset_scan_positions_px")
+        if dset_positions is not None:
+            self.dset._scan_positions_px.data = dset_positions.to(restore_device)
+        dset_descan = result.get("dset_descan_shifts")
+        if dset_descan is not None:
+            self.dset._descan_shifts.data = dset_descan.to(restore_device)
+
         # --- restore optimizer params (worker may have set/changed them) so that future
         #     spawns (e.g. reset=True without optimizer_params) can re-init the optimizer ---
         for model, key in (
             (self.obj_model, "obj_optimizer_params"),
             (self.probe_model, "probe_optimizer_params"),
+            (self.dset, "dset_optimizer_params"),
         ):
             saved = result.get(key)
             if saved is not None:
@@ -565,7 +598,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.set_optimizers()
 
         # --- optimizer states (params and device must be set before loading) ---
-        for name, key in (("object", "obj_optimizer_state"), ("probe", "probe_optimizer_state")):
+        for name, key in (
+            ("object", "obj_optimizer_state"),
+            ("probe", "probe_optimizer_state"),
+            ("dataset", "dset_optimizer_state"),
+        ):
             opt_state = result.get(key)
             opt = self.optimizers.get(name)
             if opt_state is not None and opt is not None:
@@ -736,6 +773,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if isinstance(skip, (str, type)):
             skip = [skip]
         skip = list(skip)
+        # The data-fidelity criterion is transient config (re-set each reconstruct); don't
+        # serialize it (avoids a dill fallback and keeps the archive model-agnostic).
+        skip.append("_criterion")
 
         # Always skip raw dataset data unless explicitly requested
         if not save_raw_data:
