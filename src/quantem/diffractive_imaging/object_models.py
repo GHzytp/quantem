@@ -75,6 +75,13 @@ class PtychoObjConstraintParams:
             Only consulted when ``obj_type="potential"``; for ``"complex"`` /
             ``"pure_phase"`` the amplitude is clamped to ``[0, 1]`` (or fixed to 1)
             regardless of this flag.
+        positivity_mode: Literal["clamp", "shrink"], default ``"clamp"``
+            How to enforce positivity. "clamp" clamps the object to be non-negative after each 
+            update, does not move the parameter, only how it is shown/used.
+            "shrink" subtracts a background offset from the object so background regions sit at 
+            zero, is applied to the parameter after the update step. 
+            If an FOV mask is set the offset is the mean of the background 
+            (``mask < 0.5 * mask.max()``); otherwise it's ``obj.min()``.
         fix_potential_baseline : bool, default ``False``
             ``obj_type="potential"`` only. Subtracts an offset from the object so
             background regions sit at zero. If an FOV mask is set the offset is
@@ -114,13 +121,6 @@ class PtychoObjConstraintParams:
 
         # hard constraints
         positivity: bool = True
-        # positivity_mode selects HOW positivity is enforced for obj_type="potential":
-        #   "clamp"  -- straight-through clamp(obj, 0) in the forward (default). Cheap display
-        #               gauge: it does NOT move the _obj parameter, only how it is shown/used.
-        #   "shrink" -- proximal per-slice shrinkage on the _obj parameter post-step: subtract
-        #               fix_potential_baseline_factor * (per-slice background) then clamp >= 0.
-        #               Per-slice keeps it on the diffraction-invariant gauge (loss-neutral for
-        #               multislice) and self-limits as the background -> 0. ObjectPixelated only.
         positivity_mode: Literal["clamp", "shrink"] = "clamp"
         fix_potential_baseline: bool = False
         fix_potential_baseline_factor: float = 1.0
