@@ -61,19 +61,6 @@ def _rotation_degrees_to_radians(rotation_angle: float | None) -> float | None:
     return math.radians(float(rotation_angle))
 
 
-def _uses_aberration_orientation_convention(key: str) -> bool:
-    return key.startswith("phi") or key.endswith("_b")
-
-
-def _aberration_coefs_to_direct_convention(
-    aberration_coefs: dict[str, float | torch.Tensor],
-) -> dict[str, float | torch.Tensor]:
-    return {
-        key: -value if _uses_aberration_orientation_convention(key) else value
-        for key, value in aberration_coefs.items()
-    }
-
-
 @dataclass
 class OptimizationParameter:
     low: float
@@ -740,8 +727,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             aberration_coefs = state.current_aberrations(override_aberration_coefs)
             rotation_angle = state.current_rotation_angle(override_rotation_angle)
 
-        direct_aberration_coefs = _aberration_coefs_to_direct_convention(aberration_coefs)
-
         if upsampling_factor is None:
             upsampling_factor = 1
         upsampling_factor = math.ceil(upsampling_factor)
@@ -777,7 +762,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             dx, dy = aberration_surface_cartesian_gradients(
                 k * self.wavelength,
                 phi,
-                aberration_coefs=direct_aberration_coefs,
+                aberration_coefs=aberration_coefs,
             )
             grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
 
@@ -786,7 +771,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     q * self.wavelength,
                     theta,
                     self.wavelength,
-                    aberration_coefs=direct_aberration_coefs,
+                    aberration_coefs=aberration_coefs,
                 )
                 sign_sin_chi_q = torch.sign(torch.sin(chi_q))
             else:
@@ -802,7 +787,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.semiangle_cutoff,
             self.angular_sampling,
             self.wavelength,
-            aberration_coefs=direct_aberration_coefs,
+            aberration_coefs=aberration_coefs,
         )
         BF_weights = cmplx_probe_k[bf_mask].abs().square().sum()
 
@@ -846,7 +831,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 cmplx_probe_k,
                 grad_k,
                 sign_sin_chi_q,
-                direct_aberration_coefs,
+                aberration_coefs,
                 batch_idx,
             )
             if power is None:
@@ -1175,8 +1160,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs,
         bf_mask,
     ):
-        direct_aberration_coefs = _aberration_coefs_to_direct_convention(aberration_coefs)
-
         # Get initial shifts
         kxa, kya = spatial_frequencies(
             self.gpts,
@@ -1189,7 +1172,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         dx, dy = aberration_surface_cartesian_gradients(
             k * self.wavelength,
             phi,
-            aberration_coefs=direct_aberration_coefs,
+            aberration_coefs=aberration_coefs,
         )
         grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
         lateral_shifts = grad_k / 2 / np.pi
@@ -1331,8 +1314,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self.corrected_stack = vbf_stack
 
-        fitted_rotation_angle = fit_results.pop("rotation_angle", None)
-        fitted_aberration_coefs = _aberration_coefs_to_direct_convention(fit_results)
+        fitted_aberration_coefs = fit_results.copy()
+        fitted_rotation_angle = fitted_aberration_coefs.pop("rotation_angle", None)
 
         state.optimized_aberrations = validate_aberration_coefficients(fitted_aberration_coefs)
         state.optimized_rotation_angle = fitted_rotation_angle
@@ -1392,7 +1375,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         device = self.device
         wavelength = self.wavelength
-        direct_aberration_coefs = _aberration_coefs_to_direct_convention(aberration_coefs)
 
         # ---------------------------------------------------------
         # Select strongest spatial frequencies
@@ -1444,9 +1426,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             km * wavelength, phim, self.semiangle_cutoff, self.angular_sampling, soft_edges=True
         )
 
-        chi0 = aberration_surface(k0 * wavelength, phi0, wavelength, direct_aberration_coefs)
-        chip = aberration_surface(kp * wavelength, phip, wavelength, direct_aberration_coefs)
-        chim = aberration_surface(km * wavelength, phim, wavelength, direct_aberration_coefs)
+        chi0 = aberration_surface(k0 * wavelength, phi0, wavelength, aberration_coefs)
+        chip = aberration_surface(kp * wavelength, phip, wavelength, aberration_coefs)
+        chim = aberration_surface(km * wavelength, phim, wavelength, aberration_coefs)
 
         # ---------------------------------------------------------
         # Overlap-only masks
@@ -1565,8 +1547,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
 
-        direct_merged = merge_aberration_coefficients(direct_aberration_coefs, delta_cartesian)
-        return _aberration_coefs_to_direct_convention(direct_merged)
+        return merge_aberration_coefficients(aberration_coefs, delta_cartesian)
 
     def fit_hyperparameters_least_squares(
         self,
