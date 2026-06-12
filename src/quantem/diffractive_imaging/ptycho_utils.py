@@ -413,8 +413,12 @@ def fit_origin(
     elif fit_function == "bezier_two":
         f = _bezier_two
     elif fit_function == "constant":
-        qr0_fit = np.mean(qr0_meas) * np.ones_like(qr0_meas)
-        qc0_fit = np.mean(qc0_meas) * np.ones_like(qc0_meas)
+        # only average over the masked-in (and finite) positions; otherwise NaN/masked-out
+        # positions (e.g. zeroed diffraction patterns) would poison the mean
+        qr0_sel = qr0_meas[mask] if mask is not None else qr0_meas
+        qc0_sel = qc0_meas[mask] if mask is not None else qc0_meas
+        qr0_fit = np.nanmean(qr0_sel) * np.ones_like(qr0_meas)
+        qc0_fit = np.nanmean(qc0_sel) * np.ones_like(qc0_meas)
         qr0_residuals = qr0_meas - qr0_fit
         qc0_residuals = qc0_meas - qc0_fit
         return qr0_fit, qc0_fit, qr0_residuals, qc0_residuals
