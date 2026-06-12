@@ -1,9 +1,10 @@
 import warnings
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.signal.windows import tukey
 
@@ -555,7 +556,7 @@ class PtychographyVisualizations(PtychographyBase):
         fig, axs = show_2d(
             objs,
             title=titles,
-            cmap=config.get("viz.phase_cmap"),
+            cmap=kwargs.pop("cmap", config.get("viz.phase_cmap")),
             norm=norm,
             cbar=cbar,
             scalebar=scalebars,
@@ -1068,8 +1069,8 @@ class PtychographyVisualizations(PtychographyBase):
 
     def show_updated_scan_positions(
         self,
-        scan_positions_px: np.ndarray | None = None,
-        initial_scan_positions_px: np.ndarray | None = None,
+        scan_positions_px: np.ndarray | torch.Tensor | None = None,
+        initial_scan_positions_px: np.ndarray | torch.Tensor | None = None,
         scale_arrows: float = 1.0,
         plot_arrow_freq: int | None = None,
         plot_cropped_rotated_fov: bool = True,
@@ -1124,9 +1125,9 @@ class PtychographyVisualizations(PtychographyBase):
         )
 
         if scan_positions_px.ndim == 3:
-            scan_positions_px = scan_positions_px.mean(axis=0)
+            scan_positions_px = cast(np.ndarray, scan_positions_px.mean(axis=0))
         if initial_scan_positions_px.ndim == 3:
-            initial_scan_positions_px = initial_scan_positions_px.mean(axis=0)
+            initial_scan_positions_px = cast(np.ndarray, initial_scan_positions_px.mean(axis=0))
 
         if scan_positions_px.ndim != 2 or scan_positions_px.shape[-1] != 2:
             raise ValueError(

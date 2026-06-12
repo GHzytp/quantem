@@ -6,7 +6,9 @@ from quantem.diffractive_imaging.dataset_models import (
 from quantem.diffractive_imaging.detector_models import DetectorPixelated as DetectorPixelated
 from quantem.diffractive_imaging.object_models import (
     ObjectDIP as ObjectDIP,
+    ObjectINR as ObjectINR,
     ObjectPixelated as ObjectPixelated,
+    ObjectTensorDecomp as ObjectTensorDecomp,
     PtychoObjConstraintParams as PtychoObjConstraintParams,
     PtychoObjConstraintsType as PtychoObjConstraintsType,
 )

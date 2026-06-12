@@ -50,7 +50,7 @@ class PtychoLite(Ptychography):
         log_prefix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = False,
-        device: Literal["cpu", "gpu"] = "cpu",
+        device: str | int = "cpu",
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
@@ -180,7 +180,7 @@ class PtychoLite(Ptychography):
         new_optimizers: bool = False,  # not sure what the default should be
         constraints: dict[str, Any] | None = None,
         store_iterations_every: int | None = None,
-        device: "Literal['cpu', 'gpu'] | int | list[int] | None" = None,
+        device: "str | int | list[int] | None" = None,
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
@@ -427,7 +427,7 @@ class PtychoLiteDIP(Ptychography):
         new_optimizers: bool = False,  # not sure what the default should be
         constraints: dict[str, Any] | None = None,
         store_iterations_every: int | None = None,
-        device: Literal["cpu", "gpu"] | int | list[int] | None = None,
+        device: str | int | list[int] | None = None,
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
