@@ -1264,8 +1264,12 @@ class PtychographyDatasetRaster(DatasetConstraints):
             com_measured_c = np.sum(intensities_mask * kcm[None, None], axis=(-2, -1))
 
             intensities_sum = np.sum(intensities_mask, axis=(-2, -1))
+            intensities_mask = intensities_sum == 0
+            intensities_sum[intensities_mask] = 1
             com_measured_r /= intensities_sum
             com_measured_c /= intensities_sum
+            com_measured_r[intensities_mask] = np.nan
+            com_measured_c[intensities_mask] = np.nan
 
         else:
             shape_r, shape_c = intensities.shape[:2]

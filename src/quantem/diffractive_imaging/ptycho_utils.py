@@ -432,7 +432,9 @@ def fit_origin(
         qr0_meas_masked = qr0_meas[mask]
         qc0_meas_masked = qc0_meas[mask]
         mask1D = mask.reshape(1, np.prod(shape))
-        rc_masked = np.vstack((r1D * mask1D, c1D * mask1D))
+        rc_masked = np.vstack((r1D[mask1D], c1D[mask1D]))
+        # old failed for zero-valued DPs
+        # rc_masked = np.vstack((r1D * mask1D, c1D * mask1D))
 
         popt_r, _ = curve_fit(f, rc_masked, qr0_meas_masked)
         popt_c, _ = curve_fit(f, rc_masked, qc0_meas_masked)
