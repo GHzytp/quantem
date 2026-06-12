@@ -19,6 +19,7 @@ from quantem.core.utils.validators import (
     validate_int,
     validate_tensor,
 )
+from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging.complex_probe import (
     aberration_surface,
     aberration_surface_cartesian_basis,
@@ -924,6 +925,50 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def obj(self) -> np.ndarray:
         obj = to_numpy(self.corrected_bf)
         return obj
+
+    def visualize(
+        self,
+        return_fig: bool = False,
+        **kwargs,
+    ):
+        """
+        Show the reconstructed object and its Hann-windowed Fourier transform.
+
+        Parameters
+        ----------
+        cbar : bool, optional
+            Whether to show colorbars, by default True.
+        return_fig : bool, optional
+            If True, return ``(fig, axs)``.
+        fft_norm : str | dict, optional
+            Normalization passed to ``show_2d`` for the object FFT.
+        **kwargs
+            Additional arguments passed to ``show_2d``.
+        """
+        if self.corrected_bf is None:
+            raise RuntimeError("Run reconstruct() before visualize().")
+
+        obj = self.obj
+        window = np.hanning(obj.shape[-2])[:, None] * np.hanning(obj.shape[-1])[None, :]
+        obj_fft = np.fft.fftshift(np.fft.fft2(obj * window))
+
+        obj_scalebar = {"sampling": self.scan_sampling[0], "units": "Å"}
+        fft_sampling = 1 / (self.scan_sampling[0] * obj.shape[-2])
+        fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
+
+        fig, axs = show_2d(
+            [obj, np.abs(obj_fft)],
+            title=["Object", "Object FFT"],
+            scalebar=[obj_scalebar, fft_scalebar],
+            cmap=["magma", "magma"],
+            norm=[None, None],
+            **kwargs,
+        )
+        axs[1].set_aspect(obj.shape[-1] / obj.shape[-2])
+
+        if return_fig:
+            return fig, axs
+        return None
 
     def optimize_hyperparameters(
         self,
