@@ -945,8 +945,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             [obj, np.abs(obj_fft)],
             title=["Object", "Object FFT"],
             scalebar=[obj_scalebar, fft_scalebar],
-            cmap=["magma", "magma"],
-            norm=[None, None],
             **kwargs,
         )
         axs[1].set_aspect(obj.shape[-1] / obj.shape[-2])
