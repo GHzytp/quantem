@@ -45,6 +45,7 @@ from itertools import product
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     ABERRATION_PRESETS,
     _crop_corner_centered_mask,
+    _rotation_degrees_to_radians,
     align_vbf_stack_multiscale,
     create_edge_window,
     fit_aberrations_from_shifts,
@@ -53,12 +54,6 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-
-def _rotation_degrees_to_radians(rotation_angle: float | None) -> float | None:
-    if rotation_angle is None:
-        return None
-    return math.radians(float(rotation_angle))
 
 
 @dataclass
@@ -914,6 +909,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def visualize(
         self,
         return_fig: bool = False,
+        show_obj_fft: bool = True,
+        apply_hanning_window: bool = False,
         **kwargs,
     ):
         """
@@ -934,20 +931,32 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             raise RuntimeError("Run reconstruct() before visualize().")
 
         obj = self.obj
-        window = np.hanning(obj.shape[-2])[:, None] * np.hanning(obj.shape[-1])[None, :]
-        obj_fft = np.fft.fftshift(np.fft.fft2(obj * window))
+        obj_scalebar = {"sampling": self.scan_sampling[1], "units": "Å"}
 
-        obj_scalebar = {"sampling": self.scan_sampling[0], "units": "Å"}
-        fft_sampling = 1 / (self.scan_sampling[0] * obj.shape[-2])
-        fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
+        if show_obj_fft:
+            if apply_hanning_window:
+                window = np.hanning(obj.shape[-2])[:, None] * np.hanning(obj.shape[-1])[None, :]
+                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj * window)))
+            else:
+                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj)))
 
-        fig, axs = show_2d(
-            [obj, np.abs(obj_fft)],
-            title=["Object", "Object FFT"],
-            scalebar=[obj_scalebar, fft_scalebar],
-            **kwargs,
-        )
-        axs[1].set_aspect(obj.shape[-1] / obj.shape[-2])
+            fft_sampling = 1 / (self.scan_sampling[1] * obj.shape[-1])
+            fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
+
+            fig, axs = show_2d(
+                [obj, obj_fft],
+                title=["Object phase", "Object phase FFT"],
+                scalebar=[obj_scalebar, fft_scalebar],
+                **kwargs,
+            )
+            axs[1].set_aspect(obj.shape[-1] / obj.shape[-2])
+        else:
+            fig, axs = show_2d(
+                obj,
+                title="Object phase",
+                scalebar=obj_scalebar,
+                **kwargs,
+            )
 
         if return_fig:
             return fig, axs
