@@ -403,6 +403,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         super().__init__(
@@ -410,6 +411,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
             tilt_angles=-tilt_angles,  # TODO: Flip the tilt angles to be negative to match the convention of INR.
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=_token,
         )
 
@@ -462,10 +464,18 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         seed: int = 42,
         _token: object | None = None,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token=_token)
+        super().__init__(
+            tilt_stack,
+            tilt_angles,
+            learn_shift,
+            learn_tilt_axis,
+            norm_quantile,
+            _token=_token,
+        )
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):
