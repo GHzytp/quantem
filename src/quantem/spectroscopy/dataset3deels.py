@@ -679,7 +679,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
             fig.suptitle(f"Thickness Analysis: {dataset.name}", fontsize=14)
 
-            im = ax1.imshow(t_over_lambda, cmap="viridis", origin="lower")
+            im = ax1.imshow(t_over_lambda, cmap="viridis", origin="upper")
             ax1.set_title(r"Relative Thickness Map ($t/\lambda$)")
             plt.colorbar(im, ax=ax1, label=r"$t/\lambda$")
 
