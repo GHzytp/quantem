@@ -169,6 +169,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         AutoSerialize.__init__(self)
@@ -188,7 +189,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_stack = torch.from_numpy(tilt_stack)
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
-        max_val = torch.quantile(tilt_stack, 0.95)
+        if norm_quantile:
+            max_val = torch.quantile(tilt_stack, 0.95)
+        else:
+            max_val = torch.max(tilt_stack)
 
         # Tilt stack normalization
         tilt_stack = tilt_stack / max_val
@@ -221,12 +225,14 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
     ):
         return cls(
             tilt_stack=tilt_stack,
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=cls._token,
         )
 
