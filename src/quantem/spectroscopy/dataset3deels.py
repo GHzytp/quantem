@@ -113,6 +113,278 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return background_fit
 
+    # ========== NEW METHOD: Background subtraction for limited pre-edge data ==========
+
+    def subtract_background_limited_preedge(
+        self,
+        target_edge,
+        pre_edge_range=None,
+        method="polynomial",
+        polynomial_degree=2,
+        show=True,
+        return_dataset=True,
+    ):
+        """
+        Background subtraction optimized for limited pre-edge data.
+
+        This method bypasses the 10-30% window_size constraint in the standard
+        subtract_background() method, allowing background fitting when only a
+        small pre-edge region is available (common in high-loss only acquisitions).
+
+        Parameters
+        ----------
+        target_edge : float
+            Energy of the edge onset (eV)
+            Examples: 285 for C K-edge, 532 for O K-edge, 284 for C K-edge
+        pre_edge_range : tuple of float, optional
+            Explicit (start, end) energies in eV for pre-edge fitting window.
+            If None, automatically uses all available data before edge.
+            Example: (519, 527) for O K-edge when data starts at 518 eV
+        method : str, optional
+            Background fitting method:
+            - 'polynomial': Polynomial fit (default, most stable for short ranges)
+            - 'linear': Linear fit (equivalent to polynomial degree=1)
+            - 'powerlaw': Power-law A*E^(-r) (needs longer pre-edge, may fail)
+        polynomial_degree : int, optional
+            Degree of polynomial (1=linear, 2=quadratic, 3=cubic). Default is 2.
+            Only used when method='polynomial'.
+        show : bool, optional
+            Display before/after visualization. Default True.
+        return_dataset : bool, optional
+            If True, return Dataset3deels. If False, return numpy array. Default True.
+
+        Returns
+        -------
+        Dataset3deels or ndarray
+            Background-subtracted data
+
+        Raises
+        ------
+        ValueError
+            If pre-edge region is insufficient or target_edge is out of range
+        RuntimeError
+            If fitting fails (typically with powerlaw on limited data)
+
+        Notes
+        -----
+        **When to use this method:**
+        - Data starts close to the edge (limited pre-edge region)
+        - Standard subtract_background() fails with window_size error
+        - High-loss only acquisitions (no low-loss data)
+        - Cropped energy ranges
+
+        **Recommended methods by pre-edge size:**
+        - < 10 eV: method='linear' (most stable)
+        - 10-20 eV: method='polynomial', degree=2
+        - > 20 eV: method='polynomial', degree=2-3, or 'powerlaw'
+
+        **Comparison to GMS background subtraction:**
+        This mimics the GMS "Fit Background" function but without the
+        window percentage constraint, using direct energy range specification.
+
+        Examples
+        --------
+        >>> # O K-edge at 532 eV, data starts at 518 eV (only 14 eV pre-edge)
+        >>> eels_sub = eels_hl.subtract_background_limited_preedge(
+        ...     target_edge=532,
+        ...     method='polynomial',
+        ...     polynomial_degree=2
+        ... )
+
+        >>> # Specify exact pre-edge window
+        >>> eels_sub = eels_hl.subtract_background_limited_preedge(
+        ...     target_edge=532,
+        ...     pre_edge_range=(519, 527),  # 8 eV window
+        ...     method='linear',
+        ...     show=True
+        ... )
+
+        >>> # C K-edge with enough pre-edge for power-law
+        >>> eels_sub = eels_hl.subtract_background_limited_preedge(
+        ...     target_edge=285,
+        ...     pre_edge_range=(200, 280),  # 80 eV window
+        ...     method='powerlaw'
+        ... )
+
+        See Also
+        --------
+        subtract_background : Standard method with window_size percentage
+        powerlaw_backgroundfit_eels : Direct power-law fitting function
+        """
+
+        import warnings
+
+        from scipy.optimize import curve_fit
+
+        energy = self.energy_axis
+        mean_spec = self.calculate_mean_spectrum()
+
+        # ===== 1. Determine pre-edge fitting window =====
+        if pre_edge_range is None:
+            pre_edge_start = float(energy[0])
+            pre_edge_end = float(target_edge - 5)
+            print(f"Auto-detected pre-edge: {pre_edge_start:.1f} - {pre_edge_end:.1f} eV")
+        else:
+            pre_edge_start, pre_edge_end = float(pre_edge_range[0]), float(pre_edge_range[1])
+            print(f"Using specified pre-edge: {pre_edge_start:.1f} - {pre_edge_end:.1f} eV")
+
+        # ===== 2. Validate inputs =====
+        if target_edge < energy[0] or target_edge > energy[-1]:
+            raise ValueError(
+                f"Target edge {target_edge} eV is outside data range "
+                f"[{energy[0]:.1f}, {energy[-1]:.1f}] eV"
+            )
+
+        if pre_edge_start < energy[0]:
+            raise ValueError(
+                f"Pre-edge start {pre_edge_start:.1f} eV is before data start {energy[0]:.1f} eV"
+            )
+
+        if pre_edge_end >= target_edge:
+            raise ValueError(
+                f"Pre-edge end {pre_edge_end:.1f} eV must be before target edge {target_edge:.1f} eV"
+            )
+
+        available_preedge = pre_edge_end - pre_edge_start
+
+        if available_preedge < 1:
+            raise ValueError(
+                f"Insufficient pre-edge region: only {available_preedge:.1f} eV available. "
+                f"Need at least 1 eV for fitting."
+            )
+
+        # Warn if pre-edge is very limited
+        if available_preedge < 10:
+            warnings.warn(
+                f"Limited pre-edge region ({available_preedge:.1f} eV). "
+                f"Background fit may be unreliable. Consider method='linear' for stability.",
+                UserWarning,
+            )
+
+        # ===== 3. Extract pre-edge data =====
+        mask = (energy >= pre_edge_start) & (energy <= pre_edge_end)
+        E_window = energy[mask]
+        I_window = mean_spec[mask]
+
+        n_points = len(E_window)
+        print(f"Pre-edge region: {available_preedge:.1f} eV ({n_points} data points)")
+
+        if n_points < 3:
+            raise ValueError(
+                f"Insufficient data points in pre-edge window: only {n_points} points. "
+                f"Need at least 3 for fitting."
+            )
+
+        # ===== 4. Fit background using selected method =====
+        if method == "linear" or (method == "polynomial" and polynomial_degree == 1):
+            # Linear fit: y = m*x + b
+            coeffs = np.polyfit(E_window, I_window, deg=1)
+            background = np.polyval(coeffs, energy)
+            fit_info = f"Linear: y = {coeffs[0]:.2e}*E + {coeffs[1]:.2e}"
+
+        elif method == "polynomial":
+            # Polynomial fit
+            if polynomial_degree > n_points - 1:
+                warnings.warn(
+                    f"Polynomial degree {polynomial_degree} too high for {n_points} points. "
+                    f"Using degree {n_points - 1} instead.",
+                    UserWarning,
+                )
+                polynomial_degree = n_points - 1
+
+            coeffs = np.polyfit(E_window, I_window, deg=polynomial_degree)
+            background = np.polyval(coeffs, energy)
+            fit_info = f"Polynomial (degree {polynomial_degree})"
+
+        elif method == "powerlaw":
+            # Power-law fit: A * E^(-r)
+            def powerlaw(E, A, r):
+                return A * (E ** (-r))
+
+            # Initial guess
+            A0 = I_window[0] * (E_window[0] ** 3)
+            r0 = 3.0
+
+            try:
+                popt, _ = curve_fit(
+                    powerlaw,
+                    E_window,
+                    I_window,
+                    p0=[A0, r0],
+                    bounds=([0, 0], [np.inf, 10]),
+                    maxfev=5000,
+                )
+                background = powerlaw(energy, popt[0], popt[1])
+                fit_info = f"Power-law: A={popt[0]:.2e}, r={popt[1]:.2f}"
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Power-law fit failed to converge with {available_preedge:.1f} eV pre-edge. "
+                    f"Try method='polynomial' or 'linear' instead. Error: {e}"
+                )
+        else:
+            raise ValueError(
+                f"Unknown method '{method}'. Choose 'linear', 'polynomial', or 'powerlaw'."
+            )
+
+        print(f"✓ Fit method: {fit_info}")
+
+        # ===== 5. Subtract background from 3D data =====
+        data_sub = np.maximum(self.array - background[None, None, :], 0)
+
+        # ===== 6. Visualize if requested =====
+        if show:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            fig.suptitle(
+                f"Background Subtraction: {self.name}\nEdge at {target_edge} eV",
+                fontsize=14,
+                fontweight="bold",
+            )
+
+            # Before subtraction
+            ax1.plot(energy, mean_spec, "k-", lw=1.5, label="Raw spectrum")
+            ax1.plot(energy, background, "r--", lw=2, label=f"Background ({fit_info})")
+            ax1.axvspan(
+                pre_edge_start,
+                pre_edge_end,
+                alpha=0.2,
+                color="green",
+                label=f"Fit region ({available_preedge:.1f} eV)",
+            )
+            ax1.axvline(target_edge, color="orange", ls=":", lw=2, label="Edge onset")
+            ax1.set_xlabel("Energy (eV)", fontsize=12)
+            ax1.set_ylabel("Intensity", fontsize=12)
+            ax1.set_title("Before Background Subtraction")
+            ax1.legend(fontsize=10)
+            ax1.grid(True, alpha=0.3)
+
+            # After subtraction
+            subtracted_spec = mean_spec - background
+            ax2.plot(energy, subtracted_spec, "b-", lw=1.5, label="Background-subtracted")
+            ax2.axvline(target_edge, color="orange", ls=":", lw=2, label="Edge onset")
+            ax2.axhline(0, color="gray", ls="--", alpha=0.5)
+            ax2.set_xlabel("Energy (eV)", fontsize=12)
+            ax2.set_ylabel("Intensity", fontsize=12)
+            ax2.set_title("After Background Subtraction")
+            ax2.legend(fontsize=10)
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.show()
+
+        # ===== 7. Return result =====
+        if return_dataset:
+            result = Dataset3deels.from_array(
+                data_sub,
+                sampling=self.sampling,
+                origin=self.origin,
+                units=self.units,
+                name=f"{self.name} (background subtracted)",
+            )
+            print(f"✓ Created background-subtracted dataset: {result.shape}")
+            return result
+        else:
+            return data_sub
+
     def powerlaw_backgroundfit_eels(self, spectrum, energy_range, target_edge, window_size):
         """
         Using a window of the energy axis preceding the target edge, fit a power law function to use for background subtraction.
