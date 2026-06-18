@@ -351,6 +351,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         fit_to_plane=True,
         fit_zlp=True,
         return_3d_dataset=True,
+        return_shifts=False,
     ):
         # Default behavior is to automatically call measure_zlp_offset to generate an array of ZLP shifts for each scan position.
         # Alternatively, a 2D array matching the x and y dimensions of the 3D dataset can be supplied as the value of zlp_shifts_array to skip this step.
@@ -433,15 +434,24 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         fig.tight_layout()
 
+        # <<<--- CHANGED: Modified return logic to optionally include shifts
         if return_3d_dataset:
-            return Dataset3deels.from_array(
+            corrected_dataset = Dataset3deels.from_array(
                 array=aligned_data_3d,
                 name=self.name,
                 sampling=self.sampling,
                 origin=new_origin,
                 units=self.units,
             )
-        return aligned_data_3d
+            if return_shifts:
+                return corrected_dataset, zlp_array  # Return both dataset and shifts
+            else:
+                return corrected_dataset  # Original behavior
+        else:
+            if return_shifts:
+                return aligned_data_3d, zlp_array  # Return both array and shifts
+            else:
+                return aligned_data_3d  # Original behavior
 
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
