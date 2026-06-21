@@ -181,7 +181,6 @@ class Dataset1d(Dataset):
         self,
         title: str | None = None,
         returnfig: bool = False,
-        **kwargs,
     ):
         """
         Plots 1D dataset
@@ -192,8 +191,6 @@ class Dataset1d(Dataset):
             If True, displays scalebar
         title: str
             Title of Dataset
-        **kwargs: dict
-            Keyword arguments for show_2d
         """
 
         if title is None:
