@@ -18,10 +18,10 @@ def inverse_softplus(x: torch.Tensor, min_value: float = 1e-8) -> torch.Tensor:
     )
 
 
-def eds_data_loss(
+def xeds_data_loss(
     predicted: torch.Tensor, target: torch.Tensor, loss: str = "poisson", min_value: float = 1e-8
 ) -> torch.Tensor:
-    """Compute EDS fit loss with clamped positive predictions."""
+    """Compute XEDS fit loss with clamped positive predictions."""
     pred_safe = torch.nan_to_num(predicted, nan=min_value, posinf=1e8, neginf=min_value)
     pred_safe = torch.clamp(pred_safe, min=min_value, max=1e8)
     if loss == "poisson":
@@ -93,8 +93,8 @@ def abundance_smoothness_l2(abundance_maps: torch.Tensor) -> torch.Tensor:
     return loss
 
 
-class EDSModel(nn.Module):
-    """EDS spectrum model = peaks + optional background."""
+class XEDSModel(nn.Module):
+    """XEDS spectrum model = peaks + optional background."""
 
     def __init__(self, peak_model, background_model=None):
         super().__init__()

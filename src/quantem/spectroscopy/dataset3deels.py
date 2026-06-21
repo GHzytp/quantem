@@ -72,7 +72,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         Subtract background typical for EELS using iterative Gaussian fitting.
         This method isolates the continuum background from the low-loss region.
 
-        WARNING: Only use with EELS data! Will remove peaks if used with EDS.
+        WARNING: Only use with EELS data! Will remove peaks if used with XEDS.
 
         Parameters
         ----------

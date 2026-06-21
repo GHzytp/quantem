@@ -12,7 +12,7 @@ from quantem.core.utils.validators import ensure_valid_array
 class Dataset1d(Dataset):
     """1D dataset class that inherits from Dataset.
 
-    This class represents a 1D dataset, such as spectra from EDS or EELS.
+    This class represents a 1D dataset, such as spectra from XEDS or EELS.
 
     Attributes
     ----------

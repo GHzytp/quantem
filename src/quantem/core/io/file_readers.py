@@ -10,12 +10,12 @@ from quantem.core.datastructures import Dataset2d as Dataset2d
 from quantem.core.datastructures import Dataset3d as Dataset3d
 from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
 from quantem.spectroscopy import (
-    Dataset3deds as Dataset3deds,
-)
-from quantem.spectroscopy import (
     Dataset3deels as Dataset3deels,
 )
 from quantem.spectroscopy import Dataset3dspectroscopy as Dataset3dspectroscopy
+from quantem.spectroscopy import (
+    Dataset3dxeds as Dataset3dxeds,
+)
 
 
 def read_4dstem(
@@ -168,11 +168,13 @@ def read_3d_spectroscopy(
         The type of file reader needed. See rosettasciio for supported formats
         https://hyperspy.org/rosettasciio/supported_formats/index.html
     data_type: str
-        type of spectroscopy data 'EELS' or 'EDS'
+        type of spectroscopy data 'EELS' or 'XEDS'
     Returns
     --------
     Dataset3dspectroscopy
     """
+    data_type_normalized = str(data_type).upper()
+
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
     data_list = file_reader(file_path)
 
@@ -222,17 +224,17 @@ def read_3d_spectroscopy(
     ]
 
     for i, unit in enumerate(units):
-        if unit == "eV" and data_type == "EDS":
+        if unit == "eV" and data_type_normalized == "XEDS":
             sampling[i] = sampling[i] / 1000
             origin[i] = origin[i] / 1000
             units[i] = "keV"
 
-    if data_type == "EELS":
+    if data_type_normalized == "EELS":
         dataset_cls = Dataset3deels
-    elif data_type == "EDS":
-        dataset_cls = Dataset3deds
+    elif data_type_normalized == "XEDS":
+        dataset_cls = Dataset3dxeds
     else:
-        raise ValueError(f"`data_type` must be `EDS` or `EELS` not `{data_type}`")
+        raise ValueError(f"`data_type` must be `XEDS` or `EELS` not `{data_type}`")
 
     dataset = dataset_cls.from_array(
         array=array,

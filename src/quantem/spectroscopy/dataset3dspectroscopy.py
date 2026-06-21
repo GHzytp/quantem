@@ -71,7 +71,7 @@ class Dataset3dspectroscopy(Dataset3d):
     # loads elemental information
     @classmethod
     def load_element_info(cls):
-        """Load element database for EDS X-ray lines or EELS edges."""
+        """Load element database for XEDS X-ray lines or EELS edges."""
         if cls.element_info is not None:
             return cls.element_info
 
@@ -92,7 +92,7 @@ class Dataset3dspectroscopy(Dataset3d):
             with open(full_path, "r", encoding="utf-8") as f:
                 cls.element_info = json.load(f)["elements"]
 
-        if dataset_type == "eds":
+        if dataset_type == "xeds":
             cls._normalize_element_info()
 
         return cls.element_info
@@ -340,7 +340,7 @@ class Dataset3dspectroscopy(Dataset3d):
             self.attached_spectra[spectrum_index][0],
             linewidth=1.5,
         )
-        if self.dataset_type == "eds":
+        if self.dataset_type == "xeds":
             ax_spec.set_xlabel("Energy (keV)")
         elif self.dataset_type == "eels":
             ax_spec.set_xlabel("Energy (eV)")
@@ -386,7 +386,7 @@ class Dataset3dspectroscopy(Dataset3d):
             - 'reconstructed': reconstructed dataset (dataset3dspectroscopy) using n_components
         """
 
-        from quantem.spectroscopy import Dataset3deds, Dataset3deels
+        from quantem.spectroscopy import Dataset3deels, Dataset3dxeds
 
         data = np.asarray(self.array, dtype=float)
         scan_row, scan_col, n_energy = data.shape
@@ -449,8 +449,8 @@ class Dataset3dspectroscopy(Dataset3d):
         reconstructed_array = reconstructed_spectra.reshape(scan_row, scan_col, n_energy)
 
         dataset_type = str(self.dataset_type).lower()
-        if dataset_type == "eds":
-            dataset_class = Dataset3deds
+        if dataset_type == "xeds":
+            dataset_class = Dataset3dxeds
         elif dataset_type == "eels":
             dataset_class = Dataset3deels
         else:
@@ -893,7 +893,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # RIGHT PLOT: Show spectrum
         ax_spec.plot(E, spec, linewidth=1.5, color="k")
-        if self.dataset_type == "eds":
+        if self.dataset_type == "xeds":
             ax_spec.set_xlabel("Energy (keV)")
         else:
             ax_spec.set_xlabel("Energy (eV)")
@@ -989,7 +989,7 @@ class Dataset3dspectroscopy(Dataset3d):
         else:
             E_spec = E
 
-        unit_label = "keV" if str(self.dataset_type).lower() == "eds" else "eV"
+        unit_label = "keV" if str(self.dataset_type).lower() == "xeds" else "eV"
         fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(12, 4))
         show_2d(
             energy_map,
@@ -1065,15 +1065,15 @@ class Dataset3dspectroscopy(Dataset3d):
             background fit. The current pixel is included. Used only when
             ``fit_mode="local"``.
         window_size : int, optional
-            For EDS, number of spectral channels in the rolling low-percentile
+            For XEDS, number of spectral channels in the rolling low-percentile
             envelope used before polynomial fitting. For EELS power-law fitting,
             percent of ``target_edge`` used for the pre-edge fit window. Defaults
-            to 50 channels for EDS and 10 percent for EELS.
+            to 50 channels for XEDS and 10 percent for EELS.
         show : bool, optional
             If True, plot the mean raw spectrum, fitted background, and
             background-subtracted spectrum.
         polynomial_degree : int, optional
-            Degree of the polynomial power-series background used for EDS data.
+            Degree of the polynomial power-series background used for XEDS data.
             Ignored for EELS data.
         return_background : bool, optional
             If True, return ``(dataset, background_cube)`` when ``return_dataset``
@@ -1086,7 +1086,7 @@ class Dataset3dspectroscopy(Dataset3d):
             True, also returns the fitted background cube.
         """
 
-        from quantem.spectroscopy import Dataset3deds, Dataset3deels
+        from quantem.spectroscopy import Dataset3deels, Dataset3dxeds
 
         fit_mode = str(fit_mode).lower()
         if fit_mode not in {"global", "local"}:
@@ -1137,8 +1137,8 @@ class Dataset3dspectroscopy(Dataset3d):
             )
 
         dataset_type = str(self.dataset_type).lower()
-        if dataset_type == "eds":
-            dataset_class = Dataset3deds
+        if dataset_type == "xeds":
+            dataset_class = Dataset3dxeds
         elif dataset_type == "eels":
             dataset_class = Dataset3deels
         else:
@@ -1212,7 +1212,7 @@ class Dataset3dspectroscopy(Dataset3d):
         dataset_type = str(self.dataset_type).lower()
         spectrum = np.asarray(spectrum, dtype=float)
 
-        if dataset_type == "eds":
+        if dataset_type == "xeds":
             return self.calculate_background_polynomial(
                 spectrum,
                 energy_axis=np.asarray(energy_axis, dtype=float),
@@ -1337,7 +1337,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 linewidth=1.5,
                 label="Background-subtracted",
             )
-        if self.dataset_type == "eds":
+        if self.dataset_type == "xeds":
             ax_specbacksub.set_xlabel("Energy (keV)")
         else:
             ax_specbacksub.set_xlabel("Energy (eV)")

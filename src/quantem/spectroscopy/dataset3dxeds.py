@@ -13,19 +13,19 @@ from scipy.signal import find_peaks, peak_prominences, peak_widths
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy import Dataset3dspectroscopy
 from quantem.spectroscopy.spectroscopy_models import (
-    EDSModel,
     GaussianPeaks,
     PolynomialBackground,
+    XEDSModel,
     abundance_smoothness_l2,
     build_element_basis,
-    eds_data_loss,
     inverse_softplus,
     polynomial_energy_basis,
+    xeds_data_loss,
 )
 
 
-class Dataset3deds(Dataset3dspectroscopy):
-    """An EDS dataset class that inherits from Dataset3dspectroscopy.
+class Dataset3dxeds(Dataset3dspectroscopy):
+    """An XEDS dataset class that inherits from Dataset3dspectroscopy.
 
     This class represents a scanning transmission electron microscopy (STEM) dataset,
     where the data consists of a 3D array with dimensions (scan_row, scan_col, energy).
@@ -47,7 +47,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         signal_units: str = "arb. units",
         _token: object | None = None,
     ):
-        """Initialize a 3D EDS dataset."""
+        """Initialize a 3D XEDS dataset."""
         super().__init__(
             array=array,
             name=name,
@@ -57,7 +57,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             signal_units=signal_units,
             _token=_token,
         )
-        self.dataset_type = "eds"
+        self.dataset_type = "xeds"
 
     @staticmethod
     def _normalize_specs(specs, param_name="spec", allow_none=False):
@@ -101,7 +101,7 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     @classmethod
     def _normalize_element_info(cls, combine_close_peaks=True, energy_threshold_ev=15):
-        """Normalize EDS X-ray lines and optionally merge unresolved line families."""
+        """Normalize XEDS X-ray lines and optionally merge unresolved line families."""
         if not isinstance(cls.element_info, dict):
             return cls.element_info
 
@@ -576,7 +576,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                     roi=kwargs.pop("roi", None),
                     roi_cal=kwargs.pop("roi_cal", None),
                     mask=selector_masks[selector],
-                    data_type=kwargs.pop("data_type", "eds"),
+                    data_type=kwargs.pop("data_type", "xeds"),
                     cmap=cmap,
                     show=True,
                 )
@@ -888,7 +888,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         line=None,
         return_details=False,
     ):
-        """Automatically identify elements from EDS peaks in the mean spectrum.
+        """Automatically identify elements from XEDS peaks in the mean spectrum.
 
         Finds peaks in the spatially-averaged spectrum, matches them against a
         database of known X-ray line energies, and classifies elements as
@@ -995,7 +995,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             roi_cal=roi_cal,
             energy_range=energy_range,
             mask=mask,
-            data_type="eds",
+            data_type="xeds",
             show=False,
         )
         spec = self.calculate_mean_spectrum(
@@ -2675,7 +2675,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         default_lr_lbfgs,
         verbose=False,
     ):
-        """Fit a single mean spectrum using the PyTorch EDS model."""
+        """Fit a single mean spectrum using the PyTorch XEDS model."""
         target = spectrum_raw
         spectrum_offset = torch.tensor(0.0, dtype=spectrum_raw.dtype, device=spectrum_raw.device)
         spectrum_scale = torch.tensor(1.0, dtype=spectrum_raw.dtype, device=spectrum_raw.device)
@@ -2693,7 +2693,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             peak_width=peak_width,
             elements_to_fit=elements_to_fit,
         )
-        model = EDSModel(peaks, background)
+        model = XEDSModel(peaks, background)
         model = model.to(device=energy_axis.device, dtype=energy_axis.dtype)
         if len(model.peak_model.element_names) == 0:
             raise ValueError("No elements found in the selected energy range/elements_to_fit.")
@@ -2721,18 +2721,18 @@ class Dataset3deds(Dataset3dspectroscopy):
                 def closure():
                     optimizer_obj.zero_grad()
                     predicted = model()
-                    loss = eds_data_loss(predicted, target, loss=loss_name)
+                    loss = xeds_data_loss(predicted, target, loss=loss_name)
                     loss.backward()
                     return loss
 
                 loss = optimizer_obj.step(closure)
                 if not torch.is_tensor(loss):
                     with torch.no_grad():
-                        loss = eds_data_loss(model(), target, loss=loss_name)
+                        loss = xeds_data_loss(model(), target, loss=loss_name)
             else:
                 optimizer_obj.zero_grad()
                 predicted = model()
-                loss = eds_data_loss(predicted, target, loss=loss_name)
+                loss = xeds_data_loss(predicted, target, loss=loss_name)
                 loss.backward()
                 optimizer_obj.step()
 
@@ -2766,7 +2766,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         optimizer="lbfgs",
         device=None,
     ):
-        """Fit the spatially-summed mean EDS spectrum and display results.
+        """Fit the spatially-summed mean XEDS spectrum and display results.
 
         A convenience wrapper around :meth:`_fit_mean_model_pytorch` that
         handles device selection, energy windowing, and result visualization.
@@ -2958,7 +2958,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         device=None,
         constrain_background=0.1,
     ):
-        """Fit EDS spectra using a PyTorch model.
+        """Fit XEDS spectra using a PyTorch model.
 
         Supports two workflows:
         - Mean-only fitting (`fit_mean_only=True`): fit a single spectrum formed by
@@ -3369,7 +3369,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             pred_eval = pred_local[valid_pixel_mask] / local_scale
             target_eval = spectra_flat[valid_pixel_mask] / local_scale
 
-            loss_data = eds_data_loss(
+            loss_data = xeds_data_loss(
                 pred_eval,
                 target_eval,
                 loss=effective_loss_local,
@@ -3530,7 +3530,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         window_size=50,
     ):
         """
-        Fit an EDS continuum background with a polynomial power series in energy.
+        Fit an XEDS continuum background with a polynomial power series in energy.
 
         A rolling low-percentile envelope is used as the fit target so sharp
         characteristic X-ray peaks do not dominate the continuum fit.
@@ -3641,5 +3641,5 @@ class Dataset3deds(Dataset3dspectroscopy):
         return np.maximum(background, 0.0)
 
     def calculate_background_powerlaw(self, spectrum, *args, **kwargs):
-        """Compatibility wrapper for the EDS polynomial background fit."""
+        """Compatibility wrapper for the XEDS polynomial background fit."""
         return self.calculate_background_polynomial(spectrum, *args, **kwargs)

@@ -5,6 +5,6 @@ from quantem.spectroscopy.dataset3deels import (
     Dataset3deels as Dataset3deels,
 )
 
-from quantem.spectroscopy.dataset3deds import (
-    Dataset3deds as Dataset3deds,
+from quantem.spectroscopy.dataset3dxeds import (
+    Dataset3dxeds as Dataset3dxeds,
 )
