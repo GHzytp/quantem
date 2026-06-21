@@ -371,7 +371,7 @@ class Dataset3dspectroscopy(Dataset3d):
             If True, standardize the data before PCA (zero mean, unit variance)
         mask : Optional[NDArray]
             Optional spatial mask to select pixels for analysis. Accepts shape
-            (scan_y, scan_x) or a flattened spatial mask.
+            (scan_row, scan_col) or a flattened spatial mask.
         plot_results : bool
             If True, plot the explained variance and first few components
 
@@ -381,7 +381,7 @@ class Dataset3dspectroscopy(Dataset3d):
             Dictionary containing:
             - 'pca': PCA result attributes
             - 'components': principal component spectra (n_components x n_energy)
-            - 'loadings': spatial loadings (n_components x scan_y x scan_x)
+            - 'loadings': spatial loadings (n_components x scan_row x scan_col)
             - 'explained_variance_ratio': explained variance for each component
             - 'reconstructed': reconstructed dataset (dataset3dspectroscopy) using n_components
         """
@@ -389,21 +389,21 @@ class Dataset3dspectroscopy(Dataset3d):
         from quantem.spectroscopy import Dataset3deds, Dataset3deels
 
         data = np.asarray(self.array, dtype=float)
-        nx, ny, n_energy = data.shape
-        n_pixels = ny * nx
+        scan_row, scan_col, n_energy = data.shape
+        n_pixels = scan_row * scan_col
 
         spectra = np.moveaxis(data, 2, -1).reshape(n_pixels, n_energy)
         pixel_mask = np.ones(n_pixels, dtype=bool)
 
         if mask is not None:
             mask_array = np.asarray(mask, dtype=bool)
-            if mask_array.shape == (ny, nx):
+            if mask_array.shape == (scan_row, scan_col):
                 pixel_mask = mask_array.reshape(-1)
             elif mask_array.shape == (n_pixels,):
                 pixel_mask = mask_array
             else:
                 raise ValueError(
-                    f"mask shape {mask_array.shape} must match spatial shape {(ny, nx)} "
+                    f"mask shape {mask_array.shape} must match spatial shape {(scan_row, scan_col)} "
                     f"or flattened shape {(n_pixels,)}"
                 )
 
@@ -434,7 +434,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         loadings_flat = np.zeros((n_components, n_pixels), dtype=loadings.dtype)
         loadings_flat[:, pixel_mask] = loadings.T
-        loadings_spatial = loadings_flat.reshape(n_components, ny, nx)
+        loadings_spatial = loadings_flat.reshape(n_components, scan_row, scan_col)
 
         if plot_results:
             self._plot_pca_results(
@@ -446,7 +446,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         reconstructed_spectra = spectra.copy()
         reconstructed_spectra[pixel_mask] = reconstructed
-        reconstructed_array = reconstructed_spectra.reshape(ny, nx, n_energy).transpose(1, 0, 2)
+        reconstructed_array = reconstructed_spectra.reshape(scan_row, scan_col, n_energy)
 
         dataset_type = str(self.dataset_type).lower()
         if dataset_type == "eds":
@@ -1281,8 +1281,8 @@ class Dataset3dspectroscopy(Dataset3d):
     ):
         from scipy.spatial import cKDTree
 
-        nx, ny, n_energy = array3d.shape
-        n_pixels = ny * nx
+        scan_row, scan_col, n_energy = array3d.shape
+        n_pixels = scan_row * scan_col
         try:
             n_neighbors = int(kernel_width)
         except (TypeError, ValueError) as exc:
@@ -1291,8 +1291,8 @@ class Dataset3dspectroscopy(Dataset3d):
             raise ValueError("kernel_width must be >= 1")
         n_neighbors = min(n_neighbors, n_pixels)
 
-        yy, xx = np.indices((ny, nx))
-        coords = np.column_stack((yy.reshape(-1), xx.reshape(-1)))
+        row_indices, col_indices = np.indices((scan_row, scan_col))
+        coords = np.column_stack((row_indices.reshape(-1), col_indices.reshape(-1)))
         _, neighbor_indices = cKDTree(coords).query(coords, k=n_neighbors)
         if n_neighbors == 1:
             neighbor_indices = neighbor_indices[:, None]
@@ -1301,7 +1301,7 @@ class Dataset3dspectroscopy(Dataset3d):
         background = np.empty_like(spectra)
 
         for pixel_index, neighbors in enumerate(neighbor_indices):
-            local_spectrum = spectra[neighbors].mean(axis=2)
+            local_spectrum = spectra[neighbors].mean(axis=0)
             try:
                 background[pixel_index] = self._fit_background_spectrum(
                     local_spectrum,
@@ -1312,10 +1312,10 @@ class Dataset3dspectroscopy(Dataset3d):
                     polynomial_degree=polynomial_degree,
                 )
             except Exception as exc:
-                y, x = divmod(pixel_index, nx)
-                raise RuntimeError(f"Background fit failed at pixel ({y}, {x})") from exc
+                i_row, i_col = divmod(pixel_index, scan_col)
+                raise RuntimeError(f"Background fit failed at pixel ({i_row}, {i_col})") from exc
 
-        return background.reshape(ny, nx, n_energy).transpose(1, 0, 2)
+        return background.reshape(scan_row, scan_col, n_energy)
 
     def _plot_background_subtraction(
         self,

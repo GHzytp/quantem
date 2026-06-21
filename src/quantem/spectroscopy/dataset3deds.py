@@ -28,7 +28,7 @@ class Dataset3deds(Dataset3dspectroscopy):
     """An EDS dataset class that inherits from Dataset3dspectroscopy.
 
     This class represents a scanning transmission electron microscopy (STEM) dataset,
-    where the data consists of a 3D array with dimensions (scan_y, scan_x, energy).
+    where the data consists of a 3D array with dimensions (scan_row, scan_col, energy).
     The first two dimensions represent real space sampling, while the last dimension
     represents the energy axis.
 
@@ -496,15 +496,15 @@ class Dataset3deds(Dataset3dspectroscopy):
         mask = (self.energy_axis[:, None] > energies[None, :] - width) & (
             self.energy_axis[:, None] < energies[None, :] + width
         )
-        # n, h, w = self.array.shape
+        # scan_row, scan_col, n_energy = self.array.shape
         # maps = (mask.astype(self.array.dtype).T @ self.array.reshape(n, -1)).reshape(
-        #    mask.shape[1], h, w
+        #    mask.shape[1], scan_row, scan_col
         # )
 
-        w, h, n = self.array.shape
-        maps = (mask.astype(self.array.dtype).T @ self.array.reshape(-1, n).transpose()).reshape(
-            mask.shape[1], w, h
-        )
+        scan_row, scan_col, n_energy = self.array.shape
+        maps = (
+            mask.astype(self.array.dtype).T @ self.array.reshape(-1, n_energy).transpose()
+        ).reshape(mask.shape[1], scan_row, scan_col)
 
         self._spectrum_images = {
             **getattr(self, "_spectrum_images", {}),
@@ -3216,8 +3216,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                 "fit_range": energy_range,
             }
 
-        n_y, n_x, n_energy = spectra.shape
-        n_pixels = n_y * n_x
+        scan_row, scan_col, n_energy = spectra.shape
+        n_pixels = scan_row * scan_col
         spectra_flat = spectra.reshape(n_pixels, n_energy)
 
         total_counts = spectra_flat.sum(dim=1)
@@ -3379,7 +3379,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             if spatial_lambda <= 0:
                 return loss_total
 
-            conc_maps = conc_local.view(n_y, n_x, n_elements).permute(2, 0, 1)
+            conc_maps = conc_local.view(scan_row, scan_col, n_elements).permute(2, 0, 1)
             conc_maps = conc_maps / torch.clamp(global_scale, min=1e-8)
             loss_smooth = abundance_smoothness_l2(conc_maps)
             return loss_total + spatial_lambda * loss_smooth
@@ -3421,7 +3421,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             mean_fitted_spectrum_all = pred_final.mean(dim=0).cpu().numpy()
             mean_background_spectrum_all = bg_final.mean(dim=0).cpu().numpy()
 
-            abundance_maps = conc_final.view(n_y, n_x, n_elements).permute(2, 0, 1).cpu().numpy()
+            abundance_maps = (
+                conc_final.view(scan_row, scan_col, n_elements).permute(2, 0, 1).cpu().numpy()
+            )
             peak_widths = nn.functional.softplus(peak_width_params).detach().cpu().numpy()
 
         pytorch_spectrum_images = self._build_pytorch_spectrum_images(
@@ -3507,7 +3509,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             "peak_widths": peak_widths,
             "loss_history": loss_history_array,
             "global_loss_history": np.asarray(global_loss_history),
-            "valid_pixel_mask": valid_pixel_mask.view(n_y, n_x).cpu().numpy(),
+            "valid_pixel_mask": valid_pixel_mask.view(scan_row, scan_col).cpu().numpy(),
             "energy_axis": energy_axis_np,
             "input_spectrum": mean_input_spectrum,
             "fitted_spectrum": mean_fitted_spectrum,
