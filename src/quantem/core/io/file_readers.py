@@ -18,6 +18,13 @@ from quantem.spectroscopy import (
 )
 
 
+def _print_available_datasets(data_list):
+    print("Available datasets:")
+    for index, entry in enumerate(data_list):
+        array = entry["data"]
+        print(f"  Dataset {index}: shape {array.shape}, ndim={array.ndim}")
+
+
 def read_4dstem(
     file_path: str | PathLike,
     file_type: str | None = None,
@@ -105,19 +112,17 @@ def read_4dstem(
     else:
         # Automatically find first 4D dataset
         four_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 4]
+        _print_available_datasets(data_list)
 
         if len(four_d_datasets) == 0:
-            print(f"No 4D datasets found in {file_path}. Available datasets:")
-            for i, d in enumerate(data_list):
-                print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+            print(f"No 4D datasets found in {file_path}.")
             raise ValueError("No 4D dataset found in file")
 
         dataset_index, imported_data = four_d_datasets[0]
 
-        if len(data_list) > 1:
-            print(
-                f"File contains {len(data_list)} dataset(s). Using dataset {dataset_index} with shape {imported_data['data'].shape}"
-            )
+        print(
+            f"Using first 4D dataset at index {dataset_index} with shape {imported_data['data'].shape}"
+        )
 
     imported_axes = imported_data["axes"]
 
@@ -184,28 +189,24 @@ def read_3d_spectroscopy(
         if imported_data["data"].ndim != 3:
             raise ValueError(
                 f"Dataset at index {dataset_index} has {imported_data['data'].ndim} dimensions, "
-                f"expected 4D. Shape: {imported_data['data'].shape}"
+                f"expected 3D. Shape: {imported_data['data'].shape}"
             )
     else:
         # Automatically find first 3D dataset
         three_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 3]
+        _print_available_datasets(data_list)
 
         if len(three_d_datasets) == 0:
-            print(f"No 3D datasets found in {file_path}. Available datasets:")
-            for i, d in enumerate(data_list):
-                print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+            print(f"No 3D datasets found in {file_path}.")
             raise ValueError("No 3D dataset found in file")
 
         dataset_index, imported_data = three_d_datasets[0]
 
-        dataset_indices = []
-        for entry in three_d_datasets:
-            dataset_indices.append(entry[0])
-
-        if len(data_list) > 1:
-            print(
-                f"File contains {len(data_list)} dataset(s) and {len(three_d_datasets)} 3D dataset(s) at indices {', '.join(map(str, dataset_indices))}. Using dataset {dataset_index} with shape {imported_data['data'].shape}"
-            )
+        dataset_indices = [entry[0] for entry in three_d_datasets]
+        print(
+            f"Using first 3D dataset at index {dataset_index} with shape {imported_data['data'].shape}. "
+            f"3D dataset indices: {', '.join(map(str, dataset_indices))}"
+        )
 
     imported_axes = imported_data["axes"]
     # axis_order = (0, 1, 2) if file_type == "digitalmicrograph" else (2, 0, 1)
