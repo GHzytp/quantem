@@ -460,7 +460,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             [lbl for lbl, _, _ in unique],
         )
 
-    def generage_spectrum_images(self, elements=None, width=0.15, return_maps=False):
+    def generate_spectrum_images(self, elements=None, width=0.15, return_maps=False):
         """Generate spectrum images by integrating around X-ray line energies.
 
         For each matched X-ray line, sums the spectral intensity within an
@@ -496,10 +496,6 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         mask = (self.energy_axis[:, None] > energies[None, :] - width) & (
             self.energy_axis[:, None] < energies[None, :] + width
         )
-        # scan_row, scan_col, n_energy = self.array.shape
-        # maps = (mask.astype(self.array.dtype).T @ self.array.reshape(n, -1)).reshape(
-        #    mask.shape[1], scan_row, scan_col
-        # )
 
         scan_row, scan_col, n_energy = self.array.shape
         maps = (
@@ -631,7 +627,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         """
         spectrum_images = self._get_spectrum_images(method)
         if not spectrum_images:
-            raise ValueError("No spectrum images found. Run generage_spectrum_images(...) first.")
+            raise ValueError("No spectrum images found. Run generate_spectrum_images(...) first.")
 
         line_map = {str(k): np.asarray(v) for k, v in spectrum_images.items()}
         labels = list(line_map)
