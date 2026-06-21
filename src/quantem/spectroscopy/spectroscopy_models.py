@@ -183,10 +183,10 @@ class GaussianPeaks(nn.Module):
             for shell_label in set(shell_labels):
                 shell_indices = [i for i, label in enumerate(shell_labels) if label == shell_label]
                 shell_weights = np.clip(weights[shell_indices], a_min=0.0, a_max=None)
-                shell_sum = float(np.sum(shell_weights))
+                shell_sum = np.sum(shell_weights)
                 if shell_sum <= 0.0:
-                    shell_weights = np.ones(len(shell_indices), dtype=np.float32) / float(
-                        len(shell_indices)
+                    shell_weights = np.ones(len(shell_indices), dtype=np.float32) / len(
+                        shell_indices
                     )
                 else:
                     shell_weights = shell_weights / shell_sum
@@ -194,7 +194,7 @@ class GaussianPeaks(nn.Module):
             weights_to_use = normalized_weights
 
             all_peak_energies.extend(energies)
-            all_peak_weights.extend(float(weight) for weight in weights_to_use)
+            all_peak_weights.extend(weights_to_use)
             all_peak_element_indices.extend([elem_idx] * len(energies))
             for shell_label in shell_labels:
                 key = (elem_idx, shell_label)

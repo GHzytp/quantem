@@ -554,7 +554,7 @@ class Dataset3deels(Dataset3dspectroscopy):
                     else:
                         zlp_crude_idx = int(np.argmax(spec_filt))
 
-                    mu0 = float(energy_axis[zlp_crude_idx])
+                    mu0 = energy_axis[zlp_crude_idx]
 
                     lo = mu0 - fit_window
                     hi = mu0 + fit_window
@@ -564,7 +564,7 @@ class Dataset3deels(Dataset3dspectroscopy):
                     xw = energy_axis[x_mask]
                     yw = spec_filt[x_mask]
 
-                    A0 = float(spec_filt[zlp_crude_idx])
+                    A0 = spec_filt[zlp_crude_idx]
                     sigma0 = fit_window / 2
 
                     p0 = (A0, mu0, sigma0)
@@ -584,10 +584,10 @@ class Dataset3deels(Dataset3dspectroscopy):
 
                     popt, _ = curve_fit(_gaussian_fit, xw, yw, p0=p0, bounds=bounds)
 
-                    zlp_measured[i_row, i_col] = float(popt[1])
+                    zlp_measured[i_row, i_col] = popt[1]
                 else:
                     zlp_crude_idx = int(np.argmax(spec_filt))
-                    zlp_measured[i_row, i_col] = float(energy_axis[zlp_crude_idx])
+                    zlp_measured[i_row, i_col] = energy_axis[zlp_crude_idx]
 
         if fit_to_plane:
             # Fit a 2D plane to the array of measured ZLPs
@@ -689,7 +689,7 @@ class Dataset3deels(Dataset3dspectroscopy):
                 "Check that zlp_shifts_array is in energy units, not channel indices."
             )
 
-        new_origin = float(new_Eaxis[0])
+        new_origin = new_Eaxis[0]
 
         # Calculate mean spectra before and after correction for plotting
         mean_spectrum_raw = self.array.mean(axis=(0, 1))

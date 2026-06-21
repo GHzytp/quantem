@@ -312,9 +312,7 @@ class Dataset3dspectroscopy(Dataset3d):
         from quantem.core.datastructures.dataset1d import Dataset1d
 
         energy_sampling = (
-            float(energy_axis[1] - energy_axis[0])
-            if len(energy_axis) > 1
-            else float(self.sampling[2])
+            energy_axis[1] - energy_axis[0] if len(energy_axis) > 1 else float(self.sampling[2])
         )
         two_d_spectrum = Dataset1d.from_array(
             array=spectrum,
@@ -1182,8 +1180,8 @@ class Dataset3dspectroscopy(Dataset3d):
                 raise ValueError("Invalid energy range parameter.")
             if e_max < E[0] or e_min > E[-1]:
                 raise ValueError("Energy range parameter is outside of data bounds.")
-            e_min = max(e_min, float(E[0]))
-            e_max = min(e_max, float(E[-1]))
+            e_min = max(e_min, E[0])
+            e_max = min(e_max, E[-1])
             selected &= (E >= e_min) & (E <= e_max)
 
         if mask is not None:
@@ -1225,7 +1223,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         method = str(method).lower()
         if method == "iterative":
-            return np.full_like(spectrum, float(self.calculate_background_iterative(spectrum)))
+            return np.full_like(spectrum, self.calculate_background_iterative(spectrum))
         if method != "powerlaw":
             raise ValueError("EELS background method must be 'powerlaw' or 'iterative'")
         if target_edge is None:

@@ -50,8 +50,8 @@ def load_xray_lines_database(path: Union[Path, str]) -> dict[str, dict[str, dict
                 line_name = f"{line_name}__{duplicate_counts[key]}"
 
             element_lines[line_name] = {
-                "energy (keV)": float(energy_kev),
-                "weight": float(weight),
+                "energy (keV)": energy_kev,
+                "weight": weight,
             }
 
     return elements
@@ -90,7 +90,7 @@ def load_eels_edges_database(path: Union[Path, str]) -> dict[str, dict[str, dict
                 edge_name = f"{edge_name}__{duplicate_counts[key]}"
 
             edge_info: dict[str, object] = {
-                "onset_energy (eV)": float(energy_ev),
+                "onset_energy (eV)": energy_ev,
             }
             if edge_label:
                 edge_info["edge_label"] = edge_label
@@ -98,7 +98,7 @@ def load_eels_edges_database(path: Union[Path, str]) -> dict[str, dict[str, dict
             atomic_number = _parse_float(row, ("atomic_number",))
             if atomic_number is not None:
                 edge_info["atomic_number"] = (
-                    int(atomic_number) if atomic_number.is_integer() else float(atomic_number)
+                    int(atomic_number) if atomic_number.is_integer() else atomic_number
                 )
 
             element_name = str(row.get("element", "")).strip()

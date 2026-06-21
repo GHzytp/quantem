@@ -128,11 +128,11 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         def merged_info(entries):
             weights = np.asarray([entry["weight"] for entry in entries], dtype=float)
             energies = np.asarray([entry["energy"] for entry in entries], dtype=float)
-            weight_sum = float(np.sum(weights))
+            weight_sum = np.sum(weights)
             if weight_sum > 0.0:
-                energy = float(np.sum(energies * weights) / weight_sum)
+                energy = np.sum(energies * weights) / weight_sum
             else:
-                energy = float(np.mean(energies))
+                energy = np.mean(energies)
             return {"energy (keV)": energy, "weight": weight_sum}
 
         normalized_info = {}
@@ -302,11 +302,11 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         snr_value: float, line_weight: float, distance_value: float, tolerance: float
     ) -> float:
         """Compute a confidence score for a peak-to-line match."""
-        sigma = max(float(tolerance) / 3.0, 1e-9)
+        sigma = max(tolerance / 3.0, 1e-9)
         return (
-            np.log1p(max(float(snr_value), 0.0))
-            * max(float(line_weight), 0.0)
-            * np.exp(-0.5 * (float(distance_value) / sigma) ** 2)
+            np.log1p(max(snr_value, 0.0))
+            * max(line_weight, 0.0)
+            * np.exp(-0.5 * (distance_value / sigma) ** 2)
         )
 
     @staticmethod
@@ -363,8 +363,8 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 # band so the floor tracks "visible" peaks without being pulled
                 # down by noise tails or up by a few extreme peaks.
                 q30, q40, q50, q60 = np.percentile(snr_values, [30, 40, 50, 60])
-                floor = 0.5 * float(q40 + q50)
-                floor = float(np.clip(floor, q30, q60))
+                floor = 0.5 * (q40 + q50)
+                floor = np.clip(floor, q30, q60)
                 floor = max(0.0, floor)
             else:
                 floor = 8.0
@@ -380,8 +380,8 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 # peaks are shown, not which peaks are detected.
                 anchor = np.sort(high)[::-1][: min(high.size, 40)]
                 med, q75, q90 = np.percentile(anchor, [50, 75, 90])
-                snr_threshold = float(
-                    np.clip(max(med, 0.7 * q75, 2.5 * floor), max(2.5 * floor, floor), q90)
+                snr_threshold = np.clip(
+                    max(med, 0.7 * q75, 2.5 * floor), max(2.5 * floor, floor), q90
                 )
             else:
                 snr_threshold = max(4.0 * floor, 30.0)
@@ -451,7 +451,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             raise ValueError(f"No X-ray lines matched specifier(s): {specs}")
 
         unique = sorted(
-            {(lbl, round(float(e), 12), round(float(w), 12)) for lbl, e, w in rows},
+            {(lbl, round(e, 12), round(w, 12)) for lbl, e, w in rows},
             key=lambda t: (t[1], -t[2], t[0]),
         )
         return (
@@ -516,7 +516,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         if return_maps:
             return images, titles
 
-    def Integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
+    def _integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
         """Integrate the spectrum around specified X-ray lines.
 
         Sums spectral intensity within ``line_energy +/- width`` for each
@@ -546,7 +546,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         specs = type(self)._normalize_specs(spec, param_name="spec")
         arr = np.asarray(self.array, dtype=float)
         energy_axis = np.asarray(self.energy_axis, dtype=float)
-        energy_min, energy_max = float(energy_axis.min()), float(energy_axis.max())
+        energy_min, energy_max = energy_axis.min(), energy_axis.max()
 
         selector_masks, integrated_maps = {}, {}
         for selector in map(str, specs):
@@ -597,7 +597,9 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
     def integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
         """Convenience wrapper for Integrate."""
-        return self.Integrate(spec=spec, width=width, return_maps=return_maps, show=show, **kwargs)
+        return self._integrate(
+            spec=spec, width=width, return_maps=return_maps, show=show, **kwargs
+        )
 
     def show_spectrum_images(
         self, x_ray_lines=None, return_fig=False, return_maps=False, method="integration", **kwargs
@@ -689,7 +691,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 continue
             element_map = np.asarray(maps[i], dtype=float)
             for weight, label in zip(line_weights, line_labels):
-                line_maps[str(label)] = element_map * float(weight)
+                line_maps[str(label)] = element_map * weight
         return line_maps
 
     def quantify_composition_cliff_lorimer(
@@ -1078,7 +1080,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                     cand_h = float(heights[j])
                     cand_p = float(prominences[j])
                     cand_w = float(widths[j])
-                    if float(E[cand_idx] - E[best_idx]) > energy_gap_limit:
+                    if E[cand_idx] - E[best_idx] > energy_gap_limit:
                         break
 
                     lo, hi = sorted((best_idx, cand_idx))
@@ -1127,20 +1129,20 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         # Prominence filter in SNR units: suppress shoulder/noise artifacts that
         # may have acceptable height but do not form a distinct peak.
         prominence_snr = np.asarray(
-            [float(p) / max(float(background_std), 1e-12) for p in peak_proms], dtype=float
+            [p / max(background_std, 1e-12) for p in peak_proms], dtype=float
         )
 
         def _local_noise_std(pk_idx):
             # Use local baseline variability so narrow doublets are not lost
             # when a wide energy range inflates global noise estimates.
             local_window = max(0.24, 12.0 * float(self.sampling[2]))
-            mask_local = np.abs(E - float(E[int(pk_idx)])) <= local_window
+            mask_local = np.abs(E - E[int(pk_idx)]) <= local_window
             if int(np.count_nonzero(mask_local)) < 9:
-                return float(background_std)
+                return background_std
 
             y_local = np.asarray(spec[mask_local], dtype=float)
             if y_local.size < 9 or not np.all(np.isfinite(y_local)):
-                return float(background_std)
+                return background_std
 
             local_cut = float(np.nanpercentile(y_local, 70))
             base_local = y_local[y_local <= local_cut]
@@ -1149,35 +1151,35 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
             local_std = float(np.nanstd(base_local))
             if not np.isfinite(local_std) or local_std <= 0:
-                local_std = float(background_std)
+                local_std = background_std
             return max(local_std, 1e-12)
 
         local_noise = np.asarray([_local_noise_std(int(i)) for i in peak_indices], dtype=float)
         local_snr_values = np.asarray(
-            [float(h) / max(float(n), 1e-12) for h, n in zip(peak_heights, local_noise)],
+            [h / max(n, 1e-12) for h, n in zip(peak_heights, local_noise)],
             dtype=float,
         )
         local_prominence_snr = np.asarray(
-            [float(p) / max(float(n), 1e-12) for p, n in zip(peak_proms, local_noise)], dtype=float
+            [p / max(n, 1e-12) for p, n in zip(peak_proms, local_noise)], dtype=float
         )
 
-        prominence_floor = max(2.2, 0.85 * float(floor))
+        prominence_floor = max(2.2, 0.85 * floor)
         salience_snr = prominence_snr * np.sqrt(np.maximum(peak_width_samples, 1e-12))
-        salience_floor = max(4.2, 2.0 * float(floor))
+        salience_floor = max(4.2, 2.0 * floor)
         local_salience_snr = local_prominence_snr * np.sqrt(np.maximum(peak_width_samples, 1e-12))
 
-        adaptive_floor = max(2.0, 0.62 * float(floor))
-        adaptive_prominence_floor = max(1.6, 0.62 * float(prominence_floor))
-        adaptive_salience_floor = max(2.6, 0.62 * float(salience_floor))
+        adaptive_floor = max(2.0, 0.62 * floor)
+        adaptive_prominence_floor = max(1.6, 0.62 * prominence_floor)
+        adaptive_salience_floor = max(2.6, 0.62 * salience_floor)
 
         display_peaks_with_prom = [
             (
                 int(i),
                 float(h),
                 float(E[i]),
-                float(max(float(h / background_std), float(local_snr))),
-                float(max(float(p_snr), float(local_p_snr))),
-                float(max(float(sal), float(local_sal))),
+                max(h / background_std, local_snr),
+                max(p_snr, local_p_snr),
+                max(sal, local_sal),
             )
             for i, h, p_snr, sal, local_snr, local_p_snr, local_sal in zip(
                 peak_indices,
@@ -1208,8 +1210,8 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         # Validate peaks as local Gaussian components (center/sigma/amplitude)
         # rather than raw single-bin maxima, then merge overlapping components.
         def _gauss_with_offset(x, amp, mu, sigma, offset):
-            sigma = max(float(sigma), 1e-12)
-            return float(offset) + float(amp) * np.exp(-0.5 * ((x - float(mu)) / sigma) ** 2)
+            sigma = max(sigma, 1e-12)
+            return offset + amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
         def _fit_local_gaussian(pk_idx):
             window = max(0.18, 10.0 * float(self.sampling[2]))
@@ -1223,8 +1225,8 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             if not np.all(np.isfinite(y_local)):
                 return None
 
-            baseline = float(np.percentile(y_local, 20))
-            peak_val = float(spec[pk_idx])
+            baseline = np.percentile(y_local, 20)
+            peak_val = spec[pk_idx]
             amp0 = max(peak_val - baseline, 1e-9)
             sigma0 = max(0.04, 2.0 * float(self.sampling[2]))
 
@@ -1253,30 +1255,30 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
             y_hat = _gauss_with_offset(x_local, amp, mu, sigma, offset)
             ss_res = float(np.sum((y_local - y_hat) ** 2))
-            ss_tot = float(np.sum((y_local - float(np.mean(y_local))) ** 2))
+            ss_tot = float(np.sum((y_local - np.mean(y_local)) ** 2))
             r2 = 1.0 - ss_res / max(ss_tot, 1e-12)
-            amp_snr = amp / max(float(background_std), 1e-12)
+            amp_snr = amp / max(background_std, 1e-12)
 
             return {
                 "idx": int(pk_idx),
-                "mu": float(mu),
-                "sigma": float(sigma),
-                "amp": float(amp),
-                "amp_snr": float(amp_snr),
-                "r2": float(r2),
-                "area": float(amp * sigma),
+                "mu": mu,
+                "sigma": sigma,
+                "amp": amp,
+                "amp_snr": amp_snr,
+                "r2": r2,
+                "area": amp * sigma,
             }
 
-        gaussian_validation_gate = max(2.2 * float(floor), 0.25 * float(snr_threshold))
+        gaussian_validation_gate = max(2.2 * floor, 0.25 * snr_threshold)
         strong_keep_idx = {
             int(pk_idx)
             for pk_idx, _, _, snr, _, _ in display_peaks_with_prom
-            if float(snr) >= gaussian_validation_gate
+            if snr >= gaussian_validation_gate
         }
 
         gauss_components = []
         for pk_idx, _, _, snr, _, _ in display_peaks_with_prom:
-            if float(snr) >= gaussian_validation_gate:
+            if snr >= gaussian_validation_gate:
                 continue
             fit = _fit_local_gaussian(int(pk_idx))
             if fit is None:
@@ -1284,7 +1286,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             # Keep only physically plausible and sufficiently Gaussian components.
             if fit["r2"] < 0.58:
                 continue
-            if fit["amp_snr"] < max(2.0, 0.75 * float(floor)):
+            if fit["amp_snr"] < max(2.0, 0.75 * floor):
                 continue
             if fit["sigma"] < max(1.5 * float(self.sampling[2]), 0.010) or fit["sigma"] > 0.18:
                 continue
@@ -1302,8 +1304,8 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 prev = merged[-1]
                 # Keep neighbouring components separate unless they are truly
                 # unresolved by both center spacing and valley separation.
-                center_gap = abs(float(comp["mu"]) - float(prev["mu"]))
-                overlap_thresh = 1.15 * min(float(prev["sigma"]), float(comp["sigma"]))
+                center_gap = abs(comp["mu"] - prev["mu"])
+                overlap_thresh = 1.15 * min(prev["sigma"], comp["sigma"])
 
                 prev_idx = int(prev["idx"])
                 comp_idx = int(comp["idx"])
@@ -1312,7 +1314,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                     valley = float(min(spec[lo], spec[hi]))
                 else:
                     valley = float(np.min(spec[lo : hi + 1]))
-                smaller_amp = max(min(float(prev["amp"]), float(comp["amp"])), 1e-12)
+                smaller_amp = max(min(prev["amp"], comp["amp"]), 1e-12)
                 valley_relief = (smaller_amp - valley) / smaller_amp
 
                 unresolved_pair = center_gap <= overlap_thresh and valley_relief < 0.22
@@ -1344,7 +1346,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             shoulder_window = max(8.0 * float(self.sampling[2]), 0.22)
             weak_snr_ratio = 0.45
             weak_prom_ratio = 0.65
-            local_prom_floor = max(3.5, 1.10 * float(floor))
+            local_prom_floor = max(3.5, 1.10 * floor)
 
             pruned = []
             for idx, h, en, snr, p_snr, sal in by_energy:
@@ -1352,10 +1354,10 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 for o_idx, o_h, o_en, o_snr, o_p_snr, o_sal in by_energy:
                     if o_idx == idx:
                         continue
-                    if abs(float(o_en) - float(en)) > shoulder_window:
+                    if abs(o_en - en) > shoulder_window:
                         continue
                     if strongest_neighbor is None or o_snr > strongest_neighbor[0]:
-                        strongest_neighbor = (float(o_snr), float(o_p_snr), float(o_en))
+                        strongest_neighbor = (o_snr, o_p_snr, o_en)
 
                 if strongest_neighbor is None:
                     pruned.append((idx, h, en, snr, p_snr, sal))
@@ -1363,9 +1365,9 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
                 nbr_snr, nbr_prom, _ = strongest_neighbor
                 is_weak_shoulder = (
-                    float(snr) < weak_snr_ratio * max(nbr_snr, 1e-12)
-                    and float(p_snr) < weak_prom_ratio * max(nbr_prom, 1e-12)
-                    and float(p_snr) < local_prom_floor
+                    snr < weak_snr_ratio * max(nbr_snr, 1e-12)
+                    and p_snr < weak_prom_ratio * max(nbr_prom, 1e-12)
+                    and p_snr < local_prom_floor
                 )
                 if not is_weak_shoulder:
                     pruned.append((idx, h, en, snr, p_snr, sal))
