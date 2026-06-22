@@ -750,6 +750,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         ignore_range=None,
         tolerance=0.15,
         threshold=None,
+        noise_percentile=75,
         min_line_weight=0.0,
         mask=None,
         show_text=True,
@@ -787,6 +788,10 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             Minimum mean-spectrum intensity required for a peak to be
             considered. Use ``"mean"`` to require peaks above the average
             spectrum intensity. If ``None``, no intensity threshold is applied.
+        noise_percentile : float or None, optional
+            Percentile intensity used as the SNR denominator. The default
+            ``75`` uses the 75th percentile of the mean-spectrum intensity. If
+            ``None``, the mean finite intensity is used.
         min_line_weight : float, optional
             Minimum database line weight required for a line to be considered.
         mask : ndarray or None, optional
@@ -868,16 +873,18 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 and float(ignore_range[0]) <= float(value) <= float(ignore_range[1])
             )
 
-        def robust_noise(values):
+        def noise_level(values, percentile=75):
             values = np.asarray(values, dtype=float)
             values = values[np.isfinite(values)]
             if values.size == 0:
                 return 1.0
-            median = float(np.median(values))
-            mad = float(np.median(np.abs(values - median)))
-            noise = 1.4826 * mad
-            if not np.isfinite(noise) or noise <= 0:
-                noise = float(np.std(values))
+            if percentile is None:
+                noise = float(np.mean(values))
+            else:
+                percentile = float(percentile)
+                if not 0 <= percentile <= 100:
+                    raise ValueError("noise_percentile must be between 0 and 100, or None")
+                noise = float(np.percentile(values, percentile))
             return noise if np.isfinite(noise) and noise > 0 else 1.0
 
         def resolve_threshold(value):
@@ -893,7 +900,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 raise ValueError("threshold must be finite")
             return threshold_value
 
-        noise = robust_noise(spec)
+        noise = noise_level(spec, noise_percentile)
         threshold_value = resolve_threshold(threshold)
         peak_indices, _ = find_peaks(spec, height=threshold_value)
         prominences = (
@@ -1091,6 +1098,8 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 "peak_matches": peak_matches,
                 "peak_alternatives": alternatives_by_peak,
                 "threshold": threshold_value,
+                "noise": noise,
+                "noise_percentile": noise_percentile,
             }
         return fig, (ax_img, ax_spec)
 
