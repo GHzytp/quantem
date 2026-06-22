@@ -1,3 +1,5 @@
+# citation: Williams, G. P. (2009). Electron binding energies. In X-Ray Data Booklet (Table 1-1). Center for X-Ray Optics, Lawrence Berkeley National Laboratory. https://xdb.lbl.gov/Section1/Table_1-1.p
+
 energy_eV,atomic_number,element,line,relative_intensity,weight
 2633.7,47,Ag,Ll,4,0.021053
 2978.2,47,Ag,La2,11,0.057895

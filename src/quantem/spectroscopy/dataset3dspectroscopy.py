@@ -23,7 +23,11 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     show_mean_spectrum as _visualize_mean_spectrum,
 )
-from quantem.spectroscopy.utils import load_eels_edges_database, load_xray_lines_database
+from quantem.spectroscopy.utils import (
+    _read_csv_without_preamble,
+    load_eels_edges_database,
+    load_xray_lines_database,
+)
 
 
 class _ModelElementsDict(dict):
@@ -129,26 +133,25 @@ class Dataset3dspectroscopy(Dataset3d):
         atomic_weights_path = "atomic_weights.csv"
         full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), atomic_weights_path)
         data = {}
-        with open(full_path, "r", newline="") as f:
-            reader = csv.reader(f)
-            for row_index, row in enumerate(reader, start=1):
-                if not row:
-                    continue
-                if len(row) < 2:
-                    raise ValueError(
-                        f"{atomic_weights_path} row {row_index} must contain element symbol and weight"
-                    )
-                symbol = str(row[0]).strip()
-                weight_raw = str(row[1]).strip()
-                if not symbol:
-                    continue
-                try:
-                    weight = float(weight_raw)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"{atomic_weights_path} row {row_index} has invalid weight: {weight_raw!r}"
-                    ) from exc
-                data[symbol] = weight
+        reader = csv.reader(_read_csv_without_preamble(full_path))
+        for row_index, row in enumerate(reader, start=1):
+            if not row:
+                continue
+            if len(row) < 2:
+                raise ValueError(
+                    f"{atomic_weights_path} row {row_index} must contain element symbol and weight"
+                )
+            symbol = str(row[0]).strip()
+            weight_raw = str(row[1]).strip()
+            if not symbol:
+                continue
+            try:
+                weight = float(weight_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{atomic_weights_path} row {row_index} has invalid weight: {weight_raw!r}"
+                ) from exc
+            data[symbol] = weight
 
         if not data:
             raise ValueError(f"{atomic_weights_path} did not contain any atomic weights")

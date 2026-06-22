@@ -1,3 +1,5 @@
+#citation: # EELS Atlas. EELS.info. Retrieved June 22, 2026, from https://eels.info/atlas
+
 atomic_number,symbol,element,edge_label,edge_energy_eV
 1,H,Hydrogen,major,14
 2,He,Helium,major,25
