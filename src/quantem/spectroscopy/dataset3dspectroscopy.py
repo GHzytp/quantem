@@ -3,14 +3,26 @@ import json
 import os
 from typing import Any, Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.patches import Rectangle
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset3d import Dataset3d
-from quantem.core.visualization import show_2d
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    _plot_background_subtraction as _visualize_background_subtraction,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    _plot_pca_results as _visualize_pca_results,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_attached_spectrum as _visualize_attached_spectrum,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    show_energy_window_map as _visualize_energy_window_map,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    show_mean_spectrum as _visualize_mean_spectrum,
+)
 from quantem.spectroscopy.utils import load_eels_edges_database, load_xray_lines_database
 
 
@@ -44,6 +56,12 @@ class Dataset3dspectroscopy(Dataset3d):
     element_info = None
     element_info_path = None
     atomic_weights = None
+
+    plot_attached_spectrum = _visualize_attached_spectrum
+    _plot_pca_results = _visualize_pca_results
+    show_mean_spectrum = _visualize_mean_spectrum
+    show_energy_window_map = _visualize_energy_window_map
+    _plot_background_subtraction = _visualize_background_subtraction
 
     def __init__(
         self,
@@ -330,25 +348,6 @@ class Dataset3dspectroscopy(Dataset3d):
     def clear_attached_spectra(self):
         self.attached_spectra = None
 
-    def plot_attached_spectrum(self, spectrum_index=0):
-        fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
-
-        ax_spec.plot(
-            self.attached_spectra[spectrum_index][1],
-            self.attached_spectra[spectrum_index][0],
-            linewidth=1.5,
-        )
-        if self.dataset_type == "xeds":
-            ax_spec.set_xlabel("Energy (keV)")
-        elif self.dataset_type == "eels":
-            ax_spec.set_xlabel("Energy (eV)")
-        ax_spec.set_ylabel("Intensity")
-        ax_spec.set_title(f"Spectrum in index {spectrum_index}")
-        ax_spec.grid(True, alpha=0.1)
-
-        fig.tight_layout()
-        plt.show()
-
     ## PCA ANALYSIS METHODS
     def perform_pca(
         self,
@@ -506,79 +505,6 @@ class Dataset3dspectroscopy(Dataset3d):
             explained_variance_ratio,
             reconstructed,
         )
-
-    def _plot_pca_results(
-        self,
-        components: NDArray,
-        loadings: NDArray,
-        explained_variance_ratio: NDArray,
-        n_show: int = 4,
-    ):
-        """
-        Plot PCA results including scree plot, components, and loadings.
-
-        Parameters
-        ----------
-        components : NDArray
-            Principal component spectra
-        loadings : NDArray
-            Spatial loadings for each component
-        explained_variance_ratio : NDArray
-            Explained variance ratios
-        n_show : int
-            Number of components to show
-        """
-        fig, (ax_scree, ax_components) = plt.subplots(1, 2, figsize=(12, 4))
-        cumsum_var = np.cumsum(explained_variance_ratio)
-        component_numbers = np.arange(1, len(explained_variance_ratio) + 1)
-
-        ax_scree.bar(
-            component_numbers,
-            explained_variance_ratio * 100,
-            alpha=0.6,
-            label="Individual",
-        )
-        ax_scree.plot(component_numbers, cumsum_var * 100, "ro-", label="Cumulative")
-        ax_scree.set_xlabel("Component Number")
-        ax_scree.set_ylabel("Explained Variance (%)")
-        ax_scree.set_title("Scree Plot")
-        ax_scree.legend()
-        ax_scree.grid(True, alpha=0.3)
-
-        energy_sampling = float(self.sampling[2])
-        energy_origin = float(self.origin[2])
-        energy_axis = energy_origin + energy_sampling * np.arange(components.shape[1])
-
-        for i in range(n_show):
-            ax_components.plot(
-                energy_axis,
-                components[i],
-                label=f"PC{i + 1} ({explained_variance_ratio[i] * 100:.1f}%)",
-            )
-        ax_components.set_xlabel("Energy")
-        ax_components.set_ylabel("Component")
-        ax_components.set_title("Principal Component Spectra")
-        ax_components.legend()
-        ax_components.grid(True, alpha=0.3)
-
-        fig.suptitle("PCA Analysis")
-        fig.tight_layout()
-        plt.show()
-
-        show_2d(
-            [loadings[i] for i in range(n_show)],
-            title=[
-                f"Loading {i + 1} ({explained_variance_ratio[i] * 100:.1f}%)"
-                for i in range(n_show)
-            ],
-            cmap="RdBu_r",
-            cbar=True,
-            scalebar={
-                "sampling": float(self.sampling[1]),
-                "units": str(self.units[1]),
-            },
-        )
-        plt.show()
 
     def _calibrated_position_to_pixel(self, value, axis):
         if value is None:
@@ -791,243 +717,6 @@ class Dataset3dspectroscopy(Dataset3d):
             self.add_spectrum_to_data(spec, E)
 
         return spec
-
-    def show_mean_spectrum(
-        self,
-        roi=None,
-        roi_cal=None,
-        energy_range=None,
-        mask=None,
-        intensity_range=None,
-        normalize=False,
-        **kwargs,
-    ):
-        """
-        Plot the mean spectrum from a spatial ROI in a 3D spectroscopy cube (Y, X, E).
-
-        Parameters
-        ----------
-        roi : list or tuple, optional
-            Region of interest as [y, x, dy, dx] where:
-            - y, x: top-left pixel coordinates
-            - dy, dx: height and width of ROI
-            Use None for default values:
-            - [y, None, dy, None] = row y with height dy, full width
-            - [None, x, None, dx] = column x with width dx, full height
-            - [y, x, None, None] = from (y,x) to bottom-right corner
-            If roi=None, uses full image. Can also be [y, x] for single pixel.
-        energy_range : list or tuple, optional
-            Energy range to display as [min_energy, max_energy] in keV.
-        mask : array, optional
-            Boolean mask for pixel selection.
-        intensity_range : 2-tuple, None
-            If not None, sets intensity range on spectrum plot
-        normalize : bool, optional
-            If ``True``, scale the mean spectrum to the range [0, 1]. If
-            ``False``, plot the mean spectrum in original intensity units.
-        Returns
-        -------
-        (fig, ax) : tuple
-            The Matplotlib Figure and Axes of the spectrum plot.
-        """
-
-        # CALCULATE MEAN SPECTRUM FOR GIVEN ROI AND ENERGY RANGE --------------------------
-
-        y, x, dy, dx = self._resolve_roi(roi=roi, roi_cal=roi_cal)
-
-        energy_range_for_calc = None if energy_range is None else list(energy_range)
-        spec = self.calculate_mean_spectrum(
-            roi=roi,
-            roi_cal=roi_cal,
-            energy_range=energy_range_for_calc,
-            mask=mask,
-            normalize=normalize,
-        )
-
-        E = np.asarray(self.energy_axis, dtype=float)
-
-        if mask is not None:
-            E = E[np.asarray(mask, dtype=bool)]
-
-        if energy_range is not None:
-            indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
-            E = E[indices]
-
-        # PLOTTING ---------------------------------------------------------------------------
-
-        # Create subplot layout: image on left, spectrum on right
-        fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(12, 4))
-
-        # LEFT PLOT: Show sum image with ROI highlighted
-        # Create sum image across all energy channels (or masked channels)
-        if mask is not None:
-            sum_img = np.asarray(self.array, dtype=float)[:, :, np.asarray(mask, dtype=bool)].sum(
-                axis=2
-            )
-            title_suffix = " (masked energies)"
-        else:
-            sum_img = np.asarray(self.array, dtype=float).sum(axis=2)
-            title_suffix = ""
-
-        map_title = f"Integrated Intensity Map{title_suffix}"
-        show_2d(
-            sum_img,
-            figax=(fig, ax_img),
-            title=map_title,
-            cmap="viridis",
-            cbar=True,
-            show_ticks=True,
-            scalebar={
-                "sampling": float(self.sampling[1]),
-                "units": str(self.units[1]),
-            },
-            **kwargs,
-        )
-        # Highlight the ROI with a rectangle
-        rect = Rectangle(
-            (x - 0.5, y - 0.5), dx, dy, linewidth=2, edgecolor="red", facecolor="none", alpha=0.8
-        )
-        ax_img.add_patch(rect)
-
-        # RIGHT PLOT: Show spectrum
-        ax_spec.plot(E, spec, linewidth=1.5, color="k")
-        if self.dataset_type == "xeds":
-            ax_spec.set_xlabel("Energy (keV)")
-        else:
-            ax_spec.set_xlabel("Energy (eV)")
-        ax_spec.set_ylabel("Normalized intensity" if normalize else "Intensity")
-        ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
-        ax_spec.grid(True, alpha=0.1)
-        if intensity_range is not None:
-            ax_spec.set_ylim([intensity_range[0], intensity_range[1]])
-
-        fig.tight_layout()
-        return fig, (ax_img, ax_spec)
-
-    def show_energy_window_map(
-        self,
-        energy_window=None,
-        roi=None,
-        roi_cal=None,
-        mask=None,
-        cmap="viridis",
-        show=True,
-    ):
-        """Show a spatial map integrated over a selected energy window.
-
-        This is a complementary view to ``show_mean_spectrum``:
-        - ``show_mean_spectrum`` answers *what energies are present*.
-        - ``show_energy_window_map`` answers *where a chosen energy range is present*.
-
-        Parameters
-        ----------
-        energy_window : list[float] | tuple[float, float] | None
-            Energy interval [emin, emax] to integrate. If None, use the
-            full calibrated energy range of the dataset.
-        roi : list | tuple | None, optional
-            ROI as ``[y, x]`` or ``[y, x, dy, dx]`` (with ``None`` defaults),
-            used only for overlay rectangle.
-        mask : array-like | None, optional
-            Optional boolean mask over energy channels. If provided, it is
-            combined with ``energy_window``.
-        cmap : str, optional
-            Matplotlib colormap for the map.
-        show : bool, optional
-            If True, call ``plt.show()``.
-
-        Returns
-        -------
-        tuple
-            ``(fig, (ax_map, ax_spec), energy_map)`` where ``energy_map`` is the integrated 2D array.
-        """
-        y, x, dy, dx = self._resolve_roi(roi=roi, roi_cal=roi_cal)
-        has_roi_overlay = any(val is not None for val in (roi, roi_cal))
-
-        dE = float(self.sampling[2])
-        E0 = float(self.origin[2]) if hasattr(self, "origin") else 0.0
-        E = E0 + dE * np.arange(self.shape[2])
-
-        if energy_window is None:
-            emin = float(np.min(E))
-            emax = float(np.max(E))
-        else:
-            if len(energy_window) != 2:
-                raise ValueError("energy_window must be [min_energy, max_energy]")
-
-            emin = float(energy_window[0])
-            emax = float(energy_window[1])
-            if not np.isfinite(emin) or not np.isfinite(emax) or emin >= emax:
-                raise ValueError(
-                    "Invalid energy_window. Expected [min_energy, max_energy] with min < max"
-                )
-
-        window_mask = (E >= emin) & (E <= emax)
-        if mask is not None:
-            mask = np.asarray(mask, dtype=bool)
-            if mask.shape != (self.shape[2],):
-                raise ValueError(
-                    f"Mask shape {mask.shape} does not match energy axis shape ({self.shape[2]},)"
-                )
-            window_mask = window_mask & mask
-
-        if not np.any(window_mask):
-            raise ValueError("No energy channels selected. Adjust energy_window or mask")
-
-        arr = np.asarray(self.array, dtype=float)
-        energy_map = arr[:, :, window_mask].sum(axis=-1)
-
-        spec = self.calculate_mean_spectrum(
-            roi=roi,
-            roi_cal=roi_cal,
-            mask=mask,
-            attach_mean_spectrum=False,
-        )
-        if mask is not None:
-            E_spec = E[mask]
-        else:
-            E_spec = E
-
-        unit_label = "keV" if str(self.dataset_type).lower() == "xeds" else "eV"
-        fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(12, 4))
-        show_2d(
-            energy_map,
-            figax=(fig, ax_map),
-            title=f"Energy-Window Map [{emin:.3f}, {emax:.3f}] {unit_label}",
-            cmap=cmap,
-            cbar=True,
-            show_ticks=True,
-            scalebar={
-                "sampling": float(self.sampling[1]),
-                "units": str(self.units[1]),
-            },
-        )
-
-        if has_roi_overlay:
-            rect = Rectangle(
-                (x - 0.5, y - 0.5),
-                dx,
-                dy,
-                linewidth=2,
-                edgecolor="red",
-                facecolor="none",
-                alpha=0.8,
-            )
-            ax_map.add_patch(rect)
-
-        ax_spec.plot(E_spec, spec, linewidth=1.5, color="k")
-        ax_spec.axvspan(emin, emax, color="orange", alpha=0.2, label="Selected window")
-        ax_spec.set_xlabel(f"Energy ({unit_label})")
-        ax_spec.set_ylabel("Intensity")
-        ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
-        ax_spec.grid(True, alpha=0.1)
-        ax_spec.legend(loc="best")
-
-        fig.tight_layout()
-
-        if show:
-            plt.show()
-
-        return fig, (ax_map, ax_spec), energy_map
 
     # BACKGROND SUBTRACTION
 
@@ -1314,38 +1003,6 @@ class Dataset3dspectroscopy(Dataset3d):
                 raise RuntimeError(f"Background fit failed at pixel ({i_row}, {i_col})") from exc
 
         return background.reshape(scan_row, scan_col, n_energy)
-
-    def _plot_background_subtraction(
-        self,
-        energy_axis,
-        input_spectrum,
-        background_spectrum,
-        subtracted_spectrum,
-        fit_mode,
-        show_subtracted,
-    ):
-        fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
-
-        ax_specbacksub.plot(energy_axis, input_spectrum, linewidth=1.2, label="Input")
-        ax_specbacksub.plot(energy_axis, background_spectrum, linewidth=1.2, label="Background")
-        if show_subtracted:
-            ax_specbacksub.plot(
-                energy_axis,
-                subtracted_spectrum,
-                linewidth=1.5,
-                label="Background-subtracted",
-            )
-        if self.dataset_type == "xeds":
-            ax_specbacksub.set_xlabel("Energy (keV)")
-        else:
-            ax_specbacksub.set_xlabel("Energy (eV)")
-        ax_specbacksub.set_ylabel("Intensity")
-        ax_specbacksub.set_title(f"Background-subtracted spectrum from ROI ({fit_mode})")
-        ax_specbacksub.grid(True, alpha=0.1)
-        ax_specbacksub.legend()
-
-        fig.tight_layout()
-        plt.show()
 
     @property
     def energy_axis(self):

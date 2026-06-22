@@ -6,10 +6,30 @@ from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
-from scipy.stats import norm
 
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    interpret_thickness_quality as _visualize_thickness_quality,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_absolute_thickness as _visualize_absolute_thickness,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_absolute_zlp_shift as _visualize_absolute_zlp_shift,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_dual_eels_picker as _visualize_dual_eels_picker,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_quantem_diagnostic as _visualize_quantem_diagnostic,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_zlp_drift_diagnostics as _visualize_zlp_drift_diagnostics,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    visualize_thickness_windows as _visualize_thickness_windows,
+)
 
 
 class Dataset3deels(Dataset3dspectroscopy):
@@ -25,6 +45,14 @@ class Dataset3deels(Dataset3dspectroscopy):
     element_info = None
     element_info_path = "eels_edges.csv"
     dataset_type = "EELS"
+
+    plot_absolute_zlp_shift = _visualize_absolute_zlp_shift
+    visualize_thickness_windows = _visualize_thickness_windows
+    interpret_thickness_quality = _visualize_thickness_quality
+    plot_absolute_thickness = _visualize_absolute_thickness
+    plot_dual_eels_picker = _visualize_dual_eels_picker
+    plot_quantem_diagnostic = _visualize_quantem_diagnostic
+    plot_zlp_drift_diagnostics = _visualize_zlp_drift_diagnostics
 
     def __init__(
         self,
@@ -851,95 +879,6 @@ class Dataset3deels(Dataset3dspectroscopy):
         print("QuantEM: Alignment and Dual-EELS sync complete.")
         return ll, hl, shifts
 
-    def plot_absolute_zlp_shift(dataset, search_window=(-10, 10)):
-        """
-        Calculates the ZLP shift per pixel and plots the absolute deviation from 0.0 eV.
-        """
-        data = dataset.array
-
-        # Generate energy axis
-        energies = np.asarray(dataset.energy_axis, dtype=float)
-
-        # Mask energy window for peak finding
-        mask = (energies > search_window[0]) & (energies < search_window[1])
-        search_energies = energies[mask]
-
-        # Calculate peak map and absolute deviation
-        peak_indices = np.argmax(data[:, :, mask], axis=2)
-        zlp_map_ev = search_energies[peak_indices]
-        absolute_shift = np.abs(zlp_map_ev)
-
-        # Visualization
-        fig, ax = plt.subplots(figsize=(8, 6))
-        im = ax.imshow(absolute_shift, cmap="magma", origin="lower")
-
-        plt.colorbar(im, ax=ax, label="Absolute Shift (eV)")
-        ax.set_title(f"Absolute ZLP Deviation: {dataset.name}")
-        ax.set_xlabel("X (pixels)")
-        ax.set_ylabel("Y (pixels)")
-
-        plt.tight_layout()
-        plt.show()
-
-        return absolute_shift
-
-    def visualize_thickness_windows(dataset, zlp_window=(-3.0, 3.0), total_window=(-3.0, 75.0)):
-        """
-        Visualizes integration windows for I0 (ZLP) and It (Total).
-        Returns a configuration dictionary for the calculation step.
-        """
-        # 1. Extract Energy and Mean Spectrum
-        data = dataset.array
-        mean_spec = np.mean(data, axis=(0, 1))
-
-        # Use built-in energy axis if available, else generate from metadata
-        if hasattr(dataset, "energy_axis"):
-            energy = np.asarray(dataset.energy_axis, dtype=float)
-        else:
-            energy = dataset.origin[2] + np.arange(dataset.shape[2]) * dataset.sampling[2]
-
-        # 2. Find indices for the windows
-        zlp_idx = (
-            np.argmin(np.abs(energy - zlp_window[0])),
-            np.argmin(np.abs(energy - zlp_window[1])),
-        )
-        tot_idx = (
-            np.argmin(np.abs(energy - total_window[0])),
-            np.argmin(np.abs(energy - total_window[1])),
-        )
-
-        # 3. Create the Visualization
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(energy, mean_spec, "k-", lw=1.5, label="Mean Spectrum", zorder=5)
-
-        # Highlight Windows
-        z_mask = (energy >= zlp_window[0]) & (energy <= zlp_window[1])
-        t_mask = (energy >= total_window[0]) & (energy <= total_window[1])
-
-        ax.fill_between(
-            energy[z_mask], 0, mean_spec[z_mask], color="red", alpha=0.3, label="$I_0$ (ZLP)"
-        )
-        ax.fill_between(
-            energy[t_mask], 0, mean_spec[t_mask], color="blue", alpha=0.1, label="$I_t$ (Total)"
-        )
-
-        ax.axvline(0, color="green", lw=1.5, ls=":", label="0 eV")
-        ax.set_title(f"QuantEM: Integration Windows ({dataset.name})", fontweight="bold")
-        ax.set_xlabel("Energy Loss (eV)")
-        ax.set_ylabel("Intensity (counts)")
-        ax.set_xlim(energy[0], total_window[1] + 20)
-        ax.legend()
-
-        plt.tight_layout()
-        plt.show()
-
-        return {
-            "zlp_idx": zlp_idx,
-            "total_idx": tot_idx,
-            "zlp_val": zlp_window,
-            "total_val": total_window,
-        }
-
     def calculate_thickness_log_ratio(dataset, window_params, plot=True):
         """
         Calculates the relative thickness map (t/lambda) using the Log-Ratio method.
@@ -985,294 +924,3 @@ class Dataset3deels(Dataset3dspectroscopy):
             plt.show()
 
         return t_over_lambda
-
-    def interpret_thickness_quality(t_over_lambda, a=0.3, b=1, c=2, dataset=None):
-        """
-        Performs a scientific quality assessment on the calculated t/lambda map.
-
-        The Physical Meaning of the ThresholdsThe t/lambda value represents the average number of inelastic scattering events
-        an electron undergoes.
-        Vacuum (< a):
-            (default a = 0.3)
-            In pure vacuum, t/lambda should be 0. In practice, values up to ~0.3 often indicate the presence of thin carbon support films,
-            surface contamination, or detector noise. Measurements in this regime are highly sensitive to ZLP (Zero Loss Peak) estimation errors.
-
-        Thin (a <t/lambda < b):
-            (default b = 1)
-            The "Sweet Spot" for EELS. At t/lambda ~1, the probability of a single inelastic scattering event is maximized.
-            In this regime, core-loss edges are sharp and clearly visible without the immediate need for complex mathematical
-            deconvolution (e.g., Fourier-Log) to remove multiple scattering effects.
-
-        Medium (b < t/lambda < c):
-            (default c = 2)
-            Multiple scattering begins to dominate the spectrum. The plural scattering of plasmons creates "ghost" peaks
-            that overlap with higher-energy chemical edges. While data is still usable, quantitative analysis typically
-            requires plural scattering correction for high accuracy.
-
-        Thick (t/lambda > c):
-            The "Multiple Scattering Regime.
-            " Most electrons have undergone three or more scattering events, resulting in a "spectral soup"
-            where fine-structure details and high-resolution chemical information are significantly broadened or lost.
-        """
-
-        name = dataset.name if dataset else "Dataset"
-
-        # Classification Masks
-        vacuum = t_over_lambda < a
-        thin = (t_over_lambda >= a) & (t_over_lambda < b)
-        medium = (t_over_lambda >= b) & (t_over_lambda < c)
-        thick = t_over_lambda >= c
-
-        print(f"\n{'=' * 20} QUANTEM INTERPRETATION: {name} {'=' * 20}")
-        for label, mask in [
-            ("Vacuum (<0.3)", vacuum),
-            ("Thin (0.3-1.0)", thin),
-            ("Medium (1.0-2.0)", medium),
-            ("Thick (>2.0)", thick),
-        ]:
-            pct = 100 * np.sum(mask) / t_over_lambda.size
-            print(f"  {label:20}: {pct:5.1f}%")
-
-        # Plotting Classification
-        classified = np.zeros_like(t_over_lambda)
-        classified[thin] = 1
-        classified[medium] = 2
-        classified[thick] = 3
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-        im1 = ax1.imshow(classified, cmap="RdYlGn_r", origin="lower")
-        ax1.set_title("Region Classification")
-        cbar = plt.colorbar(im1, ax=ax1, ticks=[0, 1, 2, 3])
-        cbar.ax.set_yticklabels(["Vacuum", "Thin", "Medium", "Thick"])
-
-        t_masked = np.copy(t_over_lambda)
-        t_masked[vacuum] = np.nan
-        im2 = ax2.imshow(t_masked, cmap="viridis", origin="lower")
-        ax2.set_title("Sample-Only Thickness")
-        plt.colorbar(im2, ax=ax2, label=r"$t/\lambda$")
-
-        plt.tight_layout()
-        plt.show()
-
-    def plot_absolute_thickness(t_lambda_map, mfp_nm, dataset=None):
-        """
-        Converts relative thickness to nanometers and visualizes the absolute map.
-        """
-        thickness_nm = t_lambda_map * mfp_nm
-        name = dataset.name if dataset else "Sample"
-
-        # Mask vacuum for better visualization contrast
-        display_map = np.copy(thickness_nm)
-        display_map[t_lambda_map < 0.1] = np.nan
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-        fig.suptitle(f"Physical Analysis: {name}", fontsize=14)
-
-        im = ax1.imshow(display_map, cmap="magma", origin="lower")
-        ax1.set_title("Absolute Thickness (nm)")
-        plt.colorbar(im, ax=ax1, label="nm")
-
-        valid_data = thickness_nm[t_lambda_map >= 0.1].flatten()
-        ax2.hist(valid_data, bins=50, color="firebrick", alpha=0.7, ec="k")
-        ax2.axvline(
-            np.nanmean(display_map),
-            color="blue",
-            ls="--",
-            label=f"Mean: {np.nanmean(display_map):.1f} nm",
-        )
-        ax2.set_title("Physical Distribution")
-        ax2.set_xlabel("Thickness (nm)")
-        ax2.legend()
-
-        plt.tight_layout()
-        plt.show()
-
-        print(
-            f"\nQuantEM Absolute Report:\n  Mean: {np.nanmean(display_map):.2f} nm\n  MFP:  {mfp_nm:.2f} nm"
-        )
-        return thickness_nm
-
-    def plot_dual_eels_picker(ll, hl, coords=None, title="QuantEM: Dual-EELS Analysis"):
-        """
-        Dual-EELS Picker with starting coordinates.
-
-        coords, when provided, is interpreted as (scan_row, scan_col).
-        """
-        # 1. Setup Data
-        sum_ll = np.sum(ll.array, axis=2)
-        sum_hl = np.sum(hl.array, axis=2)
-        energy_ll = np.asarray(ll.energy_axis, dtype=float)
-        energy_hl = np.asarray(hl.energy_axis, dtype=float)
-
-        # 2. Handle Initial Coordinates
-        if coords is not None:
-            i_row, i_col = coords
-        else:
-            i_row, i_col = ll.shape[0] // 2, ll.shape[1] // 2
-
-        # 3. Create Figure
-        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-        fig.suptitle(f"{title}\n(Click on maps to update spectra)", fontsize=16)
-        ax_map_ll, ax_spec_ll = axes[0, 0], axes[0, 1]
-        ax_map_hl, ax_spec_hl = axes[1, 0], axes[1, 1]
-
-        # Plot Maps & Markers
-        ax_map_ll.imshow(sum_ll, cmap="viridis", origin="lower")
-        (marker_ll,) = ax_map_ll.plot(i_col, i_row, "r+", ms=15, mew=2)
-
-        ax_map_hl.imshow(sum_hl, cmap="magma", origin="lower")
-        (marker_hl,) = ax_map_hl.plot(i_col, i_row, "r+", ms=15, mew=2)
-
-        # Plot Initial Spectra
-        (line_ll,) = ax_spec_ll.plot(energy_ll, ll.array[i_row, i_col, :], color="tab:blue")
-        (line_hl,) = ax_spec_hl.plot(energy_hl, hl.array[i_row, i_col, :], color="tab:red")
-
-        def update_plots(i_row, i_col):
-            marker_ll.set_data([i_col], [i_row])
-            marker_hl.set_data([i_col], [i_row])
-
-            new_ll = ll.array[i_row, i_col, :]
-            new_hl = hl.array[i_row, i_col, :]
-            line_ll.set_ydata(new_ll)
-            line_hl.set_ydata(new_hl)
-
-            # Rescale
-            ax_spec_ll.set_ylim(0, np.max(new_ll) * 1.1)
-            ax_spec_hl.set_ylim(0, np.max(new_hl) * 1.1)
-
-            ax_spec_ll.set_title(f"LL Spectrum at ({i_row}, {i_col})")
-            ax_spec_hl.set_title(f"HL Spectrum at ({i_row}, {i_col})")
-            fig.canvas.draw_idle()
-
-        def on_click(event):
-            if event.inaxes in [ax_map_ll, ax_map_hl]:
-                i_col, i_row = int(round(event.xdata)), int(round(event.ydata))
-                if 0 <= i_row < ll.shape[0] and 0 <= i_col < ll.shape[1]:
-                    update_plots(i_row, i_col)
-
-        fig.canvas.mpl_connect("button_press_event", on_click)
-
-        ax_spec_ll.set_title(f"LL Spectrum at ({i_row}, {i_col})")
-        ax_spec_hl.set_title(f"HL Spectrum at ({i_row}, {i_col})")
-
-        plt.tight_layout()
-        plt.close(fig)  # Prevents double-plotting in VS Code
-        return fig
-
-    def plot_quantem_diagnostic(dataset, zlp_window=5.0, title_suffix=""):
-        """
-        QuantEM Diagnostic Dashboard: Visualizes mean spectra, spatial variation,
-        and Zero Loss Peak (ZLP) centering accuracy.
-
-        1. Global Average Spectrum (Top Left): Shows the mean intensity across the entire scan.
-        It is used to check the signal-to-noise ratio and see if the Zero Loss Peak (ZLP) is roughly centered at 0 eV.
-        2. Spatial Variation (Top Right): Plots spectra from a 5x5 grid of pixels across your sample.
-        This helps you see if the energy shift or intensity changes drastically from one side of the scan to the other
-        (e.g., due to sample thickness changes or beam drift).
-        3. Integrated Intensity Map (Bottom Left): A spatial image of the total counts.
-        This is your "search image" to help you correlate the spectral data with the physical structure of your sample.
-        4. ZLP Alignment Detail (Bottom Right): A high-zoom view of the energy region around 0 eV of the Mean Spectrum.
-        It includes a dashed green line at the "Target 0" to show exactly how much residual calibration error remains
-        after your alignment.
-
-        Parameters:
-        -----------
-        dataset : QuantEM Object
-            The EELS dataset containing .array, .origin, and .sampling attributes.
-        zlp_window : float, optional
-            The energy range (± eV) to display in the ZLP zoom plot. Default is 5.0.
-        title_suffix : str, optional
-            Additional text to append to the figure title (e.g., "(RAW)" or "(Aligned)").
-
-        Returns:
-        --------
-        fig : matplotlib.figure.Figure
-            The figure object for further manipulation or saving.
-        """
-        data = dataset.array
-        energy = np.asarray(dataset.energy_axis, dtype=float)
-
-        mean_spec = np.mean(data, axis=(0, 1))
-        zlp_pos = energy[np.argmax(mean_spec)]
-        sum_img = np.sum(data, axis=2)
-
-        fig = plt.figure(figsize=(14, 9))
-        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.2)
-        fig.suptitle(f"QuantEM Diagnostic: {dataset.name} {title_suffix}", fontsize=16)
-
-        # 1. Mean Spectrum
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.plot(energy, mean_spec, color="black", label="Mean")
-        ax1.axvline(0, color="green", ls=":", label="Target")
-        ax1.set_title("Global Average Spectrum")
-        ax1.legend()
-
-        # 2. Spatial Variability
-        ax2 = fig.add_subplot(gs[0, 1])
-        # Take a 5x5 grid for better representation than 3x3
-        yy, xx = np.meshgrid(
-            np.linspace(0, data.shape[0] - 1, 5, dtype=int),
-            np.linspace(0, data.shape[1] - 1, 5, dtype=int),
-        )
-        for y, x in zip(yy.flatten(), xx.flatten()):
-            ax2.plot(energy, data[y, x, :], alpha=0.3, lw=0.5)
-        ax2.set_title("Spatial Variation (Grid Samples)")
-
-        # 3. Map
-        ax3 = fig.add_subplot(gs[1, 0])
-        im = ax3.imshow(sum_img, cmap="viridis", origin="lower")
-        plt.colorbar(im, ax=ax3)
-        ax3.set_title("Integrated Intensity")
-
-        # 4. ZLP Zoom
-        ax4 = fig.add_subplot(gs[1, 1])
-        mask = (energy > zlp_pos - zlp_window) & (energy < zlp_pos + zlp_window)
-        ax4.plot(energy[mask], mean_spec[mask], lw=2)
-        ax4.axvline(0, color="green", ls=":")
-        ax4.set_title("ZLP Alignment Detail")
-        plt.close(fig)
-
-        return fig
-
-    def plot_zlp_drift_diagnostics(dataset, title="ZLP Drift Analysis"):
-        """
-        QuantEM Diagnostic: Maps the ZLP position and calculates the drift distribution.
-        Uses scipy.stats for Gaussian fitting.
-        """
-        data = dataset.array
-        energy = np.asarray(dataset.energy_axis, dtype=float)
-
-        # 1. Mask and find peak per pixel
-        search_mask = (energy > -2.0) & (energy < 2.0)
-        search_energies = energy[search_mask]
-        peak_indices = np.argmax(data[:, :, search_mask], axis=2)
-        zlp_map = search_energies[peak_indices]
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        fig.suptitle(f"QuantEM: {dataset.name} - {title}", fontsize=16)
-
-        # Plot A: Map
-        im = ax1.imshow(zlp_map, cmap="RdYlBu_r", origin="lower")
-        plt.colorbar(im, ax=ax1, label="Energy Shift (eV)")
-
-        # Plot B: Histogram + Scipy Fit
-        flat_pos = zlp_map.flatten()
-        mu, std = norm.fit(flat_pos)  # Professional scipy fitting
-
-        ax2.hist(flat_pos, bins=30, density=True, alpha=0.6, color="skyblue")
-        x_range = np.linspace(np.min(flat_pos), np.max(flat_pos), 100)
-        ax2.plot(
-            x_range,
-            norm.pdf(x_range, mu, std),
-            color="darkred",
-            lw=2,
-            label=f"Fit: μ={mu:.3f} eV, σ={std:.3f} eV",
-        )
-        ax2.legend()
-
-        plt.tight_layout()
-
-        plt.close(fig)
-
-        return fig

@@ -22,6 +22,9 @@ from quantem.spectroscopy.spectroscopy_models import (
     polynomial_energy_basis,
     xeds_data_loss,
 )
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    show_spectrum_images as _visualize_spectrum_images,
+)
 
 
 class Dataset3dxeds(Dataset3dspectroscopy):
@@ -36,6 +39,8 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
     element_info = None
     element_info_path = "x_ray_lines.csv"
+
+    show_spectrum_images = _visualize_spectrum_images
 
     def __init__(
         self,
@@ -596,78 +601,6 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         return self._integrate(
             spec=spec, width=width, return_maps=return_maps, show=show, **kwargs
         )
-
-    def show_spectrum_images(
-        self, x_ray_lines=None, return_fig=False, return_maps=False, method="integration", **kwargs
-    ):
-        """Display cached spectrum images.
-
-        Parameters
-        ----------
-        x_ray_lines : str | sequence[str] | None, optional
-            Selectors to filter which images are shown.  If ``None``, one
-            panel per element is displayed.
-        return_fig : bool, optional
-            If ``True``, return ``(fig, ax)``.
-        method : {"integration", "fit"}, optional
-            Which cache to read from: integration-based maps or PyTorch
-            fit-based maps.
-        **kwargs
-            Forwarded to :func:`show_2d` (e.g. ``cmap``).
-
-        Returns
-        -------
-        tuple[Figure, Axes] | None
-            Only returned when *return_fig* is ``True``.
-
-        Raises
-        ------
-        ValueError
-            If no cached spectrum images exist for the chosen *method*.
-        """
-        spectrum_images = self._get_spectrum_images(method)
-        if not spectrum_images:
-            raise ValueError("No spectrum images found. Run generate_spectrum_images(...) first.")
-
-        line_map = {str(k): np.asarray(v) for k, v in spectrum_images.items()}
-        labels = list(line_map)
-        labels_by_element = type(self)._group_labels_by_element(labels)
-
-        def sum_maps(lbls):
-            return np.sum([line_map[lbl] for lbl in lbls], axis=0)
-
-        specs = type(self)._normalize_specs(x_ray_lines, param_name="x_ray_lines", allow_none=True)
-        if not specs:
-            titles = sorted(labels_by_element)
-            images = [sum_maps(labels_by_element[t]) for t in titles]
-        else:
-            selected = [
-                type(self)._select_labels(
-                    str(raw), labels=labels, labels_by_element=labels_by_element
-                )
-                for raw in specs
-            ]
-            if any(not s for s in selected):
-                bad = next(raw for raw, s in zip(specs, selected) if not s)
-                raise ValueError(f"No spectrum images matched selector '{bad}'")
-            images = [line_map[s[0]] if len(s) == 1 else sum_maps(s) for s in selected]
-            titles = [s[0] if len(s) == 1 else str(raw).strip() for raw, s in zip(specs, selected)]
-
-        fig, ax = show_2d(
-            images,
-            title=titles,
-            cmap=kwargs.pop("cmap", "magma"),
-            scalebar={"sampling": self.sampling[1], "units": self.units[1]},
-            returnfig=True,
-            **kwargs,
-        )
-
-        if return_fig and return_maps:
-            return (fig, ax), (images, titles)
-        elif return_fig:
-            return fig, ax
-        elif return_maps:
-            return images, titles
 
     def _build_pytorch_spectrum_images(
         self, abundance_maps: np.ndarray, element_names: list[str] | tuple[str, ...]
