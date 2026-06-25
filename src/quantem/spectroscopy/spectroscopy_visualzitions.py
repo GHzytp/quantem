@@ -9,11 +9,10 @@ from quantem.core.visualization import show_2d
 def plot_attached_spectrum(self, spectrum_index=0):
     fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
 
-    ax_spec.plot(
-        self.attached_spectra[spectrum_index][1],
-        self.attached_spectra[spectrum_index][0],
-        linewidth=1.5,
-    )
+    ds = self.attached_spectra[spectrum_index]
+    energy = ds.origin[0] + ds.sampling[0] * np.arange(ds.shape[0])
+    ax_spec.plot(energy, ds.array, linewidth=1.5)
+
     if self.dataset_type == "xeds":
         ax_spec.set_xlabel("Energy (keV)")
     elif self.dataset_type == "eels":
