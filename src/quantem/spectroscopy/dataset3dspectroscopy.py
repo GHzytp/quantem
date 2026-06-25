@@ -640,7 +640,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # SPECTRUM CALCULATION --------------------------------------------------------------
 
-        E = np.asarray(self.energy_axis, dtype=float)
+        E = self.energy_axis
 
         # MASK HANDLING ---------------------------------------------------------------------
         if mask is not None:

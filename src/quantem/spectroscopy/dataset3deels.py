@@ -450,10 +450,10 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         # Fit power law function to spectrum within window region of the energy exis
 
-        window_minE = (target_edge - 5) - target_edge * (window_size / 100)
-        window_maxE = target_edge - 5
+        window_min_E = (target_edge - 5) - target_edge * (window_size / 100)
+        window_max_E = target_edge - 5
 
-        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
+        window_indices = np.where((energy_axis >= window_min_E) & (energy_axis <= window_max_E))[0]
 
         window_E = energy_axis[window_indices]
         window_I = spectrum[window_indices]
@@ -471,7 +471,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         ax.plot(energy_axis, spectrum, label="spectrum", color="b")
         ax.plot(energy_axis, background_fit, label="background", color="r")
         ax.vlines(
-            x=[window_minE, window_maxE],
+            x=[window_min_E, window_max_E],
             ymin=0,
             ymax=np.max(spectrum),
             label="window limits",
@@ -482,7 +482,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return background_fit
 
-    def smooth_eels_rollingaverage(self, roi=None, energy_range=None, mask=None, kernel_size=10):
+    def smooth_eels_rolling_average(self, roi=None, energy_range=None, mask=None, kernel_size=10):
         energy_axis = self.energy_axis
 
         if energy_range is not None:
