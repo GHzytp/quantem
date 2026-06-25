@@ -96,7 +96,7 @@ class Dataset1d(Dataset):
         >>> import numpy as np
         >>> from quantem.core.datastructures import Dataset1d
         >>> arr = np.random.rand(10)
-        >>> data = Dataset3d.from_array(arr)
+        >>> data = Dataset1d.from_array(arr)
         >>> data.shape
         (10,)
 
@@ -140,8 +140,8 @@ class Dataset1d(Dataset):
 
         Parameters
         ----------
-        shape : tuple[int, int, int]
-            Shape (n_frames, height, width)
+        shape : tuple[int]
+            Shape (length)
         name : str
             Dataset name. Default: "constant 1D dataset"
         fill_value : float
@@ -187,10 +187,10 @@ class Dataset1d(Dataset):
 
         Parameters
         ----------
-        scalebar: ScalebarConfig or bool
-            If True, displays scalebar
         title: str
             Title of Dataset
+        returnfig: bool
+            Option to include figure as return value for method
         """
 
         if title is None:
