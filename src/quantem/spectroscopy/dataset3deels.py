@@ -737,7 +737,6 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         fig.tight_layout()
 
-        # <<<--- CHANGED: Modified return logic to optionally include shifts
         if return_3d_dataset:
             corrected_dataset = Dataset3deels.from_array(
                 array=aligned_data_3d,
@@ -747,14 +746,14 @@ class Dataset3deels(Dataset3dspectroscopy):
                 units=self.units,
             )
             if return_shifts:
-                return corrected_dataset, zlp_array  # Return both dataset and shifts
+                return corrected_dataset, zlp_array
             else:
-                return corrected_dataset  # Original behavior
+                return corrected_dataset
         else:
             if return_shifts:
-                return aligned_data_3d, zlp_array  # Return both array and shifts
+                return aligned_data_3d, zlp_array
             else:
-                return aligned_data_3d  # Original behavior
+                return aligned_data_3d
 
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """
