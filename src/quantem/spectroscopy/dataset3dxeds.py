@@ -469,7 +469,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             Only returned when *return_maps* is ``True``.
         """
         if elements is None:
-            if self.model_elements is None:
+            if not self.model_elements:
                 raise ValueError("elements must be specified")
             elements = list(self.model_elements)
 

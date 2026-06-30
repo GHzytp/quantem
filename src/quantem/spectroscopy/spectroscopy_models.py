@@ -353,25 +353,3 @@ class PolynomialBackground(nn.Module):
         for i, coeff in enumerate(self.coeffs):
             background += coeff * (self.energy_norm**i)
         return background
-
-
-class ExponentialBackground(nn.Module):
-    """Exponential background for bremsstrahlung"""
-
-    def __init__(self, energy_axis):
-        super().__init__()
-        energy_axis_tensor = (
-            energy_axis.float()
-            if torch.is_tensor(energy_axis)
-            else torch.tensor(energy_axis, dtype=torch.float32)
-        )
-        self.register_buffer("energy_axis", energy_axis_tensor)
-        dtype = self.energy_axis.dtype
-        device = self.energy_axis.device
-
-        self.amplitude = nn.Parameter(torch.tensor(1.0, dtype=dtype, device=device))
-        self.decay = nn.Parameter(torch.tensor(0.5, dtype=dtype, device=device))
-        self.offset = nn.Parameter(torch.tensor(0.1, dtype=dtype, device=device))
-
-    def forward(self):
-        return self.amplitude * torch.exp(-self.decay * self.energy_axis) + self.offset

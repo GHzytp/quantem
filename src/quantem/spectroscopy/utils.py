@@ -54,8 +54,7 @@ def load_xray_lines_database(path: Union[Path, str]) -> dict[str, dict[str, dict
                 continue
             energy_kev = energy_ev / 1000.0
 
-        # Use the normalized CSV column as the X-ray line weight.
-        weight = _parse_float(row, ("col4_norm", "weight", "relative_intensity"))
+        weight = _parse_float(row, ("weight", "relative_intensity"))
         if weight is None:
             weight = 0.0
 

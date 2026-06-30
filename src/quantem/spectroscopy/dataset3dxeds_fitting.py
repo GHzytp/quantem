@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from scipy.signal import find_peaks, peak_prominences
 
+from quantem.core import config
 from quantem.spectroscopy.spectroscopy_models import (
     GaussianPeaks,
     PolynomialBackground,
@@ -504,7 +505,7 @@ def fit_spectrum_mean_pytorch(
     optimizer : {"adam", "lbfgs"}, optional
         Optimizer to use.
     device : str | torch.device | None, optional
-        Torch device.  If ``None``, uses CUDA when available.
+        Torch device. If ``None``, uses ``quantem.core.config.get("device")``.
 
     Returns
     -------
@@ -518,12 +519,8 @@ def fit_spectrum_mean_pytorch(
     if optimizer_name not in {"adam", "lbfgs"}:
         raise ValueError("optimizer must be 'lbfgs' or 'adam'")
 
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
+    device, _ = config.validate_device(config.get("device") if device is None else device)
+    device = torch.device(device)
 
     if elements_to_fit is None:
         if not self.model_elements:
@@ -726,7 +723,7 @@ def fit_spectrum_pytorch(
         specific default is used.
     device : str | torch.device | None, optional
         Torch device for fitting (for example ``"cpu"`` or ``"cuda"``).
-        If ``None``, uses CUDA when available, otherwise CPU.
+        If ``None``, uses ``quantem.core.config.get("device")``.
     constrain_background : float, optional
         Background prior weight used in local fitting to keep per-pixel
         background coefficients close to the globally optimized background.
@@ -805,12 +802,8 @@ def fit_spectrum_pytorch(
         if verbose:
             print(f"using model_elements {elements_to_fit}")
 
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
+    device, _ = config.validate_device(config.get("device") if device is None else device)
+    device = torch.device(device)
 
     effective_lr_global = lr_global
     effective_lr_local = lr_local
@@ -1138,17 +1131,8 @@ def fit_spectrum_pytorch(
         abundance_maps=abundance_maps,
         element_names=list(global_model.peak_model.element_names),
     )
-    if hasattr(self, "_spectrum_images_pytorch"):
-        self._spectrum_images_pytorch = {
-            **self._spectrum_images_pytorch,
-            **pytorch_spectrum_images,
-        }
-    else:
-        self._spectrum_images_pytorch = {}
-        self._spectrum_images_pytorch = {
-            **self._spectrum_images_pytorch,
-            **pytorch_spectrum_images,
-        }
+    base = getattr(self, "_spectrum_images_pytorch", {})
+    self._spectrum_images_pytorch = {**base, **pytorch_spectrum_images}
 
     loss_history_array = np.asarray(loss_history)
     energy_axis_np = energy_axis.cpu().numpy()
