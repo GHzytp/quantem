@@ -893,9 +893,8 @@ class Dataset3deels(Dataset3dspectroscopy):
         I_zlp = np.sum(data[:, :, z_start : z_end + 1], axis=2)
         I_total = np.sum(data[:, :, t_start : t_end + 1], axis=2)
 
-        # 2. Log-Ratio Calculation (with epsilon to avoid log(0))
-        epsilon = 1e-10
-        t_over_lambda = np.log((I_total + epsilon) / (I_zlp + epsilon))
+        # 2. Log-Ratio Calculation
+        t_over_lambda = np.log1p((I_total) / (I_zlp))
 
         # 3. Data Cleaning
         t_over_lambda = np.nan_to_num(t_over_lambda, nan=0.0, posinf=0.0, neginf=0.0)

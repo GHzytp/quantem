@@ -5,6 +5,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
+from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy import Dataset3dspectroscopy
 from quantem.spectroscopy.dataset3dxeds_fitting import (
@@ -339,6 +340,41 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             "fit": getattr(self, "_spectrum_images_pytorch", None),
         }.get(method)
 
+    def _map_to_dataset2d(
+        self,
+        array,
+        name: str | None = None,
+        signal_units: str | None = None,
+    ) -> Dataset2d:
+        """Wrap a real-space map with this dataset's spatial calibration."""
+        if isinstance(array, Dataset2d):
+            return array
+        return Dataset2d.from_array(
+            array=np.asarray(array),
+            name=name if name is not None else f"{self.name} map",
+            origin=np.asarray(self.origin[:2], dtype=float),
+            sampling=np.asarray(self.sampling[:2], dtype=float),
+            units=list(self.units[:2]),
+            signal_units=self.signal_units if signal_units is None else signal_units,
+        )
+
+    def _maps_to_dataset2d(
+        self,
+        maps: dict[str, np.ndarray],
+        *,
+        name_prefix: str = "",
+        signal_units: str | None = None,
+    ) -> dict[str, Dataset2d]:
+        """Wrap a map dictionary with this dataset's spatial calibration."""
+        return {
+            key: self._map_to_dataset2d(
+                value,
+                name=f"{name_prefix}{key}".strip() or str(key),
+                signal_units=signal_units,
+            )
+            for key, value in maps.items()
+        }
+
     def x_ray_lookup(
         self, spec: str | list[str] | tuple[str, ...] | set[str]
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -429,7 +465,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
         Returns
         -------
-        tuple[ndarray, list[str]] | None
+        tuple[list[Dataset2d], list[str]] | None
             Only returned when *return_maps* is ``True``.
         """
         if elements is None:
@@ -451,9 +487,10 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             mask.astype(self.array.dtype).T @ self.array.reshape(-1, n_energy).transpose()
         ).reshape(mask.shape[1], scan_row, scan_col)
 
+        spectrum_images = self._maps_to_dataset2d(dict(zip(labels, maps)))
         self._spectrum_images = {
             **getattr(self, "_spectrum_images", {}),
-            **dict(zip(labels, maps)),
+            **spectrum_images,
         }
 
         images, titles = self.show_spectrum_images(x_ray_lines=elements, return_maps=True)
@@ -483,7 +520,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
         Returns
         -------
-        ndarray | dict[str, ndarray]
+        Dataset2d | dict[str, Dataset2d]
             Single map when one selector is given, otherwise a dict keyed by
             selector string.
         """
@@ -534,10 +571,14 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                     **kwargs,
                 )
 
+        integrated_datasets = self._maps_to_dataset2d(
+            integrated_maps,
+            name_prefix="Integrated XEDS ",
+        )
         return (
-            integrated_maps
-            if return_maps or len(integrated_maps) != 1
-            else next(iter(integrated_maps.values()))
+            integrated_datasets
+            if return_maps or len(integrated_datasets) != 1
+            else next(iter(integrated_datasets.values()))
         )
 
     def integrate(self, spec, width=0.15, return_maps=False, show=True, **kwargs):
@@ -548,7 +589,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
 
     def _build_pytorch_spectrum_images(
         self, abundance_maps: np.ndarray, element_names: list[str] | tuple[str, ...]
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, Dataset2d]:
         """Convert per-element abundance maps into per-line spectrum images using weights."""
         maps = np.asarray(abundance_maps)
         if maps.ndim != 3:
@@ -564,7 +605,10 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 continue
             element_map = np.asarray(maps[i], dtype=float)
             for weight, label in zip(line_weights, line_labels):
-                line_maps[str(label)] = element_map * weight
+                line_maps[str(label)] = self._map_to_dataset2d(
+                    element_map * weight,
+                    name=str(label),
+                )
         return line_maps
 
     def quantify_composition_cliff_lorimer(
@@ -581,18 +625,19 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         method : {"integration", "fit"}, optional
             Which cached spectrum images to use for intensity extraction.
         return_maps : bool, optional
-            If ``True``, include per-pixel atomic-percent and weight-percent
-            maps in the returned dict.
+            If ``True``, also return per-pixel atomic-percent and weight-percent
+            maps.
         verbose : bool, optional
             If ``True``, print the quantification summary table.
 
         Returns
         -------
-        dict
-            Keys include ``atomic_percent``, ``weight_percent``,
-            ``intensities``, ``weighted_intensities``, and
-            ``summary_table``.  When *return_maps* is ``True``, also
-            includes ``atomic_percent_maps`` and ``weight_percent_maps``.
+        tuple[dict[str, float], dict[str, float]]
+            Atomic-percent and weight-percent compositions keyed by element.
+            Intermediate outputs are stored on ``_cliff_lorimer_*`` attributes.
+        tuple[tuple[dict[str, float], dict[str, float]], tuple[dict[str, Dataset2d], dict[str, Dataset2d]]]
+            When *return_maps* is ``True``, returns ``((atomic_percent,
+            weight_percent), (atomic_percent_maps, weight_percent_maps))``.
 
         Raises
         ------
@@ -607,7 +652,10 @@ class Dataset3dxeds(Dataset3dspectroscopy):
             raise ValueError("No spectrum images available for quantification")
 
         ordered_elements = type(self)._ordered_element_keys(type(self)._ensure_element_info())
-        line_map = {str(k): np.asarray(v, dtype=float) for k, v in spectrum_images.items()}
+        line_map = {
+            str(k): np.asarray(getattr(v, "array", v), dtype=float)
+            for k, v in spectrum_images.items()
+        }
         labels = list(line_map)
         labels_by_element = type(self)._group_labels_by_element(labels)
 
@@ -687,13 +735,17 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 ],
             ]
         )
-        result = {
-            "intensities": intensities,
-            "weighted_intensities": weighted_intensities,
-            "atomic_percent": atomic_percent,
-            "weight_percent": weight_percent,
-            "summary_table": table_text,
-        }
+        self._cliff_lorimer_intensities = intensities
+        self._cliff_lorimer_weighted_intensities = weighted_intensities
+        self._cliff_lorimer_atomic_percent = atomic_percent
+        self._cliff_lorimer_weight_percent = weight_percent
+        self._cliff_lorimer_summary_table = table_text
+        self._cliff_lorimer_selector_maps = None
+        self._cliff_lorimer_intensity_maps = None
+        self._cliff_lorimer_weighted_intensity_maps = None
+        self._cliff_lorimer_atomic_percent_maps = None
+        self._cliff_lorimer_weight_percent_maps = None
+
         if verbose:
             print(table_text)
 
@@ -723,16 +775,33 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 )
                 for el, mmap in mass_maps.items()
             }
-            result.update(
-                {
-                    "selector_maps": selector_maps,
-                    "intensity_maps": intensity_maps,
-                    "weighted_intensity_maps": weighted_intensity_maps,
-                    "atomic_percent_maps": atomic_percent_maps,
-                    "weight_percent_maps": weight_percent_maps,
-                }
+            atomic_percent_maps = self._maps_to_dataset2d(
+                atomic_percent_maps,
+                name_prefix="Atomic percent ",
+                signal_units="%",
             )
-        return result
+            weight_percent_maps = self._maps_to_dataset2d(
+                weight_percent_maps,
+                name_prefix="Weight percent ",
+                signal_units="%",
+            )
+            self._cliff_lorimer_selector_maps = self._maps_to_dataset2d(
+                selector_maps,
+                name_prefix="Cliff-Lorimer selector ",
+            )
+            self._cliff_lorimer_intensity_maps = self._maps_to_dataset2d(
+                intensity_maps,
+                name_prefix="Cliff-Lorimer intensity ",
+            )
+            self._cliff_lorimer_weighted_intensity_maps = self._maps_to_dataset2d(
+                weighted_intensity_maps,
+                name_prefix="Cliff-Lorimer weighted intensity ",
+            )
+            self._cliff_lorimer_atomic_percent_maps = atomic_percent_maps
+            self._cliff_lorimer_weight_percent_maps = weight_percent_maps
+            return (atomic_percent, weight_percent), (atomic_percent_maps, weight_percent_maps)
+
+        return atomic_percent, weight_percent
 
     def clear_spectrum_images(self):
         """Clear cached integration-based spectrum images."""

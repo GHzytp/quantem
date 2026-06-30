@@ -403,7 +403,7 @@ def show_spectrum_images(
     if not spectrum_images:
         raise ValueError("No spectrum images found. Run generate_spectrum_images(...) first.")
 
-    line_map = {str(k): np.asarray(v) for k, v in spectrum_images.items()}
+    line_map = {str(k): np.asarray(getattr(v, "array", v)) for k, v in spectrum_images.items()}
     labels = list(line_map)
     labels_by_element = type(self)._group_labels_by_element(labels)
 
@@ -433,6 +433,11 @@ def show_spectrum_images(
         returnfig=True,
         **kwargs,
     )
+
+    if return_maps and hasattr(self, "_map_to_dataset2d"):
+        images = [
+            self._map_to_dataset2d(image, name=str(title)) for image, title in zip(images, titles)
+        ]
 
     if return_fig and return_maps:
         return (fig, ax), (images, titles)
