@@ -95,7 +95,9 @@ class Dataset3deels(Dataset3dspectroscopy):
         self._virtual_images = {}
         self.dataset_type = "eels"
 
-    def calculate_background_iterative(self, spectrum):
+    def calculate_background_iterative(
+        self, spectrum, smoothing_kernel_sigma=1.0, sigma_cutoff=3.0
+    ):
         """
         Subtract background typical for EELS using iterative Gaussian fitting.
         This method isolates the continuum background from the low-loss region.
@@ -106,8 +108,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         ----------
         spectrum : ndarray
             1D EELS spectrum
-        energy_axis : ndarray
-            Energy axis corresponding to spectrum
+        smoothing_kernel_sigma:
 
         Returns
         -------
@@ -119,21 +120,20 @@ class Dataset3deels(Dataset3dspectroscopy):
         from scipy.stats import norm
 
         # Smooth for better fitting
-        spec_smooth = gaussian_filter(spectrum, sigma=1.0)
+        spec_smooth = gaussian_filter(spectrum, smoothing_kernel_sigma)
         pixel_vals = spec_smooth.copy()
 
         # Iteratively fit Gaussian to low-intensity values (the continuum)
         # Remove outliers (edge peaks) iteratively
         num_iterations = 10
-        cutoff = 3  # +/- 3 sigma
 
         for _ in range(num_iterations):
             mu, std = norm.fit(pixel_vals)
             if std == 0:
                 break
-            # Keep only values within +/- 3 sigma (removes edge contributions)
-            lower = mu - cutoff * std
-            upper = mu + cutoff * std
+            # Keep only values within +/- the number of standard deviations specificed by sigma_cutoff(removes edge contributions)
+            lower = mu - sigma_cutoff * std
+            upper = mu + sigma_cutoff * std
             pixel_vals = pixel_vals[(pixel_vals >= lower) & (pixel_vals <= upper)]
 
         # Subtract the estimated background level
@@ -450,10 +450,10 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         # Fit power law function to spectrum within window region of the energy exis
 
-        window_minE = (target_edge - 5) - target_edge * (window_size / 100)
-        window_maxE = target_edge - 5
+        window_min_E = (target_edge - 5) - target_edge * (window_size / 100)
+        window_max_E = target_edge - 5
 
-        window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
+        window_indices = np.where((energy_axis >= window_min_E) & (energy_axis <= window_max_E))[0]
 
         window_E = energy_axis[window_indices]
         window_I = spectrum[window_indices]
@@ -471,7 +471,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         ax.plot(energy_axis, spectrum, label="spectrum", color="b")
         ax.plot(energy_axis, background_fit, label="background", color="r")
         ax.vlines(
-            x=[window_minE, window_maxE],
+            x=[window_min_E, window_max_E],
             ymin=0,
             ymax=np.max(spectrum),
             label="window limits",
@@ -482,7 +482,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return background_fit
 
-    def smooth_eels_rollingaverage(self, roi=None, energy_range=None, mask=None, kernel_size=10):
+    def smooth_eels_rolling_average(self, roi=None, energy_range=None, mask=None, kernel_size=10):
         energy_axis = self.energy_axis
 
         if energy_range is not None:
@@ -737,7 +737,6 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         fig.tight_layout()
 
-        # <<<--- CHANGED: Modified return logic to optionally include shifts
         if return_3d_dataset:
             corrected_dataset = Dataset3deels.from_array(
                 array=aligned_data_3d,
@@ -747,14 +746,14 @@ class Dataset3deels(Dataset3dspectroscopy):
                 units=self.units,
             )
             if return_shifts:
-                return corrected_dataset, zlp_array  # Return both dataset and shifts
+                return corrected_dataset, zlp_array
             else:
-                return corrected_dataset  # Original behavior
+                return corrected_dataset
         else:
             if return_shifts:
-                return aligned_data_3d, zlp_array  # Return both array and shifts
+                return aligned_data_3d, zlp_array
             else:
-                return aligned_data_3d  # Original behavior
+                return aligned_data_3d
 
     def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
         """

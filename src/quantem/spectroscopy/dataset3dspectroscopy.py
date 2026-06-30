@@ -392,7 +392,8 @@ class Dataset3dspectroscopy(Dataset3d):
         scan_row, scan_col, n_energy = data.shape
         n_pixels = scan_row * scan_col
 
-        spectra = np.moveaxis(data, 2, -1).reshape(n_pixels, n_energy)
+        spectra = data.reshape(n_pixels, n_energy)
+
         pixel_mask = np.ones(n_pixels, dtype=bool)
 
         if mask is not None:
@@ -640,7 +641,7 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # SPECTRUM CALCULATION --------------------------------------------------------------
 
-        E = np.asarray(self.energy_axis, dtype=float)
+        E = self.energy_axis
 
         # MASK HANDLING ---------------------------------------------------------------------
         if mask is not None:
