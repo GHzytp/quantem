@@ -32,6 +32,7 @@ def peak_autoid(
     mask=None,
     show_text=True,
     peaks=15,
+    mode=None,
     line=None,
     return_details=False,
 ):
@@ -78,6 +79,13 @@ def peak_autoid(
     peaks : int or None, optional
         Maximum number of peaks to plot and print in the table. Matching is
         still performed on all peaks that pass ``threshold``.
+    mode : {"autofill", "elements_only", "elements_preferred"} or None, optional
+        Search strategy when ``elements`` or saved ``model_elements`` are
+        available. ``"elements_only"`` restricts matching to those elements,
+        ``"elements_preferred"`` searches all elements but ranks matching
+        requested/saved elements before other candidates, and ``"autofill"``
+        searches all elements. If ``None``, defaults to ``"elements_only"``
+        when element context is available and ``"autofill"`` otherwise.
     line : float or sequence[float] or None, optional
         Reference energy line(s) in keV to draw as dashed black vertical
         markers.
@@ -98,10 +106,58 @@ def peak_autoid(
     )
     min_line_weight = max(float(min_line_weight), 0.0)
 
-    edge_filters = type(self)._parse_element_selectors(
+    requested_edge_filters = type(self)._parse_element_selectors(
         elements, allow_none=True, param_name="elements"
     )
-    search_elements = set(edge_filters) if edge_filters else None
+
+    def model_edge_filters():
+        model_elements = getattr(self, "model_elements", {}) or {}
+        filters = {}
+        for element_name, selected_lines in model_elements.items():
+            element_name = str(element_name)
+            if not isinstance(selected_lines, dict) or not selected_lines:
+                filters[element_name] = None
+                continue
+
+            selected = set(map(str, selected_lines.keys()))
+            all_lines = set(map(str, (all_info.get(element_name) or {}).keys()))
+            filters[element_name] = None if all_lines and selected >= all_lines else selected
+        return filters or None
+
+    saved_edge_filters = model_edge_filters()
+
+    def merge_edge_filters(primary, secondary):
+        if primary is None:
+            return secondary
+        if secondary is None:
+            return primary
+
+        merged = {str(k): (None if v is None else set(map(str, v))) for k, v in primary.items()}
+        for element_name, selectors in secondary.items():
+            element_name = str(element_name)
+            if element_name not in merged or selectors is None or merged[element_name] is None:
+                merged[element_name] = None if selectors is None else set(map(str, selectors))
+            else:
+                merged[element_name].update(map(str, selectors))
+        return merged or None
+
+    edge_filters = merge_edge_filters(saved_edge_filters, requested_edge_filters)
+    requested_elements = set(edge_filters) if edge_filters else None
+
+    mode_name = (
+        str(mode) if mode is not None else ("elements_only" if requested_elements else "autofill")
+    )
+    mode_name = str(mode_name).strip().lower()
+    valid_modes = {"autofill", "elements_only", "elements_preferred"}
+    if mode_name not in valid_modes:
+        raise ValueError("mode must be one of: autofill, elements_only, elements_preferred")
+    if mode_name in {"elements_only", "elements_preferred"} and not requested_elements:
+        raise ValueError(
+            f"mode={mode_name!r} requires elements to be specified or saved in model_elements"
+        )
+
+    search_elements = requested_elements if mode_name == "elements_only" else None
+    preferred_elements = requested_elements if mode_name == "elements_preferred" else set()
 
     fig, (ax_img, ax_spec) = self.show_mean_spectrum(
         roi=roi,
@@ -232,7 +288,17 @@ def peak_autoid(
                         "score": float(score),
                     }
                 )
-        candidates.sort(key=lambda item: item["score"], reverse=True)
+        if mode_name == "elements_preferred" and preferred_elements:
+            candidates.sort(
+                key=lambda item: (
+                    not (
+                        str(item["element"]) in preferred_elements and float(item["score"]) > 0.0
+                    ),
+                    -float(item["score"]),
+                )
+            )
+        else:
+            candidates.sort(key=lambda item: item["score"], reverse=True)
         return candidates
 
     peak_matches = []
@@ -366,6 +432,7 @@ def peak_autoid(
             "display_peaks": display_peaks,
             "peak_matches": peak_matches,
             "peak_alternatives": alternatives_by_peak,
+            "mode": mode_name,
             "threshold": threshold_value,
             "noise": noise,
             "noise_percentile": noise_percentile,
