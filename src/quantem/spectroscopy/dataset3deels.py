@@ -3,7 +3,6 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
 
@@ -754,108 +753,6 @@ class Dataset3deels(Dataset3dspectroscopy):
                 return aligned_data_3d, zlp_array
             else:
                 return aligned_data_3d
-
-    def calibrate_zero_loss_peak(self, center_guess=None, search_window=10):
-        """
-        Calibrate the energy axis by centering the zero loss peak at 0 eV.
-        Finds the ZLP at every pixel, fits a 2D plane to the ZLP positions,
-        and shifts each spectrum individually so the ZLP sits at 0, while aligning
-        all ZLPs to the same channel index, allowing a single origin to correctly
-        calibrate the entire dataset.
-
-        Parameters
-        ----------
-        center_guess : float or None
-            Expected energy position of the ZLP in eV. If None, uses the
-            tallest peak in each spectrum as the ZLP. If provided, searches
-            for the tallest peak within the search window around that energy.
-        search_window : int
-            Number of channels to search on either side of center_guess.
-            Only used when center_guess is not None. Default is 10.
-
-        Returns
-        -------
-        Dataset3deels
-            New dataset with corrected energy calibration.
-        """
-
-        scan_row, scan_col, n_energy = self.array.shape
-
-        energy_axis = np.asarray(self.energy_axis, dtype=float)
-
-        # --- Build ZLP position map ---
-        # For every pixel, find the energy where the ZLP sits.
-        # A median filter is applied to each spectrum first to remove
-        # hot pixels (cosmic rays, detector glitches) that could be
-        # brighter than the ZLP and fool the peak finder.
-        # If center_guess is provided, only look within a window
-        # of search_window channels around that energy.
-        # If center_guess is None, just find the tallest peak.
-
-        zlp_map = np.zeros((scan_row, scan_col))
-
-        if center_guess is not None:
-            guess_index = int(np.argmin(np.abs(energy_axis - center_guess)))
-            lo = max(guess_index - search_window, 0)
-            hi = min(guess_index + search_window + 1, n_energy)
-
-        for i_row in range(scan_row):
-            for i_col in range(scan_col):
-                spectrum = median_filter(self.array[i_row, i_col, :], size=3)
-
-                if center_guess is None:
-                    peak_index = np.argmax(spectrum)
-                else:
-                    peak_index = lo + np.argmax(spectrum[lo:hi])
-
-                zlp_map[i_row, i_col] = energy_axis[peak_index]
-
-        # --- Fit a 2D plane to the ZLP map ---
-        # The plane equation is: zlp_energy(scan_row, scan_col) = a*row + b*col + c
-        # This smooths out noisy per-pixel ZLP measurements by assuming
-        # the drift varies linearly across the scan area.
-
-        row_coords, col_coords = np.meshgrid(
-            np.arange(scan_row), np.arange(scan_col), indexing="ij"
-        )
-        row_flat = row_coords.ravel()
-        col_flat = col_coords.ravel()
-        z_flat = zlp_map.ravel()
-
-        A = np.column_stack([row_flat, col_flat, np.ones(len(row_flat))])
-        coeffs, _, _, _ = np.linalg.lstsq(A, z_flat, rcond=None)
-        a, b, c = coeffs
-
-        zlp_plane = a * row_coords + b * col_coords + c
-
-        # --- Shift each spectrum so the ZLP lands at 0 eV ---
-        # For each pixel, subtract its plane-predicted ZLP position from
-        # the energy axis, then interpolate the spectrum back onto the
-        # original energy grid. This physically moves the data so all
-        # ZLPs align at the same channel index.
-
-        corrected_array = np.zeros_like(self.array)
-
-        for i_row in range(scan_row):
-            for i_col in range(scan_col):
-                shift = zlp_plane[i_row, i_col]
-                shifted_energy = energy_axis - shift
-                interpolator = interp1d(
-                    shifted_energy,
-                    self.array[i_row, i_col, :],
-                    kind="linear",
-                    bounds_error=False,
-                    fill_value=0.0,
-                )
-                corrected_array[i_row, i_col, :] = interpolator(energy_axis)
-
-        return Dataset3deels.from_array(
-            array=corrected_array,
-            name=self.name,
-            sampling=self.sampling,
-            origin=self.origin,
-            units=self.units,
-        )
 
     def correct_zlp_shift(ll, hl):
         """
