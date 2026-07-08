@@ -542,13 +542,36 @@ class Dataset3deels(Dataset3dspectroscopy):
     def measure_zlp_offset(
         self,
         zlp_guess_x=None,
+        search_window=10,
         fit_window=0.8,
-        fit_to_plane=False,
         median_filter_pixels=3,
+        polynomial_order_rows=3,
+        polynomial_order_columns=3,
+        fit_to_plane=False,
+        fit_to_polynomial=False,
         fit_zlp=True,
     ):
         """
         Measure ZLP offset at each pixel position by using a guess of ZLP posfitting each spectrum to a Gaussian
+
+        Finds the difference between the maximum of the ZLP Gaussian fit and 0 eV at every pixel,
+        and fits a 2D plane to measured ZLP offsets if fit_to_plane=True.
+
+        Parameters
+        ----------
+        zlp_guess_x : float or None
+            Expected energy position of the ZLP in eV. If None, uses the
+            tallest peak in each spectrum as the ZLP. If provided, searches
+            for the tallest peak within the search window around that energy.
+        search_window : int
+            Number of channels to search on either side of center_guess.
+            Only used when center_guess is not None. Default is 10.
+
+        Returns
+        -------
+        Dataset3deels
+            New dataset with corrected energy calibration.
+
         """
 
         # Define Gaussian constraint to fit ZLP to
@@ -559,7 +582,18 @@ class Dataset3deels(Dataset3dspectroscopy):
             row, col = M
             return (a * row) + (b * col) + c
 
-        scan_row, scan_col, _n_energy = self.array.shape
+        def _polynomial_fit_2d(M, c00, c10, c01, c20, c11, c02):
+            row, col = M
+            return (
+                c00
+                + (c10 * row)
+                + (c01 * col)
+                + (c20 * row**2)
+                + (c11 * row * col)
+                + (c02 * col**2)
+            )
+
+        scan_row, scan_col, n_energy = self.array.shape
         energy_axis = self.energy_axis
 
         # For each pixel, measure the zlp position by fitting a Gaussian to the measured zero-loss signal and taking its center as the zlp position.
@@ -636,6 +670,28 @@ class Dataset3deels(Dataset3dspectroscopy):
                 title=["Measured ZLP (mean of Gaussian fit)", "ZLP plane fit"],
             )
             return zlp_plane_2d
+        elif fit_to_polynomial:
+            # Fit a 2D polynomial to the array of measured ZLPs
+            row_data, col_data = np.meshgrid(
+                np.arange(scan_row), np.arange(scan_col), indexing="ij"
+            )
+
+            coord_data_unpacked = np.vstack((row_data.ravel(), col_data.ravel()))
+            ydata_unpacked = zlp_measured.ravel()
+
+            popt, _ = curve_fit(_polynomial_fit_2d, coord_data_unpacked, ydata_unpacked)
+
+            zlp_plane_1d = _polynomial_fit_2d(
+                coord_data_unpacked, popt[0], popt[1], popt[2], popt[3], popt[4], popt[5]
+            )
+            zlp_plane_2d = zlp_plane_1d.reshape(scan_row, scan_col)
+
+            show_2d(
+                [zlp_measured, zlp_plane_2d],
+                cmap="magma",
+                title=["Measured ZLP (mean of Gaussian fit)", "ZLP polynomial fit"],
+            )
+
         else:
             show_2d(
                 [zlp_measured],
