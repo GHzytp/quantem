@@ -707,6 +707,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         fit_window=0.8,
         measure_offset=True,
         fit_to_plane=True,
+        fit_to_polynomial=False,
         fit_zlp=True,
         return_3d_dataset=True,
         return_shifts=False,
@@ -719,6 +720,7 @@ class Dataset3deels(Dataset3dspectroscopy):
                 zlp_guess_x=zlp_guess_x,
                 fit_window=fit_window,
                 fit_to_plane=fit_to_plane,
+                fit_to_polynomial=fit_to_polynomial,
                 fit_zlp=fit_zlp,
             )
         elif zlp_shifts_array is not None:
