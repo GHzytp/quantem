@@ -865,30 +865,105 @@ class Dataset3deels(Dataset3dspectroscopy):
         else:
             return hl_corrected
 
-    def calculate_thickness_log_ratio(dataset, window_params, plot=True):
+    def calculate_thickness_log_ratio(
+        self,
+        zlp_window=10,
+        median_filter_pixels=3,
+        fit_zlp=True,
+        zlp_guess_x=None,
+        plot=True,
+    ):
         """
         Calculates the relative thickness map (t/lambda) using the Log-Ratio method.
         """
-        data = dataset.array
-        z_start, z_end = window_params["zlp_idx"]
-        t_start, t_end = window_params["total_idx"]
 
-        print(f"QuantEM: Calculating thickness for {dataset.name}...")
+        def _gaussian_fit(x, A, mu, sigma):
+            return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
-        # 1. Vectorized Integration
-        I_zlp = np.sum(data[:, :, z_start : z_end + 1], axis=2)
-        I_total = np.sum(data[:, :, t_start : t_end + 1], axis=2)
+        scan_row, scan_col, n_energy = self.array.shape
+        energy_axis = self.energy_axis
 
-        # 2. Log-Ratio Calculation
+        zlp_measured = np.zeros((scan_row, scan_col))
+
+        for i_row in range(scan_row):
+            for i_col in range(scan_col):
+                # Apply median filter to discount hot pixels that might spuriously produce the maximum intensity of the spectrum
+                if median_filter_pixels > 0:
+                    spec_filt = median_filter(self.array[i_row, i_col, :], median_filter_pixels)
+                else:
+                    spec_filt = self.array[i_row, i_col, :]
+
+                if fit_zlp:
+                    # Use initial guess for ZLP to define window for Gaussian fitting. If zlp_guess_x=None (default) use the maximum value of the spectrum
+                    if zlp_guess_x is not None:
+                        zlp_crude_idx = int(np.argmin(np.abs(energy_axis - zlp_guess_x)))
+                    else:
+                        zlp_crude_idx = int(np.argmax(spec_filt))
+
+                    mu0 = energy_axis[zlp_crude_idx]
+
+                    lo = mu0 - zlp_window
+                    hi = mu0 + zlp_window
+
+                    x_mask = (energy_axis >= lo) & (energy_axis <= hi)
+
+                    xw = energy_axis[x_mask]
+                    yw = spec_filt[x_mask]
+
+                    A0 = spec_filt[zlp_crude_idx]
+                    sigma0 = zlp_window / 2
+
+                    p0 = (A0, mu0, sigma0)
+
+                    bounds = (
+                        (
+                            0.0,
+                            lo,
+                            1e-12,
+                        ),
+                        (
+                            np.inf,
+                            hi,
+                            np.inf,
+                        ),
+                    )
+
+                    popt, _ = curve_fit(_gaussian_fit, xw, yw, p0=p0, bounds=bounds)
+
+                    zlp_measured[i_row, i_col] = popt[1]
+                else:
+                    zlp_crude_idx = int(np.argmax(spec_filt))
+                    zlp_measured[i_row, i_col] = energy_axis[zlp_crude_idx]
+
+        I_zlp = np.zeros((scan_row, scan_col))
+
+        for i_row in range(scan_row):
+            for i_col in range(scan_col):
+                I_zlp[i_row, i_col] = np.sum(
+                    self.array[
+                        i_row,
+                        i_col,
+                        np.where(energy_axis >= (zlp_measured[i_row, i_col] - zlp_window / 2))[0][
+                            0
+                        ] : np.where(energy_axis <= (zlp_measured[i_row, i_col] + zlp_window / 2))[
+                            0
+                        ][-1],
+                    ]
+                )
+
+        # print(f"Calculating thickness for {self.name}...")
+
+        # Integrate intensity of ZLP and entire spectrum separately, and calculate t/lambda
+        I_total = np.sum(self.array, axis=2)
+
         t_over_lambda = np.log1p((I_total) / (I_zlp))
 
-        # 3. Data Cleaning
+        # Remove NaN matrix elements
         t_over_lambda = np.nan_to_num(t_over_lambda, nan=0.0, posinf=0.0, neginf=0.0)
         t_over_lambda = np.clip(t_over_lambda, 0, 4.0)
 
         if plot:
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-            fig.suptitle(f"Thickness Analysis: {dataset.name}", fontsize=14)
 
             im = ax1.imshow(t_over_lambda, cmap="viridis", origin="upper")
             ax1.set_title(r"Relative Thickness Map ($t/\lambda$)")
