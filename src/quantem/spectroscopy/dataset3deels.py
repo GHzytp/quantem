@@ -711,6 +711,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         fit_zlp=True,
         return_3d_dataset=True,
         return_shifts=False,
+        in_place=False,
     ):
         # Default behavior is to automatically call measure_zlp_offset to generate an array of ZLP shifts for each scan position.
         # Alternatively, a 2D array matching the scan_row and scan_col dimensions of the 3D dataset can be supplied as the value of zlp_shifts_array to skip this step.
@@ -806,6 +807,12 @@ class Dataset3deels(Dataset3dspectroscopy):
                 return corrected_dataset, zlp_array
             else:
                 return corrected_dataset
+        elif in_place:
+            self.array = aligned_data_3d
+            if return_shifts:
+                return aligned_data_3d, zlp_array
+            else:
+                return aligned_data_3d
         else:
             if return_shifts:
                 return aligned_data_3d, zlp_array
