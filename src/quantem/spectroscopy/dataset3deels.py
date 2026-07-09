@@ -819,26 +819,51 @@ class Dataset3deels(Dataset3dspectroscopy):
             else:
                 return aligned_data_3d
 
-    def correct_zlp_shift(ll, hl):
+    def correct_high_loss_energy_axis(
+        self,
+        ll_3d_dataset=None,
+        zlp_guess_x=None,
+        zlp_shifts_array=None,
+        fit_window=0.8,
+        measure_offset=True,
+        fit_to_plane=True,
+        fit_to_polynomial=False,
+        fit_zlp=True,
+        return_3d_dataset=True,
+        return_shifts=False,
+        in_place=False,
+    ):
         """
-        Aligns ZLP jitter across the spatial map and synchronizes Dual-EELS pairs.
+        Applies ZLP correction to low-loss 3D EELS dataset and extends the computed shift at each
+        pixel position to correct the corresponding high-loss 3D EELS dataset
         """
-        print(f"QuantEM: Aligning {ll.name} and syncing {hl.name}...")
+        if ll_3d_dataset is None:
+            raise ValueError("No ll_3d_dataset provided for ZLP alignment")
+        elif ll_3d_dataset.__class__ != Dataset3deels:
+            raise ValueError("ll_3d_dataset input is not a Dataset3deels object")
 
-        # 1. Map the drift via argmax
-        zlp_indices = np.argmax(ll.array, axis=2)
-        ref_idx = int(np.median(zlp_indices))
-        shifts = zlp_indices - ref_idx
+        ll_corrected, ll_shifts = ll_3d_dataset.apply_zlp_correction(
+            zlp_guess_x=zlp_guess_x,
+            fit_window=fit_window,
+            fit_to_plane=fit_to_plane,
+            fit_to_polynomial=fit_to_polynomial,
+            fit_zlp=fit_zlp,
+            return_3d_dataset=False,
+            return_shifts=True,
+        )
 
-        # 2. Apply internal QuantEM calibration
-        ll.calibrate_zero_loss_peak()
+        # Synchronize High-Loss energy origin based on median shift
+        hl_corrected, hl_shifts = self.apply_zlp_correction(
+            zlp_shifts_array=ll_shifts,
+            measure_offset=False,
+            return_3d_dataset=return_3d_dataset,
+            return_shifts=True,
+        )
 
-        # 3. Synchronize High-Loss energy origin based on median shift
-        shift_ev = np.median(shifts) * ll.sampling[2]
-        hl.origin[2] -= shift_ev
-
-        print("QuantEM: Alignment and Dual-EELS sync complete.")
-        return ll, hl, shifts
+        if return_shifts:
+            return hl_corrected, hl_shifts
+        else:
+            return hl_corrected
 
     def calculate_thickness_log_ratio(dataset, window_params, plot=True):
         """
