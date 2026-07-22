@@ -133,9 +133,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if (
             isinstance(probe_model, ProbePixelated)
             and (probe_model.vacuum_probe_intensity is not None)
-            and (dset.amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
+            # ``centered_amplitudes`` shares amplitudes' shape but is always resident (amplitudes is
+            # recomputed lazily), so use it here to avoid materializing the full raw array.
+            and (dset.centered_amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
         ):
-            probe_model.rescale_vacuum_probe((dset.amplitudes.shape[1], dset.amplitudes.shape[2]))
+            probe_model.rescale_vacuum_probe(
+                (dset.centered_amplitudes.shape[1], dset.centered_amplitudes.shape[2])
+            )
 
         # Remove centralized optimizer storage - now managed by individual models
         self.probe_model = probe_model
