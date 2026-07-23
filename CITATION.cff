@@ -29,8 +29,8 @@ authors:
     affiliation: "Delft University of Technology"  
   - given-names: Cedric
     family-names: Lim
-    # orcid: "0009-0000-1319-5175"  
-    # affiliation: "Stanford University"  
+    orcid: "0009-0000-1319-5175"  
+    affiliation: "Stanford University"  
   - given-names: Karen
     family-names: Ehrhardt
     # orcid: ""  
