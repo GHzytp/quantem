@@ -41,9 +41,9 @@ The [quantem-tutorials](https://github.com/electronmicroscopy/quantem-tutorials)
 
 ## Citing
 
-If you use quantem in your research, please cite our main DOI as well as the relevant paper(s) for any module(s) that you used:
+If you use quantem in your research, please cite this repository as the relevant paper(s) for any module(s) that you used:
 
-- **quantem repository**: https://doi.org/10.5281/zenodo.18642593
+- **quantem (software)**: please cite the version you used. Ready to use citations can be copied from the [Zenodo record](https://doi.org/10.5281/zenodo.18642593), or from the "Cite this repository" button on [GitHub](https://github.com/electronmicroscopy/quantem).
 
 - **Iterative ptychography**: McCray, A. R. C., Ribet, S. M., Varnavides, G., & Ophus, C. (2025). *Deep generative priors for robust and efficient electron ptychography.* arXiv:2511.07795. https://arxiv.org/abs/2511.07795
 - **Direct ptychography**: Varnavides, G., Bekkevold, J. M., Ribet, S. M., Scott, M. C., Jones, L., & Ophus, C. (2026). *Relaxing Direct Ptychography Sampling Requirements via Parallax Imaging Insights.* Microscopy and Microanalysis, 32(2), ozaf139. https://doi.org/10.1093/mam/ozaf139
