@@ -1,14 +1,57 @@
+![quantem logo](https://raw.githubusercontent.com/electronmicroscopy/quantem/main/media/quantem_logo_53.png)
+
 # quantem
 
-This is the home repository for the quantitative electron microscopy (quantem) data analysis toolkit.
+[![PyPI version](https://img.shields.io/pypi/v/quantem.svg)](https://pypi.org/project/quantem/)
+[![Python versions](https://img.shields.io/pypi/pyversions/quantem.svg)](https://pypi.org/project/quantem/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Installation Instructions
+``quantem`` is a quantitative electron microscopy data analysis toolkit built on [PyTorch](https://pytorch.org/). It brings together tools for reconstructing or analyzing a wide range of transmission electron microscopy (TEM) techniques, including nanobeam diffraction, phase retrieval, real-space imaging and tomography, spectroscopy, and related analyses within a consistent, GPU-accelerated API.
 
-The package is available on the Python Package Index (PyPi), as [quantem](https://pypi.org/project/quantem/).
+## Capabilities
 
-You can install it using `pip install quantem`.
+- **Ptychographic phase retrieval**: ML-enabled iterative reconstruction ([McCray et al., 2025](https://arxiv.org/abs/2511.07795)) and direct methods ([Varnavides et al., 2026](https://doi.org/10.1093/mam/ozaf139)).
+- **Tomography**: fast and accurate HAADF tomography using implicit representations ([Lim et al., 2025](https://arxiv.org/abs/2512.08113)).
+- **Imaging**: drift correction and lattice analysis for (S)TEM images.
+- **Data structures & I/O**: a unified `Dataset` hierarchy that reads common electron-microscopy formats and serializes to [Zarr](https://zarr.dev/).
+- **Visualization**: publication-quality figures with perceptually-uniform colormaps.
+- **GPU-accelerated & ML-ready**: a PyTorch backend with neural object representations and multi-GPU / multi-node reconstruction.
+- **Spectroscopy**: under development.
+- **Diffraction**: multi-angle precession electron diffraction (MAPED), under development ([Ribet et al., 2025](https://doi.org/10.1093/mam/ozaf103)).
 
-For a developer install, please refer to [CONTRIBUTORS.md](CONTRIBUTORS.md).
+## Installation
+
+quantem is available on the [Python Package Index](https://pypi.org/project/quantem/) and requires Python 3.11+:
+
+```bash
+pip install quantem
+```
+
+This installs PyTorch as a dependency. For CUDA-specific PyTorch builds, follow the [official PyTorch install guide](https://pytorch.org/get-started/locally/) for your platform first.
+
+To install from source or set up a development environment, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### GPU acceleration
+
+For custom CUDA kernels that accelerate tomography, ptychography, and io behind a torch-native API, see the companion [quantem-cuda](https://github.com/electronmicroscopy/quantem-cuda) package (optional, more coming soon).
+
+## Getting started
+
+The [quantem-tutorials](https://github.com/electronmicroscopy/quantem-tutorials) repository contains Jupyter notebooks that walk through the main workflows for each module.
+
+## Citing
+
+If you use quantem in your research, please cite the relevant paper(s):
+
+- **Iterative ptychography**: McCray, A. R. C., Ribet, S. M., Varnavides, G., & Ophus, C. (2025). *Deep generative priors for robust and efficient electron ptychography.* arXiv:2511.07795. https://arxiv.org/abs/2511.07795
+- **Direct ptychography**: Varnavides, G., Bekkevold, J. M., Ribet, S. M., Scott, M. C., Jones, L., & Ophus, C. (2026). *Relaxing Direct Ptychography Sampling Requirements via Parallax Imaging Insights.* Microscopy and Microanalysis, 32(2), ozaf139. https://doi.org/10.1093/mam/ozaf139
+- **Electron tomography (implicit neural representations)**: Lim, C., Casert, C., McCray, A. R. C., Lee, S., Barnum, A., Dionne, J., & Ophus, C. (2025). *Missing Wedge Inpainting and Joint Alignment in Electron Tomography through Implicit Neural Representations.* arXiv:2512.08113. https://arxiv.org/abs/2512.08113
+- **Multi-angle precession electron diffraction (MAPED)**: Ribet, S. M., Dhall, R., Ophus, C., & Bustillo, K. C. (2025). *Multi-angle Precession Electron Diffraction (MAPED): A Versatile Approach to 4D-STEM Precession.* Microscopy and Microanalysis, 31(6), ozaf103. https://doi.org/10.1093/mam/ozaf103
+
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and workflow, and [CONTRIBUTORS.md](CONTRIBUTORS.md) for the people who have built quantem.
 
 ## License
 
