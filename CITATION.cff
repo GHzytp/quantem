@@ -1,7 +1,7 @@
 # This file describes how to cite the quantem software (schema: https://citation-file-format.github.io).
-# It is maintained BY HAND. Unlike Zenodo's auto-generated author list, this file will not
+# It is maintained by hand. Unlike Zenodo's auto-generated author list, this file will not
 # pick up new contributors on its own: update `authors`, `version`, and `date-released`
-# with each release. Add `orcid:` and `affiliation:` to each author as that info becomes available.
+# with each release.
 message: >-
   If you use quantem in your research, please cite this software using the metadata below,
   along with any relevant method papers listed in the README.
