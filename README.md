@@ -3,6 +3,7 @@
 # quantem
 
 [![PyPI version](https://img.shields.io/pypi/v/quantem.svg)](https://pypi.org/project/quantem/)
+[![DOI](https://zenodo.org/badge/961571754.svg)](https://doi.org/10.5281/zenodo.18642593)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ``quantem`` is a quantitative electron microscopy data analysis toolkit built on [PyTorch](https://pytorch.org/). It brings together tools for reconstructing or analyzing a wide range of transmission electron microscopy (TEM) techniques, including nanobeam diffraction, phase retrieval, real-space imaging and tomography, spectroscopy, and related analyses within a consistent, GPU-accelerated API.
@@ -28,7 +29,7 @@ pip install quantem
 
 This installs PyTorch as a dependency. For CUDA-specific PyTorch builds, follow the [official PyTorch install guide](https://pytorch.org/get-started/locally/) for your platform first.
 
-To install from source or set up a development environment, see [CONTRIBUTING.md](CONTRIBUTING.md).
+To install from source or set up a development environment, see [CONTRIBUTING.md](CONTRIBUTING.md). A local install can also be used to access the newest development features of individual modules that exist on feature branches prior to PRs. 
 
 ### GPU acceleration
 
@@ -40,7 +41,9 @@ The [quantem-tutorials](https://github.com/electronmicroscopy/quantem-tutorials)
 
 ## Citing
 
-If you use quantem in your research, please cite the relevant paper(s):
+If you use quantem in your research, please cite our main DOI as well as the relevant paper(s) for any module(s) that you used:
+
+- **quantem repository**: https://doi.org/10.5281/zenodo.18642593
 
 - **Iterative ptychography**: McCray, A. R. C., Ribet, S. M., Varnavides, G., & Ophus, C. (2025). *Deep generative priors for robust and efficient electron ptychography.* arXiv:2511.07795. https://arxiv.org/abs/2511.07795
 - **Direct ptychography**: Varnavides, G., Bekkevold, J. M., Ribet, S. M., Scott, M. C., Jones, L., & Ophus, C. (2026). *Relaxing Direct Ptychography Sampling Requirements via Parallax Imaging Insights.* Microscopy and Microanalysis, 32(2), ozaf139. https://doi.org/10.1093/mam/ozaf139
