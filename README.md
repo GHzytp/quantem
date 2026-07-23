@@ -1,10 +1,10 @@
-![quantem logo](https://raw.githubusercontent.com/electronmicroscopy/quantem/main/media/quantem_logo_53.png)
+<img src="media/quantem_logo_53.png" alt="quantem_logo" width="200"/>
 
 # quantem
 
 [![PyPI version](https://img.shields.io/pypi/v/quantem.svg)](https://pypi.org/project/quantem/)
-[![DOI](https://zenodo.org/badge/961571754.svg)](https://doi.org/10.5281/zenodo.18642593)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.18642593-blue)](https://doi.org/10.5281/zenodo.18642593)
 
 ``quantem`` is a quantitative electron microscopy data analysis toolkit built on [PyTorch](https://pytorch.org/). It brings together tools for reconstructing or analyzing a wide range of transmission electron microscopy (TEM) techniques, including nanobeam diffraction, phase retrieval, real-space imaging and tomography, spectroscopy, and related analyses within a consistent, GPU-accelerated API.
 
