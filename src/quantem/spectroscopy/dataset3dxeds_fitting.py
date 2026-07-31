@@ -35,6 +35,7 @@ def peak_autoid(
     mode=None,
     line=None,
     return_details=False,
+    intensity_range=None,
 ):
     """Identify likely elements by matching XEDS spectrum peaks to known lines.
 
@@ -92,6 +93,10 @@ def peak_autoid(
     return_details : bool, optional
         If ``True``, return a dictionary with figure, axes, peaks, matches,
         alternatives, and element scores.
+    intensity_range : sequence[float] or None, optional
+        Spectrum y-axis limits as ``[ymin, ymax]``. If ``None``, the limits
+        are chosen automatically with extra space below the spectrum for
+        unmatched-peak markers.
 
     Returns
     -------
@@ -164,6 +169,7 @@ def peak_autoid(
         roi_cal=roi_cal,
         energy_range=energy_range,
         mask=mask,
+        intensity_range=intensity_range,
         data_type="xeds",
         show=False,
     )
@@ -405,8 +411,9 @@ def peak_autoid(
                 ax_spec.axvline(ref_energy, color="black", linestyle="--", linewidth=1.2, zorder=3)
         ax_spec.set_xlim(x_min, x_max)
 
-    current_bottom, current_top = ax_spec.get_ylim()
-    ax_spec.set_ylim(bottom=min(current_bottom, y_min - 0.10 * y_span), top=current_top)
+    if intensity_range is None:
+        current_bottom, current_top = ax_spec.get_ylim()
+        ax_spec.set_ylim(bottom=min(current_bottom, y_min - 0.10 * y_span), top=current_top)
     fig.tight_layout()
     plt.show()
 
