@@ -145,7 +145,7 @@ class PtychographyDatasetBase(
         self._preprocessed = False
         self._preprocessing_params = {}  # for serialization and reloading
         self._com_rotation_rad = 0  # default
-        self._com_transpose = False  # default
+        self._transpose = False  # default
 
         # scan_positions_px: [num_positions, 2] in pixels
         self._scan_positions_px = nn.Parameter(
@@ -1269,10 +1269,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
             self.detector_mask = torch.nn.functional.pad(
                 self.detector_mask,
                 (
-                    self.diffraction_padding[0],
-                    self.diffraction_padding[0],
                     self.diffraction_padding[1],
                     self.diffraction_padding[1],
+                    self.diffraction_padding[0],
+                    self.diffraction_padding[0],
                 ),
                 mode="constant",
                 value=0,
@@ -1372,10 +1372,14 @@ class PtychographyDatasetRaster(DatasetConstraints):
             ):
                 masked_intensity = intensities[Rr, Rc]
                 if dp_mask is not None:
-                    masked_intensity *= dp_mask
+                    masked_intensity = masked_intensity * dp_mask
                 summed_intensity = masked_intensity.sum()
-                com_measured_r[Rr, Rc] = np.sum(masked_intensity * kcm) / summed_intensity
-                com_measured_c[Rr, Rc] = np.sum(masked_intensity * krm) / summed_intensity
+                if summed_intensity == 0:
+                    com_measured_r[Rr, Rc] = np.nan
+                    com_measured_c[Rr, Rc] = np.nan
+                else:
+                    com_measured_r[Rr, Rc] = np.sum(masked_intensity * krm) / summed_intensity
+                    com_measured_c[Rr, Rc] = np.sum(masked_intensity * kcm) / summed_intensity
 
         if fit_function == "none":
             com_fit_r, com_fit_c = com_measured_r, com_measured_c
@@ -1716,7 +1720,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
                     row = row.astype(dtype)
             intensity = np.maximum(row[Rc], 0)
             mean_intensity += np.sum(intensity)
-            
+
             ### shifting amplitude rather than intensity to minimize ringing artifacts
             amplitude = np.maximum(np.sqrt(intensity), 0)
             mean_amplitude += np.sum(amplitude)

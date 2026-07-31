@@ -2,7 +2,7 @@ import math
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Callable, Literal, Self, Sequence, cast
+from typing import Callable, Literal, Sequence, cast
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -51,7 +51,8 @@ class PtychoObjConstraintParams:
         Constraints for grid-based object representations (``ObjectPixelated`` and
         ``ObjectDIP`` share this set today).
     INR
-        Placeholder for the upcoming implicit-neural-representation object.
+        Constraints for the implicit-neural-representation objects (``ObjectINR``,
+        ``ObjectTensorDecomp``).
 
     Examples
     --------
@@ -76,12 +77,14 @@ class PtychoObjConstraintParams:
             ``"pure_phase"`` the amplitude is clamped to ``[0, 1]`` (or fixed to 1)
             regardless of this flag.
         positivity_mode: Literal["clamp", "shrink"], default ``"clamp"``
-            How to enforce positivity. "clamp" clamps the object to be non-negative after each 
+            How to enforce positivity. "clamp" clamps the object to be non-negative after each
             update, does not move the parameter, only how it is shown/used.
-            "shrink" subtracts a background offset from the object so background regions sit at 
-            zero, is applied to the parameter after the update step. 
-            If an FOV mask is set the offset is the mean of the background 
-            (``mask < 0.5 * mask.max()``); otherwise it's ``obj.min()``.
+            "shrink" subtracts a per-slice background offset from the object so background regions
+            sit at zero, is applied to the parameter after the update step.
+            If an FOV mask is set the offset is the per-slice mean of the background
+            (``mask < 0.5 * mask.max()``); otherwise it's the per-slice 10th percentile. The
+            offset is scaled by ``fix_potential_baseline_factor`` even when
+            ``fix_potential_baseline`` is False.
         fix_potential_baseline : bool, default ``False``
             ``obj_type="potential"`` only. Subtracts an offset from the object so
             background regions sit at zero. If an FOV mask is set the offset is
@@ -475,7 +478,8 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
     def backward(self, *args, **kwargs):
         raise NotImplementedError(
-            f"Analytical gradients are not implemented for {Self}, use autograd=True"
+            f"Analytical gradients are not implemented for {type(self).__name__}, "
+            "use autograd=True"
         )
 
 
@@ -908,8 +912,15 @@ class ObjectPixelated(ObjectConstraints):
             rng=rng,
             _token=cls._token,
         )
-        obj_model._initial_obj = torch.tensor(
-            initial_obj, dtype=obj_model.dtype, device=obj_model.device
+        initial = torch.as_tensor(initial_obj)
+        if initial.is_complex() and obj_type != "complex":
+            if obj_type == "pure_phase":
+                # Convert legacy complex initial_obj (amp*exp(1j*phase)) to bare phase
+                initial = initial.angle()
+            else:
+                raise ValueError(f"Complex initial_obj is not valid for obj_type '{obj_type}'")
+        obj_model._initial_obj = (
+            initial.clone().detach().to(dtype=obj_model.dtype, device=obj_model.device)
         )
 
         return obj_model
@@ -987,9 +998,6 @@ class ObjectPixelated(ObjectConstraints):
                 arr = ph
         elif self._initialize_mode == "array":
             arr = self._initial_obj
-            if self.obj_type == "pure_phase" and arr.is_complex():
-                # Convert legacy complex initial_obj (amp*exp(1j*phase)) to bare phase
-                arr = arr.angle()
         else:
             raise ValueError(f"Invalid initialize mode: {self._initialize_mode}")
 
@@ -1086,8 +1094,6 @@ class ObjectDIP(ObjectConstraints):
         self._pretrain_losses = []
         self._pretrain_lrs = []
         self._model_input_noise_std = input_noise_std
-        self._model_input = torch.tensor([])
-        self._pretrain_target = torch.tensor([])
 
     @classmethod
     def from_model(
@@ -1173,9 +1179,9 @@ class ObjectDIP(ObjectConstraints):
             return getattr(self.model, "dtype")
         else:
             if self.obj_type in ["complex"]:
-                return config.get("dtype_complex")
+                return getattr(torch, config.get("dtype_complex"))
             else:
-                return config.get("dtype_real")
+                return getattr(torch, config.get("dtype_real"))
 
     @property
     def model(self) -> "torch.nn.Module":
@@ -1760,8 +1766,8 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         Pass ``model`` to wrap a custom INR ``nn.Module`` directly (mapping ``(N, 3)`` coords to
         ``(N, 1)``), as with ``ObjectDIP.from_pixelated`` -- handy for testing architectures. When
         ``model`` is ``None`` a default zero-initialized ``HSiren`` is built from the
-        ``hidden_features`` / ``hidden_layers`` / ``omega_0`` args (with a positivity activation
-        for ``potential``); when a ``model`` is given those args and the activation are its own.
+        ``hidden_features`` / ``hidden_layers`` / ``omega_0`` args (with identity output
+        activations); when a ``model`` is given those args and the activation are its own.
         """
         if not (
             isinstance(pixelated, ObjectPixelated) or "ObjectPixelated" in str(type(pixelated))
