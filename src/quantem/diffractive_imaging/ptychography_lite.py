@@ -16,6 +16,15 @@ from quantem.diffractive_imaging.probe_models import ProbeDIP, ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 
 
+def _scheduler_spec(scheduler_type: str, scheduler_factor: float) -> dict[str, Any]:
+    scheduler_dict: dict[str, Any] = {
+        "name": "exponential" if scheduler_type == "exp" else scheduler_type
+    }
+    if scheduler_type in ("exp", "plateau"):
+        scheduler_dict["factor"] = scheduler_factor
+    return scheduler_dict
+
+
 class PtychoLite(Ptychography):
     """
     High-level convenience wrapper around Ptychography.
@@ -204,11 +213,7 @@ class PtychoLite(Ptychography):
         opt_params: dict[str, Any] | None
         scheduler_params: dict[str, Any] | None
         if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
-            scheduler_dict: dict[str, Any] = {
-                "name": "exponential" if scheduler_type == "exp" else scheduler_type
-            }
-            if scheduler_type in ("exp", "plateau"):
-                scheduler_dict["factor"] = scheduler_factor
+            scheduler_dict = _scheduler_spec(scheduler_type, scheduler_factor)
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -447,11 +452,7 @@ class PtychoLiteDIP(Ptychography):
         opt_params: dict[str, Any] | None
         scheduler_params: dict[str, Any] | None
         if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
-            scheduler_dict: dict[str, Any] = {
-                "name": "exponential" if scheduler_type == "exp" else scheduler_type
-            }
-            if scheduler_type in ("exp", "plateau"):
-                scheduler_dict["factor"] = scheduler_factor
+            scheduler_dict = _scheduler_spec(scheduler_type, scheduler_factor)
             opt_params = {
                 "object": {
                     "name": "adamw",

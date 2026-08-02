@@ -15,6 +15,12 @@ from quantem.diffractive_imaging.ptychography_base import PtychographyBase, Snap
 
 
 class PtychographyVisualizations(PtychographyBase):
+    def _scalebar_real(self) -> dict[str, Any]:
+        return {"sampling": self.sampling[1], "units": "Å"}
+
+    def _scalebar_recip(self) -> dict[str, Any]:
+        return {"sampling": self.reciprocal_sampling[1], "units": r"$\mathrm{A^{-1}}$"}
+
     def show_obj(
         self,
         obj: np.ndarray | None = None,
@@ -86,7 +92,7 @@ class PtychographyVisualizations(PtychographyBase):
             titles.extend([t + "Phase", t + "Amplitude"])
             cmaps.extend([ph_cmap, "gray"])
 
-        scalebar = [{"sampling": self.sampling[1], "units": "Å"}] + [None] * (len(ims) - 1)
+        scalebar = [self._scalebar_real()] + [None] * (len(ims) - 1)
 
         show_2d(
             ims,
@@ -172,7 +178,7 @@ class PtychographyVisualizations(PtychographyBase):
             t += f"Iter {obj_iter} "
 
         if show_obj:
-            obj_scalebar = {"sampling": self.sampling[1], "units": "Å"}
+            obj_scalebar = self._scalebar_real()
             if self.obj_type == "potential":
                 obj_show = obj_pad
             else:  # complex or pure phase just show the phase
@@ -246,7 +252,7 @@ class PtychographyVisualizations(PtychographyBase):
         if probe_iter != "Final":
             t += f"Iter {probe_iter} "
 
-        scalebar = [{"sampling": self.sampling[1], "units": "Å"}]
+        scalebar = [self._scalebar_real()]
         if sum_probes:
             probes = [np.fft.fftshift(probe.sum(0))]
         else:
@@ -361,7 +367,7 @@ class PtychographyVisualizations(PtychographyBase):
             top_img = np.fft.fftshift(top_img)
             bottom_img = np.fft.fftshift(bottom_img)
 
-        scalebar = [{"sampling": self.sampling[1], "units": "Å"}, None]
+        scalebar = [self._scalebar_real(), None]
         titles = [f"Top Surface {label}", f"Bottom Surface {label}"]
 
         fig, axs = show_2d(
@@ -398,9 +404,7 @@ class PtychographyVisualizations(PtychographyBase):
                 probe = probe[None, ...]
 
         probes = [np.fft.fftshift(np.fft.fft2(probe[i])) for i in range(len(probe))]
-        scalebar = [{"sampling": self.reciprocal_sampling[1], "units": r"$\mathrm{A^{-1}}$"}] + [
-            None
-        ] * (len(probes) - 1)
+        scalebar = [self._scalebar_recip()] + [None] * (len(probes) - 1)
         if len(probes) > 1:
             titles = self.get_probe_intensities(probe)
             titles = [
@@ -526,7 +530,7 @@ class PtychographyVisualizations(PtychographyBase):
         titles = [titles_flat[i : i + max_width] for i in range(0, len(titles_flat), max_width)]
 
         scalebars: list = [[None for _ in row] for row in objs]
-        scalebars[0][0] = {"sampling": self.sampling[1], "units": "Å"}
+        scalebars[0][0] = self._scalebar_real()
 
         if interval_type == "quantile":
             norm = {"interval_type": "quantile"}
@@ -857,7 +861,7 @@ class PtychographyVisualizations(PtychographyBase):
 
         scalebars: list = [[None for _ in row] for row in images_grid]
         if scalebars:
-            scalebars[0][0] = {"sampling": self.sampling[1], "units": "Å"}
+            scalebars[0][0] = self._scalebar_real()
 
         show_2d(
             images_grid,
@@ -896,7 +900,7 @@ class PtychographyVisualizations(PtychographyBase):
         # Set up scalebars
         scalebars: list = [[None for _ in row] for row in probes_grid]
         if scalebars:
-            scalebars[0][0] = {"sampling": self.sampling[1], "units": "Å"}
+            scalebars[0][0] = self._scalebar_real()
 
         show_2d(
             probes_grid,
@@ -969,8 +973,8 @@ class PtychographyVisualizations(PtychographyBase):
 
         scalebars: list = [[None for _ in row] for row in all_images]
         if scalebars:
-            scalebars[0][0] = {"sampling": self.sampling[1], "units": "Å"}
-            scalebars[0][1] = {"sampling": self.sampling[1], "units": "Å"}
+            scalebars[0][0] = self._scalebar_real()
+            scalebars[0][1] = self._scalebar_real()
 
         show_2d(
             all_images,
@@ -1291,7 +1295,7 @@ class PtychographyVisualizations(PtychographyBase):
         else:
             amplitudes = self._to_numpy(amplitudes.sum(0))
 
-        scalebar = [{"sampling": self.reciprocal_sampling[1], "units": r"$\mathrm{A^{-1}}$"}]
+        scalebar = [self._scalebar_recip()]
 
         if fft_shift:
             probe_plot = np.fft.fftshift(probe_plot)

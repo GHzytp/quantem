@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import gc
-import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
 
@@ -17,6 +16,7 @@ from quantem.diffractive_imaging.dataset_models import (
     PtychographyDatasetBase,
     PtychographyDatasetRaster,
 )
+from quantem.diffractive_imaging.ptychography_lite import PtychoLite, PtychoLiteDIP
 
 
 @dataclass
@@ -257,8 +257,8 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs):
     reconstruct_kwargs = resolved_kwargs.get("reconstruct")
     if reconstruct_kwargs:
         reconstruct_kwargs = dict(reconstruct_kwargs)
-        # only PtychoLite.reconstruct takes verbose, and it resets recon_obj.verbose
-        if "verbose" in inspect.signature(recon_obj.reconstruct).parameters:
+        # only PtychoLite/PtychoLiteDIP.reconstruct take verbose, and they reset recon_obj.verbose
+        if isinstance(recon_obj, (PtychoLite, PtychoLiteDIP)):
             reconstruct_kwargs.setdefault("verbose", False)
         recon_obj.reconstruct(**reconstruct_kwargs)
 
@@ -549,45 +549,7 @@ class OptimizePtychography:
 
             # Second and third subplots: individual parameter plots
             for idx, param_name in enumerate(param_names):
-                ax = axes[idx + 1]
-
-                # Extract data
-                param_trials = [t for t in trials if param_name in t.params]
-                param_values = np.array([trial.params[param_name] for trial in param_trials])
-                losses = np.array([trial.value for trial in param_trials])
-
-                # Scatter plot
-                ax.scatter(
-                    param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5
-                )
-
-                # Highlight best trial
-                best_param_value = best_trial.params.get(param_name)
-                if best_param_value is not None:
-                    ax.scatter(
-                        [best_param_value],
-                        [best_value],
-                        color="red",
-                        s=200,
-                        marker="*",
-                        edgecolors="black",
-                        linewidth=1.5,
-                        zorder=5,
-                    )
-
-                    # Vertical line at optimal parameter value
-                    ax.axvline(
-                        best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7
-                    )
-
-                # Clean up parameter name for label
-                clean_name = param_name.split(".")[-1]
-
-                # Labels
-                ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
-                ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
-                ax.set_title(f"{param_name}", fontsize=10)
-                ax.grid(True, alpha=0.3)
+                self._plot_param_panel(axes[idx + 1], trials, param_name, best_trial, best_value)
 
             plt.tight_layout()
             return fig, axes
@@ -602,41 +564,7 @@ class OptimizePtychography:
 
         # Plot each parameter
         for idx, param_name in enumerate(param_names):
-            ax = axes[idx]
-
-            # Extract data
-            param_trials = [t for t in trials if param_name in t.params]
-            param_values = np.array([trial.params[param_name] for trial in param_trials])
-            losses = np.array([trial.value for trial in param_trials])
-
-            # Scatter plot
-            ax.scatter(param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5)
-
-            # Highlight best trial
-            best_param_value = best_trial.params.get(param_name)
-            if best_param_value is not None:
-                ax.scatter(
-                    [best_param_value],
-                    [best_value],
-                    color="red",
-                    s=200,
-                    marker="*",
-                    edgecolors="black",
-                    linewidth=1.5,
-                    zorder=5,
-                )
-
-                # Vertical line at optimal parameter value
-                ax.axvline(best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7)
-
-            # Clean up parameter name for label
-            clean_name = param_name.split(".")[-1]
-
-            # Labels
-            ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
-            ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
-            ax.set_title(f"{param_name}", fontsize=10)
-            ax.grid(True, alpha=0.3)
+            self._plot_param_panel(axes[idx], trials, param_name, best_trial, best_value)
 
         # Hide unused subplots
         for idx in range(n_params, len(axes)):
@@ -644,6 +572,35 @@ class OptimizePtychography:
 
         plt.tight_layout()
         return fig, axes
+
+    def _plot_param_panel(self, ax, trials, param_name, best_trial, best_value):
+        """Scatter one parameter's values vs loss, highlighting the best trial."""
+        param_trials = [t for t in trials if param_name in t.params]
+        param_values = np.array([trial.params[param_name] for trial in param_trials])
+        losses = np.array([trial.value for trial in param_trials])
+
+        ax.scatter(param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5)
+
+        best_param_value = best_trial.params.get(param_name)
+        if best_param_value is not None:
+            ax.scatter(
+                [best_param_value],
+                [best_value],
+                color="red",
+                s=200,
+                marker="*",
+                edgecolors="black",
+                linewidth=1.5,
+                zorder=5,
+            )
+            # Vertical line at optimal parameter value
+            ax.axvline(best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7)
+
+        clean_name = param_name.split(".")[-1]
+        ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
+        ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
+        ax.set_title(f"{param_name}", fontsize=10)
+        ax.grid(True, alpha=0.3)
 
     def _extract_optimization_params(self):
         """Extract OptimizationParameter specs from stored config."""
@@ -684,8 +641,6 @@ class OptimizePtychography:
             dict with 'results', 'best_result', 'param_grids', 'reconstructions'
         """
         from itertools import product
-
-        import numpy as np
 
         if self.objective_func is None:
             raise RuntimeError("No objective function set. Use from_constructors() first.")
@@ -740,8 +695,7 @@ class OptimizePtychography:
                 gc.collect()
 
         # Find best
-        argfn = np.argmax if self.direction == "maximize" else np.argmin
-        best_idx = argfn([r["loss"] for r in results])
+        best_idx = self._best_index([r["loss"] for r in results])
         best_result = results[best_idx]
 
         # Plot objects
@@ -754,6 +708,11 @@ class OptimizePtychography:
                 "best_result": best_result,
                 "param_grids": param_grids,
             }
+
+    def _best_index(self, losses) -> int:
+        """Index of the best loss given the study direction."""
+        argfn = np.argmax if self.direction == "maximize" else np.argmin
+        return int(argfn(losses))
 
     def _run_reconstruction_with_params(self, params):
         """Run a single reconstruction with given parameters and return the object.
@@ -861,8 +820,7 @@ class OptimizePtychography:
         axes = axes.flatten()
 
         # Find best result
-        losses = [r["loss"] for r in results]
-        best_idx = (np.argmax if self.direction == "maximize" else np.argmin)(losses)
+        best_idx = self._best_index([r["loss"] for r in results])
 
         for idx, result in enumerate(results):
             ax = axes[idx]

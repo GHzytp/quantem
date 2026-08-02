@@ -25,7 +25,6 @@ class SimpleBatcher:
         train_indices: np.ndarray | None = None,
         val_indices: np.ndarray | None = None,
     ):
-        self.indices = np.arange(num)
         self.batch_size = batch_size if batch_size is not None else num
         self.shuffle = shuffle
         self.rng = rng
@@ -127,6 +126,28 @@ def compute_train_val_split(
             train_indices = np.setdiff1d(indices, val_indices, assume_unique=False)
 
     return np.asarray(train_indices, dtype=int), np.asarray(val_indices, dtype=int)
+
+
+def add_input_noise(
+    model_input: torch.Tensor,
+    noise_std: float,
+    dtype: torch.dtype,
+    device: "torch.device | str | int",
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Add gaussian noise to a DIP model input when noise_std > 0."""
+    if noise_std > 0.0:
+        noise = (
+            torch.randn(
+                model_input.shape,
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+            * noise_std
+        )
+        return model_input + noise
+    return model_input
 
 
 @overload
@@ -595,7 +616,7 @@ def center_crop_arr(
                 raise ValueError(
                     f"Dimension {i} of shape ({s}) is larger than dimension {i} of arr ({a})."
                 )
-            pad[i] = [(s - a) // 2, -(-(s - a) // 2)]
+            pad[i] = [(s - a) // 2, ceil((s - a) / 2)]
 
     if any(p != [0, 0] for p in pad):
         arr = np.pad(arr, pad_width=pad, mode="constant")

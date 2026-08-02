@@ -39,6 +39,7 @@ from quantem.diffractive_imaging.complex_probe import (
     real_space_probe,
 )
 from quantem.diffractive_imaging.ptycho_utils import (
+    add_input_noise,
     fourier_shift_expand,
     shift_array,
 )
@@ -1136,7 +1137,8 @@ class ProbeDIP(ProbeConstraints):
         self.register_buffer("_pretrain_target", torch.tensor([]))
 
         self._model = model.to(self._device)
-        self._check_roi_shape()
+        if roi_shape is not None:
+            self._check_roi_shape()
         self.set_pretrained_weights(self._model)
 
         self._optimizer = None
@@ -1313,18 +1315,9 @@ class ProbeDIP(ProbeConstraints):
 
     def _noisy_model_input(self) -> torch.Tensor:
         """model input with gaussian noise added when _input_noise_std > 0"""
-        if self._input_noise_std > 0.0:
-            noise = (
-                torch.randn(
-                    self.model_input.shape,
-                    dtype=self.dtype,
-                    device=self.device,
-                    generator=self._rng_torch,
-                )
-                * self._input_noise_std
-            )
-            return self.model_input + noise
-        return self.model_input
+        return add_input_noise(
+            self.model_input, self._input_noise_std, self.dtype, self.device, self._rng_torch
+        )
 
     def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
         """Get shifted probes at fractional positions"""
@@ -1534,8 +1527,6 @@ class ProbeDIP(ProbeConstraints):
         )
 
     def _check_roi_shape(self):
-        if not hasattr(self, "_roi_shape"):
-            return
         num_layers = getattr(self.model, "num_layers", None)
         if num_layers is not None:
             if not np.all(np.array(self.roi_shape) % 2**num_layers == 0):

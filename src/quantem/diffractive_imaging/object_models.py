@@ -32,7 +32,7 @@ from quantem.core.utils.validators import (
 )
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.custom_normalizations import CustomNormalization
-from quantem.diffractive_imaging.ptycho_utils import sum_patches
+from quantem.diffractive_imaging.ptycho_utils import add_input_noise, sum_patches
 
 object_type = Literal["potential", "pure_phase", "complex"]
 
@@ -919,8 +919,8 @@ class ObjectPixelated(ObjectConstraints):
                 initial = initial.angle()
             else:
                 raise ValueError(f"Complex initial_obj is not valid for obj_type '{obj_type}'")
-        obj_model._initial_obj = (
-            initial.clone().detach().to(dtype=obj_model.dtype, device=obj_model.device)
+        obj_model._initial_obj = initial.detach().to(
+            dtype=obj_model.dtype, device=obj_model.device, copy=True
         )
 
         return obj_model
@@ -1177,11 +1177,7 @@ class ObjectDIP(ObjectConstraints):
     def dtype(self) -> "torch.dtype":
         if hasattr(self.model, "dtype"):
             return getattr(self.model, "dtype")
-        else:
-            if self.obj_type in ["complex"]:
-                return getattr(torch, config.get("dtype_complex"))
-            else:
-                return getattr(torch, config.get("dtype_real"))
+        return super().dtype
 
     @property
     def model(self) -> "torch.nn.Module":
@@ -1298,20 +1294,9 @@ class ObjectDIP(ObjectConstraints):
 
     def forward(self, patch_indices: torch.Tensor):
         """Get object patches at given indices"""
-        if self._input_noise_std > 0.0:
-            noise = (
-                torch.randn(
-                    self.model_input.shape,
-                    dtype=self.dtype,
-                    device=self.device,
-                    generator=self._rng_torch,
-                )
-                * self._input_noise_std
-            )
-            model_input = self.model_input + noise
-        else:
-            model_input = self.model_input
-
+        model_input = add_input_noise(
+            self.model_input, self._input_noise_std, self.dtype, self.device, self._rng_torch
+        )
         obj_array = self.model(model_input)[0]
         if self.mask.numel() > 0:
             obj_array = obj_array * self._mask
@@ -1428,20 +1413,9 @@ class ObjectDIP(ObjectConstraints):
         output = self.obj
 
         for a0 in pbar:
-            if self._input_noise_std > 0.0:
-                noise = (
-                    torch.randn(
-                        self.model_input.shape,
-                        dtype=self.dtype,
-                        device=self.device,
-                        generator=self._rng_torch,
-                    )
-                    * self._input_noise_std
-                )
-                model_input = self.model_input + noise
-            else:
-                model_input = self.model_input
-
+            model_input = add_input_noise(
+                self.model_input, self._input_noise_std, self.dtype, self.device, self._rng_torch
+            )
             if apply_constraints:
                 output = self.apply_hard_constraints(self.model(model_input)[0])
             else:
