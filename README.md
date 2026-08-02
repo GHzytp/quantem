@@ -16,7 +16,7 @@
 - **Data structures & I/O**: a unified `Dataset` hierarchy that reads common electron-microscopy formats and serializes to [Zarr](https://zarr.dev/).
 - **Visualization**: publication-quality figures with perceptually-uniform colormaps.
 - **GPU-accelerated & ML-ready**: a PyTorch backend with neural object representations and multi-GPU / multi-node reconstruction.
-- **Spectroscopy**: under development.
+- **Spectroscopy**: GPU-accelerated spectra fitting for EDS and EELS, under development.
 - **Diffraction**: multi-angle precession electron diffraction (MAPED), under development ([Ribet et al., 2025](https://doi.org/10.1093/mam/ozaf103)).
 
 ## Installation
@@ -41,7 +41,7 @@ The [quantem-tutorials](https://github.com/electronmicroscopy/quantem-tutorials)
 
 ## Citing
 
-If you use quantem in your research, please cite this repository as the relevant paper(s) for any module(s) that you used:
+If you use quantem in your research, please cite this repository as well as the relevant paper(s) for any module(s) that you used:
 
 - **quantem (software)**: please cite the version you used. Ready to use citations can be copied from the [Zenodo record](https://doi.org/10.5281/zenodo.18642593), or from the "Cite this repository" button on [GitHub](https://github.com/electronmicroscopy/quantem).
 
