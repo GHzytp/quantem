@@ -5,11 +5,6 @@ Thank you to everyone who has contributed code, ideas, bug reports, and tutorial
 
 Contributions are broken down by module: 
 
-- [install uv](https://docs.astral.sh/uv/getting-started/installation/)
-- `git clone` the repo and `cd` into the directory
-- run `uv sync` to install all the dependencies in an editable environment
-The following will set up the pre-commit and [ruff](https://github.com/astral-sh/ruff) for linting and formatting. These commands only need to be run once when first setting up your dev environment: 
-
 ## Core
 - [Georgios Varnavides](https://github.com/gvarnavi)
 - [Arthur McCray](https://github.com/arthurmccray)
