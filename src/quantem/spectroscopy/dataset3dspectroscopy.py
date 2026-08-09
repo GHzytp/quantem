@@ -8,6 +8,7 @@ import torch
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset3d import Dataset3d
+from quantem.core.utils.filter import median_filter
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     _plot_background_subtraction as _visualize_background_subtraction,
 )
@@ -273,6 +274,30 @@ class Dataset3dspectroscopy(Dataset3d):
                 print(f" - {element_key}: {', '.join(unique_lines)}")
         else:
             print("Added to model: nothing new")
+
+    def median_filter_masked_energies(self, mask: np.ndarray, kernel_width: int = 3):
+        """
+        Fix bad energy channels by median-filtering along the energy axis in-place.
+
+        This applies a 1D median filter along dimension 2 and writes back only the
+        masked energy channels, broadcasting across all scan positions.
+
+        Parameters
+        ----------
+        mask
+            A boolean mask with shape ``(energy,)`` specifying bad energy channels.
+        kernel_width
+            Width of the median kernel along the energy axis.
+        """
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self.array.shape[2],):
+            raise ValueError(
+                "Mask shape must match the energy dimension of the dataset. "
+                + f"Expected {(self.array.shape[2],)}, got {mask.shape}."
+            )
+
+        filtered = median_filter(self.array, size=kernel_width, axes=(2,))
+        self.array[:, :, mask] = filtered[:, :, mask]
 
     def remove_elements_from_model(self, elements):
         """

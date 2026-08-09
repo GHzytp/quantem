@@ -664,11 +664,14 @@ class Dataset3deels(Dataset3dspectroscopy):
             zlp_plane_1d = _plane_fit_2d(coord_data_unpacked, popt[0], popt[1], popt[2])
             zlp_plane_2d = zlp_plane_1d.reshape(scan_row, scan_col)
 
-            show_2d(
+            fig, _ = show_2d(
                 [zlp_measured, zlp_plane_2d],
                 cmap="magma",
-                title=["Measured ZLP (mean of Gaussian fit)", "ZLP plane fit"],
+                cbar=True,
+                title=["Measured ZLP\n(mean of Gaussian fit)", "ZLP plane fit"],
+                tight_layout=False,
             )
+            fig.subplots_adjust(top=0.88, wspace=0.35)
             return zlp_plane_2d
         elif fit_to_polynomial:
             # Fit a 2D polynomial to the array of measured ZLPs
@@ -686,18 +689,24 @@ class Dataset3deels(Dataset3dspectroscopy):
             )
             zlp_plane_2d = zlp_plane_1d.reshape(scan_row, scan_col)
 
-            show_2d(
+            fig, _ = show_2d(
                 [zlp_measured, zlp_plane_2d],
                 cmap="magma",
-                title=["Measured ZLP (mean of Gaussian fit)", "ZLP polynomial fit"],
+                cbar=True,
+                title=["Measured ZLP\n(mean of Gaussian fit)", "ZLP polynomial fit"],
+                tight_layout=False,
             )
+            fig.subplots_adjust(top=0.88, wspace=0.35)
 
         else:
-            show_2d(
+            fig, _ = show_2d(
                 [zlp_measured],
                 cmap="magma",
-                title=["Measured ZLP (mean of Gaussian fit)"],
+                cbar=True,
+                title=["Measured ZLP\n(mean of Gaussian fit)"],
+                tight_layout=False,
             )
+            fig.subplots_adjust(top=0.88)
             return zlp_measured
 
     def apply_zlp_correction(
