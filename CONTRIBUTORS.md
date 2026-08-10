@@ -22,7 +22,6 @@ Contributions are broken down by module:
 - [Arthur McCray](https://github.com/arthurmccray)
 - [Georgios Varnavides](https://github.com/gvarnavi)
 - [Stephanie Ribet](https://github.com/smribet)
-- [Sangjoon Bob Lee](https://github.com/bobleesj)
 
 ## Imaging
 - [Colin Ophus](https://github.com/cophus)
