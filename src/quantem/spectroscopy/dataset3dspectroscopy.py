@@ -968,13 +968,18 @@ class Dataset3dspectroscopy(Dataset3d):
         window_maxE = target_edge - 5
         if window_minE < energy_axis[0]:
             raise ValueError(
-                "Insufficient pre-edge background fitting region for this target edge "
-                "and window size within given energy range."
+                "Insufficient pre-edge background fitting region: "
+                f"target_edge={target_edge:g} eV with window_size={window_size}% requires "
+                f"{window_minE:.3f}-{window_maxE:.3f} eV, but the available energy range starts at "
+                f"{energy_axis[0]:.3f} eV."
             )
 
         window_indices = np.where((energy_axis >= window_minE) & (energy_axis <= window_maxE))[0]
         if len(window_indices) < 2:
-            raise ValueError("Insufficient points in EELS pre-edge background fitting window.")
+            raise ValueError(
+                "Insufficient points in EELS pre-edge background fitting window: "
+                f"found {len(window_indices)} points in {window_minE:.3f}-{window_maxE:.3f} eV."
+            )
 
         window_E = energy_axis[window_indices]
         window_I = np.asarray(spectrum, dtype=float)[window_indices]
@@ -1029,7 +1034,11 @@ class Dataset3dspectroscopy(Dataset3d):
                 )
             except Exception as exc:
                 i_row, i_col = divmod(pixel_index, scan_col)
-                raise RuntimeError(f"Background fit failed at pixel ({i_row}, {i_col})") from exc
+                raise RuntimeError(
+                    f"Background fit failed at pixel ({i_row}, {i_col}) "
+                    f"using method={method!r}, target_edge={target_edge}, "
+                    f"window_size={window_size}, kernel_width={kernel_width}: {exc}"
+                ) from exc
 
         return background.reshape(scan_row, scan_col, n_energy)
 
