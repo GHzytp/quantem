@@ -649,6 +649,36 @@ class TestVisualization:
         for recon in (fourier, montage):
             assert recon._obj_sampling[0] == pytest.approx(SCAN_SAMPLING)
 
+    def test_fov_matches_the_scan_extent(self, dataset4d):
+        fourier, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+
+        for recon in (fourier, montage):
+            assert recon.fov == pytest.approx((N * SCAN_SAMPLING, N * SCAN_SAMPLING))
+
+    @pytest.mark.parametrize("upsampling_factor", [1, 2])
+    def test_padded_canvas_keeps_the_scan_sampling(self, dataset4d, upsampling_factor):
+        """A padded canvas spans more than the scan, so its sampling is not fov/shape.
+
+        Deriving from the *scan* field of view would under-report the pixel size by the
+        padding fraction; `_obj_fov` reports the canvas extent instead.
+        """
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1, upsampling_factor))
+        montage.reconstruct(boundary="pad", upsampling_factor=upsampling_factor, verbose=False)
+
+        assert montage.obj.shape[0] > N * upsampling_factor  # canvas really did grow
+        assert montage._obj_sampling[0] == pytest.approx(SCAN_SAMPLING / upsampling_factor)
+        assert montage._obj_fov[0] > montage.fov[0]
+        # and the reported extent still matches the image it describes
+        assert montage.obj.shape[0] * montage._obj_sampling[0] == pytest.approx(
+            montage._obj_fov[0]
+        )
+
+    def test_wrapped_canvas_spans_exactly_the_scan(self, dataset4d):
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        montage.reconstruct(boundary="wrap", upsampling_factor=2, verbose=False)
+
+        assert montage._obj_fov == pytest.approx(montage.fov)
+
     def test_visualize_before_reconstruct_raises(self, dataset4d):
         _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
         with pytest.raises(RuntimeError, match="Run reconstruct"):

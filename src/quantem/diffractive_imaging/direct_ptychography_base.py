@@ -213,8 +213,9 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
       the optimizers call ``float(self.variance_loss())``)
     - ``corrected_bf`` property returning the reconstructed image, or ``None``
 
-    A ``reconstruct`` that upsamples must record ``_last_upsampling_factor``, so that
-    ``_obj_sampling`` -- and hence ``visualize``'s scalebar -- stays correct.
+    A subclass whose reconstruction spans more than the scan field of view (e.g. a padded
+    canvas) must override ``_obj_fov``; upsampling needs no bookkeeping, since
+    ``_obj_sampling`` reads the object's own shape.
     """
 
     # --- state the subclass __init__ must provide (annotation only, no default) ---
@@ -222,13 +223,10 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     wavelength: float
     scan_units: Tuple[str, str]
     detector_units: Tuple[str, str]
+    scan_gpts: Tuple[int, int]
     gpts: Tuple[int, int]
     sampling: Tuple[float, float]
     angular_sampling: Tuple[float, float]
-
-    #: upsampling factor of the most recent reconstruction. Class-level default keeps
-    #: ``_obj_sampling`` well defined before ``reconstruct`` has ever run.
-    _last_upsampling_factor: int = 1
 
     # ------------------------------------------------------------------
     # subclass hooks
@@ -245,9 +243,30 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         raise NotImplementedError(f"{type(self).__name__} does not implement corrected_bf.")
 
     @property
+    def fov(self) -> tuple[float, float]:
+        """Field of view of the scan, in Angstrom. Fixed by the acquisition."""
+        return tuple(n * s for n, s in zip(self.scan_gpts, self.scan_sampling))
+
+    @property
+    def _obj_fov(self) -> tuple[float, float]:
+        """Field of view the reconstructed object spans, in Angstrom.
+
+        Defaults to the scan field of view, which is what a reconstruction sampled on the
+        scan grid covers at any upsampling factor. Override where the object spans more.
+        """
+        return self.fov
+
+    @property
     def _obj_sampling(self) -> tuple[float, float]:
-        """Real-space sampling of the reconstructed object, in Angstrom."""
-        return tuple(s / self._last_upsampling_factor for s in self.scan_sampling)
+        """Real-space sampling of the reconstructed object, in Angstrom.
+
+        Derived from the object's own shape rather than tracked across reconstructions, so
+        upsampling needs no bookkeeping and the scalebar cannot fall out of sync.
+        """
+        obj = self.corrected_bf
+        if obj is None:
+            return tuple(self.scan_sampling)
+        return tuple(f / n for f, n in zip(self._obj_fov, obj.shape[-2:]))
 
     # ------------------------------------------------------------------
     # properties

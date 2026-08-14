@@ -203,7 +203,6 @@ class DirectPtychography(DirectPtychographyBase):
         self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
-        self._last_upsampling_factor = 1
         self._q_signal_power = self._vbf_fourier.abs().square().sum(dim=0)  # (N_qx, N_qy)
 
         return self
@@ -379,7 +378,6 @@ class DirectPtychography(DirectPtychographyBase):
         if upsampling_factor is None:
             upsampling_factor = 1
         upsampling_factor = math.ceil(upsampling_factor)
-        self._last_upsampling_factor = upsampling_factor
 
         if bf_mask is None:
             bf_mask = self.bf_mask

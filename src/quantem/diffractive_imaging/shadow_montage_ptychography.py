@@ -480,6 +480,18 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         _, var, _ = self._weighted_moments()
         return var.reshape(self._canvas_shape)
 
+    @property
+    def _obj_fov(self) -> tuple[float, float]:
+        """Field of view of the canvas, in Angstrom.
+
+        With ``boundary="pad"`` the canvas grows past the scan to cover the shifted
+        positions, so it spans more than :attr:`fov`. Computed by :meth:`_return_canvas`
+        alongside the canvas shape, so the two always agree.
+        """
+        if self._canvas_fov is None:
+            return self.fov
+        return self._canvas_fov
+
     # ------------------------------------------------------------------
     # preprocessing
     # ------------------------------------------------------------------
@@ -509,8 +521,8 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self._corrected_bf = None
         self._canvas_shape = None
         self._canvas_origin_px = None
+        self._canvas_fov = None
         self._bf_weights = None
-        self._last_upsampling_factor = 1
 
     # ------------------------------------------------------------------
     # reconstruction
@@ -555,13 +567,24 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         return shifts_px, bf_weights
 
     def _return_canvas(self, shifts_px, upsampling_factor, boundary, pad_px):
-        """``(canvas_shape, canvas_origin_px)`` for the requested boundary handling."""
+        """``(canvas_shape, canvas_origin_px, canvas_fov)`` for the requested boundary.
+
+        The field of view is returned alongside the shape, rather than recomputed later,
+        so the two cannot disagree about the upsampling factor.
+        """
         positions_up = self._positions_px * upsampling_factor
 
+        def with_fov(canvas_shape, origin):
+            canvas_fov = tuple(
+                n * s / upsampling_factor for n, s in zip(canvas_shape, self.scan_sampling)
+            )
+            return canvas_shape, origin, canvas_fov
+
         if boundary == "wrap":
+            # spans exactly the scan field of view, at any upsampling factor
             canvas_shape = tuple(int(n) * upsampling_factor for n in self.scan_gpts)
             origin = torch.zeros(2, device=self.device, dtype=torch.float64)
-            return canvas_shape, origin
+            return with_fov(canvas_shape, origin)
 
         if boundary != "pad":
             raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
@@ -575,7 +598,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         # +2 leaves room for the upper bilinear corner at the far edge
         canvas_shape = tuple(int(v) + 2 for v in (hi - lo))
-        return canvas_shape, lo
+        return with_fov(canvas_shape, lo)
 
     def reconstruct(
         self,
@@ -701,7 +724,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         shifts_px, bf_weights = self._return_shifts_px(
             rotation_angle, aberration_coefs, bf.bf_mask, upsampling_factor
         )
-        canvas_shape, canvas_origin = self._return_canvas(
+        canvas_shape, canvas_origin, canvas_fov = self._return_canvas(
             shifts_px, upsampling_factor, boundary, pad_px
         )
 
@@ -735,8 +758,8 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self._sum_w, self._sum_wv, self._sum_wv2 = buffers
         self._canvas_shape = canvas_shape
         self._canvas_origin_px = canvas_origin
+        self._canvas_fov = canvas_fov
         self._bf_weights = bf_weights
-        self._last_upsampling_factor = upsampling_factor
 
         # normalization must precede filtering: dividing by the (spatially varying) weight
         # map is not linear, so it does not commute with the Fourier filters below
