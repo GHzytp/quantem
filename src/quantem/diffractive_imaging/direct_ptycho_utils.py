@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from quantem.core import config
 
@@ -17,6 +17,9 @@ from quantem.core.utils.imaging_utils import cross_correlation_shift_torch, unwr
 from quantem.diffractive_imaging.complex_probe import (
     spatial_frequencies,
 )
+
+# bilinear corner offsets: (row offset, col offset)
+_BILINEAR_CORNERS = ((0, 0), (1, 0), (0, 1), (1, 1))
 
 # fmt: off
 ABERRATION_PRESETS = {
@@ -644,3 +647,306 @@ def _crop_corner_centered_mask(mask: torch.Tensor, bf_mask_padding_px: int):
     y0, y1 = ys.min() - px, ys.max() + px + 1
     x0, x1 = xs.min() - px, xs.max() + px + 1
     return torch.fft.ifftshift(mask_c[y0:y1, x0:x1])
+
+
+def preferred_accumulator_dtype(device) -> torch.dtype:
+    """float64 where available; MPS has no float64 support."""
+    device_type = torch.device(device).type
+    return torch.float32 if device_type == "mps" else torch.float64
+
+
+def allocate_splat_buffers(
+    canvas_shape: tuple[int, int],
+    device,
+    dtype: torch.dtype | None = None,
+    accumulate_squares: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Flat, zeroed ``(sum_w, sum_wv, sum_wv2)`` accumulators for :func:`scatter_add_splat`."""
+    if dtype is None:
+        dtype = preferred_accumulator_dtype(device)
+    numel = canvas_shape[0] * canvas_shape[1]
+
+    def _zeros():
+        return torch.zeros(numel, device=device, dtype=dtype)
+
+    return _zeros(), _zeros(), _zeros() if accumulate_squares else None
+
+
+def scatter_add_splat(
+    values: torch.Tensor,
+    coords: torch.Tensor,
+    canvas_shape: tuple[int, int],
+    *,
+    boundary: Literal["wrap", "pad"] = "wrap",
+    interpolation: Literal["bilinear", "nearest"] = "bilinear",
+    out: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """
+    Batched sub-pixel scatter-add of values onto a 2D canvas.
+
+    This is the torch counterpart of :func:`quantem.core.utils.imaging_utils.bilinear_kde`'s
+    accumulation stage: it splits each point across the four surrounding pixels with bilinear
+    weights and accumulates ``w``, ``w * v`` and ``w * v**2`` via ``index_add_``. Unlike that
+    function it takes a leading batch axis, runs on any torch device, offers a drop
+    (``"pad"``) as well as a wrap boundary, and does no smoothing or normalization.
+
+    Parameters
+    ----------
+    values : torch.Tensor
+        ``(..., T)`` values to deposit.
+    coords : torch.Tensor
+        ``(..., T, 2)`` canvas coordinates in pixels, ordered ``(row, col)``. Broadcast
+        against ``values``.
+    canvas_shape : tuple of int
+        ``(n_rows, n_cols)`` of the output canvas.
+    boundary : {"wrap", "pad"}
+        ``"wrap"`` wraps coordinates periodically; ``"pad"`` drops out-of-bounds points.
+    interpolation : {"bilinear", "nearest"}
+        Sub-pixel deposition scheme.
+    out : tuple of torch.Tensor, optional
+        Pre-allocated flat buffers ``(sum_w, sum_wv, sum_wv2)`` to accumulate into, as
+        returned by :func:`allocate_splat_buffers`. ``sum_wv2`` may be ``None`` to skip
+        the sum-of-squares. If omitted, fresh buffers are allocated.
+
+    Returns
+    -------
+    sum_w, sum_wv, sum_wv2 : torch.Tensor
+        Flat ``(n_rows * n_cols,)`` accumulators. ``sum_wv2`` is ``None`` if not requested.
+
+    Notes
+    -----
+    ``index_add_`` uses atomics on CUDA and is therefore not bit-reproducible there;
+    compare results with a tolerance rather than for exact equality.
+    """
+    n_rows, n_cols = int(canvas_shape[0]), int(canvas_shape[1])
+
+    if out is None:
+        out = allocate_splat_buffers(canvas_shape, coords.device)
+    sum_w, sum_wv, sum_wv2 = out
+    dtype = sum_w.dtype
+
+    values = values.to(dtype)
+    coords = coords.to(dtype)
+
+    if interpolation == "bilinear":
+        base = torch.floor(coords)
+        frac = coords - base
+        corners = _BILINEAR_CORNERS
+    elif interpolation == "nearest":
+        base = torch.round(coords)
+        frac = None
+        corners = ((0, 0),)
+    else:
+        raise ValueError(f"`interpolation` must be 'bilinear' or 'nearest', got {interpolation!r}")
+
+    base_row = base[..., 0].to(torch.int64)
+    base_col = base[..., 1].to(torch.int64)
+
+    for d_row, d_col in corners:
+        row = base_row + d_row
+        col = base_col + d_col
+
+        if frac is None:
+            weights = torch.ones_like(values)
+        else:
+            w_row = frac[..., 0] if d_row else 1 - frac[..., 0]
+            w_col = frac[..., 1] if d_col else 1 - frac[..., 1]
+            weights = w_row * w_col
+            weights = weights.expand_as(values) if weights.shape != values.shape else weights
+
+        if boundary == "wrap":
+            row = row % n_rows
+            col = col % n_cols
+        elif boundary == "pad":
+            # clamp the indices and zero their weights instead of masking, which would
+            # need a `nonzero()` and hence a device->host synchronization
+            valid = (row >= 0) & (row < n_rows) & (col >= 0) & (col < n_cols)
+            row = row.clamp(0, n_rows - 1)
+            col = col.clamp(0, n_cols - 1)
+            weights = weights * valid
+        else:
+            raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
+
+        flat_indices = (row * n_cols + col).reshape(-1)
+        flat_weights = weights.reshape(-1)
+        flat_values = values.reshape(-1)
+
+        sum_w.index_add_(0, flat_indices, flat_weights)
+        sum_wv.index_add_(0, flat_indices, flat_weights * flat_values)
+        if sum_wv2 is not None:
+            sum_wv2.index_add_(0, flat_indices, flat_weights * flat_values * flat_values)
+
+    return sum_w, sum_wv, sum_wv2
+
+
+def fit_and_shift_diffraction_origin(
+    dataset,
+    device: str | int = "cpu",
+    max_batch_size: int | None = None,
+    fit_method: str = "plane",
+    mode: str = "bilinear",
+    force_measured_origin=None,
+    force_fitted_origin=None,
+    rotation_angle: float | None = None,
+    probe_positions=None,
+):
+    """
+    Measure, fit and remove the diffraction origin, returning a corner-centered stack.
+
+    Works for both 4D ``(Rx, Ry, Qx, Qy)`` and 3D ``(N, Qx, Qy)`` datasets. For 3D input
+    ``probe_positions`` (``(N, 2)``) must be supplied for the background fit, and
+    ``rotation_angle`` must be given -- rotation estimation needs the 2D scan grid.
+
+    Returns
+    -------
+    shifted_tensor : torch.Tensor
+        Same shape as the input, with the diffraction origin moved to ``(0, 0)``.
+    rotation_angle : float
+        The supplied angle, or the estimated one when ``rotation_angle`` was ``None``.
+    """
+    from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
+
+    origin = CenterOfMassOriginModel.from_dataset(dataset, device=device)
+
+    # measure and fit origin
+    if force_fitted_origin is None:
+        if force_measured_origin is None:
+            origin.calculate_origin(max_batch_size)
+        else:
+            origin.origin_measured = force_measured_origin
+        if probe_positions is None:
+            origin.fit_origin_background(fit_method=fit_method)
+        else:
+            origin.fit_origin_background(probe_positions=probe_positions, fit_method=fit_method)
+    else:
+        origin.origin_fitted = force_fitted_origin
+
+    if rotation_angle is None:
+        if dataset.ndim != 4:
+            raise ValueError(
+                "`rotation_angle` must be given for non-raster scans: detector rotation is "
+                "estimated from the curl of the center-of-mass over a 2D scan grid, which "
+                "requires 4D data."
+            )
+        origin.estimate_detector_rotation()
+        rotation_angle = origin.detector_rotation_deg
+
+    # shift to origin
+    origin.shift_origin_to(
+        max_batch_size=max_batch_size,
+        mode=mode,
+    )
+
+    return origin.shifted_tensor, rotation_angle
+
+
+def bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold: float = 0.5):
+    """Bright-field mask from the mean diffraction pattern of a corner-centered stack."""
+    scan_dims = tuple(range(shifted_tensor.ndim - 2))
+    mean_dp = shifted_tensor.mean(dim=scan_dims)
+    return mean_dp > mean_dp.max() * intensity_threshold
+
+
+def normalize_vbf_stack(vbf_stack, normalization_order: int, gpts: tuple[int, int]):
+    """
+    Normalize a ``(*scan_gpts, N_bf)`` virtual bright-field stack.
+
+    ``normalization_order=0`` scales each BF image to unity mean over the scan;
+    ``normalization_order=1`` divides out a least-squares linear background instead.
+    """
+    if normalization_order == 0:
+        scan_dims = tuple(range(vbf_stack.ndim - 1))
+        vbf_stack = vbf_stack / vbf_stack.mean(scan_dims)  # unity mean, important
+
+    elif normalization_order == 1:
+        # Fit linear background to each BF image
+        x = torch.linspace(-0.5, 0.5, gpts[0])
+        y = torch.linspace(-0.5, 0.5, gpts[1])
+        ya, xa = torch.meshgrid(y, x, indexing="ij")
+
+        # Basis for linear fit: [1, x, y]
+        basis = torch.stack(
+            [torch.ones_like(xa.ravel()), xa.ravel(), ya.ravel()], dim=1
+        )  # shape: [N_pixels, 3]
+
+        # Fit each BF image
+        for k in range(vbf_stack.shape[-1]):
+            intensities = vbf_stack[..., k].ravel()
+
+            # Least squares
+            coefs = torch.linalg.lstsq(basis, intensities).solution
+
+            # Normalize
+            background = (basis @ coefs).reshape(gpts)
+            vbf_stack[..., k] /= background
+    else:
+        raise ValueError(f"`normalization_order` must be 0 or 1, got {normalization_order!r}")
+
+    return vbf_stack
+
+
+def build_vbf_stack_from_dataset4d(
+    dataset,
+    device: str | int = "cpu",
+    max_batch_size: int | None = None,
+    fit_method: str = "plane",
+    mode: str = "bilinear",
+    force_measured_origin=None,
+    force_fitted_origin=None,
+    rotation_angle: float | None = None,
+    intensity_threshold: float = 0.5,
+    normalization_order: int = 0,
+    edge_blend_pixels: int = 0,
+):
+    """
+    Turn a 4D-STEM dataset into the virtual bright-field stack the direct-ptychography
+    classes consume.
+
+    Returns
+    -------
+    vbf_dataset : Dataset3d
+        ``(N_bf, Rx, Ry)`` stack of virtual bright-field images.
+    bf_mask_dataset : Dataset2d
+        Corner-centered bright-field mask on the detector grid.
+    rotation_angle : float
+        The supplied angle, or the estimated one when ``rotation_angle`` was ``None``.
+    """
+    from quantem.core.datastructures import Dataset2d, Dataset3d
+
+    shifted_tensor, rotation_angle = fit_and_shift_diffraction_origin(
+        dataset,
+        device=device,
+        max_batch_size=max_batch_size,
+        fit_method=fit_method,
+        mode=mode,
+        force_measured_origin=force_measured_origin,
+        force_fitted_origin=force_fitted_origin,
+        rotation_angle=rotation_angle,
+    )
+
+    bf_mask = bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold)
+    bf_mask_dataset = Dataset2d.from_array(
+        bf_mask.cpu().numpy(),
+        name="BF mask",
+        units=dataset.units[-2:],
+        sampling=dataset.sampling[-2:],
+    )
+
+    # vbf_stack
+    vbf_stack = shifted_tensor[..., bf_mask].cpu()
+    gpts = vbf_stack.shape[:2]
+    vbf_stack = normalize_vbf_stack(vbf_stack, normalization_order, gpts)
+
+    # smooth window
+    window_edge = create_edge_window(shape=gpts, edge_blend_pixels=edge_blend_pixels, device="cpu")
+    vbf_stack = (1 - window_edge[..., None]) + window_edge[..., None] * vbf_stack
+
+    vbf_stack = torch.moveaxis(vbf_stack, (0, 1, 2), (1, 2, 0))
+    vbf_dataset = Dataset3d.from_array(
+        vbf_stack.numpy(),
+        name="vBF stack",
+        units=("index",) + tuple(dataset.units[:2]),
+        sampling=(1,) + tuple(dataset.sampling[:2]),
+    )
+
+    return vbf_dataset, bf_mask_dataset, rotation_angle
