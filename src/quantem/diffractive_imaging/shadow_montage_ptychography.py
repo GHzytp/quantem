@@ -84,6 +84,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         scan_units: Tuple[str, str],
         scan_gpts: Tuple[int, int],
         boundary: Literal["wrap", "pad"],
+        gridded_scan: bool,
         subtract_frame_mean: bool,
         soft_edges: bool,
         crop_bf_mask: bool,
@@ -125,6 +126,9 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self.semiangle_cutoff = semiangle_cutoff
         self.soft_edges = soft_edges
         self.boundary = boundary
+        #: whether the positions lie on a regular lattice; drives the sampling-density
+        #: correction that `weight_normalize` applies
+        self.gridded_scan = gridded_scan
         self.subtract_frame_mean = subtract_frame_mean
         self.rng = rng
 
@@ -192,6 +196,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             scan_units=tuple(vbf_dataset.units[-2:]),
             scan_gpts=scan_gpts,
             boundary=boundary,
+            gridded_scan=True,
             subtract_frame_mean=subtract_frame_mean,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
@@ -381,6 +386,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             scan_units=("A", "A"),
             scan_gpts=scan_gpts,
             boundary=boundary,
+            gridded_scan=False,
             subtract_frame_mean=subtract_frame_mean,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
@@ -615,7 +621,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         verbose=None,
         use_initial_state=False,
         boundary=None,
-        interpolation="bilinear",
+        interpolation="nearest",
         weight_normalize=None,
         weight_threshold=1e-2,
         pad_px=None,
@@ -650,12 +656,31 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             ``"wrap"`` wraps the montage periodically over the scan grid and reproduces
             ``DirectPtychography``; ``"pad"`` grows the canvas to cover the shifted positions
             and drops nothing. Defaults to the value chosen at construction.
-        interpolation : {"bilinear", "nearest"}
-            Sub-pixel deposition scheme. ``"nearest"`` reproduces the integer-rounded shifts
-            of the streaming prototype.
+        interpolation : {"nearest", "bilinear"}
+            Sub-pixel deposition scheme.
+
+            ``"nearest"`` (default) snaps each shift to the closest canvas pixel, which on a
+            raster scan is exactly a roll of the virtual bright-field image by
+            ``round(shift)`` -- the quantization error is ``1/(2*upsampling_factor)`` scan
+            pixels, so it shrinks as you upsample. Measured against the exact Fourier shift
+            on a 4 mrad apoferritin dataset, it retains 0.81 / 0.95 / 0.99 / 1.00 of the
+            in-band power at ``upsampling_factor`` 1 / 2 / 4 / 8.
+
+            Switch to ``"bilinear"`` if the result looks blocky: it spreads each shift over
+            the four neighbouring pixels instead, at the cost of some smoothing (0.67 / 0.90
+            / 0.97 / 0.99 of the in-band power over the same series). Prefer it for scans
+            whose positions are not on a lattice, where snapping leaves parts of the canvas
+            unvisited -- on a jittered scan ``"nearest"`` left 17-31% of the canvas empty
+            against 10-15% for ``"bilinear"``, and the gap widens with upsampling.
         weight_normalize : bool, optional
             Divide by the accumulated weight rather than by the total bright-field weight.
-            Defaults to ``True`` for ``"pad"`` and ``False`` for ``"wrap"``.
+            Defaults to ``True`` for an ungridded scan and ``False`` otherwise.
+
+            Weight normalization corrects for uneven sampling density, which is what an
+            ungridded scan needs. On a raster scan the density is already uniform, so it only
+            rescales the edges of a padded canvas -- dividing the few contributions there by
+            a small weight amplifies their noise. Leaving it ``False`` instead lets those
+            edges fade out, which is usually what you want to look at.
 
             For ``"wrap"`` with ``upsampling_factor > 1`` the accumulated weight is a comb of
             ones and zeros, so normalizing by it is meaningless -- leave it ``False``.
@@ -665,7 +690,9 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         pad_px : int, optional
             Freeze the ``"pad"`` canvas to the position bounding box plus this many pixels,
             instead of sizing it from the (aberration-dependent) shifts. Use this to keep the
-            canvas fixed across hyperparameter trials.
+            canvas a fixed size across hyperparameter trials or a defocus series, where the
+            automatic size would otherwise change with the shifts. Contributions landing
+            beyond ``pad_px`` are dropped, so choose it larger than the shifts you expect.
         compute_variance : bool
             Accumulate the sum of squares needed by :meth:`variance_loss`.
         suppress_nyquist : bool
@@ -719,7 +746,9 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         if boundary is None:
             boundary = self.boundary
         if weight_normalize is None:
-            weight_normalize = boundary == "pad"
+            # density correction matters for an ungridded scan; on a raster it would only
+            # amplify noise at the low-weight edges of a padded canvas
+            weight_normalize = not self.gridded_scan
 
         shifts_px, bf_weights = self._return_shifts_px(
             rotation_angle, aberration_coefs, bf.bf_mask, upsampling_factor

@@ -324,6 +324,66 @@ class TestRotationConvention:
         assert not np.allclose(unrotated, montage.obj)
 
 
+class TestReconstructDefaults:
+    """The defaults are behaviour; pin them."""
+
+    def test_interpolation_defaults_to_nearest(self, dataset4d):
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+
+        default = montage.reconstruct(upsampling_factor=2, verbose=False).obj.copy()
+        nearest = montage.reconstruct(
+            upsampling_factor=2, interpolation="nearest", verbose=False
+        ).obj
+
+        assert np.array_equal(default, nearest)
+
+    def test_nearest_is_a_roll_of_the_bright_field_images(self, dataset4d):
+        """On a raster scan, snapping moves every position of a BF image by one integer.
+
+        `positions_px * U` is an exact integer, so `round(n + s) == n + round(s)`.
+        """
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        upsampling_factor = 4
+        shifts, _ = montage._return_shifts_px(
+            0.0, montage.aberration_coefs, montage.bf_mask, upsampling_factor
+        )
+        positions = montage.positions_px * upsampling_factor
+        coords = positions[None] + shifts[:, None]
+
+        offsets = coords.round() - positions[None]
+        # every position of a given BF image moves by the same integer
+        assert torch.equal(offsets, shifts.round()[:, None].expand_as(offsets))
+
+    def test_gridded_constructors_flag_the_scan_as_gridded(self, dataset4d):
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        assert montage.gridded_scan is True
+
+    def test_weight_normalize_defaults_off_for_a_raster_scan(self, dataset4d):
+        """Uniform density needs no correction, and normalizing amplifies edge noise."""
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+
+        default = montage.reconstruct(boundary="pad", verbose=False).obj.copy()
+        unnormalized = montage.reconstruct(
+            boundary="pad", weight_normalize=False, verbose=False
+        ).obj
+
+        assert np.array_equal(default, unnormalized)
+
+    def test_weight_normalize_defaults_on_for_an_ungridded_scan(self, dataset4d):
+        dataset3d, positions = TestNonGridScan._dataset3d_and_positions(dataset4d)
+        recon = ShadowMontagePtychography.from_dataset3d(
+            dataset3d,
+            positions,
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            **_common_kwargs(integer_shift_defocus(1)),
+        )
+
+        assert recon.gridded_scan is False
+        default = recon.reconstruct(verbose=False).obj.copy()
+        normalized = recon.reconstruct(weight_normalize=True, verbose=False).obj
+        assert np.array_equal(default, normalized)
+
+
 class TestPadBoundary:
     """`boundary="pad"` grows the canvas instead of wrapping."""
 
