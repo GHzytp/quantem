@@ -33,6 +33,14 @@ from quantem.diffractive_imaging.direct_ptychography import (
     DirectPtychography as DirectPtychography,
 )
 
+from quantem.diffractive_imaging.direct_ptychography_base import (
+    OptimizationParameter as OptimizationParameter,
+)
+
+from quantem.diffractive_imaging.shadow_montage_ptychography import (
+    ShadowMontagePtychography as ShadowMontagePtychography,
+)
+
 from quantem.diffractive_imaging.origin_models import (
     CenterOfMassOriginModel as CenterOfMassOriginModel,
 )
