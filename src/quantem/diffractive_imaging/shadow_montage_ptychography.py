@@ -34,10 +34,8 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     _crop_corner_centered_mask,
     _rotation_degrees_to_radians,
     allocate_splat_buffers,
-    bf_mask_from_mean_pattern,
+    build_vbf_stack_from_dataset3d,
     build_vbf_stack_from_dataset4d,
-    fit_and_shift_diffraction_origin,
-    normalize_vbf_stack,
     scatter_add_convolve,
     scatter_add_splat,
 )
@@ -337,60 +335,22 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         Positions are *not* rotated: the detector rotation already enters through the
         bright-field k-grid, and rotating the positions as well would double-count it.
         """
-        positions_ang = cls._validate_positions(positions)
-        if positions_ang.shape[0] != dataset.shape[0]:
-            raise ValueError(
-                f"`positions` has {positions_ang.shape[0]} rows but `dataset` has "
-                f"{dataset.shape[0]} diffraction patterns."
+        vbf_stack, positions_px, bf_mask_dataset, scan_gpts, scan_sampling, rotation_angle = (
+            build_vbf_stack_from_dataset3d(
+                dataset,
+                positions,
+                scan_sampling,
+                device=device,
+                max_batch_size=max_batch_size,
+                fit_method=fit_method,
+                mode=mode,
+                force_measured_origin=force_measured_origin,
+                force_fitted_origin=force_fitted_origin,
+                rotation_angle=rotation_angle,
+                intensity_threshold=intensity_threshold,
+                normalization_order=normalization_order,
             )
-
-        if isinstance(scan_sampling, str):
-            if scan_sampling != "auto":
-                raise ValueError(
-                    f"`scan_sampling` must be a pair or 'auto', got {scan_sampling!r}"
-                )
-            scan_sampling = cls._infer_scan_sampling(positions_ang)
-            warnings.warn(
-                f"Inferred scan_sampling={scan_sampling} Angstrom from the median "
-                "nearest-neighbour position spacing.",
-                stacklevel=2,
-            )
-        scan_sampling = tuple(float(s) for s in scan_sampling)
-
-        shifted_tensor, rotation_angle = fit_and_shift_diffraction_origin(
-            dataset,
-            device=device,
-            max_batch_size=max_batch_size,
-            fit_method=fit_method,
-            mode=mode,
-            force_measured_origin=force_measured_origin,
-            force_fitted_origin=force_fitted_origin,
-            rotation_angle=rotation_angle,
-            probe_positions=positions_ang,
         )
-
-        bf_mask = bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold)
-        bf_mask_dataset = Dataset2d.from_array(
-            bf_mask.cpu().numpy(),
-            name="BF mask",
-            units=dataset.units[-2:],
-            sampling=dataset.sampling[-2:],
-        )
-
-        if normalization_order != 0:
-            raise ValueError(
-                "`normalization_order=1` fits a 2D linear background per bright-field image "
-                "and needs a scan grid, which an ungridded scan does not have; use "
-                "`normalization_order=0`."
-            )
-
-        vbf_stack = shifted_tensor[..., bf_mask].cpu()  # (N, N_bf)
-        vbf_stack = normalize_vbf_stack(vbf_stack, normalization_order, vbf_stack.shape[:1])
-        vbf_stack = vbf_stack.T.contiguous()  # (N_bf, N)
-
-        # anchor to the position bounding box, then convert to canvas pixels
-        positions_px = (positions_ang - positions_ang.min(axis=0)) / np.asarray(scan_sampling)
-        scan_gpts = tuple(int(math.ceil(v)) + 1 for v in positions_px.max(axis=0))
 
         return cls(
             vbf_stack=vbf_stack,
@@ -421,35 +381,6 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         """Integer ``(Rx*Ry, 2)`` raster positions in scan pixels, "ij" ordered."""
         ii, jj = np.meshgrid(np.arange(scan_gpts[0]), np.arange(scan_gpts[1]), indexing="ij")
         return np.stack((ii.ravel(), jj.ravel()), axis=-1).astype(np.float64)
-
-    @staticmethod
-    def _validate_positions(positions) -> NDArray:
-        if isinstance(positions, Dataset2d):
-            if str(positions.units[0]) != "A":
-                raise ValueError(
-                    f"`positions` must be given in 'A', got {tuple(positions.units)!r}"
-                )
-            positions = positions.array
-        positions = np.asarray(
-            positions.detach().cpu().numpy() if hasattr(positions, "detach") else positions,
-            dtype=np.float64,
-        )
-        if positions.ndim != 2 or positions.shape[1] != 2:
-            raise ValueError(f"`positions` must have shape (N, 2), got {positions.shape}")
-        return positions
-
-    @staticmethod
-    def _infer_scan_sampling(
-        positions_ang: NDArray, max_points: int = 4096
-    ) -> Tuple[float, float]:
-        """Median nearest-neighbour spacing, isotropic, from a subsample of positions."""
-        pts = positions_ang
-        if len(pts) > max_points:
-            pts = pts[np.linspace(0, len(pts) - 1, max_points).astype(int)]
-        dists = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
-        np.fill_diagonal(dists, np.inf)
-        spacing = float(np.median(dists.min(axis=1)))
-        return (spacing, spacing)
 
     # ------------------------------------------------------------------
     # properties

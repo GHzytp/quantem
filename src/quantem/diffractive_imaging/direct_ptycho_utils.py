@@ -10,7 +10,9 @@ else:
         import torch
 
 import math
+import warnings
 
+import numpy as np
 from tqdm.auto import tqdm
 
 from quantem.core.utils.imaging_utils import cross_correlation_shift_torch, unwrap_phase_2d_torch
@@ -872,6 +874,190 @@ def scatter_add_convolve(
             out.index_add_(0, flat_indices, contribution.reshape(-1))
 
     return out
+
+
+def validate_probe_positions(positions):
+    """``(N, 2)`` float64 probe positions in Angstrom, from an array, tensor or Dataset2d."""
+    from quantem.core.datastructures import Dataset2d
+
+    if isinstance(positions, Dataset2d):
+        if str(positions.units[0]) != "A":
+            raise ValueError(f"`positions` must be given in 'A', got {tuple(positions.units)!r}")
+        positions = positions.array
+
+    positions = np.asarray(
+        positions.detach().cpu().numpy() if hasattr(positions, "detach") else positions,
+        dtype=np.float64,
+    )
+    if positions.ndim != 2 or positions.shape[1] != 2:
+        raise ValueError(f"`positions` must have shape (N, 2), got {positions.shape}")
+    return positions
+
+
+def infer_scan_sampling(positions_ang, max_points: int = 4096):
+    """Median nearest-neighbour spacing, isotropic, from a subsample of positions."""
+    points = positions_ang
+    if len(points) > max_points:
+        points = points[np.linspace(0, len(points) - 1, max_points).astype(int)]
+
+    distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
+    np.fill_diagonal(distances, np.inf)
+    spacing = float(np.median(distances.min(axis=1)))
+    return (spacing, spacing)
+
+
+def build_vbf_stack_from_dataset3d(
+    dataset,
+    positions,
+    scan_sampling,
+    device: str | int = "cpu",
+    max_batch_size: int | None = None,
+    fit_method: str = "plane",
+    mode: str = "bilinear",
+    force_measured_origin=None,
+    force_fitted_origin=None,
+    rotation_angle: float | None = None,
+    intensity_threshold: float = 0.5,
+    normalization_order: int = 0,
+):
+    """
+    Origin-correct and mask an ungridded diffraction stack into a flat vBF stack.
+
+    The ungridded counterpart of :func:`build_vbf_stack_from_dataset4d`, shared by
+    ``ShadowMontagePtychography.from_dataset3d`` and ``DirectPtychography.from_dataset3d``
+    so the two entry points cannot drift apart.
+
+    Returns
+    -------
+    vbf_stack : torch.Tensor
+        ``(N_bf, N)`` bright-field intensities, flattened over scan positions.
+    positions_px : ndarray
+        ``(N, 2)`` positions in scan pixels, anchored at the bounding-box corner.
+    bf_mask_dataset : Dataset2d
+    scan_gpts : tuple of int
+        Grid that just covers the positions.
+    scan_sampling : tuple of float
+        Resolved pixel size, with ``"auto"`` replaced by the inferred value.
+    rotation_angle : float
+    """
+    from quantem.core.datastructures import Dataset2d
+
+    positions_ang = validate_probe_positions(positions)
+    if positions_ang.shape[0] != dataset.shape[0]:
+        raise ValueError(
+            f"`positions` has {positions_ang.shape[0]} rows but `dataset` has "
+            f"{dataset.shape[0]} diffraction patterns."
+        )
+
+    if isinstance(scan_sampling, str):
+        if scan_sampling != "auto":
+            raise ValueError(f"`scan_sampling` must be a pair or 'auto', got {scan_sampling!r}")
+        scan_sampling = infer_scan_sampling(positions_ang)
+        warnings.warn(
+            f"Inferred scan_sampling={scan_sampling} Angstrom from the median "
+            "nearest-neighbour position spacing.",
+            stacklevel=3,
+        )
+    scan_sampling = tuple(float(s) for s in scan_sampling)
+
+    if normalization_order != 0:
+        raise ValueError(
+            "`normalization_order=1` fits a 2D linear background per bright-field image "
+            "and needs a scan grid, which an ungridded scan does not have; use "
+            "`normalization_order=0`."
+        )
+
+    shifted_tensor, rotation_angle = fit_and_shift_diffraction_origin(
+        dataset,
+        device=device,
+        max_batch_size=max_batch_size,
+        fit_method=fit_method,
+        mode=mode,
+        force_measured_origin=force_measured_origin,
+        force_fitted_origin=force_fitted_origin,
+        rotation_angle=rotation_angle,
+        probe_positions=positions_ang,
+    )
+
+    bf_mask = bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold)
+    bf_mask_dataset = Dataset2d.from_array(
+        bf_mask.cpu().numpy(),
+        name="BF mask",
+        units=dataset.units[-2:],
+        sampling=dataset.sampling[-2:],
+    )
+
+    vbf_stack = shifted_tensor[..., bf_mask].cpu()  # (N, N_bf)
+    vbf_stack = normalize_vbf_stack(vbf_stack, normalization_order, vbf_stack.shape[:1])
+    vbf_stack = vbf_stack.T.contiguous()  # (N_bf, N)
+
+    # anchor to the position bounding box, then convert to canvas pixels
+    positions_px = (positions_ang - positions_ang.min(axis=0)) / np.asarray(scan_sampling)
+    scan_gpts = tuple(int(math.ceil(v)) + 1 for v in positions_px.max(axis=0))
+
+    return vbf_stack, positions_px, bf_mask_dataset, scan_gpts, scan_sampling, rotation_angle
+
+
+def regrid_vbf_stack(
+    vbf_stack,
+    positions_px,
+    scan_gpts,
+    interpolation: Literal["bilinear", "nearest"] = "bilinear",
+    hole_warning_threshold: float = 0.01,
+):
+    """
+    Resample a flat ``(N_bf, N)`` vBF stack onto a regular scan grid.
+
+    Splats each bright-field image at its probe positions with *no* aberration shift and
+    divides by the accumulated weight, which is what lets the scan-Fourier formulation
+    accept an ungridded acquisition.
+
+    Grid pixels that no probe position reaches are left at zero, and an FFT reads those
+    holes as real signal, so their fraction is reported.
+
+    Returns
+    -------
+    gridded : torch.Tensor
+        ``(N_bf, *scan_gpts)``.
+    hole_fraction : float
+    """
+    num_bf = int(vbf_stack.shape[0])
+    device = vbf_stack.device
+    scan_gpts = (int(scan_gpts[0]), int(scan_gpts[1]))
+    coords = torch.as_tensor(positions_px, device=device, dtype=torch.float64)[None]
+
+    # one image at a time: `scatter_add_splat` accumulates its whole batch into a single
+    # canvas, which is what the montage wants but would sum the stack away here
+    gridded = torch.empty((num_bf, *scan_gpts), device=device, dtype=torch.float32)
+    weights = None
+    for index in range(num_bf):
+        buffers = allocate_splat_buffers(scan_gpts, device, accumulate_squares=False)
+        sum_w, sum_wv, _ = scatter_add_splat(
+            vbf_stack[index : index + 1],
+            coords,
+            scan_gpts,
+            boundary="pad",
+            interpolation=interpolation,
+            out=buffers,
+        )
+        if weights is None:
+            weights = sum_w
+        normalized = sum_wv / sum_w.clamp_min(torch.finfo(sum_w.dtype).tiny)
+        gridded[index] = normalized.reshape(scan_gpts).to(torch.float32)
+
+    occupied = (weights > 0).reshape(scan_gpts)
+    hole_fraction = float((~occupied).sum()) / occupied.numel()
+
+    if hole_fraction > hole_warning_threshold:
+        warnings.warn(
+            f"{hole_fraction:.1%} of the {scan_gpts[0]}x{scan_gpts[1]} scan grid received no "
+            "probe position. A scan-Fourier reconstruction reads those holes as zero signal "
+            "and turns them into structured artifacts. Use a coarser `scan_gpts`, "
+            "`interpolation='bilinear'`, or ShadowMontagePtychography, which needs no grid.",
+            stacklevel=3,
+        )
+
+    return gridded, hole_fraction, occupied
 
 
 def fit_and_shift_diffraction_origin(

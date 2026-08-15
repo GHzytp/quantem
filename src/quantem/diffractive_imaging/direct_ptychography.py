@@ -37,9 +37,11 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     _crop_corner_centered_mask,
     _rotation_degrees_to_radians,
     align_vbf_stack_multiscale,
+    build_vbf_stack_from_dataset3d,
     build_vbf_stack_from_dataset4d,
     fit_aberrations_from_shifts,
     group_basis_by_method,
+    regrid_vbf_stack,
     unwrap_bf_overlap_phase_torch,
 )
 from quantem.diffractive_imaging.direct_ptychography_base import (
@@ -192,6 +194,130 @@ class DirectPtychography(DirectPtychographyBase):
             device=device,
             verbose=verbose,
             _token=cls._token,
+        )
+
+    @classmethod
+    def from_dataset3d(
+        cls,
+        dataset: Dataset3d,
+        positions: Dataset2d | torch.Tensor | NDArray,
+        energy: float,
+        semiangle_cutoff: float,
+        rotation_angle: float,
+        scan_sampling: Tuple[float, float] | Literal["auto"],
+        aberration_coefs: dict = {},
+        scan_gpts: Tuple[int, int] | None = None,
+        interpolation: Literal["bilinear", "nearest"] = "bilinear",
+        max_batch_size: int | None = None,
+        fit_method: str = "plane",
+        mode: str = "bilinear",
+        force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
+        force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
+        intensity_threshold: float = 0.5,
+        soft_edges: bool = True,
+        crop_bf_mask: bool = True,
+        bf_mask_padding_px: int = 1,
+        rng: np.random.Generator | int | None = None,
+        device: str | int = "cpu",
+        verbose: int | bool = True,
+        normalization_order: int = 0,
+    ):
+        """
+        Build from an ungridded stack of diffraction patterns and their probe positions.
+
+        Every kernel here is a multiplier on the scan-space Fourier transform, which needs a
+        regular grid. So the bright-field images are resampled onto one first, by splatting
+        them at their probe positions with no aberration shift and dividing by the
+        accumulated weight. Once gridded, SSB, OBF, matched-filter and iCoM all run exactly
+        as they do for a raster scan.
+
+        Parameters
+        ----------
+        dataset : Dataset3d
+            ``(N, Qx, Qy)`` diffraction patterns, reciprocal units ``"A^-1"`` or ``"mrad"``.
+        positions : Dataset2d, torch.Tensor or ndarray
+            ``(N, 2)`` probe positions in Angstrom, ordered ``(row, col)`` to match the
+            diffraction axes. A ``Dataset2d`` must carry units ``"A"``.
+        rotation_angle : float
+            Detector rotation in degrees. Required: rotation is otherwise estimated from the
+            curl of the center of mass over a 2D scan grid, which an ungridded scan lacks.
+        scan_sampling : tuple of float or "auto"
+            Grid pixel size in Angstrom. ``"auto"`` uses the median nearest-neighbour
+            position spacing and warns with the inferred value.
+        scan_gpts : tuple of int, optional
+            Grid size. Defaults to whatever just covers the positions at ``scan_sampling``.
+        interpolation : {"bilinear", "nearest"}
+            Deposition scheme for the regridding. ``"bilinear"`` by default, since it leaves
+            far fewer unvisited pixels than snapping does.
+
+        Notes
+        -----
+        Regridding is the only approximation, and its failure mode is holes: a grid pixel no
+        probe reached stays zero, and the FFT reads that as signal. A warning reports the
+        fraction, and a coarser ``scan_gpts`` is the usual fix.
+
+        :class:`~quantem.diffractive_imaging.shadow_montage_ptychography.ShadowMontagePtychography`
+        needs no grid at all, and is the better choice for a sparse or strongly irregular
+        scan -- at the cost of the parallax kernel being the only exact one there.
+        """
+        vbf_stack, positions_px, bf_mask_dataset, fitted_gpts, scan_sampling, rotation_angle = (
+            build_vbf_stack_from_dataset3d(
+                dataset,
+                positions,
+                scan_sampling,
+                device=device,
+                max_batch_size=max_batch_size,
+                fit_method=fit_method,
+                mode=mode,
+                force_measured_origin=force_measured_origin,
+                force_fitted_origin=force_fitted_origin,
+                rotation_angle=rotation_angle,
+                intensity_threshold=intensity_threshold,
+                normalization_order=normalization_order,
+            )
+        )
+
+        if scan_gpts is None:
+            scan_gpts = fitted_gpts
+        else:
+            scan_gpts = tuple(int(n) for n in scan_gpts)
+            # rescale the positions so a requested grid still spans the same field of view
+            positions_px = positions_px * (
+                np.asarray(scan_gpts, dtype=np.float64) / np.asarray(fitted_gpts, dtype=np.float64)
+            )
+            scan_sampling = tuple(
+                s * f / n for s, f, n in zip(scan_sampling, fitted_gpts, scan_gpts)
+            )
+
+        gridded, hole_fraction, _ = regrid_vbf_stack(
+            vbf_stack, positions_px, scan_gpts, interpolation=interpolation
+        )
+        if verbose:
+            print(
+                f"Regridded {vbf_stack.shape[1]} positions onto {scan_gpts[0]}x{scan_gpts[1]}; "
+                f"{hole_fraction:.1%} of grid pixels unvisited."
+            )
+
+        vbf_dataset = Dataset3d.from_array(
+            gridded.cpu().numpy(),
+            name="regridded virtual BF stack",
+            sampling=(1.0, *scan_sampling),
+            units=("index", "A", "A"),
+        )
+
+        return cls.from_virtual_bfs(
+            vbf_dataset=vbf_dataset,
+            bf_mask_dataset=bf_mask_dataset,
+            energy=energy,
+            rotation_angle=rotation_angle,
+            semiangle_cutoff=semiangle_cutoff,
+            aberration_coefs=aberration_coefs,
+            soft_edges=soft_edges,
+            crop_bf_mask=crop_bf_mask,
+            bf_mask_padding_px=bf_mask_padding_px,
+            rng=rng,
+            device=device,
+            verbose=verbose,
         )
 
     def _preprocess(

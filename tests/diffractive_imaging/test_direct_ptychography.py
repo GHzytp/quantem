@@ -5,6 +5,8 @@ four hyperparameter-fitting routines, and save/load. Synthetic data comes from
 ``conftest.py``: a white-noise pure-phase object imaged with a defocused soft aperture.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -27,6 +29,7 @@ from .conftest import (
     direct_ptycho_kwargs,
     integer_shift_defocus,
     make_dataset4d,
+    scan_positions_px,
 )
 
 TRUE_C10 = integer_shift_defocus(1)
@@ -499,3 +502,155 @@ class TestDatasetVariants:
             losses[scale] = float(recon.variance_loss())
 
         assert min(losses, key=losses.get) == pytest.approx(1.0)
+
+
+class TestFromDataset3d:
+    """Ungridded scans, by resampling the bright-field stack onto a grid first.
+
+    Every kernel here is a scan-space Fourier multiplier and so needs a regular grid. Once
+    regridded they all run unchanged, which is what makes this exact for positions that were
+    already on a lattice.
+    """
+
+    @staticmethod
+    def _dataset3d(dataset4d):
+        return Dataset3d.from_array(
+            np.asarray(dataset4d.array).reshape(-1, N, N),
+            name="ungridded patterns",
+            sampling=(1.0, dataset4d.sampling[-2], dataset4d.sampling[-1]),
+            units=("index", "A^-1", "A^-1"),
+        )
+
+    @staticmethod
+    def _build(dataset3d, positions, **overrides):
+        kwargs = dict(
+            energy=PROBE_ENERGY,
+            semiangle_cutoff=SEMIANGLE_CUTOFF,
+            rotation_angle=0.0,
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            aberration_coefs={"C10": TRUE_C10},
+            force_fitted_origin=(N // 2, N // 2),
+            verbose=False,
+        )
+        kwargs.update(overrides)
+        return DirectPtychography.from_dataset3d(dataset3d, positions, **kwargs)
+
+    @pytest.mark.parametrize("kernel", DECONVOLUTION_KERNELS)
+    def test_lattice_positions_reproduce_from_dataset4d(self, dataset4d, kernel):
+        """On a lattice the splat is an identity map, so this must be exact."""
+        gridded = _build(dataset4d)
+        ungridded = self._build(self._dataset3d(dataset4d), scan_positions_px() * SCAN_SAMPLING)
+
+        assert ungridded.scan_gpts == gridded.scan_gpts
+        assert np.allclose(
+            ungridded.reconstruct(deconvolution_kernel=kernel, verbose=False).obj,
+            gridded.reconstruct(deconvolution_kernel=kernel, verbose=False).obj,
+            atol=1e-6,
+        )
+
+    def test_position_axis_order_is_row_col(self, dataset4d):
+        """Swapping the columns must transpose the regridded stack, not scramble it.
+
+        Checked with no aberrations, so the parallax shifts vanish. With a shift present the
+        relation does not hold: the shifts come from the detector k-grid, which transposing
+        the *positions* leaves alone.
+        """
+        dataset3d = self._dataset3d(dataset4d)
+        positions = scan_positions_px() * SCAN_SAMPLING
+        flat = dict(aberration_coefs={}, scan_gpts=(N, N))
+
+        row_col = self._build(dataset3d, positions, **flat)
+        col_row = self._build(dataset3d, positions[:, ::-1].copy(), **flat)
+
+        assert np.allclose(
+            to_numpy(col_row.vbf_stack),
+            to_numpy(row_col.vbf_stack).transpose(0, 2, 1),
+            atol=1e-5,
+        )
+
+    def test_jittered_positions_recover_the_object(self, dataset4d):
+        rng = np.random.default_rng(0)
+        positions = scan_positions_px() * SCAN_SAMPLING
+        positions = positions + rng.uniform(-0.3, 0.3, positions.shape) * SCAN_SAMPLING
+
+        reconstruction = self._build(self._dataset3d(dataset4d), positions, scan_gpts=(N, N))
+        obj = reconstruction.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+
+        assert correlation(obj, band_limited_phase()) > 0.5
+
+    def test_warns_when_the_grid_has_holes(self, dataset4d):
+        """A pixel no probe reached stays zero, and the FFT reads that as signal."""
+        positions = scan_positions_px() * SCAN_SAMPLING
+
+        with pytest.warns(UserWarning, match="received no probe position"):
+            self._build(self._dataset3d(dataset4d), positions, scan_gpts=(3 * N, 3 * N))
+
+    def test_no_warning_on_a_fully_covered_grid(self, dataset4d):
+        positions = scan_positions_px() * SCAN_SAMPLING
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            self._build(self._dataset3d(dataset4d), positions)
+
+    def test_requested_grid_keeps_the_field_of_view(self, dataset4d):
+        """A finer grid must upsample the same area, not crop it."""
+        positions = scan_positions_px() * SCAN_SAMPLING
+        coarse = self._build(self._dataset3d(dataset4d), positions)
+        with pytest.warns(UserWarning, match="received no probe position"):
+            finer = self._build(self._dataset3d(dataset4d), positions, scan_gpts=(2 * N, 2 * N))
+
+        assert finer.scan_gpts == (2 * N, 2 * N)
+        assert finer.fov == pytest.approx(coarse.fov)
+
+    def test_auto_scan_sampling_warns_and_infers(self, dataset4d):
+        positions = scan_positions_px() * SCAN_SAMPLING
+
+        with pytest.warns(UserWarning, match="Inferred scan_sampling"):
+            reconstruction = self._build(
+                self._dataset3d(dataset4d), positions, scan_sampling="auto"
+            )
+
+        assert reconstruction.scan_sampling[0] == pytest.approx(SCAN_SAMPLING)
+
+    def test_accepts_a_dataset2d_of_positions(self, dataset4d):
+        positions = Dataset2d.from_array(
+            scan_positions_px() * SCAN_SAMPLING,
+            name="positions",
+            sampling=(1.0, 1.0),
+            units=("A", "A"),
+        )
+        reconstruction = self._build(self._dataset3d(dataset4d), positions)
+
+        assert reconstruction.scan_gpts == (N, N)
+
+    def test_rejects_positions_in_the_wrong_units(self, dataset4d):
+        positions = Dataset2d.from_array(
+            scan_positions_px() * SCAN_SAMPLING,
+            name="positions",
+            sampling=(1.0, 1.0),
+            units=("nm", "nm"),
+        )
+        with pytest.raises(ValueError, match="must be given in 'A'"):
+            self._build(self._dataset3d(dataset4d), positions)
+
+    def test_rejects_mismatched_position_count(self, dataset4d):
+        with pytest.raises(ValueError, match="rows but `dataset` has"):
+            self._build(self._dataset3d(dataset4d), scan_positions_px()[:10] * SCAN_SAMPLING)
+
+    def test_rejects_linear_normalization(self, dataset4d):
+        with pytest.raises(ValueError, match="needs a scan grid"):
+            self._build(
+                self._dataset3d(dataset4d),
+                scan_positions_px() * SCAN_SAMPLING,
+                normalization_order=1,
+            )
+
+    def test_survives_a_serialization_round_trip(self, dataset4d, tmp_path):
+        reconstruction = self._build(
+            self._dataset3d(dataset4d), scan_positions_px() * SCAN_SAMPLING
+        )
+        reconstruction.reconstruct(deconvolution_kernel="prlx", verbose=False)
+        path = tmp_path / "ungridded.zip"
+        reconstruction.save(path, mode="o")
+
+        assert np.allclose(load(path).obj, reconstruction.obj)
