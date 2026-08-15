@@ -22,6 +22,7 @@ from quantem.diffractive_imaging import (
 from quantem.diffractive_imaging.complex_probe import spatial_frequencies
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     allocate_splat_buffers,
+    scatter_add_convolve,
     scatter_add_splat,
 )
 
@@ -177,6 +178,46 @@ class TestSplatKernel:
         with pytest.raises(ValueError, match="interpolation"):
             scatter_add_splat(values, coords, (8, 8), interpolation="cubic")
 
+    def test_convolve_with_a_unit_tap_is_a_plain_splat(self):
+        values = torch.tensor([[1.0, 2.0]])
+        coords = torch.tensor([[[3.0, 4.0], [5.0, 6.0]]])
+
+        out = scatter_add_convolve(
+            values,
+            coords,
+            (8, 8),
+            torch.tensor([[0, 0]]),
+            torch.ones(1, 1, dtype=torch.complex64),
+        ).reshape(8, 8)
+
+        assert out[3, 4].item() == pytest.approx(1.0)
+        assert out[5, 6].item() == pytest.approx(2.0)
+
+    def test_convolve_places_each_tap_at_its_offset(self):
+        offsets = torch.tensor([[0, 0], [1, 0], [0, -2]])
+        weights = torch.tensor([[1.0, 2.0j, -3.0]], dtype=torch.complex64)
+
+        out = scatter_add_convolve(
+            torch.tensor([[1.0]]), torch.tensor([[[4.0, 4.0]]]), (8, 8), offsets, weights
+        ).reshape(8, 8)
+
+        assert out[4, 4].item() == pytest.approx(1.0)
+        assert out[5, 4].item() == pytest.approx(2.0j)
+        assert out[4, 2].item() == pytest.approx(-3.0)
+        assert int((out != 0).sum()) == 3
+
+    def test_convolve_wraps_taps_at_the_boundary(self):
+        out = scatter_add_convolve(
+            torch.tensor([[1.0]]),
+            torch.tensor([[[0.0, 0.0]]]),
+            (8, 8),
+            torch.tensor([[-1, -1]]),
+            torch.ones(1, 1, dtype=torch.complex64),
+            boundary="wrap",
+        ).reshape(8, 8)
+
+        assert out[7, 7].item() == pytest.approx(1.0)
+
 
 class TestIntegerShiftConstruction:
     """The defocus used below must put every BF pixel on an exact canvas pixel."""
@@ -310,10 +351,19 @@ class TestFourierEquivalence:
 
         assert _relative_error(halves[0] + halves[1], full) < 1e-4
 
-    def test_rejects_non_parallax_kernels(self, dataset4d):
+    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    def test_accepts_the_deconvolution_kernels(self, dataset4d, kernel):
+        """Available as truncated real-space convolutions; see `TestRealSpaceKernels`."""
         _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-        with pytest.raises(ValueError, match="only implements the parallax kernel"):
-            montage.reconstruct(deconvolution_kernel="ssb", verbose=False)
+
+        obj = montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=6, verbose=False).obj
+
+        assert np.isfinite(obj).all()
+
+    def test_rejects_icom(self, dataset4d):
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        with pytest.raises(ValueError, match="unbounded"):
+            montage.reconstruct(deconvolution_kernel="icom", verbose=False)
 
 
 class TestRotationConvention:
@@ -1082,3 +1132,190 @@ class TestDefocusGradient:
         montage.save(path, mode="o")
 
         assert load(path).defocus_gradient == (7.0, -3.0)
+
+
+class TestRealSpaceKernels:
+    """SSB / OBF / MF as truncated real-space convolutions.
+
+    `obj = sum_m ifft2(G_m * K_m) = sum_m (v_m conv kappa_m)` is an identity, so truncating
+    `kappa_m` to a box stencil is the *only* approximation: with a large enough stencil these
+    must reproduce `DirectPtychography` exactly.
+
+    They converge slowly. Dividing by `|gamma|` leaves a unit-magnitude phase on a hard-edged
+    support, whose transform has `r**-1.5` tails, so the error falls like 1/radius -- and
+    being in focus does not help, since there is no chirp to concentrate the kernel.
+    """
+
+    KERNELS = ("ssb", "obf", "mf")
+    MAX_RADIUS = 15  # canvas half-width for the 32x32 fixture
+
+    @staticmethod
+    def _pair(dataset4d):
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
+        return (
+            DirectPtychography.from_dataset4d(dataset4d, **kwargs),
+            ShadowMontagePtychography.from_dataset4d(dataset4d, boundary="wrap", **kwargs),
+        )
+
+    @pytest.mark.parametrize("kernel", KERNELS)
+    def test_converges_to_the_fourier_kernel(self, dataset4d, kernel):
+        fourier, montage = self._pair(dataset4d)
+        reference = fourier.reconstruct(deconvolution_kernel=kernel, verbose=False).obj
+
+        errors = []
+        for radius in (4, 8, self.MAX_RADIUS):
+            obj = montage.reconstruct(
+                deconvolution_kernel=kernel,
+                stencil_radius=radius,
+                interpolation="nearest",
+                verbose=False,
+            ).obj
+            errors.append(_relative_error(obj, reference))
+
+        assert errors[0] > errors[1] > errors[2]
+        assert errors[-1] < 2e-2
+
+    @pytest.mark.parametrize("kernel", KERNELS)
+    def test_reported_error_bounds_the_measured_one(self, dataset4d, kernel):
+        """The estimate assumes a white object spectrum, so it must be conservative."""
+        fourier, montage = self._pair(dataset4d)
+        reference = fourier.reconstruct(deconvolution_kernel=kernel, verbose=False).obj
+
+        obj = montage.reconstruct(
+            deconvolution_kernel=kernel,
+            stencil_radius=8,
+            interpolation="nearest",
+            verbose=False,
+        ).obj
+
+        assert _relative_error(obj, reference) < montage._stencil_info["mean_error"]
+
+    def test_a_box_stencil_beats_a_tapered_one(self, dataset4d):
+        """Pins a counterintuitive choice: tapering the stencil measures consistently worse.
+
+        A Hann taper discards mid-radius content that matters more than the ringing it
+        suppresses, so do not "improve" the box away.
+        """
+        fourier, montage = self._pair(dataset4d)
+        reference = fourier.reconstruct(deconvolution_kernel="ssb", verbose=False).obj
+        radius = 8
+
+        boxed = montage.reconstruct(
+            deconvolution_kernel="ssb",
+            stencil_radius=radius,
+            interpolation="nearest",
+            verbose=False,
+        ).obj
+
+        # rebuild the same stencil, taper it, and run the same accumulation by hand
+        bf = montage._return_bf_context(montage.bf_mask)
+        shifts, _ = montage._return_shifts_px(0.0, montage.aberration_coefs, bf.bf_mask, 1)
+        offsets, weights, bf_weights, _ = montage._return_kernel_stencil(
+            bf,
+            kernel="ssb",
+            rotation_angle=0.0,
+            aberration_coefs=montage.aberration_coefs,
+            canvas_shape=montage._canvas_shape,
+            upsampling_factor=1,
+            shift_centers=shifts.round(),
+            stencil_radius=radius,
+            truncation_tolerance=1.0,
+            max_stencil_radius=radius,
+            matched_filter_norm_epsilon=1e-1,
+            kernel_batch_size=16,
+            verbose=False,
+        )
+        distance = offsets.to(torch.float64).abs().amax(-1)
+        taper = 0.5 * (1 + torch.cos(np.pi * distance / (radius + 1)))
+        canvas_shape = montage._canvas_shape
+
+        accumulator = torch.zeros(
+            canvas_shape[0] * canvas_shape[1], device=montage.device, dtype=torch.complex64
+        )
+        coords = montage.positions_px[None] + shifts.round()[:, None]
+        scatter_add_convolve(
+            montage.vbf_stack,
+            coords,
+            canvas_shape,
+            offsets,
+            weights * taper[None, :],
+            boundary="wrap",
+            interpolation="nearest",
+            out=accumulator,
+        )
+        tapered = to_numpy(accumulator.real.reshape(canvas_shape) / bf_weights)
+
+        assert _relative_error(boxed, reference) < _relative_error(tapered, reference)
+
+    def test_warns_when_the_tolerance_cannot_be_met(self, dataset4d):
+        _, montage = self._pair(dataset4d)
+
+        with pytest.warns(UserWarning, match="truncation error"):
+            montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=2, verbose=False)
+
+    def test_auto_respects_the_radius_cap(self, dataset4d):
+        _, montage = self._pair(dataset4d)
+
+        with pytest.warns(UserWarning, match="truncation error"):
+            montage.reconstruct(
+                deconvolution_kernel="ssb",
+                stencil_radius="auto",
+                max_stencil_radius=3,
+                verbose=False,
+            )
+
+        assert montage._stencil_info["stencil_radius"] <= 3
+
+    def test_auto_reports_what_it_chose(self, dataset4d):
+        _, montage = self._pair(dataset4d)
+        montage.reconstruct(deconvolution_kernel="ssb", verbose=False)
+
+        info = montage._stencil_info
+        assert info["stencil_radius"] >= 1
+        assert 0.0 <= info["mean_error"] <= info["max_error"]
+
+    @pytest.mark.parametrize("kernel", KERNELS)
+    def test_variance_loss_is_undefined(self, dataset4d, kernel):
+        _, montage = self._pair(dataset4d)
+        montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=4, verbose=False)
+
+        with pytest.raises(NotImplementedError, match="only defined for the parallax"):
+            montage.variance_loss()
+
+    def test_variance_loss_returns_after_a_parallax_reconstruction(self, dataset4d):
+        _, montage = self._pair(dataset4d)
+        montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=4, verbose=False)
+        montage.reconstruct(verbose=False)
+
+        assert float(montage.variance_loss()) > 0
+
+    def test_icom_is_rejected(self, dataset4d):
+        _, montage = self._pair(dataset4d)
+
+        with pytest.raises(ValueError, match="unbounded"):
+            montage.reconstruct(deconvolution_kernel="icom", verbose=False)
+
+    def test_phase_flip_is_not_applied_to_deconvolution_kernels(self, dataset4d):
+        """The kernels already invert the contrast transfer, as in `DirectPtychography`."""
+        _, montage = self._pair(dataset4d)
+        common = dict(deconvolution_kernel="ssb", stencil_radius=4, verbose=False)
+
+        flipped = montage.reconstruct(parallax_flip_phase=True, **common).obj
+        unflipped = montage.reconstruct(parallax_flip_phase=False, **common).obj
+
+        assert np.array_equal(flipped, unflipped)
+
+    def test_stencil_covers_the_parallax_shift_without_growing(self, dataset4d):
+        """The shift is divided out of the kernel, so the stencil sizes the residual only."""
+        _, montage = self._pair(dataset4d)
+        montage.reconstruct(deconvolution_kernel="ssb", verbose=False)
+        modest_defocus = montage._stencil_info["stencil_radius"]
+
+        montage.reconstruct(
+            deconvolution_kernel="ssb",
+            override_aberration_coefs={"C10": integer_shift_defocus(3)},
+            verbose=False,
+        )
+
+        assert montage._stencil_info["stencil_radius"] <= modest_defocus + 2

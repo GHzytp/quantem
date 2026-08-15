@@ -18,6 +18,7 @@ from quantem.diffractive_imaging.complex_probe import (
     aberration_surface,
     aberration_surface_cartesian_gradients,
     evaluate_probe,
+    gamma_factor,
     polar_coordinates,
     spatial_frequencies,
 )
@@ -37,6 +38,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     build_vbf_stack_from_dataset4d,
     fit_and_shift_diffraction_origin,
     normalize_vbf_stack,
+    scatter_add_convolve,
     scatter_add_splat,
 )
 from quantem.diffractive_imaging.direct_ptychography_base import DirectPtychographyBase
@@ -67,9 +69,12 @@ class ShadowMontagePtychography(DirectPtychographyBase):
       see :attr:`defocus_gradient` and :meth:`fit_defocus_gradient`. A Fourier multiplier is
       global over the scan by construction and cannot express this.
 
-    Only the parallax kernel is available here. SSB, OBF and matched-filter deconvolutions
-    have bright-field-dependent Fourier multipliers that are not translations, so they
-    cannot be expressed as a real-space montage; use ``DirectPtychography`` for those.
+    The parallax kernel is a pure translation and is exact. SSB, OBF and matched-filter
+    deconvolutions are convolutions rather than translations, and are available here through
+    a truncated real-space stencil -- correct in the limit, but slowly converging and far
+    more expensive than the FFT they replace. On a gridded scan prefer
+    ``DirectPtychography``, which computes them exactly; the reason they exist here is an
+    ungridded scan.
 
     Instantiate with :meth:`from_dataset4d`, :meth:`from_virtual_bfs` or
     :meth:`from_dataset3d`.
@@ -578,20 +583,23 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self._canvas_origin_px = None
         self._canvas_fov = None
         self._bf_weights = None
+        self._kernel = "prlx"
+        self._stencil_info = None
 
     # ------------------------------------------------------------------
     # reconstruction
     # ------------------------------------------------------------------
 
     def _return_k_grid(self, rotation_angle):
-        """Polar detector coordinates on the rotated k-grid."""
+        """``(kxa, kya, k, phi)`` on the rotated detector k-grid."""
         kxa, kya = spatial_frequencies(
             self.gpts,
             self.sampling,
             rotation_angle=_rotation_degrees_to_radians(rotation_angle),
             device=self.device,
         )
-        return polar_coordinates(kxa, kya)
+        k, phi = polar_coordinates(kxa, kya)
+        return kxa, kya, k, phi
 
     def _upsampled_sampling(self, upsampling_factor) -> torch.Tensor:
         return torch.as_tensor(
@@ -609,7 +617,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         ``aberration_surface_cartesian_gradients`` rather than hand-coding the analytic
         ``wavelength * k`` keeps it tied to the same expression the Fourier class uses.
         """
-        k, phi = self._return_k_grid(rotation_angle)
+        _, _, k, phi = self._return_k_grid(rotation_angle)
         dx, dy = aberration_surface_cartesian_gradients(
             k * self.wavelength, phi, aberration_coefs={"C10": 1.0}
         )
@@ -635,7 +643,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
     def _return_shifts_px(self, rotation_angle, aberration_coefs, bf_mask, upsampling_factor):
         """``(num_bf, 2)`` parallax shifts in upsampled canvas pixels, plus the BF weight."""
-        k, phi = self._return_k_grid(rotation_angle)
+        _, _, k, phi = self._return_k_grid(rotation_angle)
 
         dx, dy = aberration_surface_cartesian_gradients(
             k * self.wavelength,
@@ -678,6 +686,184 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             torch.minimum(at_min, at_max).amin(0),
             torch.maximum(at_min, at_max).amax(0),
         )
+
+    def _return_kernel_fourier(
+        self, batch_idx, bf, kernel, qxa, qya, kxa, kya, cmplx_probe_k, aberration_coefs, norm
+    ):
+        """``(B, Ny, Nx)`` Fourier deconvolution kernel for a batch of bright-field pixels.
+
+        Mirrors ``DirectPtychography._return_kernel_contributions`` term for term, minus the
+        data, so the two classes cannot drift apart.
+        """
+        ind_i = bf.bf_inds_i[batch_idx]
+        ind_j = bf.bf_inds_j[batch_idx]
+        kx = kxa[ind_i, ind_j].view(-1, 1, 1)
+        ky = kya[ind_i, ind_j].view(-1, 1, 1)
+
+        gamma = gamma_factor(
+            (qxa.unsqueeze(0) - kx, qya.unsqueeze(0) - ky),
+            (qxa.unsqueeze(0) + kx, qya.unsqueeze(0) + ky),
+            cmplx_probe_k[ind_i, ind_j].view(-1, 1, 1),
+            self.wavelength,
+            self.semiangle_cutoff,
+            self.soft_edges,
+            angular_sampling=self.angular_sampling,
+            aberration_coefs=aberration_coefs,
+            normalize=False,
+        )
+
+        if kernel == "ssb":
+            return -1.0j * gamma.conj() / gamma.abs().clip(1e-8), gamma
+        return -1.0j * gamma.conj() / (1.0 if norm is None else norm), gamma
+
+    def _return_kernel_stencil(
+        self,
+        bf,
+        *,
+        kernel,
+        rotation_angle,
+        aberration_coefs,
+        canvas_shape,
+        upsampling_factor,
+        shift_centers,
+        stencil_radius,
+        truncation_tolerance,
+        max_stencil_radius,
+        matched_filter_norm_epsilon,
+        kernel_batch_size,
+        verbose,
+    ):
+        """``(stencil_offsets, stencil_weights, bf_weights, info)`` for a convolution kernel.
+
+        Builds each bright-field pixel's Fourier kernel on the canvas grid, transforms it to
+        real space and truncates it to a box stencil. Costs ``num_bf`` canvas FFTs once per
+        reconstruction, negligible beside the scatter that follows.
+
+        ``shift_centers`` is the integer parallax shift, which is divided out of the kernel
+        by a phase ramp and added back to the deposit coordinates. Without it the stencil
+        would have to span the shift itself -- tens of pixels at realistic defocus -- rather
+        than just the residual chirp and aperture ringing.
+        """
+        upsampled_sampling = tuple(s / upsampling_factor for s in self.scan_sampling)
+        qxa, qya = spatial_frequencies(canvas_shape, upsampled_sampling, device=self.device)
+        kxa, kya, k, phi = self._return_k_grid(rotation_angle)
+
+        cmplx_probe_k = evaluate_probe(
+            k * self.wavelength,
+            phi,
+            self.semiangle_cutoff,
+            self.angular_sampling,
+            self.wavelength,
+            aberration_coefs=aberration_coefs,
+        )
+        bf_weights = cmplx_probe_k[bf.bf_mask].abs().square().sum()
+
+        n_rows, n_cols = canvas_shape
+        radius_limit = max(1, min(n_rows, n_cols) // 2 - 1)
+
+        def batches():
+            return SimpleBatcher(
+                bf.num_bf, batch_size=kernel_batch_size, shuffle=False, rng=self.rng
+            )
+
+        kernel_args = (bf, kernel, qxa, qya, kxa, kya, cmplx_probe_k, aberration_coefs)
+
+        # obf and mf normalize by a power spectrum summed over every bright-field pixel, so
+        # they need a pass over all of them before any kernel is final
+        norm = None
+        if kernel in ("obf", "mf"):
+            power = torch.zeros(canvas_shape, device=self.device)
+            for batch_idx in batches():
+                _, gamma = self._return_kernel_fourier(batch_idx, *kernel_args, None)
+                power += gamma.abs().square().sum(0)
+            power /= bf_weights
+            if kernel == "obf":
+                norm = power.sqrt().clamp_min(1e-8)
+            else:
+                norm = (power + matched_filter_norm_epsilon * power.max()).clamp_min(1e-8)
+
+        # exp(2i.pi.c.m/N) rolls kappa by -c, undoing the parallax shift
+        freq_row = torch.fft.fftfreq(n_rows, device=self.device).view(-1, 1)
+        freq_col = torch.fft.fftfreq(n_cols, device=self.device).view(1, -1)
+
+        def recentered_kappa(batch_idx):
+            kernel_fourier, _ = self._return_kernel_fourier(batch_idx, *kernel_args, norm)
+            centers = shift_centers[batch_idx].to(torch.float32)
+            ramp = torch.exp(
+                2j
+                * math.pi
+                * (centers[:, 0, None, None] * freq_row + centers[:, 1, None, None] * freq_col)
+            )
+            return torch.fft.fftshift(torch.fft.ifft2(kernel_fourier * ramp), dim=(-2, -1))
+
+        center = (n_rows // 2, n_cols // 2)
+        rows = torch.arange(n_rows, device=self.device).view(-1, 1) - center[0]
+        cols = torch.arange(n_cols, device=self.device).view(1, -1) - center[1]
+        chebyshev = torch.maximum(rows.abs(), cols.abs())
+
+        # first pass: cumulative energy inside each candidate box, per bright-field pixel.
+        # only these scalars are kept, so the full-canvas kernels never all exist at once
+        candidates = list(range(1, min(max_stencil_radius, radius_limit) + 1))
+        if stencil_radius != "auto":
+            candidates = [min(int(stencil_radius), radius_limit)]
+
+        inside = torch.zeros((bf.num_bf, len(candidates)), device=self.device)
+        total = torch.zeros(bf.num_bf, device=self.device)
+        for batch_idx in tqdm(list(batches()), disable=not verbose, desc=f"{kernel} kernel"):
+            energy = recentered_kappa(batch_idx).abs().square()
+            total[batch_idx] = energy.sum((-2, -1))
+            for column, candidate in enumerate(candidates):
+                inside[batch_idx, column] = (energy * (chebyshev <= candidate)).sum((-2, -1))
+
+        errors = 1 - inside / total.clamp_min(torch.finfo(total.dtype).tiny)[:, None]
+        errors = errors.clamp_min(0).sqrt()
+
+        mean_errors = errors.mean(0)
+        if stencil_radius == "auto":
+            meets = (mean_errors <= truncation_tolerance).nonzero()
+            column = int(meets[0]) if meets.numel() else len(candidates) - 1
+        else:
+            column = 0
+        radius = candidates[column]
+
+        info = {
+            "stencil_radius": radius,
+            "mean_error": float(mean_errors[column]),
+            "max_error": float(errors[:, column].max()),
+        }
+
+        if info["mean_error"] > truncation_tolerance:
+            warnings.warn(
+                f"A stencil radius of {radius} px leaves an estimated "
+                f"{info['mean_error']:.0%} truncation error (worst bright-field pixel "
+                f"{info['max_error']:.0%}). The {kernel.upper()} kernel is not compact in "
+                "real space -- dividing by |gamma| leaves a phase on a hard-edged support, "
+                "whose transform has tails decaying as r**-1.5, so the error falls only like "
+                "1/radius and being in focus does not help. DirectPtychography computes the "
+                "same kernel exactly by FFT; prefer it unless the scan is ungridded. This "
+                "estimate assumes a white object spectrum, so it is pessimistic for a real "
+                "one.",
+                stacklevel=3,
+            )
+
+        # second pass: crop to the chosen box
+        window = (
+            slice(center[0] - radius, center[0] + radius + 1),
+            slice(center[1] - radius, center[1] + radius + 1),
+        )
+        side = 2 * radius + 1
+        stencil_weights = torch.empty(
+            (bf.num_bf, side * side), device=self.device, dtype=torch.complex64
+        )
+        for batch_idx in batches():
+            stencil_weights[batch_idx] = recentered_kappa(batch_idx)[
+                :, window[0], window[1]
+            ].reshape(len(batch_idx), -1)
+
+        span = torch.arange(-radius, radius + 1, device=self.device)
+        offsets = torch.stack(torch.meshgrid(span, span, indexing="ij"), dim=-1).reshape(-1, 2)
+
+        return offsets, stencil_weights, bf_weights, info
 
     def _return_canvas(
         self,
@@ -744,6 +930,11 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         pad_px=None,
         compute_variance=True,
         suppress_nyquist=False,
+        stencil_radius="auto",
+        truncation_tolerance=0.1,
+        max_stencil_radius=32,
+        matched_filter_norm_epsilon=1e-1,
+        kernel_batch_size=16,
     ):
         """
         Accumulate the shadow montage and apply the post-hoc Fourier filters.
@@ -763,8 +954,11 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             Number of bright-field pixels splatted at once. Defaults to a memory-bounded
             chunk of roughly four million ``(BF pixel, scan position)`` points.
         deconvolution_kernel : str
-            Only the parallax aliases (``"prlx"``, ``"parallax"``, ``"tcbf"``, ...) are
-            supported; other kernels are not real-space translations.
+            ``"prlx"`` (and its aliases) is a pure translation and is exact. ``"ssb"``,
+            ``"obf"`` and ``"mf"`` are convolutions, evaluated here with a truncated
+            real-space stencil -- see ``stencil_radius``. ``"icom"`` is rejected: its
+            ``k . q / |q|**2`` kernel is unbounded as ``q -> 0`` and has no useful
+            truncation.
         q_highpass, q_lowpass : float, optional
             Butterworth filter cutoffs, applied once to the finished image.
         parallax_flip_phase : bool
@@ -827,10 +1021,35 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             Zero the Nyquist row and column of the phase-flip filter. Off by default, to
             match ``DirectPtychography``; turn it on for odd-order aberrations, where
             ``sign(sin(chi))`` is not symmetric and leaves a checkerboard artifact.
+        stencil_radius : int or "auto"
+            Half-width of the box stencil used by the ``ssb`` / ``obf`` / ``mf`` kernels,
+            in canvas pixels. ``"auto"`` grows it until the estimated truncation error meets
+            ``truncation_tolerance``, capped at ``max_stencil_radius``.
+
+            A box is used deliberately, with no taper: tapering measures consistently
+            *worse* at equal radius (0.40 versus 0.29 relative error at radius 8, 20 mrad in
+            focus), because it discards mid-radius content that matters more than the ringing
+            it suppresses.
+        truncation_tolerance : float
+            Target relative operator error for ``stencil_radius="auto"``. A warning reports
+            the achieved error whenever it cannot be met.
+        max_stencil_radius : int
+            Cap on the automatic radius. Cost scales with its square.
+        matched_filter_norm_epsilon : float
+            Regularization of the ``mf`` power normalization, as in ``DirectPtychography``.
+        kernel_batch_size : int
+            Bright-field pixels whose real-space kernels are built at once.
 
         Returns
         -------
         self
+
+        Notes
+        -----
+        The convolution kernels are far more expensive than the parallax one -- a stencil of
+        radius ``R`` costs ``(2R+1)**2`` deposits per point against 1 -- and they converge
+        slowly, so on a gridded scan ``DirectPtychography`` is both exact and faster. Their
+        reason to exist here is an ungridded scan.
         """
         state = self.hyperparameter_state
 
@@ -855,12 +1074,11 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             aberration_coefs = state.current_aberrations(override_aberration_coefs)
             rotation_angle = state.current_rotation_angle(override_rotation_angle)
 
-        if self._normalize_kernel_name(deconvolution_kernel) != "prlx":
+        kernel = self._normalize_kernel_name(deconvolution_kernel)
+        if kernel == "icom":
             raise ValueError(
-                f"{type(self).__name__} only implements the parallax kernel, got "
-                f"{deconvolution_kernel!r}. SSB, OBF and matched-filter deconvolutions have "
-                "bright-field-dependent Fourier multipliers that are not real-space "
-                "translations; use DirectPtychography for those."
+                "The iCoM kernel `k . q / |q|**2` is unbounded as q -> 0, so its real-space "
+                "form has no useful truncation; use DirectPtychography for it."
             )
 
         if upsampling_factor is None:
@@ -901,10 +1119,50 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         if max_batch_size is None:
             max_batch_size = max(1, _DEFAULT_POINTS_PER_BATCH // max(self.num_positions, 1))
 
-        buffers = allocate_splat_buffers(
-            canvas_shape, self.device, accumulate_squares=compute_variance
-        )
         coords_base = self._positions_px * upsampling_factor - canvas_origin
+        self._reset_reconstruction()
+        self._kernel = kernel
+
+        if kernel == "prlx":
+            stencil_offsets = stencil_weights = None
+            deposit_shifts = shifts_px
+            self._stencil_info = None
+        else:
+            # the kernel carries the parallax shift in its phase; deposit at its integer part
+            # and leave only the residual in the stencil
+            deposit_shifts = shifts_px.round()
+            stencil_offsets, stencil_weights, bf_weights, self._stencil_info = (
+                self._return_kernel_stencil(
+                    bf,
+                    kernel=kernel,
+                    rotation_angle=rotation_angle,
+                    aberration_coefs=aberration_coefs,
+                    canvas_shape=canvas_shape,
+                    upsampling_factor=upsampling_factor,
+                    shift_centers=deposit_shifts,
+                    stencil_radius=stencil_radius,
+                    truncation_tolerance=truncation_tolerance,
+                    max_stencil_radius=max_stencil_radius,
+                    matched_filter_norm_epsilon=matched_filter_norm_epsilon,
+                    kernel_batch_size=kernel_batch_size,
+                    verbose=verbose,
+                )
+            )
+            # a stencil of S taps costs S deposits per point, so shrink the batch to match
+            max_batch_size = max(1, max_batch_size // max(len(stencil_offsets), 1))
+
+        buffers = (
+            allocate_splat_buffers(canvas_shape, self.device, accumulate_squares=compute_variance)
+            if kernel == "prlx"
+            else None
+        )
+        accumulator = (
+            None
+            if kernel == "prlx"
+            else torch.zeros(
+                canvas_shape[0] * canvas_shape[1], device=self.device, dtype=torch.complex64
+            )
+        )
 
         pbar = tqdm(range(bf.num_bf), disable=not verbose)
         batcher = SimpleBatcher(bf.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng)
@@ -912,36 +1170,52 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         for batch_idx in batcher:
             mapped_idx = bf.vbf_index_mapping[batch_idx]
             values = self._vbf_stack[mapped_idx]  # (B, N_pos)
-            coords = coords_base[None] + shifts_px[batch_idx][:, None]  # (B, N_pos, 2)
+            coords = coords_base[None] + deposit_shifts[batch_idx][:, None]  # (B, N_pos, 2)
             if delta_c10 is not None:
                 # each position gets its own defocus, hence its own shift; the shift is
                 # exactly linear in C10, so this is one broadcast add rather than a re-fit
                 coords = coords + defocus_rate_px[batch_idx][:, None, :] * delta_c10[None, :, None]
 
-            scatter_add_splat(
-                values,
-                coords,
-                canvas_shape,
-                boundary=boundary,
-                interpolation=interpolation,
-                out=buffers,
-            )
+            if kernel == "prlx":
+                scatter_add_splat(
+                    values,
+                    coords,
+                    canvas_shape,
+                    boundary=boundary,
+                    interpolation=interpolation,
+                    out=buffers,
+                )
+            else:
+                scatter_add_convolve(
+                    values,
+                    coords,
+                    canvas_shape,
+                    stencil_offsets,
+                    stencil_weights[batch_idx],
+                    boundary=boundary,
+                    interpolation=interpolation,
+                    out=accumulator,
+                )
             pbar.update(len(batch_idx))
         pbar.close()
 
-        self._sum_w, self._sum_wv, self._sum_wv2 = buffers
         self._canvas_shape = canvas_shape
         self._canvas_origin_px = canvas_origin
         self._canvas_fov = canvas_fov
         self._bf_weights = bf_weights
 
-        # normalization must precede filtering: dividing by the (spatially varying) weight
-        # map is not linear, so it does not commute with the Fourier filters below
-        if weight_normalize:
-            mean, _, support = self._weighted_moments(weight_threshold)
-            obj = (mean * support).reshape(canvas_shape)
+        if kernel != "prlx":
+            # matches DirectPtychography, which takes the real part of the summed stack
+            obj = accumulator.real.reshape(canvas_shape) / bf_weights
         else:
-            obj = self._sum_wv.reshape(canvas_shape) / bf_weights
+            self._sum_w, self._sum_wv, self._sum_wv2 = buffers
+            # normalization must precede filtering: dividing by the (spatially varying)
+            # weight map is not linear, so it does not commute with the Fourier filters below
+            if weight_normalize:
+                mean, _, support = self._weighted_moments(weight_threshold)
+                obj = (mean * support).reshape(canvas_shape)
+            else:
+                obj = self._sum_wv.reshape(canvas_shape) / bf_weights
 
         obj = self._apply_fourier_filters(
             obj,
@@ -950,7 +1224,10 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             q_lowpass=q_lowpass,
             q_highpass=q_highpass,
             butterworth_order=butterworth_order,
-            parallax_flip_phase=parallax_flip_phase,
+            # the phase flip corrects the parallax kernel's contrast transfer; the
+            # deconvolution kernels already invert it, and DirectPtychography likewise
+            # applies it only to `prlx`
+            parallax_flip_phase=parallax_flip_phase and kernel == "prlx",
             suppress_nyquist=suppress_nyquist,
         )
         self._corrected_bf = obj.to(torch.float32)
@@ -1079,6 +1356,14 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         neighbouring source pixels. Prefer ``upsampling_factor=1`` and
         ``parallax_flip_phase=False`` when driving a hyperparameter search.
         """
+        if self._kernel != "prlx":
+            raise NotImplementedError(
+                f"variance_loss is only defined for the parallax kernel, not {self._kernel!r}: "
+                "the convolution kernels deposit complex weights that are not a partition of "
+                "unity, so there is no per-pixel spread across bright-field images to take. "
+                "Drive hyperparameter searches with the parallax kernel, as "
+                "DirectPtychography.fit_hyperparameters_cross_correlation does."
+            )
         if self._sum_w is None or self._sum_wv2 is None:
             return None
         return self._variance_loss_from_buffers(self._sum_w, self._sum_wv, self._sum_wv2)

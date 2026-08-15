@@ -672,6 +672,37 @@ def allocate_splat_buffers(
     return _zeros(), _zeros(), _zeros() if accumulate_squares else None
 
 
+def _deposition_corners(coords: torch.Tensor, interpolation: str):
+    """``(base, frac, corners)`` for a sub-pixel deposition scheme.
+
+    ``frac`` is ``None`` for nearest-neighbour, where every corner weight is one.
+    """
+    if interpolation == "bilinear":
+        base = torch.floor(coords)
+        return base, coords - base, _BILINEAR_CORNERS
+    if interpolation == "nearest":
+        return torch.round(coords), None, ((0, 0),)
+    raise ValueError(f"`interpolation` must be 'bilinear' or 'nearest', got {interpolation!r}")
+
+
+def _resolve_indices(row, col, weights, n_rows: int, n_cols: int, boundary: str):
+    """Apply the boundary rule and flatten to ``(flat_indices, weights)``."""
+    if boundary == "wrap":
+        row = row % n_rows
+        col = col % n_cols
+    elif boundary == "pad":
+        # clamp the indices and zero their weights instead of masking, which would
+        # need a `nonzero()` and hence a device->host synchronization
+        valid = (row >= 0) & (row < n_rows) & (col >= 0) & (col < n_cols)
+        row = row.clamp(0, n_rows - 1)
+        col = col.clamp(0, n_cols - 1)
+        weights = weights * valid
+    else:
+        raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
+
+    return (row * n_cols + col).reshape(-1), weights
+
+
 def scatter_add_splat(
     values: torch.Tensor,
     coords: torch.Tensor,
@@ -728,24 +759,11 @@ def scatter_add_splat(
     values = values.to(dtype)
     coords = coords.to(dtype)
 
-    if interpolation == "bilinear":
-        base = torch.floor(coords)
-        frac = coords - base
-        corners = _BILINEAR_CORNERS
-    elif interpolation == "nearest":
-        base = torch.round(coords)
-        frac = None
-        corners = ((0, 0),)
-    else:
-        raise ValueError(f"`interpolation` must be 'bilinear' or 'nearest', got {interpolation!r}")
-
+    base, frac, corners = _deposition_corners(coords, interpolation)
     base_row = base[..., 0].to(torch.int64)
     base_col = base[..., 1].to(torch.int64)
 
     for d_row, d_col in corners:
-        row = base_row + d_row
-        col = base_col + d_col
-
         if frac is None:
             weights = torch.ones_like(values)
         else:
@@ -754,20 +772,9 @@ def scatter_add_splat(
             weights = w_row * w_col
             weights = weights.expand_as(values) if weights.shape != values.shape else weights
 
-        if boundary == "wrap":
-            row = row % n_rows
-            col = col % n_cols
-        elif boundary == "pad":
-            # clamp the indices and zero their weights instead of masking, which would
-            # need a `nonzero()` and hence a device->host synchronization
-            valid = (row >= 0) & (row < n_rows) & (col >= 0) & (col < n_cols)
-            row = row.clamp(0, n_rows - 1)
-            col = col.clamp(0, n_cols - 1)
-            weights = weights * valid
-        else:
-            raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
-
-        flat_indices = (row * n_cols + col).reshape(-1)
+        flat_indices, weights = _resolve_indices(
+            base_row + d_row, base_col + d_col, weights, n_rows, n_cols, boundary
+        )
         flat_weights = weights.reshape(-1)
         flat_values = values.reshape(-1)
 
@@ -777,6 +784,94 @@ def scatter_add_splat(
             sum_wv2.index_add_(0, flat_indices, flat_weights * flat_values * flat_values)
 
     return sum_w, sum_wv, sum_wv2
+
+
+def scatter_add_convolve(
+    values: torch.Tensor,
+    coords: torch.Tensor,
+    canvas_shape: tuple[int, int],
+    stencil_offsets: torch.Tensor,
+    stencil_weights: torch.Tensor,
+    *,
+    boundary: Literal["wrap", "pad"] = "wrap",
+    interpolation: Literal["bilinear", "nearest"] = "bilinear",
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Scatter-add each value onto a canvas spread over a complex convolution stencil.
+
+    Where :func:`scatter_add_splat` deposits a value at a point, this deposits
+    ``value * stencil_weights[b, s]`` at ``coords + stencil_offsets[s]`` for every tap ``s``
+    -- the real-space form of multiplying a bright-field image by a Fourier kernel. The
+    parallax kernel is the special case of a single tap of weight one, which is why the
+    montage is cheap; SSB and OBF kernels need hundreds of taps.
+
+    Kept separate from :func:`scatter_add_splat` rather than folded into it: the accumulator
+    here is complex, and the weight and sum-of-squares buffers that drive
+    ``variance_loss`` have no meaning when the taps are kernel weights rather than a
+    partition of unity.
+
+    Parameters
+    ----------
+    values : torch.Tensor
+        ``(B, T)`` values to deposit.
+    coords : torch.Tensor
+        ``(B, T, 2)`` canvas coordinates in pixels, ordered ``(row, col)``.
+    canvas_shape : tuple of int
+        ``(n_rows, n_cols)`` of the output canvas.
+    stencil_offsets : torch.Tensor
+        ``(S, 2)`` integer pixel offsets of the stencil taps.
+    stencil_weights : torch.Tensor
+        ``(B, S)`` complex weight of each tap, per batch element.
+    out : torch.Tensor, optional
+        Flat complex ``(n_rows * n_cols,)`` accumulator to add into.
+
+    Returns
+    -------
+    torch.Tensor
+        The flat complex accumulator.
+
+    Notes
+    -----
+    Taps are looped over rather than broadcast, so peak memory stays ``O(B * T)`` however
+    large the stencil is. ``index_add_`` uses atomics on CUDA and is not bit-reproducible
+    there.
+    """
+    n_rows, n_cols = int(canvas_shape[0]), int(canvas_shape[1])
+
+    if out is None:
+        out = torch.zeros(n_rows * n_cols, device=values.device, dtype=torch.complex64)
+    values = values.to(out.dtype)
+    stencil_weights = stencil_weights.to(out.dtype)
+
+    base, frac, corners = _deposition_corners(coords, interpolation)
+    base_row = base[..., 0].to(torch.int64)
+    base_col = base[..., 1].to(torch.int64)
+
+    for d_row, d_col in corners:
+        if frac is None:
+            corner_weight = None
+        else:
+            w_row = frac[..., 0] if d_row else 1 - frac[..., 0]
+            w_col = frac[..., 1] if d_col else 1 - frac[..., 1]
+            corner_weight = (w_row * w_col).to(out.dtype)
+
+        for tap, (s_row, s_col) in enumerate(stencil_offsets.tolist()):
+            contribution = values * stencil_weights[:, tap : tap + 1]
+            if corner_weight is not None:
+                contribution = contribution * corner_weight
+
+            flat_indices, contribution = _resolve_indices(
+                base_row + d_row + int(s_row),
+                base_col + d_col + int(s_col),
+                contribution,
+                n_rows,
+                n_cols,
+                boundary,
+            )
+            out.index_add_(0, flat_indices, contribution.reshape(-1))
+
+    return out
 
 
 def fit_and_shift_diffraction_origin(
