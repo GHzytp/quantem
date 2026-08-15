@@ -98,7 +98,12 @@ def scan_positions_px() -> np.ndarray:
 
 
 def simulate_intensities(complex_obj: np.ndarray, probe: np.ndarray) -> np.ndarray:
-    """``(N_pos, N, N)`` diffraction intensities, corner-centered in reciprocal space."""
+    """``(N_pos, N, N)`` diffraction intensities, corner-centered in reciprocal space.
+
+    ``probe`` is either a single ``(N, N)`` array or a ``(N_pos, N, N)`` stack, which
+    broadcasts against the extracted object patches and gives every scan position its own
+    probe -- how a tilted sample is simulated.
+    """
     positions_px = scan_positions_px()
     x0 = np.round(positions_px[:, 0]).astype(int)
     y0 = np.round(positions_px[:, 1]).astype(int)
@@ -130,6 +135,147 @@ def make_dataset4d(defocus: float | None = None, seed: int = 42) -> Dataset4d:
         name="synthetic 4D-STEM",
         sampling=(SCAN_SAMPLING, SCAN_SAMPLING, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
         units=("A", "A", "A^-1", "A^-1"),
+    )
+
+
+def defocus_per_position(mean_defocus: float, defocus_gradient: tuple[float, float]) -> np.ndarray:
+    """``(N_pos,)`` local defocus for a tilted sample, mean-zero about the scan centroid.
+
+    Matches ``ShadowMontagePtychography._return_delta_c10``: the offset is measured from the
+    centroid of the scan positions in Angstrom, in the unrotated scan frame.
+    """
+    positions_ang = scan_positions_px() * SCAN_SAMPLING
+    offsets = positions_ang - positions_ang.mean(axis=0)
+    return mean_defocus + offsets @ np.asarray(defocus_gradient, dtype=np.float64)
+
+
+def make_tilted_dataset4d(
+    mean_defocus: float,
+    defocus_gradient: tuple[float, float],
+    seed: int = 42,
+) -> Dataset4d:
+    """4D-STEM dataset whose defocus varies linearly across the field of view.
+
+    The gradients used in the tests look enormous as tilts -- at this fixture's 32 Angstrom
+    field of view a gradient of 12.7 A/A is needed to swing the parallax shift by a single
+    scan pixel. That is an artifact of the tiny synthetic scan, not of the method: it is only
+    a +/-12% swing on the ~1625 A baseline defocus.
+    """
+    complex_obj = make_complex_obj(seed)
+    defocus = defocus_per_position(mean_defocus, defocus_gradient)
+    probes = np.stack([make_probe_array(float(d)) for d in defocus])
+    intensities = simulate_intensities(complex_obj, probes)
+
+    n = N // SCAN_STEP_SIZE
+    array = np.fft.fftshift(intensities * 100, axes=(-2, -1)).reshape((n, n, N, N))
+
+    return Dataset4d.from_array(
+        array.astype(np.float32),
+        name="synthetic tilted 4D-STEM",
+        sampling=(SCAN_SAMPLING, SCAN_SAMPLING, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+        units=("A", "A", "A^-1", "A^-1"),
+    )
+
+
+def _bilinear_sample_periodic(image: np.ndarray, coords: np.ndarray) -> np.ndarray:
+    """Sample ``image`` at fractional ``(..., 2)`` coordinates, wrapping at the edges."""
+    n_rows, n_cols = image.shape
+    base = np.floor(coords)
+    frac = coords - base
+    base = base.astype(np.int64)
+
+    out = np.zeros(coords.shape[:-1], dtype=np.float64)
+    for d_row, d_col in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        w_row = frac[..., 0] if d_row else 1 - frac[..., 0]
+        w_col = frac[..., 1] if d_col else 1 - frac[..., 1]
+        out += (
+            w_row * w_col * image[(base[..., 0] + d_row) % n_rows, (base[..., 1] + d_col) % n_cols]
+        )
+    return out
+
+
+def make_model_vbf_stack(
+    mean_defocus: float,
+    defocus_gradient: tuple[float, float] = (0.0, 0.0),
+    scan_gpts: tuple[int, int] = (96, 96),
+    seed: int = 42,
+):
+    """Virtual bright-field stack built directly from the parallax model, at any scan size.
+
+    Returns ``(vbf_dataset, bf_mask_dataset, object_phase)``.
+
+    Every image is ``v_m(r) = object[r + shift_m(C10(r))]``, the relation the montage inverts
+    -- the ``+`` sign was measured against the 4D pipeline, where a bright-field image
+    correlates with ``obj[r + shift]`` at 0.30 versus 0.09 for ``obj[r - shift]``.
+
+    The full 4D simulator cannot be used for the position-dependent tests: its 32x32 scan
+    only affords ~16-position patches, and at that size the per-patch defocus estimator has a
+    ~430 Angstrom bias -- larger than the signal, as the zero-gradient control shows. This
+    builds the same relation at whatever scan size the estimator needs, cheaply.
+
+    Bright-field pixels are ordered by ``np.nonzero`` over the corner-centered mask, which is
+    the order ``torch.nonzero`` gives in ``_return_bf_context``. Pass ``crop_bf_mask=False``
+    so the class uses this mask verbatim and the ordering is preserved.
+    """
+    from quantem.core.datastructures import Dataset2d, Dataset3d
+
+    wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+
+    # detector grid just large enough to hold the bright-field disk
+    radius_px = int(round(Q_PROBE / RECIPROCAL_SAMPLING))
+    n_det = 2 * radius_px + 3
+    centered = np.hypot(*np.meshgrid(*(np.arange(n_det) - n_det // 2,) * 2, indexing="ij"))
+    bf_mask = np.fft.ifftshift(centered <= radius_px)
+
+    # k = m * reciprocal_sampling exactly, independent of the grid size
+    freqs = np.fft.fftfreq(n_det, 1 / (RECIPROCAL_SAMPLING * n_det))
+    inds_i, inds_j = np.nonzero(bf_mask)
+    k_vec = np.stack((freqs[inds_i], freqs[inds_j]), axis=-1)  # (num_bf, 2)
+
+    rng = np.random.default_rng(seed)
+    phase = rng.random(scan_gpts)
+    qx = np.fft.fftfreq(scan_gpts[0], SCAN_SAMPLING)
+    qy = np.fft.fftfreq(scan_gpts[1], SCAN_SAMPLING)
+    q = np.hypot(qx[:, None], qy[None, :])
+    obj = np.fft.ifft2(np.fft.fft2(phase) * (q <= 2 * Q_PROBE)).real
+    obj -= obj.mean()
+
+    ii, jj = np.meshgrid(np.arange(scan_gpts[0]), np.arange(scan_gpts[1]), indexing="ij")
+    positions_px = np.stack((ii.ravel(), jj.ravel()), axis=-1).astype(np.float64)
+
+    offsets_ang = (positions_px - positions_px.mean(0)) * SCAN_SAMPLING
+    c10 = mean_defocus + offsets_ang @ np.asarray(defocus_gradient, dtype=np.float64)
+
+    # shift_px[m, n] = wavelength * C10[n] * k[m] / scan_sampling
+    shifts = (
+        wavelength * c10[None, :, None] * k_vec[:, None, :] / SCAN_SAMPLING
+    )  # (num_bf, N_pos, 2)
+    stack = _bilinear_sample_periodic(obj, positions_px[None] + shifts)
+
+    vbf_dataset = Dataset3d.from_array(
+        stack.reshape(len(k_vec), *scan_gpts).astype(np.float32),
+        name="model virtual BF stack",
+        sampling=(1.0, SCAN_SAMPLING, SCAN_SAMPLING),
+        units=("index", "A", "A"),
+    )
+    bf_mask_dataset = Dataset2d.from_array(
+        bf_mask,
+        name="BF mask",
+        sampling=(RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+        units=("A^-1", "A^-1"),
+    )
+    return vbf_dataset, bf_mask_dataset, obj
+
+
+def model_vbf_kwargs(defocus: float) -> dict:
+    """Constructor kwargs for a stack from :func:`make_model_vbf_stack`."""
+    return dict(
+        energy=PROBE_ENERGY,
+        semiangle_cutoff=SEMIANGLE_CUTOFF,
+        rotation_angle=0.0,
+        aberration_coefs={"C10": defocus},
+        crop_bf_mask=False,
+        verbose=False,
     )
 
 

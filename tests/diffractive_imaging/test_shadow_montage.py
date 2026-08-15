@@ -19,6 +19,7 @@ from quantem.diffractive_imaging import (
     OptimizationParameter,
     ShadowMontagePtychography,
 )
+from quantem.diffractive_imaging.complex_probe import spatial_frequencies
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     allocate_splat_buffers,
     scatter_add_splat,
@@ -30,12 +31,30 @@ from .conftest import (
     RECIPROCAL_SAMPLING,
     SCAN_SAMPLING,
     N,
+    band_limited_phase,
+    correlation,
     integer_shift_defocus,
+    make_model_vbf_stack,
+    make_tilted_dataset4d,
+    model_vbf_kwargs,
     scan_positions_px,
 )
 from .conftest import (
     direct_ptycho_kwargs as _common_kwargs,
 )
+
+#: defocus and scan size at which the per-patch estimator is well conditioned; see
+#: `make_model_vbf_stack` for why the 32x32 4D fixture is not
+MODEL_DEFOCUS = 3000.0
+MODEL_SCAN_GPTS = (96, 96)
+MODEL_C10_GRID = np.linspace(1500.0, 4500.0, 13)
+
+
+def _model_montage(defocus_gradient, defocus=MODEL_DEFOCUS):
+    """A montage over a model vBF stack with a seeded defocus plane, plus the ground truth."""
+    vbf, bf_mask, obj = make_model_vbf_stack(defocus, defocus_gradient, scan_gpts=MODEL_SCAN_GPTS)
+    montage = ShadowMontagePtychography.from_virtual_bfs(vbf, bf_mask, **model_vbf_kwargs(defocus))
+    return montage, obj
 
 
 def _build_pair(dataset4d, defocus):
@@ -778,3 +797,288 @@ class TestSemiangleCutoff:
                 force_fitted_origin=ORIGIN,
                 verbose=False,
             )
+
+
+class TestDefocusGradient:
+    """Position-dependent defocus, for a tilted sample.
+
+    The montage shifts each scan position by its own local defocus. A Fourier multiplier is
+    global over the scan by construction, so `DirectPtychography` has no counterpart to
+    compare against; these check the model relation directly instead.
+    """
+
+    def test_none_and_zero_are_the_same_reconstruction(self, dataset4d):
+        """The gradient must be a no-op when absent -- guards the fast path."""
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+
+        without = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        with_zero = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, defocus_gradient=(0.0, 0.0), **kwargs
+        )
+
+        assert np.array_equal(
+            without.reconstruct(verbose=False).obj,
+            with_zero.reconstruct(verbose=False).obj,
+        )
+
+    def test_defocus_rate_is_the_analytic_lambda_k(self, dataset4d):
+        """`d shift / d C10 = wavelength * k`, independent of the other aberrations."""
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, **_common_kwargs(integer_shift_defocus(1))
+        )
+        rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
+
+        kxa, kya = spatial_frequencies(montage.gpts, montage.sampling, device=montage.device)
+        scan_sampling = torch.as_tensor(
+            tuple(montage.scan_sampling), dtype=torch.float64, device=montage.device
+        )
+        expected = (
+            torch.stack((kxa[montage.bf_mask], kya[montage.bf_mask]), -1).to(torch.float64)
+            * montage.wavelength
+            / scan_sampling
+        )
+
+        assert torch.allclose(rate, expected, atol=1e-9)
+
+    def test_defocus_rate_ignores_other_aberrations(self, dataset4d):
+        """chi is linear in every magnitude, so the rate cannot depend on the rest."""
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, **_common_kwargs(integer_shift_defocus(1))
+        )
+        rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
+
+        base = {"C10": 500.0, "C12": 40.0, "phi12": 0.7, "C30": 1.2e5}
+        shifted = montage._return_shifts_px(0.0, {**base, "C10": 501.0}, montage.bf_mask, 1)[0]
+        unshifted = montage._return_shifts_px(0.0, base, montage.bf_mask, 1)[0]
+
+        assert torch.allclose(shifted - unshifted, rate, atol=1e-6)
+
+    def test_delta_defocus_is_mean_zero(self, dataset4d):
+        """Measuring from the centroid keeps the gradient orthogonal to the global C10."""
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, **_common_kwargs(integer_shift_defocus(1))
+        )
+        delta = montage._return_delta_c10((7.0, -3.0))
+
+        assert delta is not None
+        assert float(delta.mean().abs()) < 1e-9
+        assert float(delta.abs().max()) > 0
+
+    def test_zero_gradient_short_circuits(self, dataset4d):
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, **_common_kwargs(integer_shift_defocus(1))
+        )
+        assert montage._return_delta_c10(None) is None
+        assert montage._return_delta_c10((0.0, 0.0)) is None
+
+    def test_padded_canvas_covers_the_gradient(self, dataset4d):
+        """A gradient widens the range of shifts, so `"pad"` must grow to match."""
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
+
+        flat = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        tilted = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, defocus_gradient=(30.0, -10.0), **kwargs
+        )
+
+        flat_shape = flat.reconstruct(boundary="pad", verbose=False).obj.shape
+        tilted_shape = tilted.reconstruct(boundary="pad", verbose=False).obj.shape
+
+        assert tilted_shape[0] > flat_shape[0]
+        assert tilted_shape[1] > flat_shape[1]
+
+    def test_shift_extrema_match_a_brute_force_scan(self, dataset4d):
+        """The closed form must bound every (BF pixel, position) pair, with no slack."""
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, **_common_kwargs(integer_shift_defocus(1))
+        )
+        gradient = (30.0, -10.0)
+        shifts = montage._return_shifts_px(0.0, montage.aberration_coefs, montage.bf_mask, 1)[0]
+        rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
+        delta = montage._return_delta_c10(gradient)
+
+        lo, hi = ShadowMontagePtychography._return_shift_extrema(shifts, rate, delta)
+        brute = shifts[:, None, :] + rate[:, None, :] * delta[None, :, None]
+
+        assert torch.allclose(lo, brute.amin((0, 1)))
+        assert torch.allclose(hi, brute.amax((0, 1)))
+
+    def test_sign_convention_on_simulated_tilted_data(self):
+        """On real 4D data a negated gradient must be worse than the true one.
+
+        Only the *ordering* is asserted. At this fixture's 32 Angstrom field of view a
+        visible gradient needs a defocus swing so large that the probe size varies threefold
+        across the scan, and the parallax model itself starts to break down -- so
+        "better than no correction at all" is not true here, and is checked on the model
+        stack below instead.
+        """
+        defocus = integer_shift_defocus(1)
+        gradient = (40.0, 0.0)
+        dataset = make_tilted_dataset4d(defocus, gradient)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
+
+        def corr(g):
+            montage = ShadowMontagePtychography.from_dataset4d(
+                dataset, defocus_gradient=g, **kwargs
+            )
+            return correlation(montage.reconstruct(verbose=False).obj, band_limited_phase())
+
+        assert corr(gradient) > corr((-gradient[0], -gradient[1]))
+
+    @pytest.mark.parametrize("gradient", [(20.0, 0.0), (20.0, -10.0), (-15.0, 25.0)])
+    def test_correcting_the_gradient_sharpens_the_reconstruction(self, gradient):
+        montage, obj = _model_montage(gradient)
+        reconstruct = dict(parallax_flip_phase=False, interpolation="bilinear", verbose=False)
+
+        uncorrected = correlation(montage.reconstruct(**reconstruct).obj, obj)
+        corrected = correlation(
+            montage.reconstruct(defocus_gradient=gradient, **reconstruct).obj, obj
+        )
+
+        assert corrected > uncorrected
+        assert corrected > 0.98
+
+    def test_defocus_map_tracks_a_seeded_plane(self):
+        gradient = (20.0, -10.0)
+        montage, _ = _model_montage(gradient)
+
+        results = montage.defocus_map(
+            MODEL_C10_GRID, patch_grid=(3, 3), interpolation="bilinear", verbose=False
+        )
+        expected = MODEL_DEFOCUS + results["centers_A"] @ np.asarray(gradient)
+
+        assert results["valid"].all()
+        # the estimator carries a small uniform offset (~170 A, see the flat control below),
+        # so compare the spatial variation rather than the absolute value
+        recovered = results["c10_best"] - results["c10_best"].mean()
+        assert np.corrcoef(recovered, expected - expected.mean())[0, 1] > 0.99
+
+    def test_defocus_map_is_flat_without_a_gradient(self):
+        """The control that makes the test above meaningful."""
+        montage, _ = _model_montage((0.0, 0.0))
+
+        results = montage.defocus_map(
+            MODEL_C10_GRID, patch_grid=(3, 3), interpolation="bilinear", verbose=False
+        )
+
+        assert np.ptp(results["c10_best"]) < 0.05 * MODEL_DEFOCUS
+
+    @pytest.mark.parametrize("gradient", [(0.0, 0.0), (20.0, -10.0), (-15.0, 25.0)])
+    def test_fit_defocus_gradient_recovers_the_seed(self, gradient):
+        montage, _ = _model_montage(gradient)
+
+        montage.fit_defocus_gradient(
+            MODEL_C10_GRID, patch_grid=(3, 3), interpolation="bilinear", verbose=False
+        )
+
+        assert montage.defocus_gradient is not None
+        scale = max(np.hypot(*gradient), 1.0)
+        assert np.hypot(*np.subtract(montage.defocus_gradient, gradient)) < 0.15 * scale
+
+    def test_fit_defocus_gradient_updates_the_global_defocus(self):
+        montage, _ = _model_montage((20.0, 0.0))
+        montage.hyperparameter_state.optimized_aberrations = {}
+
+        montage.fit_defocus_gradient(
+            MODEL_C10_GRID, patch_grid=(3, 3), interpolation="bilinear", verbose=False
+        )
+
+        assert "C10" in montage.hyperparameter_state.optimized_aberrations
+        assert "C10" in montage.hyperparameter_state.optimized_keys
+
+    def test_fit_defocus_gradient_can_leave_the_defocus_alone(self):
+        montage, _ = _model_montage((20.0, 0.0))
+
+        montage.fit_defocus_gradient(
+            MODEL_C10_GRID,
+            patch_grid=(3, 3),
+            interpolation="bilinear",
+            update_defocus=False,
+            verbose=False,
+        )
+
+        assert montage.hyperparameter_state.optimized_aberrations == {}
+
+    def test_endpoint_pinned_patches_are_invalid(self):
+        """A grid that does not bracket the local defocus must be reported, not fitted."""
+        montage, _ = _model_montage((20.0, 0.0))
+
+        results = montage.defocus_map(
+            np.linspace(3400.0, 4500.0, 6),
+            patch_grid=(3, 3),
+            interpolation="bilinear",
+            verbose=False,
+        )
+
+        assert not results["valid"].all()
+        assert np.isnan(results["c10_best"][~results["valid"]]).all()
+
+    def test_fit_raises_when_too_few_patches_bracket(self):
+        montage, _ = _model_montage((20.0, 0.0))
+
+        with pytest.raises(RuntimeError, match="bracketed minimum"):
+            montage.fit_defocus_gradient(
+                np.linspace(4200.0, 4500.0, 4),
+                patch_grid=(2, 2),
+                interpolation="bilinear",
+                verbose=False,
+            )
+
+    def test_defocus_map_allows_a_one_dimensional_grid(self):
+        """A (P, 1) grid is a profile along one axis -- only the plane fit needs three."""
+        montage, _ = _model_montage((20.0, 0.0))
+
+        results = montage.defocus_map(
+            MODEL_C10_GRID, patch_grid=(3, 1), interpolation="bilinear", verbose=False
+        )
+
+        assert results["c10_best"].shape == (3,)
+
+    def test_defocus_map_rejects_a_degenerate_grid(self):
+        montage, _ = _model_montage((0.0, 0.0))
+
+        with pytest.raises(ValueError, match="must be positive"):
+            montage.defocus_map(MODEL_C10_GRID, patch_grid=(0, 3), verbose=False)
+
+    def test_defocus_map_needs_enough_trial_values(self):
+        montage, _ = _model_montage((0.0, 0.0))
+
+        with pytest.raises(ValueError, match="at least 3 points"):
+            montage.defocus_map([2000.0, 3000.0], patch_grid=(2, 2), verbose=False)
+
+    def test_gradient_is_orthogonal_to_a_global_defocus_search(self):
+        """The API worry: a grid search over C10 must stay well posed with a gradient set."""
+        gradient = (20.0, -10.0)
+        montage, _ = _model_montage(gradient)
+
+        montage.grid_search_hyperparameters(
+            aberration_coefs={
+                "C10": OptimizationParameter(
+                    low=MODEL_DEFOCUS - 900, high=MODEL_DEFOCUS + 900, n_points=7
+                )
+            },
+            defocus_gradient=gradient,
+            interpolation="bilinear",
+            parallax_flip_phase=False,
+            verbose=False,
+        )
+
+        fitted = montage.hyperparameter_state.current_aberrations()["C10"]
+        assert abs(fitted - MODEL_DEFOCUS) < 0.2 * MODEL_DEFOCUS
+
+    def test_rejects_a_malformed_gradient(self, dataset4d):
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, **_common_kwargs(integer_shift_defocus(1))
+        )
+        with pytest.raises(ValueError, match="must be a \\(row, col\\) pair"):
+            montage.defocus_gradient = (1.0, 2.0, 3.0)
+
+    def test_survives_a_serialization_round_trip(self, dataset4d, tmp_path):
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, defocus_gradient=(7.0, -3.0), **_common_kwargs(integer_shift_defocus(1))
+        )
+        path = tmp_path / "montage.zip"
+        montage.save(path, mode="o")
+
+        assert load(path).defocus_gradient == (7.0, -3.0)

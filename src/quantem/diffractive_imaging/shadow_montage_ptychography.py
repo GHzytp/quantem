@@ -10,7 +10,10 @@ from tqdm.auto import tqdm
 from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d
 from quantem.core.utils.utils import electron_wavelength_angstrom
-from quantem.core.utils.validators import validate_tensor
+from quantem.core.utils.validators import (
+    validate_aberration_coefficients,
+    validate_tensor,
+)
 from quantem.diffractive_imaging.complex_probe import (
     aberration_surface,
     aberration_surface_cartesian_gradients,
@@ -54,12 +57,15 @@ class ShadowMontagePtychography(DirectPtychographyBase):
     The two formulations are equivalent: the parallax Fourier multiplier
     ``exp(-1j * grad_chi . q)`` is exactly a translation by ``grad_chi / (2 * pi)`` Angstrom,
     and Fourier-space tiling by ``U`` is exactly real-space zero-insertion at every ``U``-th
-    pixel. Working in real space instead buys two things:
+    pixel. Working in real space instead buys three things:
 
     - no scan-space FFT is needed, so the scan positions need not lie on a grid --
       see :meth:`from_dataset3d`;
     - the phase-flip and Butterworth filters, which do not depend on the bright-field index,
-      collapse into a single post-hoc filter on the finished image.
+      collapse into a single post-hoc filter on the finished image;
+    - each scan position can carry its *own* defocus, which models a tilted sample --
+      see :attr:`defocus_gradient` and :meth:`fit_defocus_gradient`. A Fourier multiplier is
+      global over the scan by construction and cannot express this.
 
     Only the parallax kernel is available here. SSB, OBF and matched-filter deconvolutions
     have bright-field-dependent Fourier multipliers that are not translations, so they
@@ -92,6 +98,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         rng: np.random.Generator | int | None,
         device: str | int,
         verbose: int | bool,
+        defocus_gradient: Tuple[float, float] | None = None,
         _token: object | None = None,
     ):
         """ """
@@ -130,6 +137,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         #: correction that `weight_normalize` applies
         self.gridded_scan = gridded_scan
         self.subtract_frame_mean = subtract_frame_mean
+        self.defocus_gradient = defocus_gradient
         self.rng = rng
 
         if self.positions_px.shape[0] != self.num_positions:
@@ -166,6 +174,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         semiangle_cutoff: float,
         aberration_coefs: dict = {},
         boundary: Literal["wrap", "pad"] = "wrap",
+        defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
@@ -197,6 +206,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             scan_gpts=scan_gpts,
             boundary=boundary,
             gridded_scan=True,
+            defocus_gradient=defocus_gradient,
             subtract_frame_mean=subtract_frame_mean,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
@@ -222,6 +232,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         intensity_threshold: float = 0.5,
         boundary: Literal["wrap", "pad"] = "wrap",
+        defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
@@ -262,6 +273,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             semiangle_cutoff=semiangle_cutoff,
             aberration_coefs=aberration_coefs,
             boundary=boundary,
+            defocus_gradient=defocus_gradient,
             subtract_frame_mean=subtract_frame_mean,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
@@ -288,6 +300,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         intensity_threshold: float = 0.5,
         boundary: Literal["wrap", "pad"] = "pad",
+        defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
@@ -387,6 +400,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             scan_gpts=scan_gpts,
             boundary=boundary,
             gridded_scan=False,
+            defocus_gradient=defocus_gradient,
             subtract_frame_mean=subtract_frame_mean,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
@@ -467,6 +481,41 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self._positions_px = positions
 
     @property
+    def defocus_gradient(self) -> Tuple[float, float] | None:
+        """``(d C10 / d row, d C10 / d col)`` in Angstrom per Angstrom, or ``None``.
+
+        Models a tilted sample, whose defocus varies linearly across the field of view as
+        ``C10(r) = C10_global + g . (r - r_centroid)``. The magnitude is the tangent of the
+        sample tilt, so a 5 degree tilt is ``|g| = 0.087``.
+
+        Measuring from the centroid of the scan positions makes ``mean(delta C10) = 0``
+        exactly, so the gradient is orthogonal to the global ``C10``: a hyperparameter search
+        over ``C10`` stays well posed with a gradient set.
+
+        This only matters when the defocus swing across the field of view is comparable to
+        the depth of field ``wavelength / semiangle**2`` -- about 1200 Angstrom at 4 mrad,
+        where it is irrelevant, but only 22 Angstrom at 30 mrad, where it dominates.
+        """
+        return self._defocus_gradient
+
+    @defocus_gradient.setter
+    def defocus_gradient(self, value):
+        if value is None:
+            self._defocus_gradient = None
+            return
+        value = tuple(float(v) for v in np.asarray(value, dtype=np.float64).reshape(-1))
+        if len(value) != 2:
+            raise ValueError(
+                f"`defocus_gradient` must be a (row, col) pair or None, got {value!r}"
+            )
+        self._defocus_gradient = value
+
+    @property
+    def positions_centroid_px(self) -> torch.Tensor:
+        """Centroid of the scan positions, in canvas pixels. Where ``delta C10`` vanishes."""
+        return self._positions_px.mean(dim=0)
+
+    @property
     def corrected_bf(self) -> torch.Tensor | None:
         """Reconstructed phase image, or ``None`` before :meth:`reconstruct`."""
         return self._corrected_bf
@@ -534,15 +583,59 @@ class ShadowMontagePtychography(DirectPtychographyBase):
     # reconstruction
     # ------------------------------------------------------------------
 
-    def _return_shifts_px(self, rotation_angle, aberration_coefs, bf_mask, upsampling_factor):
-        """``(num_bf, 2)`` parallax shifts in upsampled canvas pixels, plus the BF weight."""
+    def _return_k_grid(self, rotation_angle):
+        """Polar detector coordinates on the rotated k-grid."""
         kxa, kya = spatial_frequencies(
             self.gpts,
             self.sampling,
             rotation_angle=_rotation_degrees_to_radians(rotation_angle),
             device=self.device,
         )
-        k, phi = polar_coordinates(kxa, kya)
+        return polar_coordinates(kxa, kya)
+
+    def _upsampled_sampling(self, upsampling_factor) -> torch.Tensor:
+        return torch.as_tensor(
+            [s / upsampling_factor for s in self.scan_sampling],
+            device=self.device,
+            dtype=torch.float64,
+        )
+
+    def _return_defocus_rate_px(self, rotation_angle, bf_mask, upsampling_factor):
+        """``(num_bf, 2)`` change in lateral shift per Angstrom of defocus, in canvas pixels.
+
+        ``chi`` is linear in every aberration magnitude, so the rate is exactly the shift of
+        a unit ``C10`` and is *independent of all other aberrations* -- hence the absent
+        ``aberration_coefs`` argument. Evaluating it through
+        ``aberration_surface_cartesian_gradients`` rather than hand-coding the analytic
+        ``wavelength * k`` keeps it tied to the same expression the Fourier class uses.
+        """
+        k, phi = self._return_k_grid(rotation_angle)
+        dx, dy = aberration_surface_cartesian_gradients(
+            k * self.wavelength, phi, aberration_coefs={"C10": 1.0}
+        )
+        rate = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
+        return rate.to(torch.float64) / (2 * math.pi) / self._upsampled_sampling(upsampling_factor)
+
+    def _return_delta_c10(self, defocus_gradient) -> torch.Tensor | None:
+        """``(N_pos,)`` local defocus offset in Angstrom, or ``None`` for no gradient.
+
+        The positions are taken in the **unrotated** scan frame: defocus varies with physical
+        position on the specimen, whereas the detector rotation belongs to the k-grid in
+        :meth:`_return_defocus_rate_px`. Rotating here as well would double-count it.
+        """
+        if defocus_gradient is None or (defocus_gradient[0] == 0.0 and defocus_gradient[1] == 0.0):
+            return None
+
+        scan_sampling = torch.as_tensor(
+            tuple(self.scan_sampling), device=self.device, dtype=torch.float64
+        )
+        offsets_ang = (self._positions_px - self.positions_centroid_px) * scan_sampling
+        gradient = torch.as_tensor(defocus_gradient, device=self.device, dtype=torch.float64)
+        return offsets_ang @ gradient
+
+    def _return_shifts_px(self, rotation_angle, aberration_coefs, bf_mask, upsampling_factor):
+        """``(num_bf, 2)`` parallax shifts in upsampled canvas pixels, plus the BF weight."""
+        k, phi = self._return_k_grid(rotation_angle)
 
         dx, dy = aberration_surface_cartesian_gradients(
             k * self.wavelength,
@@ -551,11 +644,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         )
         grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
 
-        upsampled_sampling = torch.as_tensor(
-            [s / upsampling_factor for s in self.scan_sampling],
-            device=self.device,
-            dtype=torch.float64,
-        )
+        upsampled_sampling = self._upsampled_sampling(upsampling_factor)
         shifts_px = grad_k.to(torch.float64) / (2 * math.pi) / upsampled_sampling
 
         # matches DirectPtychography.reconstruct: soft_edges is left at evaluate_probe's
@@ -572,13 +661,40 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         return shifts_px, bf_weights
 
-    def _return_canvas(self, shifts_px, upsampling_factor, boundary, pad_px):
+    @staticmethod
+    def _return_shift_extrema(shifts_px, defocus_rate_px, delta_c10):
+        """``(lo, hi)`` over every ``(bright-field pixel, scan position)`` shift.
+
+        The total shift is ``shifts[m] + rate[m] * delta_c10[n]``, which is monotone in
+        ``delta_c10``, so its extrema over ``n`` are attained at the extremes of
+        ``delta_c10`` and there is no need to materialize the ``(num_bf, N_pos, 2)`` array.
+        """
+        if delta_c10 is None:
+            return shifts_px.amin(0), shifts_px.amax(0)
+
+        at_min = shifts_px + defocus_rate_px * delta_c10.min()
+        at_max = shifts_px + defocus_rate_px * delta_c10.max()
+        return (
+            torch.minimum(at_min, at_max).amin(0),
+            torch.maximum(at_min, at_max).amax(0),
+        )
+
+    def _return_canvas(
+        self,
+        shifts_px,
+        upsampling_factor,
+        boundary,
+        pad_px,
+        defocus_rate_px=None,
+        delta_c10=None,
+    ):
         """``(canvas_shape, canvas_origin_px, canvas_fov)`` for the requested boundary.
 
         The field of view is returned alongside the shape, rather than recomputed later,
         so the two cannot disagree about the upsampling factor.
         """
         positions_up = self._positions_px * upsampling_factor
+        shift_lo, shift_hi = self._return_shift_extrema(shifts_px, defocus_rate_px, delta_c10)
 
         def with_fov(canvas_shape, origin):
             canvas_fov = tuple(
@@ -596,8 +712,8 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
 
         if pad_px is None:
-            lo = torch.floor(positions_up.amin(0) + shifts_px.amin(0))
-            hi = torch.ceil(positions_up.amax(0) + shifts_px.amax(0))
+            lo = torch.floor(positions_up.amin(0) + shift_lo)
+            hi = torch.ceil(positions_up.amax(0) + shift_hi)
         else:
             lo = torch.floor(positions_up.amin(0)) - pad_px
             hi = torch.ceil(positions_up.amax(0)) + pad_px
@@ -621,6 +737,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         verbose=None,
         use_initial_state=False,
         boundary=None,
+        defocus_gradient=None,
         interpolation="nearest",
         weight_normalize=None,
         weight_threshold=1e-2,
@@ -656,6 +773,17 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             ``"wrap"`` wraps the montage periodically over the scan grid and reproduces
             ``DirectPtychography``; ``"pad"`` grows the canvas to cover the shifted positions
             and drops nothing. Defaults to the value chosen at construction.
+        defocus_gradient : tuple of float, optional
+            ``(d C10 / d row, d C10 / d col)`` in Angstrom per Angstrom, for a tilted sample
+            whose defocus varies across the field of view. Defaults to
+            :attr:`defocus_gradient`; pass ``(0.0, 0.0)`` to disable it for one call.
+
+            Each scan position is then shifted by its *own* local defocus, which no Fourier
+            formulation can express -- ``exp(-1j * grad_chi . q)`` is a global multiplier,
+            and a position-dependent shift is not a Fourier multiplier at all.
+
+            The post-hoc ``sign(sin(chi(q)))`` phase flip still uses the global (aplanatic)
+            ``C10``; a space-variant contrast-transfer correction is not attempted.
         interpolation : {"nearest", "bilinear"}
             Sub-pixel deposition scheme.
 
@@ -745,6 +873,10 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         if boundary is None:
             boundary = self.boundary
+        if defocus_gradient is None:
+            defocus_gradient = self.defocus_gradient
+        if verbose and defocus_gradient is not None:
+            print(f"  defocus_gradient={tuple(defocus_gradient)!r} A/A,")
         if weight_normalize is None:
             # density correction matters for an ungridded scan; on a raster it would only
             # amplify noise at the low-weight edges of a padded canvas
@@ -753,8 +885,17 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         shifts_px, bf_weights = self._return_shifts_px(
             rotation_angle, aberration_coefs, bf.bf_mask, upsampling_factor
         )
+
+        delta_c10 = self._return_delta_c10(defocus_gradient)
+        if delta_c10 is None:
+            defocus_rate_px = None
+        else:
+            defocus_rate_px = self._return_defocus_rate_px(
+                rotation_angle, bf.bf_mask, upsampling_factor
+            )
+
         canvas_shape, canvas_origin, canvas_fov = self._return_canvas(
-            shifts_px, upsampling_factor, boundary, pad_px
+            shifts_px, upsampling_factor, boundary, pad_px, defocus_rate_px, delta_c10
         )
 
         if max_batch_size is None:
@@ -772,6 +913,10 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             mapped_idx = bf.vbf_index_mapping[batch_idx]
             values = self._vbf_stack[mapped_idx]  # (B, N_pos)
             coords = coords_base[None] + shifts_px[batch_idx][:, None]  # (B, N_pos, 2)
+            if delta_c10 is not None:
+                # each position gets its own defocus, hence its own shift; the shift is
+                # exactly linear in C10, so this is one broadcast add rather than a re-fit
+                coords = coords + defocus_rate_px[batch_idx][:, None, :] * delta_c10[None, :, None]
 
             scatter_add_splat(
                 values,
@@ -871,20 +1016,18 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         return torch.fft.ifft2(torch.fft.fft2(obj) * filt.to(obj.dtype)).real
 
-    def _weighted_moments(self, weight_threshold: float = 1e-2):
-        """``(mean, variance, support)`` per canvas pixel, as flat tensors."""
-        w = self._sum_w
-        if w is None or self._sum_wv is None:
-            raise RuntimeError("Run reconstruct() before asking for the accumulated moments.")
-
+    @staticmethod
+    def _moments_from_buffers(sum_w, sum_wv, sum_wv2, weight_threshold: float = 1e-2):
+        """``(mean, variance, support)`` per canvas pixel, from raw splat accumulators."""
+        w = sum_w
         tiny = torch.finfo(w.dtype).tiny
         inv_w = 1 / w.clamp_min(tiny)
 
-        mean = self._sum_wv * inv_w
-        if self._sum_wv2 is None:
+        mean = sum_wv * inv_w
+        if sum_wv2 is None:
             var = torch.zeros_like(mean)
         else:
-            var = (self._sum_wv2 * inv_w - mean.square()).clamp_min(0)
+            var = (sum_wv2 * inv_w - mean.square()).clamp_min(0)
 
         w_max = w.max()
         if w_max <= 0:
@@ -893,6 +1036,23 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             support = (w / (weight_threshold * w_max)).clamp(max=1.0)
 
         return mean * (w > 0), var * (w > 0), support
+
+    @classmethod
+    def _variance_loss_from_buffers(cls, sum_w, sum_wv, sum_wv2):
+        """Weight-averaged per-pixel variance across bright-field images."""
+        _, var, _ = cls._moments_from_buffers(sum_w, sum_wv, sum_wv2)
+        denom = sum_w.sum()
+        if denom <= 0:
+            return torch.tensor(torch.inf, dtype=sum_w.dtype, device=sum_w.device)
+        return (var * sum_w).sum() / denom
+
+    def _weighted_moments(self, weight_threshold: float = 1e-2):
+        """``(mean, variance, support)`` per canvas pixel, as flat tensors."""
+        if self._sum_w is None or self._sum_wv is None:
+            raise RuntimeError("Run reconstruct() before asking for the accumulated moments.")
+        return self._moments_from_buffers(
+            self._sum_w, self._sum_wv, self._sum_wv2, weight_threshold
+        )
 
     def variance_loss(self):
         """
@@ -921,10 +1081,330 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         """
         if self._sum_w is None or self._sum_wv2 is None:
             return None
+        return self._variance_loss_from_buffers(self._sum_w, self._sum_wv, self._sum_wv2)
 
-        _, var, _ = self._weighted_moments()
-        w = self._sum_w
-        denom = w.sum()
-        if denom <= 0:
-            return torch.tensor(torch.inf, dtype=w.dtype, device=self.device)
-        return (var * w).sum() / denom
+    # ------------------------------------------------------------------
+    # position-dependent defocus
+    # ------------------------------------------------------------------
+
+    def _return_patch_indices(self, patch_grid) -> list[torch.Tensor]:
+        """Position indices for each tile of a ``patch_grid`` partition of the scan bbox."""
+        pos = self._positions_px
+        lo = pos.amin(0)
+        span = (pos.amax(0) - lo).clamp_min(torch.finfo(pos.dtype).tiny)
+
+        tile = torch.stack(
+            [
+                ((pos[:, i] - lo[i]) / span[i] * patch_grid[i]).floor().clamp(0, patch_grid[i] - 1)
+                for i in range(2)
+            ],
+            dim=-1,
+        ).to(torch.int64)
+
+        flat = tile[:, 0] * patch_grid[1] + tile[:, 1]
+        return [
+            torch.nonzero(flat == p, as_tuple=True)[0]
+            for p in range(int(patch_grid[0]) * int(patch_grid[1]))
+        ]
+
+    def _patch_canvas(self, pos_idx, margin_px, upsampling_factor):
+        """``(canvas_shape, origin)`` for a patch, sized independently of the trial defocus."""
+        positions_up = self._positions_px[pos_idx] * upsampling_factor
+        lo = torch.floor(positions_up.amin(0) - margin_px)
+        hi = torch.ceil(positions_up.amax(0) + margin_px)
+        return tuple(int(v) + 2 for v in (hi - lo)), lo
+
+    def _patch_variance_loss(
+        self,
+        pos_idx,
+        canvas_shape,
+        canvas_origin,
+        *,
+        bf,
+        rotation_angle,
+        aberration_coefs,
+        upsampling_factor,
+        interpolation,
+        max_batch_size,
+        support_fraction=0.9,
+    ):
+        """Variance loss of a montage built from a spatial subset of the scan positions.
+
+        Deliberately does not go through :meth:`reconstruct`: threading a position subset
+        through the public signature would make its canvas logic branch for a purely internal
+        use.
+
+        Two details make the value comparable *across trial defocus values*, which is the
+        only thing this is for:
+
+        - the canvas is passed in, frozen, rather than sized from the shifts. A canvas that
+          grew with the defocus would add low-weight edge pixels, whose variance is small
+          simply because few images reach them, and the loss would then fall monotonically
+          with defocus rather than have a minimum at the right one.
+        - only pixels at ``support_fraction`` of the peak weight are scored, so partially
+          filled edges never enter the average.
+        """
+        shifts_px, _ = self._return_shifts_px(
+            rotation_angle, aberration_coefs, bf.bf_mask, upsampling_factor
+        )
+
+        buffers = allocate_splat_buffers(canvas_shape, self.device, accumulate_squares=True)
+        coords_base = self._positions_px[pos_idx] * upsampling_factor - canvas_origin
+
+        batcher = SimpleBatcher(bf.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng)
+        for batch_idx in batcher:
+            values = self._vbf_stack[bf.vbf_index_mapping[batch_idx]][:, pos_idx]
+            coords = coords_base[None] + shifts_px[batch_idx][:, None]
+            scatter_add_splat(
+                values,
+                coords,
+                canvas_shape,
+                boundary="pad",
+                interpolation=interpolation,
+                out=buffers,
+            )
+
+        sum_w, sum_wv, sum_wv2 = buffers
+        _, var, _ = self._moments_from_buffers(sum_w, sum_wv, sum_wv2)
+
+        supported = sum_w >= support_fraction * sum_w.max()
+        if not bool(supported.any()):
+            return float("inf")
+        return float(var[supported].mean())
+
+    @staticmethod
+    def _refine_minimum(values, losses):
+        """Sub-grid minimum by a 3-point parabolic fit, or ``None`` if pinned at an end."""
+        i = int(np.argmin(losses))
+        if i == 0 or i == len(losses) - 1:
+            return None
+
+        y0, y1, y2 = losses[i - 1], losses[i], losses[i + 1]
+        denom = y0 - 2 * y1 + y2
+        if denom <= 0:  # not a minimum -- flat or concave
+            return float(values[i])
+
+        # vertex offset in units of the (possibly uneven) local step
+        offset = 0.5 * (y0 - y2) / denom
+        step = values[i + 1] - values[i] if offset > 0 else values[i] - values[i - 1]
+        return float(values[i] + offset * abs(step))
+
+    def defocus_map(
+        self,
+        c10_values,
+        patch_grid: Tuple[int, int] = (3, 3),
+        bf_mask=None,
+        override_aberration_coefs=None,
+        override_rotation_angle=None,
+        upsampling_factor: int = 1,
+        interpolation: str = "bilinear",
+        min_patch_positions: int = 64,
+        max_batch_size=None,
+        verbose=None,
+    ) -> dict:
+        """
+        Best-fit defocus in each of a grid of spatial patches.
+
+        Reconstructs each patch on its own small canvas over a range of trial ``C10`` values
+        and takes the variance-loss minimum, refined by a parabolic fit so a coarse
+        ``c10_values`` grid still resolves sub-step differences. This is the measurement
+        :meth:`fit_defocus_gradient` fits a plane to; call it directly to inspect the loss
+        curves before trusting the fit.
+
+        Parameters
+        ----------
+        c10_values : array-like
+            Trial defocus values in Angstrom, ascending. Must bracket the true local defocus
+            in every patch -- a patch whose minimum sits on an endpoint is flagged invalid.
+        patch_grid : tuple of int
+            Number of patches along each scan axis. Any positive pair; a 1D grid such as
+            ``(4, 1)`` gives a defocus profile along one axis. Fitting a *plane* needs at
+            least three patches -- :meth:`fit_defocus_gradient` enforces that.
+        interpolation : {"bilinear", "nearest"}
+            Defaults to ``"bilinear"`` here, unlike :meth:`reconstruct`. Snapping to the
+            nearest pixel makes the loss a staircase in ``C10``, and small defocus changes
+            then produce *no* change at all, so the minimum cannot be located.
+        min_patch_positions : int
+            Patches with fewer positions than this are flagged invalid.
+
+        Returns
+        -------
+        dict with keys
+            ``centers_A`` ``(P, 2)`` patch centers in Angstrom, measured from the position
+            centroid so they share the frame of :attr:`defocus_gradient`; ``c10_best``
+            ``(P,)``; ``losses`` ``(P, n_c10)``; ``valid`` ``(P,)`` bool; ``c10_values``.
+
+        Notes
+        -----
+        The estimator carries a small offset that is uniform across patches -- a few percent
+        of ``C10`` on synthetic data. That cancels out of the *gradient*, which is a
+        difference between patches, but it does bias the absolute defocus, so treat the
+        offset from :meth:`fit_defocus_gradient` as approximate.
+
+        Patches need enough positions for the loss to have a clear minimum, and how many is
+        data dependent -- the warning here only catches patches smaller than the shifts
+        themselves. The reliable check is to run this on a region you believe is flat and
+        confirm ``c10_best`` comes back constant.
+        """
+        if verbose is None:
+            verbose = self.verbose
+
+        c10_values = np.asarray(c10_values, dtype=np.float64).ravel()
+        if c10_values.size < 3:
+            raise ValueError(
+                f"`c10_values` needs at least 3 points to bracket a minimum, got "
+                f"{c10_values.size}."
+            )
+        if min(int(patch_grid[0]), int(patch_grid[1])) < 1:
+            raise ValueError(f"`patch_grid` entries must be positive, got {patch_grid!r}.")
+
+        state = self.hyperparameter_state
+        base_coefs = state.current_aberrations(override_aberration_coefs)
+        rotation_angle = state.current_rotation_angle(override_rotation_angle)
+
+        bf = self._return_bf_context(self.bf_mask if bf_mask is None else bf_mask)
+        if max_batch_size is None:
+            max_batch_size = max(1, _DEFAULT_POINTS_PER_BATCH // max(self.num_positions, 1))
+
+        patches = self._return_patch_indices(patch_grid)
+        scan_sampling = torch.as_tensor(
+            tuple(self.scan_sampling), device=self.device, dtype=torch.float64
+        )
+
+        # size every patch canvas for the largest trial defocus, so it stays fixed across
+        # the scan below -- see _patch_variance_loss
+        max_shift = 0.0
+        for c10 in (c10_values.min(), c10_values.max()):
+            trial, _ = self._return_shifts_px(
+                rotation_angle, {**base_coefs, "C10": float(c10)}, bf.bf_mask, upsampling_factor
+            )
+            max_shift = max(max_shift, float(trial.abs().max()))
+        margin_px = math.ceil(max_shift) + 1
+
+        centers, best, all_losses, valid = [], [], [], []
+        pbar = tqdm(patches, disable=not verbose, desc="defocus map")
+        for pos_idx in pbar:
+            center = (
+                (self._positions_px[pos_idx].mean(0) - self.positions_centroid_px) * scan_sampling
+                if pos_idx.numel()
+                else torch.zeros(2, device=self.device, dtype=torch.float64)
+            )
+            centers.append(center.cpu().numpy())
+
+            if pos_idx.numel() < min_patch_positions:
+                all_losses.append(np.full(c10_values.size, np.nan))
+                best.append(np.nan)
+                valid.append(False)
+                continue
+
+            extent = self._positions_px[pos_idx].amax(0) - self._positions_px[pos_idx].amin(0)
+            if float(extent.min()) < 2 * max_shift:
+                warnings.warn(
+                    f"A patch spans {float(extent.min()):.0f} scan pixels but the parallax "
+                    f"shifts reach {max_shift:.0f}, so its bright-field images barely "
+                    "overlap and the variance loss has little to compare. Use a coarser "
+                    "`patch_grid`.",
+                    stacklevel=2,
+                )
+
+            canvas_shape, canvas_origin = self._patch_canvas(pos_idx, margin_px, upsampling_factor)
+            losses = np.array(
+                [
+                    self._patch_variance_loss(
+                        pos_idx,
+                        canvas_shape,
+                        canvas_origin,
+                        bf=bf,
+                        rotation_angle=rotation_angle,
+                        aberration_coefs={**base_coefs, "C10": float(c10)},
+                        upsampling_factor=upsampling_factor,
+                        interpolation=interpolation,
+                        max_batch_size=max_batch_size,
+                    )
+                    for c10 in c10_values
+                ]
+            )
+            all_losses.append(losses)
+
+            refined = self._refine_minimum(c10_values, losses)
+            best.append(np.nan if refined is None else refined)
+            valid.append(refined is not None)
+        pbar.close()
+
+        results = {
+            "centers_A": np.stack(centers),
+            "c10_best": np.array(best),
+            "losses": np.stack(all_losses),
+            "valid": np.array(valid),
+            "c10_values": c10_values,
+        }
+        self._defocus_map_results = results
+        return results
+
+    def fit_defocus_gradient(
+        self,
+        c10_values,
+        patch_grid: Tuple[int, int] = (3, 3),
+        update_defocus: bool = True,
+        verbose=None,
+        **defocus_map_kwargs,
+    ):
+        """
+        Fit a defocus plane across the field of view and store it as :attr:`defocus_gradient`.
+
+        Runs :meth:`defocus_map` and least-squares fits ``C10 = offset + g . r`` through the
+        valid patch centers. Because the centers are measured from the position centroid, the
+        offset is the mean defocus and the gradient is exactly orthogonal to it -- so a
+        subsequent :meth:`grid_search_hyperparameters` over ``C10`` stays well posed.
+
+        Parameters
+        ----------
+        update_defocus : bool
+            Also write the fitted offset into the optimized ``C10``. On by default: the offset
+            and the gradient are fit jointly, so keeping a stale global ``C10`` alongside a
+            fresh gradient would be inconsistent.
+
+        Returns
+        -------
+        self
+        """
+        if verbose is None:
+            verbose = self.verbose
+
+        results = self.defocus_map(
+            c10_values, patch_grid=patch_grid, verbose=verbose, **defocus_map_kwargs
+        )
+
+        valid = results["valid"]
+        if valid.sum() < 3:
+            raise RuntimeError(
+                f"Only {int(valid.sum())} of {valid.size} patches gave a bracketed minimum, "
+                "and a plane needs 3. Widen `c10_values`, or use a coarser `patch_grid` so "
+                "each patch has more positions."
+            )
+
+        centers = results["centers_A"][valid]
+        design = np.column_stack([np.ones(len(centers)), centers])
+        offset, g_row, g_col = np.linalg.lstsq(design, results["c10_best"][valid], rcond=None)[0]
+
+        self.defocus_gradient = (float(g_row), float(g_col))
+
+        if update_defocus:
+            state = self.hyperparameter_state
+            coefs = state.current_aberrations()
+            coefs["C10"] = float(offset)
+            state.optimized_aberrations = validate_aberration_coefficients(coefs)
+            state.optimized_keys.add("C10")
+
+        if verbose:
+            residual = results["c10_best"][valid] - design @ [offset, g_row, g_col]
+            print(
+                f"Fitted defocus plane over {int(valid.sum())}/{valid.size} patches:\n"
+                f"  C10 offset      = {offset:.1f} A\n"
+                f"  defocus_gradient= ({g_row:.4g}, {g_col:.4g}) A/A "
+                f"(|g| = {math.hypot(g_row, g_col):.4g}, "
+                f"tilt = {math.degrees(math.atan(math.hypot(g_row, g_col))):.2f} deg)\n"
+                f"  residual RMS    = {float(np.sqrt((residual**2).mean())):.1f} A"
+            )
+
+        return self
