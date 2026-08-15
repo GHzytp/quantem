@@ -1003,7 +1003,7 @@ def regrid_vbf_stack(
     positions_px,
     scan_gpts,
     interpolation: Literal["bilinear", "nearest"] = "bilinear",
-    hole_fill: Literal["mean", "zero"] = "mean",
+    hole_fill: Literal["mean", "zero", "comb"] = "mean",
     hole_warning_threshold: float = 0.1,
 ):
     """
@@ -1015,7 +1015,7 @@ def regrid_vbf_stack(
 
     Parameters
     ----------
-    hole_fill : {"mean", "zero"}
+    hole_fill : {"mean", "zero", "comb"}
         What to put in grid pixels no probe position reached.
 
         ``"mean"`` (default) uses each bright-field image's mean over the pixels that *were*
@@ -1030,7 +1030,16 @@ def regrid_vbf_stack(
         the same data. Nearest-neighbour filling was also tried and is a wash, so it is not
         offered.
 
-        ``"zero"`` leaves them at zero.
+        ``"comb"`` is for a grid *finer* than the scan, where the holes are not missing data
+        but the gaps of a deliberately sparse comb -- the same structure
+        ``upsampling_factor`` builds by Fourier tiling, except that the teeth land on the
+        real probe positions instead of a lattice. Each image's mean over its positions is
+        removed *before* splatting, so the comb already has zero mean and the DC zeroing in
+        ``_preprocess`` leaves the gaps at exactly zero rather than at ``-mean``; without
+        that subtraction the reconstruction inverts completely (in-band correlation -0.07).
+        The deconvolution then unfolds the gaps from the bright-field shifts.
+
+        ``"zero"`` leaves them at zero with no mean subtraction. Rarely what you want.
 
     Returns
     -------
@@ -1040,10 +1049,17 @@ def regrid_vbf_stack(
     occupied : torch.Tensor
         Boolean ``scan_gpts`` map of which pixels a probe position reached.
     """
+    if hole_fill not in ("mean", "zero", "comb"):
+        raise ValueError(f"`hole_fill` must be 'mean', 'zero' or 'comb', got {hole_fill!r}")
+
     num_bf = int(vbf_stack.shape[0])
     device = vbf_stack.device
     scan_gpts = (int(scan_gpts[0]), int(scan_gpts[1]))
     coords = torch.as_tensor(positions_px, device=device, dtype=torch.float64)[None]
+
+    if hole_fill == "comb":
+        # zero-mean before splatting, so the gaps stay at zero once the DC bin is zeroed
+        vbf_stack = vbf_stack - vbf_stack.mean(dim=1, keepdim=True)
 
     # one image at a time: `scatter_add_splat` accumulates its whole batch into a single
     # canvas, which is what the montage wants but would sum the stack away here
@@ -1067,14 +1083,11 @@ def regrid_vbf_stack(
     occupied = (weights > 0).reshape(scan_gpts)
     hole_fraction = float((~occupied).sum()) / occupied.numel()
 
-    if hole_fill == "mean":
-        if bool(occupied.any()):
-            occupied_mean = gridded[:, occupied].mean(dim=1)
-            gridded[:, ~occupied] = occupied_mean[:, None]
-    elif hole_fill != "zero":
-        raise ValueError(f"`hole_fill` must be 'mean' or 'zero', got {hole_fill!r}")
+    if hole_fill == "mean" and bool(occupied.any()):
+        occupied_mean = gridded[:, occupied].mean(dim=1)
+        gridded[:, ~occupied] = occupied_mean[:, None]
 
-    if hole_fraction > hole_warning_threshold:
+    if hole_fill != "comb" and hole_fraction > hole_warning_threshold:
         warnings.warn(
             f"{hole_fraction:.1%} of the {scan_gpts[0]}x{scan_gpts[1]} scan grid received no "
             f"probe position, and was filled with `hole_fill={hole_fill!r}`. A scan-Fourier "

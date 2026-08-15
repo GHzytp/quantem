@@ -11,7 +11,7 @@ Imported by ``test_direct_ptychography.py`` and ``test_shadow_montage.py`` via
 import numpy as np
 import pytest
 
-from quantem.core.datastructures import Dataset4d
+from quantem.core.datastructures import Dataset3d, Dataset4d
 from quantem.core.utils.utils import electron_wavelength_angstrom
 
 N = 32  # detector / object gridpoints
@@ -304,3 +304,194 @@ def correlation(image: np.ndarray, reference: np.ndarray) -> float:
 def dataset4d():
     """Read-only synthetic dataset at the integer-shift defocus."""
     return make_dataset4d()
+
+
+# ---------------------------------------------------------------------------
+# white-noise / analytical-CTF harness
+#
+# The object has constant Fourier amplitude, so |FFT(reconstruction)| *is* the contrast
+# transfer function and can be compared against an analytical one. This is the only fixture
+# here that can see whether `upsampling_factor` extends the CTF ("unfolding") or merely
+# replicates it: the scan pitch is deliberately coarser than the aperture's transfer limit,
+# leaving a genuine factor of 2 above the scan Nyquist to recover. Ported from
+# ipynb-playground/white-noise-ptycho.ipynb.
+# ---------------------------------------------------------------------------
+
+CTF_N = 64  # object gridpoints
+CTF_K_MAX = 2.0  # inverse Angstroms
+CTF_K_PROBE = 1.0  # inverse Angstroms -> transfers to 2 * K_PROBE
+CTF_SCAN_STEP = 2  # object pixels -> scan Nyquist is half the transfer limit
+CTF_SAMPLING = 1 / CTF_K_MAX / 2
+CTF_RECIPROCAL_SAMPLING = 2 * CTF_K_MAX / CTF_N
+CTF_SCAN_SAMPLING = CTF_SAMPLING * CTF_SCAN_STEP
+CTF_SEMIANGLE = CTF_K_PROBE * electron_wavelength_angstrom(PROBE_ENERGY) * 1e3
+CTF_ABERRATIONS = {"C10": 100, "C12": 50, "phi12": np.deg2rad(11)}
+
+
+def white_noise_object_2D(n: int = CTF_N, phi0: float = 1.0, seed: int = 0) -> np.ndarray:
+    """Real 2D array whose FFT has random phase and *constant* amplitude."""
+    rng = np.random.default_rng(seed)
+    even = n % 2 == 0
+    pos = np.arange(1, (n if even else n + 1) // 2)
+    neg = np.flip(np.arange(n // 2 + 1, n))
+
+    arr = rng.standard_normal((n, n))
+    arr[pos[:, None], pos[None, :]] = -arr[neg[:, None], neg[None, :]]
+    arr[pos[:, None], neg[None, :]] = -arr[neg[:, None], pos[None, :]]
+    arr[0, pos] = -arr[0, neg]
+    arr[pos, 0] = -arr[neg, 0]
+    if even:
+        arr[n // 2, :] = 0
+        arr[:, n // 2] = 0
+    arr[0, 0] = 0
+
+    return np.fft.ifft2(np.exp(2j * np.pi * arr) * phi0).real
+
+
+def _ctf_grids():
+    kx = ky = np.fft.fftfreq(CTF_N, CTF_SAMPLING)
+    k2 = kx[:, None] ** 2 + ky[None, :] ** 2
+    phi = np.arctan2(ky[None, :], kx[:, None])
+    aperture = np.clip((CTF_K_PROBE - np.sqrt(k2)) / CTF_RECIPROCAL_SAMPLING + 0.5, 0, 1)
+    return k2, phi, aperture
+
+
+def ctf_probe(aberrations: dict = CTF_ABERRATIONS):
+    """``(chi, probe_array)`` for the soft-aperture probe used by the CTF harness."""
+    k2, phi, aperture = _ctf_grids()
+    wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+
+    chi = k2 * wavelength * np.pi * aberrations.get("C10", 0.0)
+    chi = chi + (
+        k2
+        * wavelength
+        * np.pi
+        * aberrations.get("C12", 0.0)
+        * np.cos(2 * (phi - aberrations.get("phi12", 0.0)))
+    )
+    probe_fourier = aperture * np.exp(-1j * chi)
+    probe_fourier /= np.sqrt(np.sum(np.abs(probe_fourier) ** 2))
+    return chi, np.fft.ifft2(probe_fourier) * CTF_N
+
+
+def analytical_parallax_ctf(chi: np.ndarray):
+    """``(full_band, scan_band)`` analytical parallax CTF, fftshifted."""
+    _, _, aperture = _ctf_grids()
+    aperture_0 = aperture / np.sqrt(np.sum(np.abs(aperture) ** 2))
+    autocorr = np.real(np.fft.ifft2(np.abs(np.fft.fft2(aperture_0)) ** 2))
+    full = np.fft.fftshift(np.abs(autocorr * -np.sin(chi)))
+    return full, full[CTF_N // 4 : -CTF_N // 4, CTF_N // 4 : -CTF_N // 4]
+
+
+def ctf_raster_positions() -> np.ndarray:
+    """``(N_pos, 2)`` raster positions in *object* pixels."""
+    axis = np.arange(0.0, CTF_N, CTF_SCAN_STEP)
+    xx, yy = np.meshgrid(axis, axis, indexing="ij")
+    return np.stack((xx.ravel(), yy.ravel()), axis=-1)
+
+
+def ctf_jittered_positions(amplitude_scan_px: float, seed: int = 1) -> np.ndarray:
+    """Raster positions scattered off the lattice, with the outer ring pinned.
+
+    Pinning the boundary keeps the bounding box exactly the scan field of view, so a
+    ``boundary="wrap"`` montage and a regridded reconstruction stay directly comparable.
+    """
+    positions = ctf_raster_positions()
+    rng = np.random.default_rng(seed)
+    amplitude = amplitude_scan_px * CTF_SCAN_STEP
+    jitter = rng.uniform(-amplitude, amplitude, positions.shape)
+    edge = (
+        (positions[:, 0] == 0)
+        | (positions[:, 1] == 0)
+        | (positions[:, 0] == CTF_N - CTF_SCAN_STEP)
+        | (positions[:, 1] == CTF_N - CTF_SCAN_STEP)
+    )
+    jitter[edge] = 0.0
+    return positions + jitter
+
+
+def ctf_simulate(complex_obj: np.ndarray, probe: np.ndarray, positions_px: np.ndarray):
+    """``(N_pos, n, n)`` intensities, using the Fourier shift theorem off-lattice."""
+    n = CTF_N
+    if np.allclose(positions_px, np.round(positions_px)):
+        x0 = np.round(positions_px[:, 0]).astype(int)
+        y0 = np.round(positions_px[:, 1]).astype(int)
+        idx = np.fft.fftfreq(n, d=1 / n).astype(int)
+        patches = complex_obj[
+            (x0[:, None, None] + idx[None, :, None]) % n,
+            (y0[:, None, None] + idx[None, None, :]) % n,
+        ]
+    else:
+        fx = fy = np.fft.fftfreq(n)
+        obj_fourier = np.fft.fft2(complex_obj)
+        ramp = np.exp(
+            2j
+            * np.pi
+            * (
+                fx[None, :, None] * positions_px[:, 0, None, None]
+                + fy[None, None, :] * positions_px[:, 1, None, None]
+            )
+        )
+        patches = np.fft.ifft2(obj_fourier[None] * ramp, axes=(-2, -1))
+
+    return (np.abs(np.fft.fft2(patches * probe)) ** 2).astype(np.float32)
+
+
+def ctf_dataset4d(intensities: np.ndarray) -> Dataset4d:
+    side = int(round(np.sqrt(len(intensities))))
+    return Dataset4d.from_array(
+        np.fft.fftshift(intensities.reshape(side, side, CTF_N, CTF_N), axes=(-1, -2)),
+        name="white noise 4D-STEM",
+        sampling=(CTF_SCAN_SAMPLING,) * 2 + (CTF_RECIPROCAL_SAMPLING,) * 2,
+        units=("A", "A", "A^-1", "A^-1"),
+    )
+
+
+def ctf_dataset3d(intensities: np.ndarray) -> Dataset3d:
+    return Dataset3d.from_array(
+        np.fft.fftshift(intensities, axes=(-1, -2)),
+        name="white noise ungridded",
+        sampling=(1.0, CTF_RECIPROCAL_SAMPLING, CTF_RECIPROCAL_SAMPLING),
+        units=("index", "A^-1", "A^-1"),
+    )
+
+
+def measured_ctf(obj: np.ndarray) -> np.ndarray:
+    return np.fft.fftshift(np.abs(np.fft.fft2(obj)) * 2)
+
+
+def ctf_band_scores(measured: np.ndarray, analytic: np.ndarray, pixel_size: float):
+    """Correlation with the analytical CTF, inside and beyond the scan Nyquist."""
+    if measured.shape != analytic.shape:
+        raise ValueError(f"shape mismatch {measured.shape} vs {analytic.shape}")
+
+    freq = np.fft.fftshift(np.fft.fftfreq(measured.shape[0], pixel_size))
+    q = np.hypot(freq[:, None], freq[None, :])
+    nyquist = 1 / (2 * CTF_SCAN_SAMPLING)
+
+    def corr(mask):
+        a, b = measured[mask].astype(np.float64), analytic[mask].astype(np.float64)
+        if a.std() == 0 or b.std() == 0:
+            return float("nan")
+        return float(np.corrcoef(a, b)[0, 1])
+
+    extension = (q > nyquist) & (q <= 2 * CTF_K_PROBE)
+    return corr(q <= nyquist), corr(extension)
+
+
+def ctf_kwargs() -> dict:
+    return dict(
+        energy=PROBE_ENERGY,
+        semiangle_cutoff=CTF_SEMIANGLE,
+        rotation_angle=0.0,
+        aberration_coefs=CTF_ABERRATIONS,
+        verbose=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def ctf_scene():
+    """``(complex_obj, chi, probe, ctf_full, ctf_sub)`` for the white-noise harness."""
+    chi, probe = ctf_probe()
+    full, sub = analytical_parallax_ctf(chi)
+    return np.exp(1j * white_noise_object_2D()), chi, probe, full, sub

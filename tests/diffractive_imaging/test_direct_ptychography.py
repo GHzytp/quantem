@@ -16,8 +16,14 @@ from quantem.core.io.serialize import load
 from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.diffractive_imaging import DirectPtychography, OptimizationParameter
 from quantem.diffractive_imaging.complex_probe import spatial_frequencies
+from quantem.diffractive_imaging.direct_ptycho_utils import (
+    build_vbf_stack_from_dataset3d,
+    regrid_vbf_stack,
+)
 
 from .conftest import (
+    CTF_SAMPLING,
+    CTF_SCAN_SAMPLING,
     DECONVOLUTION_KERNELS,
     PROBE_ENERGY,
     Q_PROBE,
@@ -26,9 +32,17 @@ from .conftest import (
     N,
     band_limited_phase,
     correlation,
+    ctf_band_scores,
+    ctf_dataset3d,
+    ctf_dataset4d,
+    ctf_jittered_positions,
+    ctf_kwargs,
+    ctf_raster_positions,
+    ctf_simulate,
     direct_ptycho_kwargs,
     integer_shift_defocus,
     make_dataset4d,
+    measured_ctf,
     scan_positions_px,
 )
 
@@ -766,3 +780,161 @@ class TestFromDataset3d:
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             gridded.reconstruct(deconvolution_kernel="prlx", upsampling_factor=4, verbose=False)
+
+
+class TestUnfolding:
+    """Does `upsampling_factor` extend the CTF, or merely replicate it?
+
+    Uses the white-noise object, whose Fourier amplitude is constant, so
+    `|FFT(reconstruction)|` is the contrast transfer function and can be compared against an
+    analytical one. The scan pitch is half the aperture's transfer limit, so there is a
+    genuine factor of two above the scan Nyquist to recover -- without that, an upsampling
+    test measures nothing.
+    """
+
+    @staticmethod
+    def _scores(obj, analytic, upsampling_factor):
+        return ctf_band_scores(measured_ctf(obj), analytic, CTF_SCAN_SAMPLING / upsampling_factor)
+
+    @staticmethod
+    def _ungridded(scene, positions, **overrides):
+        _, _, probe, _, _ = scene
+        kwargs = dict(
+            ctf_kwargs(),
+            scan_sampling=(CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
+        )
+        kwargs.update(overrides)
+        return DirectPtychography.from_dataset3d(
+            ctf_dataset3d(ctf_simulate(scene[0], probe, positions)),
+            positions * CTF_SAMPLING,
+            **kwargs,
+        )
+
+    def test_gridded_upsampling_unfolds_the_ctf(self, ctf_scene):
+        """The baseline the ungridded path is judged against."""
+        obj, _, probe, ctf_full, ctf_sub = ctf_scene
+        recon = DirectPtychography.from_dataset4d(
+            ctf_dataset4d(ctf_simulate(obj, probe, ctf_raster_positions())),
+            edge_blend_pixels=0,
+            **ctf_kwargs(),
+        )
+
+        in_band, _ = self._scores(
+            recon.reconstruct(deconvolution_kernel="prlx", verbose=False).obj, ctf_sub, 1
+        )
+        up = recon.reconstruct(deconvolution_kernel="prlx", upsampling_factor=2, verbose=False).obj
+        up_in, up_ext = self._scores(up, ctf_full, 2)
+
+        assert in_band > 0.95
+        assert up_in > 0.95
+        assert up_ext > 0.95  # genuinely extended, not replicated
+
+    def test_lattice_positions_unfold_through_the_ungridded_path(self, ctf_scene):
+        _, _, _, ctf_full, _ = ctf_scene
+        recon = self._ungridded(ctf_scene, ctf_raster_positions())
+
+        obj = recon.reconstruct(
+            deconvolution_kernel="prlx", upsampling_factor=2, verbose=False
+        ).obj
+
+        assert self._scores(obj, ctf_full, 2)[1] > 0.95
+
+    def test_upsampling_factor_fails_on_an_irregular_scan(self, ctf_scene):
+        """Binning first discards the sub-pixel positions upsampling needs."""
+        _, _, _, ctf_full, _ = ctf_scene
+        recon = self._ungridded(ctf_scene, ctf_jittered_positions(1.0))
+
+        with pytest.warns(UserWarning, match="cannot unfold"):
+            obj = recon.reconstruct(
+                deconvolution_kernel="prlx", upsampling_factor=2, verbose=False
+            ).obj
+
+        assert self._scores(obj, ctf_full, 2)[1] < 0.85
+
+    def test_upsample_positions_recovers_it(self, ctf_scene):
+        """Refining the grid *before* splatting keeps the probes on it."""
+        _, _, _, ctf_full, _ = ctf_scene
+        positions = ctf_jittered_positions(1.0)
+
+        binned = (
+            self._ungridded(ctf_scene, positions)
+            .reconstruct(deconvolution_kernel="prlx", upsampling_factor=2, verbose=False)
+            .obj
+        )
+        comb = (
+            self._ungridded(ctf_scene, positions, upsample_positions=2)
+            .reconstruct(deconvolution_kernel="prlx", verbose=False)
+            .obj
+        )
+
+        assert comb.shape == binned.shape
+        comb_ext = self._scores(comb, ctf_full, 2)[1]
+        assert comb_ext > 0.93
+        assert comb_ext > self._scores(binned, ctf_full, 2)[1] + 0.15
+
+    def test_upsample_positions_refines_the_grid(self, ctf_scene):
+        recon = self._ungridded(ctf_scene, ctf_raster_positions(), upsample_positions=2)
+        plain = self._ungridded(ctf_scene, ctf_raster_positions())
+
+        assert recon.scan_gpts == tuple(2 * n for n in plain.scan_gpts)
+        assert recon.scan_sampling[0] == pytest.approx(plain.scan_sampling[0] / 2)
+
+    def test_comb_needs_the_mean_removed(self, ctf_scene):
+        """Without it the DC zeroing puts the gaps at -mean and the result inverts."""
+        _, _, _, ctf_full, _ = ctf_scene
+        positions = ctf_jittered_positions(1.0)
+
+        good = self._ungridded(ctf_scene, positions, upsample_positions=2)
+
+        # the same comb geometry, but built with hole_fill="zero" -- no mean subtraction
+        stack, positions_px, bf_mask, gpts, sampling, _ = build_vbf_stack_from_dataset3d(
+            ctf_dataset3d(ctf_simulate(ctf_scene[0], ctf_scene[2], positions)),
+            positions * CTF_SAMPLING,
+            (CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
+            rotation_angle=0.0,
+        )
+        gridded, _, _ = regrid_vbf_stack(
+            stack,
+            positions_px * 2,
+            (gpts[0] * 2, gpts[1] * 2),
+            hole_fill="zero",
+            hole_warning_threshold=2.0,
+        )
+        unsubtracted = (
+            DirectPtychography.from_virtual_bfs(
+                Dataset3d.from_array(
+                    to_numpy(gridded),
+                    name="comb",
+                    sampling=(1.0, sampling[0] / 2, sampling[1] / 2),
+                    units=("index", "A", "A"),
+                ),
+                bf_mask,
+                **ctf_kwargs(),
+            )
+            .reconstruct(deconvolution_kernel="prlx", verbose=False)
+            .obj
+        )
+
+        subtracted = good.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+        assert self._scores(subtracted, ctf_full, 2)[0] > 0.9
+        assert self._scores(unsubtracted, ctf_full, 2)[0] < 0.5
+
+    def test_montage_unfolds_without_any_regridding(self, ctf_scene):
+        """The reference: the montage never bins, so irregularity costs it nothing."""
+        from quantem.diffractive_imaging import ShadowMontagePtychography
+
+        obj, _, probe, ctf_full, _ = ctf_scene
+        positions = ctf_jittered_positions(1.0)
+        montage = ShadowMontagePtychography.from_dataset3d(
+            ctf_dataset3d(ctf_simulate(obj, probe, positions)),
+            positions * CTF_SAMPLING,
+            scan_sampling=(CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
+            boundary="wrap",
+            **ctf_kwargs(),
+        )
+
+        result = montage.reconstruct(
+            deconvolution_kernel="prlx", upsampling_factor=2, verbose=False
+        ).obj
+
+        assert self._scores(result, ctf_full, 2)[1] > 0.95
