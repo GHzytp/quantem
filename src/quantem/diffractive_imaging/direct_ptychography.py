@@ -299,7 +299,7 @@ class DirectPtychography(DirectPtychographyBase):
                 s * f / n for s, f, n in zip(scan_sampling, fitted_gpts, scan_gpts)
             )
 
-        gridded, hole_fraction, _ = regrid_vbf_stack(
+        gridded, hole_fraction, occupied = regrid_vbf_stack(
             vbf_stack,
             positions_px,
             scan_gpts,
@@ -319,7 +319,7 @@ class DirectPtychography(DirectPtychographyBase):
             units=("index", "A", "A"),
         )
 
-        return cls.from_virtual_bfs(
+        reconstruction = cls.from_virtual_bfs(
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
@@ -333,6 +333,17 @@ class DirectPtychography(DirectPtychographyBase):
             device=device,
             verbose=verbose,
         )
+
+        # regridding is where an ungridded reconstruction goes wrong, and the failure is
+        # visible in these long before it is visible in the reconstruction
+        reconstruction._regrid_info = {
+            "hole_fraction": hole_fraction,
+            "occupied": occupied,
+            "positions_px": positions_px,
+            "scan_gpts": scan_gpts,
+            "scan_sampling": scan_sampling,
+        }
+        return reconstruction
 
     def _preprocess(
         self,
