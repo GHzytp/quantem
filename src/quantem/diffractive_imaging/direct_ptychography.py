@@ -208,9 +208,8 @@ class DirectPtychography(DirectPtychographyBase):
         scan_sampling: Tuple[float, float] | Literal["auto"],
         aberration_coefs: dict = {},
         scan_gpts: Tuple[int, int] | None = None,
-        upsample_positions: int = 1,
-        interpolation: Literal["bilinear", "nearest"] = "bilinear",
-        hole_fill: Literal["mean", "zero", "comb"] = "mean",
+        interpolation: Literal["nearest", "bilinear"] = "nearest",
+        hole_fill: Literal["mean", "zero"] = "mean",
         max_batch_size: int | None = None,
         fit_method: str = "plane",
         mode: str = "bilinear",
@@ -247,41 +246,31 @@ class DirectPtychography(DirectPtychographyBase):
         scan_sampling : tuple of float or "auto"
             Grid pixel size in Angstrom. ``"auto"`` uses the median nearest-neighbour
             position spacing and warns with the inferred value.
+
+            **This, not** ``reconstruct(upsampling_factor=...)``\\ **, is how to sample more
+            finely than the scan.** Pass a fraction of the position spacing and the empty
+            pixels in between become the sparse comb the deconvolution unfolds, with its
+            teeth on the real probe positions. Measured against the analytical parallax CTF
+            on a scan scattered by a full pixel, correlation over the band above the scan
+            Nyquist: 0.720 for binning then ``upsampling_factor=2``, against 0.997 for
+            halving ``scan_sampling`` instead, and 0.982 for the montage.
         scan_gpts : tuple of int, optional
-            Grid size. Defaults to whatever just covers the positions at ``scan_sampling``.
-        upsample_positions : int
-            Regrid onto a grid this much finer than the scan, keeping every probe on it.
-
-            **Use this instead of** ``reconstruct(upsampling_factor=...)`` **here.** Both end
-            up with the same sparse comb -- ``upsampling_factor`` builds one by Fourier
-            tiling, which is exactly zero-insertion -- but tiling first bins the
-            measurements onto the coarse grid, which throws the sub-pixel probe positions
-            away. Refining the grid *before* splatting keeps the teeth on the real positions,
-            quantized only to ``1 / upsample_positions`` of a scan pixel.
-
-            Measured against the analytical parallax CTF on a scan scattered by a full
-            pixel, correlation over the band above the scan Nyquist:
-
-            ==================================  =======
-            bin, then ``upsampling_factor=2``     0.720
-            ``upsample_positions=2``              0.961
-            ``ShadowMontagePtychography``         0.982
-            ==================================  =======
-
-            Forces ``hole_fill="comb"``, since the gaps are then deliberate rather than
-            missing data.
-        interpolation : {"bilinear", "nearest"}
-            Deposition scheme for the regridding. ``"bilinear"`` by default, since it leaves
-            far fewer unvisited pixels than snapping does.
-        hole_fill : {"mean", "zero", "comb"}
+            Grid size. Defaults to whatever just covers the positions at ``scan_sampling``,
+            and may only be larger than that -- ``scan_sampling`` stays authoritative, so
+            this pads the canvas rather than rescaling the positions into it.
+        interpolation : {"nearest", "bilinear"}
+            Deposition scheme, matching ``ShadowMontagePtychography.reconstruct``.
+            ``"nearest"`` by default; see :func:`regrid_vbf_stack`.
+        hole_fill : {"mean", "zero"}
             What to put in grid pixels no probe position reached. Defaults to each
             bright-field image's mean over the visited pixels, which matters a great deal on
-            a masked or irregular scan -- see :func:`regrid_vbf_stack`.
+            a masked or irregular scan, and is also what centers a comb's gaps -- see
+            :func:`regrid_vbf_stack`.
 
         Notes
         -----
         **Do not combine this with** ``reconstruct(upsampling_factor > 1)`` **on an irregular
-        scan** -- use ``upsample_positions`` above instead. Upsampling at reconstruct time
+        scan** -- pass a finer ``scan_sampling`` instead. Upsampling at reconstruct time
         recovers detail above the scan Nyquist from where each probe actually sat, and
         binning the measurements onto a grid first discards exactly that, so the extra band
         comes back as a replica of the contrast-transfer function rather than an extension of
@@ -326,26 +315,16 @@ class DirectPtychography(DirectPtychographyBase):
         if scan_gpts is None:
             scan_gpts = fitted_gpts
         else:
+            # `scan_sampling` stays authoritative, so the grid can only be padded, never
+            # rescaled -- silently changing the pixel size to fill a requested shape would
+            # contradict the sampling the caller asked for
             scan_gpts = tuple(int(n) for n in scan_gpts)
-            # rescale the positions so a requested grid still spans the same field of view
-            positions_px = positions_px * (
-                np.asarray(scan_gpts, dtype=np.float64) / np.asarray(fitted_gpts, dtype=np.float64)
-            )
-            scan_sampling = tuple(
-                s * f / n for s, f, n in zip(scan_sampling, fitted_gpts, scan_gpts)
-            )
-
-        upsample_positions = int(upsample_positions)
-        if upsample_positions < 1:
-            raise ValueError(f"`upsample_positions` must be >= 1, got {upsample_positions}")
-        if upsample_positions > 1:
-            # refine the grid and keep the probe positions on it, rather than binning them
-            # away and re-inserting zeros afterwards
-            scan_gpts = tuple(n * upsample_positions for n in scan_gpts)
-            scan_sampling = tuple(s / upsample_positions for s in scan_sampling)
-            positions_px = positions_px * upsample_positions
-            if hole_fill != "comb":
-                hole_fill = "comb"
+            if any(n < f for n, f in zip(scan_gpts, fitted_gpts)):
+                raise ValueError(
+                    f"`scan_gpts={scan_gpts}` is smaller than the {fitted_gpts} needed to "
+                    f"cover the positions at scan_sampling={scan_sampling}; positions would "
+                    "be dropped. Pass a coarser `scan_sampling` instead."
+                )
 
         gridded, hole_fraction, occupied = regrid_vbf_stack(
             vbf_stack,
@@ -355,9 +334,16 @@ class DirectPtychography(DirectPtychographyBase):
             hole_fill=hole_fill,
         )
         if verbose:
+            occupancy = vbf_stack.shape[1] / (scan_gpts[0] * scan_gpts[1])
+            detail = (
+                f"grid is finer than the scan ({occupancy:.2f} positions per pixel), so "
+                f"{hole_fraction:.1%} of it is comb gaps for the deconvolution to unfold"
+                if occupancy < 1
+                else f"{hole_fraction:.1%} of grid pixels unvisited"
+            )
             print(
-                f"Regridded {vbf_stack.shape[1]} positions onto {scan_gpts[0]}x{scan_gpts[1]}; "
-                f"{hole_fraction:.1%} of grid pixels unvisited."
+                f"Regridded {vbf_stack.shape[1]} positions onto "
+                f"{scan_gpts[0]}x{scan_gpts[1]}; {detail}."
             )
 
         vbf_dataset = Dataset3d.from_array(
@@ -430,9 +416,9 @@ class DirectPtychography(DirectPtychographyBase):
             "detail above the scan Nyquist from where each probe actually was, which the "
             "regridding has already discarded, so the extra band will come back as a replica "
             "of the contrast-transfer function rather than an extension of it. Rebuild with "
-            f"`from_dataset3d(..., upsample_positions={upsampling_factor})`, which refines the "
-            "grid before splatting and keeps the probes on it, or use "
-            "ShadowMontagePtychography with a finer `scan_sampling`.",
+            f"a `scan_sampling` {upsampling_factor}x finer instead, which keeps the probe "
+            "positions on the grid rather than binning them away first, or use "
+            "ShadowMontagePtychography, which needs no grid at all.",
             stacklevel=2,
         )
 

@@ -16,10 +16,6 @@ from quantem.core.io.serialize import load
 from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.diffractive_imaging import DirectPtychography, OptimizationParameter
 from quantem.diffractive_imaging.complex_probe import spatial_frequencies
-from quantem.diffractive_imaging.direct_ptycho_utils import (
-    build_vbf_stack_from_dataset3d,
-    regrid_vbf_stack,
-)
 
 from .conftest import (
     CTF_SAMPLING,
@@ -37,6 +33,7 @@ from .conftest import (
     ctf_dataset4d,
     ctf_jittered_positions,
     ctf_kwargs,
+    ctf_radial_correlation,
     ctf_raster_positions,
     ctf_simulate,
     direct_ptycho_kwargs,
@@ -587,17 +584,47 @@ class TestFromDataset3d:
         positions = scan_positions_px() * SCAN_SAMPLING
         positions = positions + rng.uniform(-0.3, 0.3, positions.shape) * SCAN_SAMPLING
 
-        reconstruction = self._build(self._dataset3d(dataset4d), positions, scan_gpts=(N, N))
+        reconstruction = self._build(self._dataset3d(dataset4d), positions)
         obj = reconstruction.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
 
-        assert correlation(obj, band_limited_phase()) > 0.5
+        assert correlation(obj[:N, :N], band_limited_phase()) > 0.5
 
-    def test_warns_when_the_grid_has_holes(self, dataset4d):
-        """A pixel no probe reached stays zero, and the FFT reads that as signal."""
+    def test_warns_when_positions_are_clustered(self, dataset4d):
+        """Enough positions to cover the grid, yet most of it empty: genuinely uneven."""
+        positions = scan_positions_px() * SCAN_SAMPLING
+        corner = positions[(positions[:, 0] < 10) & (positions[:, 1] < 10)]
+        # more positions than grid pixels, but all piled onto 100 distinct spots
+        repeated = np.repeat(corner, 10, axis=0)
+
+        with pytest.warns(UserWarning, match="clustered rather than merely sparse"):
+            DirectPtychography.from_dataset3d(
+                Dataset3d.from_array(
+                    np.asarray(dataset4d.array).reshape(-1, N, N)[: len(repeated)],
+                    name="clustered",
+                    sampling=(1.0, dataset4d.sampling[-2], dataset4d.sampling[-1]),
+                    units=("index", "A^-1", "A^-1"),
+                ),
+                repeated,
+                energy=PROBE_ENERGY,
+                semiangle_cutoff=SEMIANGLE_CUTOFF,
+                rotation_angle=0.0,
+                scan_sampling=(SCAN_SAMPLING / 2, SCAN_SAMPLING / 2),
+                aberration_coefs={"C10": TRUE_C10},
+                force_fitted_origin=(N // 2, N // 2),
+                verbose=False,
+            )
+
+    def test_a_finer_grid_does_not_warn_about_its_gaps(self, dataset4d):
+        """Fewer positions than pixels is a comb, not missing data."""
         positions = scan_positions_px() * SCAN_SAMPLING
 
-        with pytest.warns(UserWarning, match="received no probe position"):
-            self._build(self._dataset3d(dataset4d), positions, scan_gpts=(3 * N, 3 * N))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            self._build(
+                self._dataset3d(dataset4d),
+                positions,
+                scan_sampling=(SCAN_SAMPLING / 2, SCAN_SAMPLING / 2),
+            )
 
     def test_no_warning_on_a_fully_covered_grid(self, dataset4d):
         positions = scan_positions_px() * SCAN_SAMPLING
@@ -606,15 +633,19 @@ class TestFromDataset3d:
             warnings.simplefilter("error", UserWarning)
             self._build(self._dataset3d(dataset4d), positions)
 
-    def test_requested_grid_keeps_the_field_of_view(self, dataset4d):
-        """A finer grid must upsample the same area, not crop it."""
+    def test_scan_gpts_pads_without_rescaling_the_positions(self, dataset4d):
+        """`scan_sampling` stays authoritative: a bigger grid pads, it does not rescale."""
         positions = scan_positions_px() * SCAN_SAMPLING
-        coarse = self._build(self._dataset3d(dataset4d), positions)
-        with pytest.warns(UserWarning, match="received no probe position"):
-            finer = self._build(self._dataset3d(dataset4d), positions, scan_gpts=(2 * N, 2 * N))
+        plain = self._build(self._dataset3d(dataset4d), positions)
+        padded = self._build(self._dataset3d(dataset4d), positions, scan_gpts=(N + 8, N + 8))
 
-        assert finer.scan_gpts == (2 * N, 2 * N)
-        assert finer.fov == pytest.approx(coarse.fov)
+        assert padded.scan_gpts == (N + 8, N + 8)
+        assert padded.scan_sampling[0] == pytest.approx(plain.scan_sampling[0])
+
+    def test_scan_gpts_too_small_raises(self, dataset4d):
+        positions = scan_positions_px() * SCAN_SAMPLING
+        with pytest.raises(ValueError, match="positions would be dropped"):
+            self._build(self._dataset3d(dataset4d), positions, scan_gpts=(N // 2, N // 2))
 
     def test_auto_scan_sampling_warns_and_infers(self, dataset4d):
         positions = scan_positions_px() * SCAN_SAMPLING
@@ -751,7 +782,7 @@ class TestFromDataset3d:
         rng = np.random.default_rng(3)
         positions = scan_positions_px() * SCAN_SAMPLING
         positions = positions + rng.uniform(-0.4, 0.4, positions.shape) * SCAN_SAMPLING
-        recon = self._build(self._dataset3d(dataset4d), positions, scan_gpts=(N, N))
+        recon = self._build(self._dataset3d(dataset4d), positions)
 
         assert recon._regrid_info["lattice_rms_px"] > 0.1
         with pytest.warns(UserWarning, match="cannot unfold"):
@@ -769,7 +800,7 @@ class TestFromDataset3d:
         rng = np.random.default_rng(3)
         positions = scan_positions_px() * SCAN_SAMPLING
         positions = positions + rng.uniform(-0.4, 0.4, positions.shape) * SCAN_SAMPLING
-        irregular = self._build(dataset3d, positions, scan_gpts=(N, N))
+        irregular = self._build(dataset3d, positions)
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             irregular.reconstruct(deconvolution_kernel="prlx", verbose=False)
@@ -839,85 +870,93 @@ class TestUnfolding:
 
         assert self._scores(obj, ctf_full, 2)[1] > 0.95
 
-    def test_upsampling_factor_fails_on_an_irregular_scan(self, ctf_scene):
-        """Binning first discards the sub-pixel positions upsampling needs."""
+    def test_upsampling_factor_degrades_on_an_irregular_scan(self, ctf_scene):
+        """Binning first discards the sub-pixel positions upsampling needs.
+
+        Compared against the same call on a lattice rather than an absolute threshold: what
+        matters is that scattering the positions costs the extension band, not where the
+        number happens to land.
+        """
         _, _, _, ctf_full, _ = ctf_scene
-        recon = self._ungridded(ctf_scene, ctf_jittered_positions(1.0))
 
-        with pytest.warns(UserWarning, match="cannot unfold"):
-            obj = recon.reconstruct(
-                deconvolution_kernel="prlx", upsampling_factor=2, verbose=False
-            ).obj
-
-        assert self._scores(obj, ctf_full, 2)[1] < 0.85
-
-    def test_upsample_positions_recovers_it(self, ctf_scene):
-        """Refining the grid *before* splatting keeps the probes on it."""
-        _, _, _, ctf_full, _ = ctf_scene
-        positions = ctf_jittered_positions(1.0)
-
-        binned = (
-            self._ungridded(ctf_scene, positions)
+        on_lattice = (
+            self._ungridded(ctf_scene, ctf_raster_positions())
             .reconstruct(deconvolution_kernel="prlx", upsampling_factor=2, verbose=False)
             .obj
         )
-        comb = (
-            self._ungridded(ctf_scene, positions, upsample_positions=2)
-            .reconstruct(deconvolution_kernel="prlx", verbose=False)
-            .obj
+        scattered_recon = self._ungridded(ctf_scene, ctf_jittered_positions(1.0))
+        with pytest.warns(UserWarning, match="cannot unfold"):
+            scattered = scattered_recon.reconstruct(
+                deconvolution_kernel="prlx", upsampling_factor=2, verbose=False
+            ).obj
+
+        assert (
+            self._scores(scattered, ctf_full, 2)[1]
+            < self._scores(on_lattice, ctf_full, 2)[1] - 0.1
         )
 
-        assert comb.shape == binned.shape
-        comb_ext = self._scores(comb, ctf_full, 2)[1]
-        assert comb_ext > 0.93
-        assert comb_ext > self._scores(binned, ctf_full, 2)[1] + 0.15
-
-    def test_upsample_positions_refines_the_grid(self, ctf_scene):
-        recon = self._ungridded(ctf_scene, ctf_raster_positions(), upsample_positions=2)
-        plain = self._ungridded(ctf_scene, ctf_raster_positions())
-
-        assert recon.scan_gpts == tuple(2 * n for n in plain.scan_gpts)
-        assert recon.scan_sampling[0] == pytest.approx(plain.scan_sampling[0] / 2)
-
-    def test_comb_needs_the_mean_removed(self, ctf_scene):
-        """Without it the DC zeroing puts the gaps at -mean and the result inverts."""
+    def test_a_finer_scan_sampling_recovers_it(self, ctf_scene):
+        """Splatting straight onto a finer grid keeps the probes on it."""
         _, _, _, ctf_full, _ = ctf_scene
         positions = ctf_jittered_positions(1.0)
 
-        good = self._ungridded(ctf_scene, positions, upsample_positions=2)
+        binned = self._ungridded(ctf_scene, positions)
+        with pytest.warns(UserWarning, match="cannot unfold"):
+            coarse = binned.reconstruct(
+                deconvolution_kernel="prlx", upsampling_factor=2, verbose=False
+            ).obj
 
-        # the same comb geometry, but built with hole_fill="zero" -- no mean subtraction
-        stack, positions_px, bf_mask, gpts, sampling, _ = build_vbf_stack_from_dataset3d(
-            ctf_dataset3d(ctf_simulate(ctf_scene[0], ctf_scene[2], positions)),
-            positions * CTF_SAMPLING,
-            (CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
-            rotation_angle=0.0,
+        refined = self._ungridded(ctf_scene, positions, scan_sampling=(CTF_SCAN_SAMPLING / 2,) * 2)
+        fine = refined.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+
+        fine_corr = ctf_radial_correlation(measured_ctf(fine), ctf_full, refined.scan_sampling[0])
+        coarse_corr = ctf_radial_correlation(
+            measured_ctf(coarse), ctf_full, binned.scan_sampling[0] / 2
         )
-        gridded, _, _ = regrid_vbf_stack(
-            stack,
-            positions_px * 2,
-            (gpts[0] * 2, gpts[1] * 2),
-            hole_fill="zero",
-            hole_warning_threshold=2.0,
+        assert fine_corr > 0.99
+        assert fine_corr > coarse_corr
+
+    def test_a_finer_scan_sampling_refines_the_grid(self, ctf_scene):
+        plain = self._ungridded(ctf_scene, ctf_raster_positions())
+        finer = self._ungridded(
+            ctf_scene, ctf_raster_positions(), scan_sampling=(CTF_SCAN_SAMPLING / 2,) * 2
         )
-        unsubtracted = (
-            DirectPtychography.from_virtual_bfs(
-                Dataset3d.from_array(
-                    to_numpy(gridded),
-                    name="comb",
-                    sampling=(1.0, sampling[0] / 2, sampling[1] / 2),
-                    units=("index", "A", "A"),
-                ),
-                bf_mask,
-                **ctf_kwargs(),
+
+        assert finer.scan_sampling[0] == pytest.approx(plain.scan_sampling[0] / 2)
+        assert finer.scan_gpts[0] >= 2 * plain.scan_gpts[0] - 2
+
+    def test_nearest_beats_bilinear_on_a_finer_grid(self, ctf_scene):
+        """Bilinear smears each measurement over four pixels and blurs out the detail."""
+        _, _, _, ctf_full, _ = ctf_scene
+        positions = ctf_jittered_positions(1.0)
+        fine = dict(scan_sampling=(CTF_SCAN_SAMPLING / 2,) * 2)
+
+        scores = {}
+        for scheme in ("nearest", "bilinear"):
+            recon = self._ungridded(ctf_scene, positions, interpolation=scheme, **fine)
+            obj = recon.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+            scores[scheme] = ctf_radial_correlation(
+                measured_ctf(obj), ctf_full, recon.scan_sampling[0]
             )
-            .reconstruct(deconvolution_kernel="prlx", verbose=False)
-            .obj
-        )
 
-        subtracted = good.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
-        assert self._scores(subtracted, ctf_full, 2)[0] > 0.9
-        assert self._scores(unsubtracted, ctf_full, 2)[0] < 0.5
+        assert scores["nearest"] > scores["bilinear"]
+
+    def test_zero_fill_inverts_a_finer_grid(self, ctf_scene):
+        """`hole_fill="mean"` centers the comb's gaps; leaving them at zero inverts it."""
+        _, _, _, ctf_full, _ = ctf_scene
+        positions = ctf_jittered_positions(1.0)
+        fine = dict(scan_sampling=(CTF_SCAN_SAMPLING / 2,) * 2)
+
+        scores = {}
+        for fill in ("mean", "zero"):
+            recon = self._ungridded(ctf_scene, positions, hole_fill=fill, **fine)
+            obj = recon.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+            scores[fill] = ctf_radial_correlation(
+                measured_ctf(obj), ctf_full, recon.scan_sampling[0]
+            )
+
+        assert scores["mean"] > 0.99
+        assert scores["zero"] < scores["mean"] - 0.1
 
     def test_montage_unfolds_without_any_regridding(self, ctf_scene):
         """The reference: the montage never bins, so irregularity costs it nothing."""

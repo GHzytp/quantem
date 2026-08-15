@@ -495,3 +495,27 @@ def ctf_scene():
     chi, probe = ctf_probe()
     full, sub = analytical_parallax_ctf(chi)
     return np.exp(1j * white_noise_object_2D()), chi, probe, full, sub
+
+
+def ctf_radial_correlation(measured: np.ndarray, analytic: np.ndarray, pixel_size: float) -> float:
+    """Correlation of radially averaged CTF profiles, independent of grid shape.
+
+    A grid sized to cover scattered positions rarely lands on the same shape as the
+    analytical CTF, so compare profiles rather than pixels.
+    """
+
+    def profile(image, px, bins=40, q_max=2 * CTF_K_PROBE):
+        freq = np.fft.fftshift(np.fft.fftfreq(image.shape[0], px))
+        q = np.hypot(freq[:, None], freq[None, :])
+        index = np.clip((q / q_max * bins).astype(int), 0, bins - 1)
+        inside = q <= q_max
+        return np.array(
+            [
+                image[inside & (index == i)].mean() if (inside & (index == i)).any() else 0.0
+                for i in range(bins)
+            ]
+        )
+
+    a = profile(measured, pixel_size)
+    b = profile(analytic, CTF_SAMPLING)
+    return float(np.corrcoef(a, b)[0, 1])

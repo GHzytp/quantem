@@ -1002,9 +1002,8 @@ def regrid_vbf_stack(
     vbf_stack,
     positions_px,
     scan_gpts,
-    interpolation: Literal["bilinear", "nearest"] = "bilinear",
-    hole_fill: Literal["mean", "zero", "comb"] = "mean",
-    hole_warning_threshold: float = 0.1,
+    interpolation: Literal["nearest", "bilinear"] = "nearest",
+    hole_fill: Literal["mean", "zero"] = "mean",
 ):
     """
     Resample a flat ``(N_bf, N)`` vBF stack onto a regular scan grid.
@@ -1013,9 +1012,20 @@ def regrid_vbf_stack(
     divides by the accumulated weight, which is what lets the scan-Fourier formulation
     accept an ungridded acquisition.
 
+    Asking for a grid *finer* than the scan is a legitimate and useful thing to do: the empty
+    pixels between the probe positions are then exactly the sparse comb that
+    ``upsampling_factor`` would build by Fourier tiling, except that the teeth land on the
+    real probe positions instead of a lattice, and the deconvolution unfolds them from the
+    bright-field shifts.
+
     Parameters
     ----------
-    hole_fill : {"mean", "zero", "comb"}
+    interpolation : {"nearest", "bilinear"}
+        Deposition scheme, matching ``ShadowMontagePtychography.reconstruct``. ``"nearest"``
+        by default: it keeps each measurement on one pixel, where bilinear smears it over
+        four and blurs away the sub-pixel detail a finer grid exists to capture (radial CTF
+        correlation 0.997 versus 0.986 on a scattered scan).
+    hole_fill : {"mean", "zero"}
         What to put in grid pixels no probe position reached.
 
         ``"mean"`` (default) uses each bright-field image's mean over the pixels that *were*
@@ -1030,16 +1040,12 @@ def regrid_vbf_stack(
         the same data. Nearest-neighbour filling was also tried and is a wash, so it is not
         offered.
 
-        ``"comb"`` is for a grid *finer* than the scan, where the holes are not missing data
-        but the gaps of a deliberately sparse comb -- the same structure
-        ``upsampling_factor`` builds by Fourier tiling, except that the teeth land on the
-        real probe positions instead of a lattice. Each image's mean over its positions is
-        removed *before* splatting, so the comb already has zero mean and the DC zeroing in
-        ``_preprocess`` leaves the gaps at exactly zero rather than at ``-mean``; without
-        that subtraction the reconstruction inverts completely (in-band correlation -0.07).
-        The deconvolution then unfolds the gaps from the bright-field shifts.
+        The same choice does double duty on a finer-than-scan grid: filling the comb's gaps
+        with the occupied mean and then zeroing the DC bin leaves them at exactly zero, which
+        is what the unfolding needs.
 
-        ``"zero"`` leaves them at zero with no mean subtraction. Rarely what you want.
+        ``"zero"`` leaves them at zero *without* that centering, and inverts the
+        reconstruction. Kept only for comparison.
 
     Returns
     -------
@@ -1049,17 +1055,13 @@ def regrid_vbf_stack(
     occupied : torch.Tensor
         Boolean ``scan_gpts`` map of which pixels a probe position reached.
     """
-    if hole_fill not in ("mean", "zero", "comb"):
-        raise ValueError(f"`hole_fill` must be 'mean', 'zero' or 'comb', got {hole_fill!r}")
+    if hole_fill not in ("mean", "zero"):
+        raise ValueError(f"`hole_fill` must be 'mean' or 'zero', got {hole_fill!r}")
 
     num_bf = int(vbf_stack.shape[0])
     device = vbf_stack.device
     scan_gpts = (int(scan_gpts[0]), int(scan_gpts[1]))
     coords = torch.as_tensor(positions_px, device=device, dtype=torch.float64)[None]
-
-    if hole_fill == "comb":
-        # zero-mean before splatting, so the gaps stay at zero once the DC bin is zeroed
-        vbf_stack = vbf_stack - vbf_stack.mean(dim=1, keepdim=True)
 
     # one image at a time: `scatter_add_splat` accumulates its whole batch into a single
     # canvas, which is what the montage wants but would sum the stack away here
@@ -1087,13 +1089,20 @@ def regrid_vbf_stack(
         occupied_mean = gridded[:, occupied].mean(dim=1)
         gridded[:, ~occupied] = occupied_mean[:, None]
 
-    if hole_fill != "comb" and hole_fraction > hole_warning_threshold:
+    # Empty pixels are only a problem when there were enough positions to fill the grid and
+    # they still did not. On a deliberately finer grid the gaps are the point, and with
+    # `nearest` deposition even a same-size grid legitimately leaves ~30% empty -- a
+    # configuration that measures *better* than a gapless bilinear one, so warning at a low
+    # threshold would push callers the wrong way.
+    positions_per_pixel = len(positions_px) / (scan_gpts[0] * scan_gpts[1])
+    if positions_per_pixel >= 1.0 and hole_fraction > 0.5:
         warnings.warn(
             f"{hole_fraction:.1%} of the {scan_gpts[0]}x{scan_gpts[1]} scan grid received no "
-            f"probe position, and was filled with `hole_fill={hole_fill!r}`. A scan-Fourier "
-            "reconstruction has to invent something there, and a large filled region biases "
-            "the result however it is filled. Use a coarser `scan_gpts`, or "
-            "ShadowMontagePtychography, which needs no grid at all.",
+            f"probe position, despite {len(positions_px)} positions being available to cover "
+            f"{scan_gpts[0] * scan_gpts[1]} pixels, so the positions are clustered rather "
+            f"than merely sparse. Those pixels were filled with `hole_fill={hole_fill!r}`. "
+            "Use a coarser `scan_sampling`, or ShadowMontagePtychography, which needs no "
+            "grid at all.",
             stacklevel=3,
         )
 
