@@ -208,6 +208,7 @@ class DirectPtychography(DirectPtychographyBase):
         aberration_coefs: dict = {},
         scan_gpts: Tuple[int, int] | None = None,
         interpolation: Literal["bilinear", "nearest"] = "bilinear",
+        hole_fill: Literal["mean", "zero"] = "mean",
         max_batch_size: int | None = None,
         fit_method: str = "plane",
         mode: str = "bilinear",
@@ -249,12 +250,21 @@ class DirectPtychography(DirectPtychographyBase):
         interpolation : {"bilinear", "nearest"}
             Deposition scheme for the regridding. ``"bilinear"`` by default, since it leaves
             far fewer unvisited pixels than snapping does.
+        hole_fill : {"mean", "zero"}
+            What to put in grid pixels no probe position reached. Defaults to each
+            bright-field image's mean over the visited pixels, which matters a great deal on
+            a masked or irregular scan -- see :func:`regrid_vbf_stack`.
 
         Notes
         -----
         Regridding is the only approximation, and its failure mode is holes: a grid pixel no
-        probe reached stays zero, and the FFT reads that as signal. A warning reports the
-        fraction, and a coarser ``scan_gpts`` is the usual fix.
+        probe reached has to be invented. ``hole_fill`` keeps that from becoming a hard-edged
+        step, but a large filled region still biases the result, so a warning reports the
+        fraction and a coarser ``scan_gpts`` is the usual fix.
+
+        A masked or non-rectangular scan is the case to watch. Contiguous holes are much
+        worse than scattered ones at equal fraction: scattered holes behave like noise, while
+        an excluded region is a low-frequency mask the deconvolution spreads everywhere.
 
         :class:`~quantem.diffractive_imaging.shadow_montage_ptychography.ShadowMontagePtychography`
         needs no grid at all, and is the better choice for a sparse or strongly irregular
@@ -290,7 +300,11 @@ class DirectPtychography(DirectPtychographyBase):
             )
 
         gridded, hole_fraction, _ = regrid_vbf_stack(
-            vbf_stack, positions_px, scan_gpts, interpolation=interpolation
+            vbf_stack,
+            positions_px,
+            scan_gpts,
+            interpolation=interpolation,
+            hole_fill=hole_fill,
         )
         if verbose:
             print(

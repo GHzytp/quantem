@@ -654,3 +654,80 @@ class TestFromDataset3d:
         reconstruction.save(path, mode="o")
 
         assert np.allclose(load(path).obj, reconstruction.obj)
+
+    @staticmethod
+    def _disk_masked(dataset4d, radius=14.0):
+        """A non-rectangular scan subset -- the case that exposes hole handling."""
+        rows_cols = scan_positions_px()
+        center = (N - 1) / 2
+        keep = ((rows_cols[:, 0] - center) ** 2 + (rows_cols[:, 1] - center) ** 2) < radius**2
+        dataset3d = Dataset3d.from_array(
+            np.asarray(dataset4d.array).reshape(-1, N, N)[keep],
+            name="masked patterns",
+            sampling=(1.0, dataset4d.sampling[-2], dataset4d.sampling[-1]),
+            units=("index", "A^-1", "A^-1"),
+        )
+        return dataset3d, rows_cols[keep] * SCAN_SAMPLING, keep
+
+    def test_mean_hole_fill_beats_zero_on_a_masked_scan(self, dataset4d):
+        """Regression guard: zero-filled holes wreck the reconstruction, mean-filled do not.
+
+        `_preprocess` zeroes the DC bin, subtracting the mean over the whole grid including
+        holes, so zero-filled holes sit at `-mean` -- a hard-edged step the deconvolution
+        smears everywhere. Measured 0.25 vs 0.69 correlation with ground truth.
+        """
+        dataset3d, positions, keep = self._disk_masked(dataset4d)
+        rows_cols = scan_positions_px()[keep].astype(int)
+        low, high = rows_cols.min(0), rows_cols.max(0) + 1
+        truth = band_limited_phase()[low[0] : high[0], low[1] : high[1]]
+
+        def score(hole_fill):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                recon = self._build(dataset3d, positions, hole_fill=hole_fill)
+            obj = recon.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+            return correlation(obj[: truth.shape[0], : truth.shape[1]], truth)
+
+        assert score("mean") > 0.6
+        assert score("mean") > score("zero") + 0.2
+
+    def test_mean_fill_matches_the_montage_on_a_masked_scan(self, dataset4d):
+        """With holes filled, the two formulations agree on data neither was built for."""
+        from quantem.diffractive_imaging import ShadowMontagePtychography
+
+        dataset3d, positions, keep = self._disk_masked(dataset4d)
+        rows_cols = scan_positions_px()[keep].astype(int)
+        low, high = rows_cols.min(0), rows_cols.max(0) + 1
+        truth = band_limited_phase()[low[0] : high[0], low[1] : high[1]]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            fourier = self._build(dataset3d, positions)
+        montage = ShadowMontagePtychography.from_dataset3d(
+            dataset3d,
+            positions,
+            energy=PROBE_ENERGY,
+            semiangle_cutoff=SEMIANGLE_CUTOFF,
+            rotation_angle=0.0,
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            aberration_coefs={"C10": TRUE_C10},
+            force_fitted_origin=(N // 2, N // 2),
+            verbose=False,
+        )
+
+        fourier_obj = fourier.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+        montage.reconstruct(deconvolution_kernel="prlx", weight_normalize=False, verbose=False)
+        origin = to_numpy(montage._canvas_origin_px)
+        row0, col0 = int(round(-origin[0])), int(round(-origin[1]))
+        montage_obj = montage.obj[row0 : row0 + truth.shape[0], col0 : col0 + truth.shape[1]]
+
+        fourier_corr = correlation(fourier_obj[: truth.shape[0], : truth.shape[1]], truth)
+        montage_corr = correlation(montage_obj, truth)
+
+        assert fourier_corr > 0.6
+        assert abs(fourier_corr - montage_corr) < 0.1
+
+    def test_rejects_an_unknown_hole_fill(self, dataset4d):
+        dataset3d, positions, _ = self._disk_masked(dataset4d)
+        with pytest.raises(ValueError, match="`hole_fill` must be"):
+            self._build(dataset3d, positions, hole_fill="interpolate")
