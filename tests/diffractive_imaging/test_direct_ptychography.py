@@ -731,3 +731,38 @@ class TestFromDataset3d:
         dataset3d, positions, _ = self._disk_masked(dataset4d)
         with pytest.raises(ValueError, match="`hole_fill` must be"):
             self._build(dataset3d, positions, hole_fill="interpolate")
+
+    def test_upsampling_an_irregular_regrid_warns(self, dataset4d):
+        """Regridding discards the sub-pixel positions upsampling needs to unfold."""
+        rng = np.random.default_rng(3)
+        positions = scan_positions_px() * SCAN_SAMPLING
+        positions = positions + rng.uniform(-0.4, 0.4, positions.shape) * SCAN_SAMPLING
+        recon = self._build(self._dataset3d(dataset4d), positions, scan_gpts=(N, N))
+
+        assert recon._regrid_info["lattice_rms_px"] > 0.1
+        with pytest.warns(UserWarning, match="cannot unfold"):
+            recon.reconstruct(deconvolution_kernel="prlx", upsampling_factor=2, verbose=False)
+
+    def test_no_unfolding_warning_on_a_lattice_or_without_upsampling(self, dataset4d):
+        dataset3d = self._dataset3d(dataset4d)
+        on_lattice = self._build(dataset3d, scan_positions_px() * SCAN_SAMPLING)
+
+        assert on_lattice._regrid_info["lattice_rms_px"] == pytest.approx(0.0, abs=1e-9)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            on_lattice.reconstruct(deconvolution_kernel="prlx", upsampling_factor=2, verbose=False)
+
+        rng = np.random.default_rng(3)
+        positions = scan_positions_px() * SCAN_SAMPLING
+        positions = positions + rng.uniform(-0.4, 0.4, positions.shape) * SCAN_SAMPLING
+        irregular = self._build(dataset3d, positions, scan_gpts=(N, N))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            irregular.reconstruct(deconvolution_kernel="prlx", verbose=False)
+
+    def test_gridded_reconstructions_never_warn_about_unfolding(self, dataset4d):
+        """`from_dataset4d` has no regrid info, so the check must be a no-op there."""
+        gridded = _build(dataset4d)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            gridded.reconstruct(deconvolution_kernel="prlx", upsampling_factor=4, verbose=False)

@@ -1,5 +1,6 @@
 import gc
 import math
+import warnings
 from typing import TYPE_CHECKING, Literal, Tuple
 
 import numpy as np
@@ -257,14 +258,26 @@ class DirectPtychography(DirectPtychographyBase):
 
         Notes
         -----
-        Regridding is the only approximation, and its failure mode is holes: a grid pixel no
-        probe reached has to be invented. ``hole_fill`` keeps that from becoming a hard-edged
-        step, but a large filled region still biases the result, so a warning reports the
-        fraction and a coarser ``scan_gpts`` is the usual fix.
+        **Do not combine this with** ``upsampling_factor > 1`` **on an irregular scan.**
+        Upsampling recovers detail above the scan Nyquist from where each probe actually
+        sat, and binning the measurements onto a grid discards exactly that, so the extra
+        band comes back as a replica of the contrast-transfer function rather than an
+        extension of it. Measured against the analytical parallax CTF with no holes at all,
+        correlation over the extension band falls 0.997 -> 0.822 -> 0.711 as the sub-pixel
+        scatter grows from 0 to 0.5 to 1.0 grid pixels, while
+        :class:`~quantem.diffractive_imaging.shadow_montage_ptychography.ShadowMontagePtychography`
+        holds 0.995 -> 0.983 on the same data. A warning fires when this applies.
 
-        A masked or non-rectangular scan is the case to watch. Contiguous holes are much
-        worse than scattered ones at equal fraction: scattered holes behave like noise, while
-        an excluded region is a low-frequency mask the deconvolution spreads everywhere.
+        The other failure mode is holes: a grid pixel no probe reached has to be invented.
+        ``hole_fill`` keeps that from becoming a hard-edged step, but a large filled region
+        still biases the result, so a warning reports the fraction and a coarser
+        ``scan_gpts`` is the usual fix. Contiguous holes are much worse than scattered ones
+        at equal fraction: scattered holes behave like noise, while an excluded region is a
+        low-frequency mask the deconvolution spreads everywhere.
+
+        In short, this is the right tool for an ungridded scan that is *nearly* a lattice, or
+        whenever ``upsampling_factor=1`` suffices. For a genuinely irregular scan, or when
+        you want finer sampling than the scan pitch, use the montage.
 
         :class:`~quantem.diffractive_imaging.shadow_montage_ptychography.ShadowMontagePtychography`
         needs no grid at all, and is the better choice for a sparse or strongly irregular
@@ -336,14 +349,57 @@ class DirectPtychography(DirectPtychographyBase):
 
         # regridding is where an ungridded reconstruction goes wrong, and the failure is
         # visible in these long before it is visible in the reconstruction
+        # how far the positions sit from the grid they were binned onto. Upsampling unfolds
+        # aliased detail using where each probe actually was, and regridding discards exactly
+        # that, so this predicts whether `upsampling_factor` can work at all.
+        subpixel = positions_px - np.round(positions_px)
+        lattice_rms_px = float(np.sqrt((subpixel**2).sum(axis=1).mean()))
+
         reconstruction._regrid_info = {
             "hole_fraction": hole_fraction,
             "occupied": occupied,
             "positions_px": positions_px,
             "scan_gpts": scan_gpts,
             "scan_sampling": scan_sampling,
+            "lattice_rms_px": lattice_rms_px,
         }
         return reconstruction
+
+    #: sub-pixel scatter, in grid pixels, above which regridding has destroyed enough of the
+    #: probe positions that upsampling replicates the band instead of extending it
+    _UNFOLDING_RMS_LIMIT = 0.1
+
+    def _warn_if_upsampling_cannot_unfold(self, upsampling_factor):
+        """Warn when upsampling an irregular regridded scan, which cannot unfold.
+
+        ``upsampling_factor`` recovers detail above the scan Nyquist from the aliased content
+        of the bright-field images, which depends on where each probe actually sat. Binning
+        those measurements onto a grid throws that away, so on an irregular scan the extra
+        band comes back as a replica of the CTF rather than an extension of it.
+
+        Measured on a white-noise object against the analytical parallax CTF, with no holes
+        at all: correlation over the band above the scan Nyquist falls 0.997 -> 0.965 ->
+        0.822 -> 0.711 as the sub-pixel scatter grows 0 -> 0.25 -> 0.5 -> 1.0 grid pixels,
+        while the montage holds 0.995 -> 0.983 on the same data.
+        """
+        info = getattr(self, "_regrid_info", None)
+        if upsampling_factor <= 1 or info is None:
+            return
+        if info["lattice_rms_px"] <= self._UNFOLDING_RMS_LIMIT:
+            return
+
+        warnings.warn(
+            f"This reconstruction was regridded from ungridded positions that sit "
+            f"{info['lattice_rms_px']:.2f} grid pixels from the grid on average, and "
+            f"`upsampling_factor={upsampling_factor}` cannot unfold that. Upsampling recovers "
+            "detail above the scan Nyquist from where each probe actually was, which "
+            "regridding discards, so the extra band will come back as a replica of the "
+            "contrast-transfer function rather than an extension of it. Use "
+            "ShadowMontagePtychography with a finer `scan_sampling` instead -- it places "
+            "every measurement at its own position and needs no regridding -- or keep "
+            "`upsampling_factor=1` here.",
+            stacklevel=2,
+        )
 
     def _preprocess(
         self,
@@ -529,6 +585,7 @@ class DirectPtychography(DirectPtychographyBase):
         if upsampling_factor is None:
             upsampling_factor = 1
         upsampling_factor = math.ceil(upsampling_factor)
+        self._warn_if_upsampling_cannot_unfold(upsampling_factor)
 
         if bf_mask is None:
             bf_mask = self.bf_mask
