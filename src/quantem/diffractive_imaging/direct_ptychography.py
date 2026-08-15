@@ -1148,7 +1148,8 @@ class DirectPtychography(DirectPtychographyBase):
         # ---------------------------------------------------------
         # Solve LS
         # ---------------------------------------------------------
-        sol = torch.linalg.lstsq(A, b).solution
+        # Fall back to CPU (to support MPS), as fit_linear_plane does for eigh
+        sol = torch.linalg.lstsq(A.cpu(), b.cpu()).solution.to(A.device)
 
         delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
 

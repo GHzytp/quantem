@@ -10,6 +10,7 @@ Imported by ``test_direct_ptychography.py`` and ``test_shadow_montage.py`` via
 
 import numpy as np
 import pytest
+import torch
 
 from quantem.core.datastructures import Dataset3d, Dataset4d
 from quantem.core.utils.utils import electron_wavelength_angstrom
@@ -519,3 +520,14 @@ def ctf_radial_correlation(measured: np.ndarray, analytic: np.ndarray, pixel_siz
     a = profile(measured, pixel_size)
     b = profile(analytic, CTF_SAMPLING)
     return float(np.corrcoef(a, b)[0, 1])
+
+
+#: every accelerator present, so the same assertions run on CPU, CUDA and MPS
+ACCELERATORS = [
+    device
+    for device, present in (
+        ("cuda", torch.cuda.is_available()),
+        ("mps", torch.backends.mps.is_available()),
+    )
+    if present
+]

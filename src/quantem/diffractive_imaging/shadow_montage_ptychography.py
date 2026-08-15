@@ -36,6 +36,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     allocate_splat_buffers,
     build_vbf_stack_from_dataset3d,
     build_vbf_stack_from_dataset4d,
+    preferred_float_dtype,
     scatter_add_convolve,
     scatter_add_splat,
 )
@@ -43,6 +44,18 @@ from quantem.diffractive_imaging.direct_ptychography_base import DirectPtychogra
 
 # target number of (BF pixel, scan position) points per splat batch
 _DEFAULT_POINTS_PER_BATCH = 4_194_304
+
+
+def _snap_to_integer(values: torch.Tensor, tolerance: float = 1e-4) -> torch.Tensor:
+    """Round values that are integers to within ``tolerance``, leave the rest alone.
+
+    Canvas bounds go through ``floor``/``ceil``, where a shift of exactly 4 arriving as
+    4.0000001 costs a whole pixel. The k-grid is float32 and positions are float32 on MPS
+    (which has no float64), so that noise is unavoidable -- and without snapping the same
+    data yields a canvas one pixel larger on CPU and a different one again on MPS.
+    """
+    rounded = torch.round(values)
+    return torch.where((values - rounded).abs() < tolerance, rounded, values)
 
 
 class ShadowMontagePtychography(DirectPtychographyBase):
@@ -401,13 +414,20 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self._vbf_stack = stack
 
     @property
+    def _float_dtype(self) -> torch.dtype:
+        """Widest float this device supports. MPS has no float64, so everything positional
+        -- coordinates, shifts, canvas origins -- has to follow the device rather than
+        hardcode float64."""
+        return preferred_float_dtype(self.device)
+
+    @property
     def positions_px(self) -> torch.Tensor:
         """``(N_pos, 2)`` scan positions in canvas pixels at ``upsampling_factor=1``."""
         return self._positions_px
 
     @positions_px.setter
     def positions_px(self, value):
-        positions = validate_tensor(value, "positions_px", dtype=torch.float64).to(
+        positions = validate_tensor(value, "positions_px", dtype=self._float_dtype).to(
             device=self.device
         )
         if positions.ndim != 2 or positions.shape[1] != 2:
@@ -536,7 +556,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         return torch.as_tensor(
             [s / upsampling_factor for s in self.scan_sampling],
             device=self.device,
-            dtype=torch.float64,
+            dtype=self._float_dtype,
         )
 
     def _return_defocus_rate_px(self, rotation_angle, bf_mask, upsampling_factor):
@@ -553,7 +573,11 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             k * self.wavelength, phi, aberration_coefs={"C10": 1.0}
         )
         rate = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
-        return rate.to(torch.float64) / (2 * math.pi) / self._upsampled_sampling(upsampling_factor)
+        return (
+            rate.to(self._float_dtype)
+            / (2 * math.pi)
+            / self._upsampled_sampling(upsampling_factor)
+        )
 
     def _return_delta_c10(self, defocus_gradient) -> torch.Tensor | None:
         """``(N_pos,)`` local defocus offset in Angstrom, or ``None`` for no gradient.
@@ -566,10 +590,10 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             return None
 
         scan_sampling = torch.as_tensor(
-            tuple(self.scan_sampling), device=self.device, dtype=torch.float64
+            tuple(self.scan_sampling), device=self.device, dtype=self._float_dtype
         )
         offsets_ang = (self._positions_px - self.positions_centroid_px) * scan_sampling
-        gradient = torch.as_tensor(defocus_gradient, device=self.device, dtype=torch.float64)
+        gradient = torch.as_tensor(defocus_gradient, device=self.device, dtype=self._float_dtype)
         return offsets_ang @ gradient
 
     def _return_shifts_px(self, rotation_angle, aberration_coefs, bf_mask, upsampling_factor):
@@ -584,7 +608,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
 
         upsampled_sampling = self._upsampled_sampling(upsampling_factor)
-        shifts_px = grad_k.to(torch.float64) / (2 * math.pi) / upsampled_sampling
+        shifts_px = grad_k.to(self._float_dtype) / (2 * math.pi) / upsampled_sampling
 
         # matches DirectPtychography.reconstruct: soft_edges is left at evaluate_probe's
         # default rather than taking self.soft_edges, so the two normalizations agree
@@ -822,18 +846,18 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         if boundary == "wrap":
             # spans exactly the scan field of view, at any upsampling factor
             canvas_shape = tuple(int(n) * upsampling_factor for n in self.scan_gpts)
-            origin = torch.zeros(2, device=self.device, dtype=torch.float64)
+            origin = torch.zeros(2, device=self.device, dtype=self._float_dtype)
             return with_fov(canvas_shape, origin)
 
         if boundary != "pad":
             raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
 
         if pad_px is None:
-            lo = torch.floor(positions_up.amin(0) + shift_lo)
-            hi = torch.ceil(positions_up.amax(0) + shift_hi)
+            lo = torch.floor(_snap_to_integer(positions_up.amin(0) + shift_lo))
+            hi = torch.ceil(_snap_to_integer(positions_up.amax(0) + shift_hi))
         else:
-            lo = torch.floor(positions_up.amin(0)) - pad_px
-            hi = torch.ceil(positions_up.amax(0)) + pad_px
+            lo = torch.floor(_snap_to_integer(positions_up.amin(0))) - pad_px
+            hi = torch.ceil(_snap_to_integer(positions_up.amax(0))) + pad_px
 
         # +2 leaves room for the upper bilinear corner at the far edge
         canvas_shape = tuple(int(v) + 2 for v in (hi - lo))
@@ -1484,7 +1508,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         patches = self._return_patch_indices(patch_grid)
         scan_sampling = torch.as_tensor(
-            tuple(self.scan_sampling), device=self.device, dtype=torch.float64
+            tuple(self.scan_sampling), device=self.device, dtype=self._float_dtype
         )
 
         # size every patch canvas for the largest trial defocus, so it stays fixed across
@@ -1503,7 +1527,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             center = (
                 (self._positions_px[pos_idx].mean(0) - self.positions_centroid_px) * scan_sampling
                 if pos_idx.numel()
-                else torch.zeros(2, device=self.device, dtype=torch.float64)
+                else torch.zeros(2, device=self.device, dtype=self._float_dtype)
             )
             centers.append(center.cpu().numpy())
 

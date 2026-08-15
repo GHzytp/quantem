@@ -651,10 +651,18 @@ def _crop_corner_centered_mask(mask: torch.Tensor, bf_mask_padding_px: int):
     return torch.fft.ifftshift(mask_c[y0:y1, x0:x1])
 
 
-def preferred_accumulator_dtype(device) -> torch.dtype:
-    """float64 where available; MPS has no float64 support."""
-    device_type = torch.device(device).type
-    return torch.float32 if device_type == "mps" else torch.float64
+def preferred_float_dtype(device) -> torch.dtype:
+    """Widest float the device supports: float64 everywhere except MPS, which has none.
+
+    Used for splat accumulators and for scan coordinates. On MPS the float32 fallback
+    resolves canvas positions to roughly 1e-3 pixels at a 10k-pixel canvas, well below the
+    sub-pixel detail any of this is trying to preserve.
+    """
+    return torch.float32 if torch.device(device).type == "mps" else torch.float64
+
+
+#: kept as the older name for the accumulator-specific use
+preferred_accumulator_dtype = preferred_float_dtype
 
 
 def allocate_splat_buffers(
@@ -1061,7 +1069,9 @@ def regrid_vbf_stack(
     num_bf = int(vbf_stack.shape[0])
     device = vbf_stack.device
     scan_gpts = (int(scan_gpts[0]), int(scan_gpts[1]))
-    coords = torch.as_tensor(positions_px, device=device, dtype=torch.float64)[None]
+    coords = torch.as_tensor(positions_px, device=device, dtype=preferred_float_dtype(device))[
+        None
+    ]
 
     # one image at a time: `scatter_add_splat` accumulates its whole batch into a single
     # canvas, which is what the montage wants but would sum the stack away here

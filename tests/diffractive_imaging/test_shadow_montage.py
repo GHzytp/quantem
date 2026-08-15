@@ -27,10 +27,12 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
 )
 
 from .conftest import (
+    ACCELERATORS,
     ORIGIN,
     PROBE_ENERGY,
     RECIPROCAL_SAMPLING,
     SCAN_SAMPLING,
+    SEMIANGLE_CUTOFF,
     N,
     band_limited_phase,
     correlation,
@@ -1319,3 +1321,126 @@ class TestRealSpaceKernels:
         )
 
         assert montage._stencil_info["stencil_radius"] <= modest_defocus + 2
+
+
+@pytest.mark.skipif(not ACCELERATORS, reason="no accelerator available")
+@pytest.mark.parametrize("device", ACCELERATORS)
+class TestAccelerators:
+    """Both classes must run, and agree with CPU, on whatever accelerator is present.
+
+    MPS has no float64 at all, so every positional tensor -- coordinates, shifts, canvas
+    origins -- has to take its dtype from the device rather than hardcode one.
+    """
+
+    @staticmethod
+    def _kwargs(dataset4d):
+        return dict(_common_kwargs(integer_shift_defocus(1)), edge_blend_pixels=0)
+
+    @staticmethod
+    def _ungridded(dataset4d):
+        """A `Dataset3d` and positions, with the origin *fitted* rather than forced.
+
+        Forcing the origin skips the centre-of-mass fit entirely, which is where the
+        device mismatch lived, so these deliberately let it run.
+        """
+        dataset3d = Dataset3d.from_array(
+            np.asarray(dataset4d.array).reshape(-1, N, N),
+            name="ungridded",
+            sampling=(1.0, dataset4d.sampling[-2], dataset4d.sampling[-1]),
+            units=("index", "A^-1", "A^-1"),
+        )
+        return dataset3d, scan_positions_px() * SCAN_SAMPLING
+
+    @pytest.mark.parametrize("boundary", ["wrap", "pad"])
+    def test_montage_matches_cpu(self, dataset4d, device, boundary):
+        def run(where):
+            montage = ShadowMontagePtychography.from_dataset4d(
+                dataset4d, device=where, boundary=boundary, **self._kwargs(dataset4d)
+            )
+            return montage.reconstruct(verbose=False).obj
+
+        on_device, on_cpu = run(device), run("cpu")
+
+        assert on_device.shape == on_cpu.shape
+        assert np.abs(on_device - on_cpu).max() / np.abs(on_cpu).max() < 1e-4
+
+    def test_montage_upsampled_matches_cpu(self, dataset4d, device):
+        def run(where):
+            montage = ShadowMontagePtychography.from_dataset4d(
+                dataset4d, device=where, **self._kwargs(dataset4d)
+            )
+            return montage.reconstruct(
+                upsampling_factor=2, interpolation="bilinear", verbose=False
+            ).obj
+
+        assert np.abs(run(device) - run("cpu")).max() / np.abs(run("cpu")).max() < 1e-4
+
+    def test_defocus_gradient_matches_cpu(self, dataset4d, device):
+        def run(where):
+            montage = ShadowMontagePtychography.from_dataset4d(
+                dataset4d,
+                device=where,
+                boundary="pad",
+                defocus_gradient=(30.0, -10.0),
+                **self._kwargs(dataset4d),
+            )
+            return montage.reconstruct(verbose=False).obj
+
+        on_device, on_cpu = run(device), run("cpu")
+
+        assert on_device.shape == on_cpu.shape
+        assert np.abs(on_device - on_cpu).max() / np.abs(on_cpu).max() < 1e-4
+
+    def test_real_space_kernel_runs(self, dataset4d, device):
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, device=device, **self._kwargs(dataset4d)
+        )
+        obj = montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=4, verbose=False).obj
+
+        assert np.isfinite(obj).all()
+
+    def test_variance_loss_and_search_run(self, dataset4d, device):
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d, device=device, **self._kwargs(dataset4d)
+        )
+        montage.reconstruct(verbose=False)
+
+        assert np.isfinite(float(montage.variance_loss()))
+
+    @pytest.mark.parametrize(
+        "cls", [DirectPtychography, ShadowMontagePtychography], ids=["fourier", "montage"]
+    )
+    def test_ungridded_fits_the_origin_on_device(self, dataset4d, device, cls):
+        """Regression: probe positions arrive as numpy and met the measured origin on MPS."""
+        dataset3d, positions = self._ungridded(dataset4d)
+
+        reconstruction = cls.from_dataset3d(
+            dataset3d,
+            positions,
+            energy=PROBE_ENERGY,
+            semiangle_cutoff=SEMIANGLE_CUTOFF,
+            rotation_angle=0.0,
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            device=device,
+            verbose=False,
+        )
+        obj = reconstruction.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+
+        assert np.isfinite(obj).all()
+
+
+@pytest.mark.skipif(not ACCELERATORS, reason="no accelerator available")
+@pytest.mark.parametrize("device", ACCELERATORS)
+def test_padded_canvas_shape_is_device_independent(dataset4d, device):
+    """Float noise must not push a canvas bound across an integer on one device only."""
+
+    def shape(where):
+        montage = ShadowMontagePtychography.from_dataset4d(
+            dataset4d,
+            device=where,
+            boundary="pad",
+            **dict(_common_kwargs(integer_shift_defocus(1)), edge_blend_pixels=0),
+        )
+        return montage.reconstruct(verbose=False).obj.shape
+
+    assert shape(device) == shape("cpu")
