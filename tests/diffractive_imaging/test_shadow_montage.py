@@ -1007,9 +1007,13 @@ class TestDefocusGradient:
 
         assert results["valid"].all()
         # the estimator carries a small uniform offset (~170 A, see the flat control below),
-        # so compare the spatial variation rather than the absolute value
+        # so compare the spatial variation rather than the absolute value.
+        # 0.97 rather than 0.99: scoring only pixels near the peak accumulated weight used
+        # to reach 0.995 on this gridded fixture, but on a real ungridded scan the weight is
+        # uneven everywhere and that cut selects density hot-spots instead of the interior --
+        # see `_patch_variance_loss`. The weight-averaged mean is unbiased on both.
         recovered = results["c10_best"] - results["c10_best"].mean()
-        assert np.corrcoef(recovered, expected - expected.mean())[0, 1] > 0.99
+        assert np.corrcoef(recovered, expected - expected.mean())[0, 1] > 0.97
 
     def test_defocus_map_is_flat_without_a_gradient(self):
         """The control that makes the test above meaningful."""

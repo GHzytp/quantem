@@ -1451,23 +1451,21 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         upsampling_factor,
         interpolation,
         max_batch_size,
-        support_fraction=0.9,
     ):
         """Variance loss of a montage built from a spatial subset of the scan positions.
 
         Deliberately does not go through :meth:`reconstruct`: threading a position subset
         through the public signature would make its canvas logic branch for a purely internal
-        use.
+        use. It is otherwise the same functional as :meth:`variance_loss` -- the same
+        weight-averaged per-pixel spread over the same accumulators -- so the patch fit and
+        a hyperparameter search cannot disagree about what a good defocus is.
 
-        Two details make the value comparable *across trial defocus values*, which is the
-        only thing this is for:
-
-        - the canvas is passed in, frozen, rather than sized from the shifts. A canvas that
-          grew with the defocus would add low-weight edge pixels, whose variance is small
-          simply because few images reach them, and the loss would then fall monotonically
-          with defocus rather than have a minimum at the right one.
-        - only pixels at ``support_fraction`` of the peak weight are scored, so partially
-          filled edges never enter the average.
+        The canvas is passed in frozen, rather than sized from the shifts, which is what
+        makes the value comparable *across trial defocus values*: a canvas that grew with
+        the defocus would add low-weight edge pixels, whose variance is small simply because
+        few images reach them, and the loss would then fall monotonically with defocus
+        rather than have a minimum at the right one. Weighting by ``sum_w`` is what keeps
+        those edges from dominating once the canvas is fixed.
         """
         shifts_px, _ = self._return_shifts_px(
             rotation_angle, aberration_coefs, bf.bf_mask, upsampling_factor
@@ -1489,13 +1487,13 @@ class ShadowMontagePtychography(DirectPtychographyBase):
                 out=buffers,
             )
 
-        sum_w, sum_wv, sum_wv2 = buffers
-        _, var, _ = self._moments_from_buffers(sum_w, sum_wv, sum_wv2)
-
-        supported = sum_w >= support_fraction * sum_w.max()
-        if not bool(supported.any()):
-            return float("inf")
-        return float(var[supported].mean())
+        # Scoring only pixels near the *peak* weight, as this used to, is a trap on an
+        # ungridded scan: the weight map is uneven everywhere, not just at the edges, so a
+        # 90%-of-peak cut kept 14% of the canvas -- the few spots where positions happened
+        # to pile up densest -- and which spots those are moves with the defocus. On the
+        # hexagonal apoferritin dataset that put the minimum at C10 = 9.5 kA against 13.0 kA
+        # for the weighted mean, the global `variance_loss`, and peak image contrast alike.
+        return float(self._variance_loss_from_buffers(*buffers))
 
     @staticmethod
     def _refine_minimum(values, losses):
