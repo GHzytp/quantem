@@ -476,6 +476,17 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self._defocus_gradient = value
 
     @property
+    def defocus_map_results(self) -> dict | None:
+        """What the last :meth:`defocus_map` measured, or ``None`` if it has not run.
+
+        :meth:`fit_defocus_gradient` leaves its map here, so the per-patch loss curves can be
+        plotted without paying for a second pass -- and a fit should be looked at before it
+        is trusted, since a patch whose minimum sits on an endpoint of ``c10_values`` is
+        dropped from the plane silently apart from the reported count.
+        """
+        return getattr(self, "_defocus_map_results", None)
+
+    @property
     def positions_centroid_px(self) -> torch.Tensor:
         """Centroid of the scan positions, in canvas pixels. Where ``delta C10`` vanishes."""
         return self._positions_px.mean(dim=0)
