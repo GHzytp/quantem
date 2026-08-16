@@ -22,12 +22,15 @@ from quantem.diffractive_imaging import (
 from quantem.diffractive_imaging.complex_probe import spatial_frequencies
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     allocate_splat_buffers,
+    estimate_frame_drift,
     scatter_add_convolve,
     scatter_add_splat,
 )
 
 from .conftest import (
     ACCELERATORS,
+    CTF_SAMPLING,
+    CTF_SCAN_SAMPLING,
     ORIGIN,
     PROBE_ENERGY,
     RECIPROCAL_SAMPLING,
@@ -36,6 +39,8 @@ from .conftest import (
     N,
     band_limited_phase,
     correlation,
+    ctf_interleaved_frames,
+    ctf_kwargs,
     integer_shift_defocus,
     make_model_vbf_stack,
     make_tilted_dataset4d,
@@ -1321,6 +1326,287 @@ class TestRealSpaceKernels:
         )
 
         assert montage._stencil_info["stencil_radius"] <= modest_defocus + 2
+
+
+class TestSharedCanvas:
+    """`obj_origin` / `obj_fov` pin the canvas to a window of the *specimen*.
+
+    Without them the canvas follows each acquisition's own position bounding box, so two
+    scans of the same region reconstruct onto canvases of different shapes, offset from one
+    another by a fraction of the drift you are trying to measure.
+    """
+
+    @staticmethod
+    def _montage(dataset4d, defocus, position_offset=(0.0, 0.0), **kwargs):
+        dataset3d = Dataset3d.from_array(
+            dataset4d.array.reshape(-1, N, N),
+            name="synthetic 3D stack",
+            units=("index", "A^-1", "A^-1"),
+            sampling=(1, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+        )
+        n_scan = dataset4d.shape[0]
+        positions = scan_positions_px()[: n_scan * n_scan] * SCAN_SAMPLING
+        positions = positions + np.asarray(position_offset, dtype=np.float64)
+        return ShadowMontagePtychography.from_dataset3d(
+            dataset3d,
+            positions,
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            boundary="pad",
+            **_common_kwargs(defocus),
+            **kwargs,
+        )
+
+    def test_scan_origin_recovers_the_input_positions(self, dataset4d):
+        """`scan_origin + positions_px * scan_sampling` must be what was passed in."""
+        offset = (37.0, -12.5)
+        montage = self._montage(dataset4d, integer_shift_defocus(1), position_offset=offset)
+
+        n_scan = dataset4d.shape[0]
+        expected = scan_positions_px()[: n_scan * n_scan] * SCAN_SAMPLING + np.asarray(offset)
+        recovered = np.asarray(montage.scan_origin) + to_numpy(montage.positions_px) * np.asarray(
+            montage.scan_sampling
+        )
+
+        assert recovered == pytest.approx(expected, abs=1e-4)
+
+    def test_pinned_window_is_reported_back(self, dataset4d):
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        origin = (-40.0, -30.0)
+        fov = (SCAN_SAMPLING * 20, SCAN_SAMPLING * 24)
+
+        montage.reconstruct(
+            deconvolution_kernel="prlx", obj_origin=origin, obj_fov=fov, verbose=False
+        )
+
+        assert montage.obj.shape == (20, 24)
+        assert montage.obj_origin == pytest.approx(origin, abs=1e-4)
+        assert montage._obj_fov == pytest.approx(fov, rel=1e-6)
+
+    def test_offset_acquisitions_land_on_the_same_canvas(self, dataset4d):
+        """The headline: the same specimen scanned in shifted coordinates must agree.
+
+        The two montages differ only in a rigid offset applied to *both* the positions and
+        the requested window, so the reconstructions have to be the same image -- which is
+        exactly what makes a cross-correlation between frames measure drift and nothing else.
+        """
+        defocus = integer_shift_defocus(1)
+        # deliberately not a whole number of scan pixels, which is the case that used to
+        # leave the two canvases a fraction of a pixel apart
+        offset = np.array([2.3 * SCAN_SAMPLING, -1.7 * SCAN_SAMPLING])
+        origin = np.array([-3.0 * SCAN_SAMPLING, -3.0 * SCAN_SAMPLING])
+        fov = (SCAN_SAMPLING * 24, SCAN_SAMPLING * 24)
+
+        plain = self._montage(dataset4d, defocus)
+        moved = self._montage(dataset4d, defocus, position_offset=offset)
+
+        plain.reconstruct(
+            deconvolution_kernel="prlx", obj_origin=tuple(origin), obj_fov=fov, verbose=False
+        )
+        moved.reconstruct(
+            deconvolution_kernel="prlx",
+            obj_origin=tuple(origin + offset),
+            obj_fov=fov,
+            verbose=False,
+        )
+
+        assert moved.obj.shape == plain.obj.shape
+        assert moved.obj_origin == pytest.approx(tuple(origin + offset), abs=1e-4)
+        assert _relative_error(moved.obj, plain.obj) < 1e-5
+
+    def test_unpinned_canvas_is_reproduced_by_pinning_it(self, dataset4d):
+        """Reading the window back out and passing it in must be a no-op."""
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        montage.reconstruct(deconvolution_kernel="prlx", pad_px=4, verbose=False)
+        automatic = montage.obj.copy()
+
+        montage.reconstruct(
+            deconvolution_kernel="prlx",
+            obj_origin=montage.obj_origin,
+            obj_fov=montage._obj_fov,
+            verbose=False,
+        )
+
+        assert montage.obj.shape == automatic.shape
+        assert _relative_error(montage.obj, automatic) < 1e-6
+
+    def test_obj_fov_and_pad_px_are_mutually_exclusive(self, dataset4d):
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        with pytest.raises(ValueError, match="both size the canvas"):
+            montage.reconstruct(
+                deconvolution_kernel="prlx", pad_px=4, obj_fov=(100.0, 100.0), verbose=False
+            )
+
+    @pytest.mark.parametrize("kwargs", [{"obj_origin": (0.0, 0.0)}, {"obj_fov": (100.0, 100.0)}])
+    def test_wrap_boundary_rejects_a_pinned_canvas(self, dataset4d, kwargs):
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        with pytest.raises(ValueError, match="boundary='wrap'"):
+            montage.reconstruct(
+                deconvolution_kernel="prlx", boundary="wrap", verbose=False, **kwargs
+            )
+
+    def test_obj_fov_must_be_positive(self, dataset4d):
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        with pytest.raises(ValueError, match="positive"):
+            montage.reconstruct(deconvolution_kernel="prlx", obj_fov=(0.0, 10.0), verbose=False)
+
+    def test_scan_origin_survives_a_round_trip(self, dataset4d, tmp_path):
+        montage = self._montage(dataset4d, integer_shift_defocus(1), position_offset=(11.0, -3.0))
+        montage.reconstruct(deconvolution_kernel="prlx", verbose=False)
+
+        path = str(tmp_path / "montage.zip")
+        montage.save(path, mode="o")
+        restored = load(path)
+
+        assert restored.scan_origin == pytest.approx(montage.scan_origin)
+        assert restored.obj_origin == pytest.approx(montage.obj_origin)
+
+    def test_gridded_construction_has_a_zero_scan_origin(self, dataset4d):
+        """A raster acquisition's grid *defines* the coordinates, so its origin is zero."""
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        assert montage.scan_origin == (0.0, 0.0)
+
+
+class TestFrameDrift:
+    """`estimate_frame_drift` on interleaved frames with a seeded, known displacement."""
+
+    #: a window well inside the object, so every frame's canvas is fully supported and the
+    #: correlation is not measuring which frame happened to reach nearer the edge
+    ORIGIN = (8 * CTF_SAMPLING, 8 * CTF_SAMPLING)
+    FOV = (48 * CTF_SAMPLING, 48 * CTF_SAMPLING)
+    DRIFT = np.array([[0.0, 0.0], [1.6, -0.8], [3.2, -1.6], [4.8, -2.4]]) * CTF_SAMPLING
+
+    def _frames(self, ctf_scene, drift=None):
+        complex_obj, _, probe, _, _ = ctf_scene
+        drift = self.DRIFT if drift is None else drift
+        datasets, positions = ctf_interleaved_frames(complex_obj, probe, drift)
+
+        montages = []
+        for dataset, pos in zip(datasets, positions):
+            montage = ShadowMontagePtychography.from_dataset3d(
+                dataset,
+                pos,
+                scan_sampling=(CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
+                boundary="pad",
+                **ctf_kwargs(),
+            )
+            montage.reconstruct(
+                deconvolution_kernel="prlx",
+                obj_origin=self.ORIGIN,
+                obj_fov=self.FOV,
+                verbose=False,
+            )
+            montages.append(montage)
+        return montages, positions
+
+    def test_recovers_a_seeded_drift(self, ctf_scene):
+        montages, _ = self._frames(ctf_scene)
+        measured = estimate_frame_drift(montages, verbose=False)
+
+        # the estimate is referred to the mean over frames, so compare mean-centered
+        expected = self.DRIFT - self.DRIFT.mean(axis=0)
+        assert measured == pytest.approx(expected, abs=0.35 * CTF_SCAN_SAMPLING)
+
+    def test_drift_sums_to_zero(self, ctf_scene):
+        montages, _ = self._frames(ctf_scene)
+        measured = estimate_frame_drift(montages, verbose=False)
+        assert measured.mean(axis=0) == pytest.approx((0.0, 0.0), abs=1e-9)
+
+    def test_correcting_the_positions_sharpens_the_combined_reconstruction(self, ctf_scene):
+        """The point of the exercise: `positions - drift` must beat `positions`.
+
+        Also pins the sign, which no amount of reasoning about correlation conventions
+        substitutes for.
+        """
+        complex_obj, _, probe, ctf_full, _ = ctf_scene
+        datasets, positions = ctf_interleaved_frames(complex_obj, probe, self.DRIFT)
+        montages, _ = self._frames(ctf_scene)
+        drift = estimate_frame_drift(montages, verbose=False)
+
+        combined = Dataset3d.from_array(
+            np.concatenate([d.array for d in datasets]),
+            name="combined frames",
+            units=datasets[0].units,
+            sampling=datasets[0].sampling,
+        )
+
+        def reconstruct(position_list):
+            montage = ShadowMontagePtychography.from_dataset3d(
+                combined,
+                np.concatenate(position_list),
+                scan_sampling=(CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
+                boundary="pad",
+                **ctf_kwargs(),
+            )
+            return montage.reconstruct(
+                deconvolution_kernel="prlx",
+                obj_origin=self.ORIGIN,
+                obj_fov=self.FOV,
+                verbose=False,
+            )
+
+        uncorrected = reconstruct(positions)
+        corrected = reconstruct([p - d for p, d in zip(positions, drift)])
+
+        # drift smears the montage, so undoing it has to raise the contrast
+        assert corrected.obj.std() > uncorrected.obj.std()
+        # and the wrong sign must make it worse, not better
+        wrong_sign = reconstruct([p + d for p, d in zip(positions, drift)])
+        assert corrected.obj.std() > wrong_sign.obj.std()
+
+    def test_zero_drift_is_recovered_as_zero(self, ctf_scene):
+        no_drift = np.zeros((3, 2))
+        montages, _ = self._frames(ctf_scene, drift=no_drift)
+        measured = estimate_frame_drift(montages, verbose=False)
+        assert np.abs(measured).max() < 0.35 * CTF_SCAN_SAMPLING
+
+    def test_rejects_frames_on_different_canvases(self, ctf_scene):
+        montages, _ = self._frames(ctf_scene)
+        montages[1].reconstruct(
+            deconvolution_kernel="prlx",
+            obj_origin=self.ORIGIN,
+            obj_fov=(self.FOV[0] + 4 * CTF_SAMPLING, self.FOV[1]),
+            verbose=False,
+        )
+        with pytest.raises(ValueError, match="share a canvas"):
+            estimate_frame_drift(montages, verbose=False)
+
+    def test_rejects_frames_at_different_origins(self, ctf_scene):
+        """The subtle failure: same shape, wrong place, silently measuring the offset."""
+        montages, _ = self._frames(ctf_scene)
+        montages[1].reconstruct(
+            deconvolution_kernel="prlx",
+            obj_origin=(self.ORIGIN[0] + 3 * CTF_SAMPLING, self.ORIGIN[1]),
+            obj_fov=self.FOV,
+            verbose=False,
+        )
+        with pytest.raises(ValueError, match="not a canvas origin"):
+            estimate_frame_drift(montages, verbose=False)
+
+    def test_rejects_unreconstructed_frames(self, ctf_scene):
+        montages, _ = self._frames(ctf_scene)
+        montages[1]._reset_reconstruction()
+        with pytest.raises(ValueError, match="not been reconstructed"):
+            estimate_frame_drift(montages, verbose=False)
+
+    def test_needs_at_least_two_frames(self, ctf_scene):
+        montages, _ = self._frames(ctf_scene)
+        with pytest.raises(ValueError, match="at least two"):
+            estimate_frame_drift(montages[:1], verbose=False)
+
+    def test_works_on_gridded_reconstructions(self, dataset4d):
+        """Nothing about it is montage-specific -- two raster reconstructions also align."""
+        defocus = integer_shift_defocus(1)
+        first, second = (
+            DirectPtychography.from_dataset4d(
+                dataset4d, edge_blend_pixels=0, **_common_kwargs(defocus)
+            )
+            for _ in range(2)
+        )
+        first.reconstruct(deconvolution_kernel="prlx", verbose=False)
+        second.reconstruct(deconvolution_kernel="prlx", verbose=False)
+
+        drift = estimate_frame_drift([first, second], verbose=False)
+        assert np.abs(drift).max() < 1e-6
 
 
 @pytest.mark.skipif(not ACCELERATORS, reason="no accelerator available")

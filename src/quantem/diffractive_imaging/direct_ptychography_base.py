@@ -248,6 +248,27 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         return tuple(n * s for n, s in zip(self.scan_gpts, self.scan_sampling))
 
     @property
+    def scan_origin(self) -> tuple[float, float]:
+        """Position of scan pixel ``(0, 0)``, in Angstrom, in the caller's coordinates.
+
+        Zero for a raster acquisition, whose grid *defines* the coordinates. The ungridded
+        constructors anchor the scan grid at the corner of the probe-position bounding box,
+        and record that corner here so pixels can be mapped back to the positions that were
+        passed in -- which is what makes two acquisitions of the same region comparable.
+        """
+        return getattr(self, "_scan_origin", (0.0, 0.0))
+
+    @scan_origin.setter
+    def scan_origin(self, value) -> None:
+        if value is None:
+            self._scan_origin = (0.0, 0.0)
+            return
+        origin = tuple(float(v) for v in np.asarray(value, dtype=np.float64).reshape(-1))
+        if len(origin) != 2:
+            raise ValueError(f"`scan_origin` must be a (row, col) pair, got {value!r}")
+        self._scan_origin = origin
+
+    @property
     def _obj_fov(self) -> tuple[float, float]:
         """Field of view the reconstructed object spans, in Angstrom.
 
@@ -255,6 +276,17 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         scan grid covers at any upsampling factor. Override where the object spans more.
         """
         return self.fov
+
+    @property
+    def obj_origin(self) -> tuple[float, float]:
+        """Position of object pixel ``(0, 0)``, in Angstrom, in the caller's coordinates.
+
+        Together with :attr:`_obj_sampling` this is the full map from object pixels back to
+        the probe positions that were passed in: ``origin + pixel * sampling``. Defaults to
+        :attr:`scan_origin`, for a reconstruction sampled on the scan grid; a class whose
+        canvas starts elsewhere must override it.
+        """
+        return self.scan_origin
 
     @property
     def _obj_sampling(self) -> tuple[float, float]:

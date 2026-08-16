@@ -947,6 +947,10 @@ def build_vbf_stack_from_dataset3d(
     scan_sampling : tuple of float
         Resolved pixel size, with ``"auto"`` replaced by the inferred value.
     rotation_angle : float
+    scan_origin : tuple of float
+        The bounding-box corner the positions were anchored at, in Angstrom. Keeping it
+        lets ``scan_origin + positions_px * scan_sampling`` recover the input positions,
+        so several acquisitions of the same region stay in one coordinate frame.
     """
     from quantem.core.datastructures import Dataset2d
 
@@ -1000,10 +1004,19 @@ def build_vbf_stack_from_dataset3d(
     vbf_stack = vbf_stack.T.contiguous()  # (N_bf, N)
 
     # anchor to the position bounding box, then convert to canvas pixels
-    positions_px = (positions_ang - positions_ang.min(axis=0)) / np.asarray(scan_sampling)
+    scan_origin = positions_ang.min(axis=0)
+    positions_px = (positions_ang - scan_origin) / np.asarray(scan_sampling)
     scan_gpts = tuple(int(math.ceil(v)) + 1 for v in positions_px.max(axis=0))
 
-    return vbf_stack, positions_px, bf_mask_dataset, scan_gpts, scan_sampling, rotation_angle
+    return (
+        vbf_stack,
+        positions_px,
+        bf_mask_dataset,
+        scan_gpts,
+        scan_sampling,
+        rotation_angle,
+        tuple(float(v) for v in scan_origin),
+    )
 
 
 def regrid_vbf_stack(
@@ -1178,6 +1191,122 @@ def fit_and_shift_diffraction_origin(
     )
 
     return origin.shifted_tensor, rotation_angle
+
+
+def estimate_frame_drift(
+    reconstructions,
+    upsample_factor: int = 16,
+    num_iterations: int = 3,
+    verbose: bool = True,
+):
+    """
+    Rigid drift of each frame of a multi-frame acquisition, in Angstrom.
+
+    A long acquisition is often split into several interleaved frames -- successive passes
+    of a self-filling hexagonal grid, say -- so that specimen drift shows up as a shift
+    *between* frames rather than as a smear within one. Reconstruct each frame on its own,
+    pass the reconstructions here, and subtract the returned drift from the probe positions
+    before reconstructing them all together::
+
+        drift = estimate_frame_drift(montages)
+        combined_positions = np.concatenate([p - d for p, d in zip(positions, drift)])
+
+    Every reconstruction must cover the *same* window of the specimen, since the estimate
+    is a plain cross-correlation between them; pin it with ``reconstruct``'s ``obj_origin``
+    and ``obj_fov``, which is checked here.
+
+    Parameters
+    ----------
+    reconstructions : sequence of DirectPtychographyBase
+        Reconstructed frames, in acquisition order. Each must have been reconstructed.
+    upsample_factor : int
+        Sub-pixel refinement of the correlation peak.
+    num_iterations : int
+        Leave-one-out refinement passes. Each frame is aligned against the mean of the
+        others, so no single frame is privileged as the reference; one pass is usually
+        enough, and the estimate converges within two or three.
+    verbose : bool
+        Report the drift per frame, and the largest update of the final pass.
+
+    Returns
+    -------
+    drift : ndarray
+        ``(n_frames, 2)`` drift in Angstrom, ordered ``(row, col)`` and referred to the mean
+        over frames, so it sums to zero rather than pinning frame 0.
+
+    Notes
+    -----
+    The drift is *rigid per frame*: it cannot represent drift accumulating within a frame,
+    which is what interleaving the frames is meant to avoid in the first place. For drift
+    that varies along the scan, see
+    :class:`~quantem.imaging.drift.DriftCorrection`, which warps individual scanlines.
+    """
+    frames = list(reconstructions)
+    if len(frames) < 2:
+        raise ValueError("`estimate_frame_drift` needs at least two reconstructions.")
+
+    images, samplings = [], []
+    for i, frame in enumerate(frames):
+        obj = frame.obj
+        if obj is None:
+            raise ValueError(f"Frame {i} has not been reconstructed yet; call `.reconstruct()`.")
+        images.append(np.asarray(obj, dtype=np.float64))
+        samplings.append(np.asarray(frame._obj_sampling, dtype=np.float64))
+
+    shapes = {img.shape for img in images}
+    if len(shapes) != 1:
+        raise ValueError(
+            f"Frames must share a canvas to be correlated, got shapes {sorted(shapes)}. "
+            "Reconstruct them with the same `obj_origin` and `obj_fov`."
+        )
+
+    # a canvas of the right shape in the wrong place is the subtler failure: the correlation
+    # would then measure the canvas offset rather than the drift, and silently succeed
+    origins = np.array([frame.obj_origin for frame in frames], dtype=np.float64)
+    sampling = samplings[0]
+    if not np.allclose(np.abs(origins - origins[0]).max(), 0.0, atol=1e-3 * sampling.min()):
+        raise ValueError(
+            "Frames share a canvas shape but not a canvas origin, so a correlation between "
+            f"them would measure that offset rather than the drift: {origins.tolist()}. "
+            "Reconstruct them with the same `obj_origin`."
+        )
+    if not all(np.allclose(s, sampling) for s in samplings):
+        raise ValueError(f"Frames must share a sampling, got {[s.tolist() for s in samplings]}.")
+
+    stack = torch.as_tensor(np.array(images), dtype=torch.float64)
+    spectra = torch.fft.fft2(stack)
+    kx = torch.fft.fftfreq(stack.shape[-2], dtype=torch.float64)[:, None]
+    ky = torch.fft.fftfreq(stack.shape[-1], dtype=torch.float64)[None, :]
+
+    shifts = torch.zeros((len(frames), 2), dtype=torch.float64)
+    for _ in range(max(1, int(num_iterations))):
+        ramp = torch.exp(
+            -2j * np.pi * (kx * shifts[:, 0, None, None] + ky * shifts[:, 1, None, None])
+        )
+        aligned = torch.fft.ifft2(spectra * ramp).real
+
+        total = aligned.sum(dim=0)
+        updates = torch.zeros_like(shifts)
+        for i in range(len(frames)):
+            # leave-one-out reference, so no frame is privileged as "the" reference
+            reference = (total - aligned[i]) / (len(frames) - 1)
+            updates[i] = cross_correlation_shift_torch(
+                reference, aligned[i], upsample_factor=upsample_factor
+            )
+        shifts = shifts + updates
+        shifts = shifts - shifts.mean(dim=0, keepdim=True)
+
+    # `cross_correlation_shift_torch` returns the shift that *undoes* the displacement, so
+    # the drift itself -- how far the frame moved -- is its negation
+    drift = -shifts.numpy() * sampling
+
+    if verbose:
+        residual = float(updates.abs().max()) * float(sampling.max())
+        print(f"Frame drift (Angstrom), final pass moved at most {residual:.2f} A:")
+        for i, d in enumerate(drift):
+            print(f"  frame {i}: ({d[0]:+8.2f}, {d[1]:+8.2f})")
+
+    return drift
 
 
 def bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold: float = 0.5):

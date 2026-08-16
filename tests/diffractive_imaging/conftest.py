@@ -522,6 +522,43 @@ def ctf_radial_correlation(measured: np.ndarray, analytic: np.ndarray, pixel_siz
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def ctf_interleaved_frames(
+    complex_obj: np.ndarray,
+    probe: np.ndarray,
+    drift: np.ndarray,
+    seed: int = 3,
+):
+    """Split the CTF raster into interleaved frames, each displaced by a known drift.
+
+    Models a multi-frame acquisition: every frame samples the whole field of view sparsely,
+    the frames interleave to fill it, and the specimen moves between them. The recorded
+    positions stay nominal while the *object* is imaged displaced, which is what specimen
+    drift does and what ``estimate_frame_drift`` has to undo.
+
+    The sign follows the specimen: a feature at object coordinate ``x`` moves to ``x +
+    drift`` in the microscope's frame, so it is measured when the probe is nominally at
+    ``x + drift`` -- equivalently the probe illuminates ``nominal - drift``. The
+    reconstruction then shows the object translated by ``+drift``, and ``positions - drift``
+    puts it back.
+
+    Returns ``(datasets, positions_A)``, both lists of length ``len(drift)``, with positions
+    in Angstrom -- what the ungridded constructors take.
+    """
+    positions = ctf_raster_positions()
+    rng = np.random.default_rng(seed)
+    assignment = rng.permutation(len(positions)) % len(drift)
+
+    datasets, positions_A = [], []
+    for frame, offset in enumerate(np.asarray(drift, dtype=np.float64)):
+        nominal = positions[assignment == frame]
+        illuminated = nominal - offset / CTF_SAMPLING
+        intensities = ctf_simulate(complex_obj, probe, illuminated)
+        datasets.append(ctf_dataset3d(intensities))
+        positions_A.append(nominal * CTF_SAMPLING)
+
+    return datasets, positions_A
+
+
 #: every accelerator present, so the same assertions run on CPU, CUDA and MPS
 ACCELERATORS = [
     device

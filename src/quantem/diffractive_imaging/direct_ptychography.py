@@ -295,21 +295,27 @@ class DirectPtychography(DirectPtychographyBase):
         needs no grid at all, and is the better choice for a sparse or strongly irregular
         scan -- at the cost of the parallax kernel being the only exact one there.
         """
-        vbf_stack, positions_px, bf_mask_dataset, fitted_gpts, scan_sampling, rotation_angle = (
-            build_vbf_stack_from_dataset3d(
-                dataset,
-                positions,
-                scan_sampling,
-                device=device,
-                max_batch_size=max_batch_size,
-                fit_method=fit_method,
-                mode=mode,
-                force_measured_origin=force_measured_origin,
-                force_fitted_origin=force_fitted_origin,
-                rotation_angle=rotation_angle,
-                intensity_threshold=intensity_threshold,
-                normalization_order=normalization_order,
-            )
+        (
+            vbf_stack,
+            positions_px,
+            bf_mask_dataset,
+            fitted_gpts,
+            scan_sampling,
+            rotation_angle,
+            scan_origin,
+        ) = build_vbf_stack_from_dataset3d(
+            dataset,
+            positions,
+            scan_sampling,
+            device=device,
+            max_batch_size=max_batch_size,
+            fit_method=fit_method,
+            mode=mode,
+            force_measured_origin=force_measured_origin,
+            force_fitted_origin=force_fitted_origin,
+            rotation_angle=rotation_angle,
+            intensity_threshold=intensity_threshold,
+            normalization_order=normalization_order,
         )
 
         if scan_gpts is None:
@@ -367,6 +373,9 @@ class DirectPtychography(DirectPtychographyBase):
             device=device,
             verbose=verbose,
         )
+        # the grid was anchored at the position bounding box, so record where that was --
+        # this is what lets `obj_origin` be read in the caller's own coordinates
+        reconstruction.scan_origin = scan_origin
 
         # regridding is where an ungridded reconstruction goes wrong, and the failure is
         # visible in these long before it is visible in the reconstruction

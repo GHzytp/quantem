@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d
-from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.core.utils.validators import (
     validate_aberration_coefficients,
     validate_tensor,
@@ -115,6 +115,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         device: str | int,
         verbose: int | bool,
         defocus_gradient: Tuple[float, float] | None = None,
+        scan_origin: Tuple[float, float] | None = None,
         _token: object | None = None,
     ):
         """ """
@@ -138,6 +139,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         self.scan_gpts = tuple(int(n) for n in scan_gpts)
         self.scan_sampling = scan_sampling
+        self.scan_origin = scan_origin
         self.reciprocal_sampling = bf_mask_dataset.sampling
         self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
 
@@ -348,21 +350,27 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         Positions are *not* rotated: the detector rotation already enters through the
         bright-field k-grid, and rotating the positions as well would double-count it.
         """
-        vbf_stack, positions_px, bf_mask_dataset, scan_gpts, scan_sampling, rotation_angle = (
-            build_vbf_stack_from_dataset3d(
-                dataset,
-                positions,
-                scan_sampling,
-                device=device,
-                max_batch_size=max_batch_size,
-                fit_method=fit_method,
-                mode=mode,
-                force_measured_origin=force_measured_origin,
-                force_fitted_origin=force_fitted_origin,
-                rotation_angle=rotation_angle,
-                intensity_threshold=intensity_threshold,
-                normalization_order=normalization_order,
-            )
+        (
+            vbf_stack,
+            positions_px,
+            bf_mask_dataset,
+            scan_gpts,
+            scan_sampling,
+            rotation_angle,
+            scan_origin,
+        ) = build_vbf_stack_from_dataset3d(
+            dataset,
+            positions,
+            scan_sampling,
+            device=device,
+            max_batch_size=max_batch_size,
+            fit_method=fit_method,
+            mode=mode,
+            force_measured_origin=force_measured_origin,
+            force_fitted_origin=force_fitted_origin,
+            rotation_angle=rotation_angle,
+            intensity_threshold=intensity_threshold,
+            normalization_order=normalization_order,
         )
 
         return cls(
@@ -376,6 +384,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             scan_sampling=scan_sampling,
             scan_units=("A", "A"),
             scan_gpts=scan_gpts,
+            scan_origin=scan_origin,
             boundary=boundary,
             gridded_scan=False,
             defocus_gradient=defocus_gradient,
@@ -502,6 +511,22 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         if self._canvas_fov is None:
             return self.fov
         return self._canvas_fov
+
+    @property
+    def obj_origin(self) -> tuple[float, float]:
+        """Position of object pixel ``(0, 0)``, in Angstrom, in the caller's coordinates.
+
+        The canvas corner, which ``"pad"`` places below the scan origin to make room for the
+        aberration shifts. With :attr:`_obj_sampling` this maps the reconstruction back onto
+        the probe positions that were passed in, and hence onto any other reconstruction of
+        the same region -- see :meth:`reconstruct`'s ``obj_origin`` and ``obj_fov``.
+        """
+        if self._canvas_origin_px is None:
+            return self.scan_origin
+        origin_px = to_numpy(self._canvas_origin_px)
+        return tuple(
+            float(o + p * s) for o, p, s in zip(self.scan_origin, origin_px, self._obj_sampling)
+        )
 
     # ------------------------------------------------------------------
     # preprocessing
@@ -828,6 +853,8 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         pad_px,
         defocus_rate_px=None,
         delta_c10=None,
+        obj_origin=None,
+        obj_fov=None,
     ):
         """``(canvas_shape, canvas_origin_px, canvas_fov)`` for the requested boundary.
 
@@ -844,6 +871,11 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             return canvas_shape, origin, canvas_fov
 
         if boundary == "wrap":
+            if obj_origin is not None or obj_fov is not None:
+                raise ValueError(
+                    "`obj_origin` and `obj_fov` pin the canvas, which boundary='wrap' fixes "
+                    "to the scan grid; use boundary='pad'."
+                )
             # spans exactly the scan field of view, at any upsampling factor
             canvas_shape = tuple(int(n) * upsampling_factor for n in self.scan_gpts)
             origin = torch.zeros(2, device=self.device, dtype=self._float_dtype)
@@ -851,6 +883,9 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         if boundary != "pad":
             raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
+
+        if pad_px is not None and obj_fov is not None:
+            raise ValueError("`pad_px` and `obj_fov` both size the canvas; pass one or the other.")
 
         if pad_px is None:
             lo = torch.floor(_snap_to_integer(positions_up.amin(0) + shift_lo))
@@ -861,6 +896,28 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         # +2 leaves room for the upper bilinear corner at the far edge
         canvas_shape = tuple(int(v) + 2 for v in (hi - lo))
+
+        if obj_origin is not None:
+            # Angstrom in the caller's frame -> upsampled canvas pixels, deliberately *not*
+            # rounded to a whole pixel. Each acquisition anchors its scan grid at its own
+            # bounding box, so the per-frame pixel lattices are already offset from one
+            # another; snapping to them would put the same requested window a fraction of a
+            # pixel apart in each frame, which is the very misregistration this removes.
+            # The positions then land at fractional canvas coordinates, which is what the
+            # splat already handles for an ungridded scan.
+            offset = np.asarray(obj_origin, dtype=np.float64) - np.asarray(self.scan_origin)
+            lo_np = offset / np.asarray(self.scan_sampling) * upsampling_factor
+            lo = torch.as_tensor(lo_np, device=self.device, dtype=self._float_dtype)
+
+        if obj_fov is not None:
+            fov = np.asarray(obj_fov, dtype=np.float64)
+            if fov.size != 2 or np.any(fov <= 0):
+                raise ValueError(f"`obj_fov` must be a positive (row, col) pair, got {obj_fov!r}")
+            canvas_shape = tuple(
+                max(1, int(round(f / s * upsampling_factor)))
+                for f, s in zip(fov, self.scan_sampling)
+            )
+
         return with_fov(canvas_shape, lo)
 
     def reconstruct(
@@ -883,6 +940,8 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         weight_normalize=None,
         weight_threshold=1e-2,
         pad_px=None,
+        obj_origin=None,
+        obj_fov=None,
         compute_variance=True,
         suppress_nyquist=False,
         stencil_radius="auto",
@@ -970,6 +1029,25 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             canvas a fixed size across hyperparameter trials or a defocus series, where the
             automatic size would otherwise change with the shifts. Contributions landing
             beyond ``pad_px`` are dropped, so choose it larger than the shifts you expect.
+        obj_origin : tuple of float, optional
+            Pin the canvas corner to this ``(row, col)`` coordinate, in Angstrom, **in the
+            same frame as the probe positions passed to** :meth:`from_dataset3d`. Defaults
+            to whatever ``pad_px`` or the shifts imply, which follows each acquisition's own
+            bounding box and so differs between them.
+        obj_fov : tuple of float, optional
+            Pin the canvas extent to ``(rows, cols)`` Angstrom, rather than sizing it from
+            the positions. Mutually exclusive with ``pad_px``.
+
+            Together, ``obj_origin`` and ``obj_fov`` name a fixed window in the specimen's
+            own coordinates, so separate acquisitions -- successive frames of a multi-frame
+            scan, say -- reconstruct onto pixel-identical canvases that can be stacked,
+            differenced or cross-correlated. Without them, each frame's canvas follows its
+            own position bounding box, and two frames covering the same region can be a few
+            pixels apart for no physical reason. Both are read back from :attr:`obj_origin`
+            and :attr:`_obj_sampling`, which map object pixels onto probe positions.
+
+            Neither applies to ``boundary="wrap"``, whose canvas is the scan grid by
+            definition.
         compute_variance : bool
             Accumulate the sum of squares needed by :meth:`variance_loss`.
         suppress_nyquist : bool
@@ -1068,7 +1146,14 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             )
 
         canvas_shape, canvas_origin, canvas_fov = self._return_canvas(
-            shifts_px, upsampling_factor, boundary, pad_px, defocus_rate_px, delta_c10
+            shifts_px,
+            upsampling_factor,
+            boundary,
+            pad_px,
+            defocus_rate_px,
+            delta_c10,
+            obj_origin=obj_origin,
+            obj_fov=obj_fov,
         )
 
         if max_batch_size is None:
