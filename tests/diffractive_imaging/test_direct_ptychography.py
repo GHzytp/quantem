@@ -386,6 +386,107 @@ class TestHyperparameterFitting:
         assert np.allclose(from_initial, recon.obj)
 
 
+class TestLossFunctions:
+    """The searches accept an objective by name or as a callable, and minimize it."""
+
+    def test_rms_gradient_is_none_before_reconstruct(self, dataset4d):
+        assert _build(dataset4d).rms_gradient_loss() is None
+
+    def test_rms_gradient_peaks_at_the_true_defocus(self, dataset4d):
+        """It is a sharpness metric, so the correct deconvolution must maximize it."""
+        recon = _build(dataset4d)
+
+        losses = {}
+        for scale in (0.5, 1.0, 1.5):
+            recon.reconstruct(
+                deconvolution_kernel="prlx",
+                override_aberration_coefs={"C10": scale * TRUE_C10},
+                verbose=False,
+            )
+            losses[scale] = recon.rms_gradient_loss()
+
+        # negated, so the true defocus is the *smallest*
+        assert losses[1.0] < losses[0.5]
+        assert losses[1.0] < losses[1.5]
+
+    def test_rms_gradient_follows_the_object_sampling(self, dataset4d):
+        """Per Angstrom, not per pixel, so upsampling does not rescale it."""
+        recon = _build(dataset4d)
+        recon.reconstruct(deconvolution_kernel="prlx", upsampling_factor=1, verbose=False)
+        coarse = recon.rms_gradient_loss()
+        recon.reconstruct(deconvolution_kernel="prlx", upsampling_factor=2, verbose=False)
+        fine = recon.rms_gradient_loss()
+
+        # upsampling tiles the spectrum rather than adding detail, so the physical gradient
+        # is the same quantity; a per-pixel metric would differ by the sampling ratio
+        assert fine == pytest.approx(coarse, rel=0.35)
+
+    def test_the_two_classes_agree(self, dataset4d):
+        """`prlx` is the same operator in both, so the objective must match."""
+        from quantem.diffractive_imaging import ShadowMontagePtychography
+
+        kwargs = dict(direct_ptycho_kwargs(TRUE_C10), edge_blend_pixels=0)
+        fourier = DirectPtychography.from_dataset4d(dataset4d, **kwargs)
+        montage = ShadowMontagePtychography.from_dataset4d(dataset4d, boundary="wrap", **kwargs)
+        for recon in (fourier, montage):
+            recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
+
+        assert montage.rms_gradient_loss() == pytest.approx(fourier.rms_gradient_loss(), rel=1e-5)
+
+    def test_grid_search_with_the_rms_gradient(self, dataset4d):
+        recon = _build(dataset4d, aberration_coefs={})
+        recon.grid_search_hyperparameters(
+            aberration_coefs={
+                "C10": OptimizationParameter(low=0.4 * TRUE_C10, high=1.6 * TRUE_C10, n_points=7)
+            },
+            loss="rms_gradient",
+            deconvolution_kernel="prlx",
+            verbose=False,
+        )
+        fitted = recon.hyperparameter_state.optimized_aberrations["C10"]
+
+        step = (1.6 - 0.4) * TRUE_C10 / 6
+        assert abs(fitted - TRUE_C10) <= step
+
+    def test_grid_search_accepts_a_callable(self, dataset4d):
+        """Anything that scores a reconstruction can drive a search."""
+        recon = _build(dataset4d, aberration_coefs={})
+        recon.grid_search_hyperparameters(
+            aberration_coefs={
+                "C10": OptimizationParameter(low=0.4 * TRUE_C10, high=1.6 * TRUE_C10, n_points=7)
+            },
+            loss=lambda r: -float(np.std(r.obj)),
+            deconvolution_kernel="prlx",
+            verbose=False,
+        )
+        fitted = recon.hyperparameter_state.optimized_aberrations["C10"]
+
+        step = (1.6 - 0.4) * TRUE_C10 / 6
+        assert abs(fitted - TRUE_C10) <= step
+
+    def test_recorded_losses_are_the_requested_objective(self, dataset4d):
+        """`_grid_search_results` must hold the loss actually optimized, not the default."""
+        recon = _build(dataset4d, aberration_coefs={})
+        recon.grid_search_hyperparameters(
+            aberration_coefs={
+                "C10": OptimizationParameter(low=0.4 * TRUE_C10, high=1.6 * TRUE_C10, n_points=3)
+            },
+            loss="rms_gradient",
+            deconvolution_kernel="prlx",
+            verbose=False,
+        )
+
+        # the RMS gradient loss is negative; the variance loss is positive
+        assert all(loss < 0 for _, loss in recon._grid_search_results)
+
+    @pytest.mark.parametrize("bad", ["sharpness", 3, None])
+    def test_unknown_losses_are_rejected(self, dataset4d, bad):
+        recon = _build(dataset4d)
+        recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
+        with pytest.raises(ValueError, match="must be a callable or one of"):
+            recon._return_loss_value(bad)
+
+
 class TestHyperparameterState:
     def test_optimized_overrides_initial(self, recon):
         state = recon.hyperparameter_state

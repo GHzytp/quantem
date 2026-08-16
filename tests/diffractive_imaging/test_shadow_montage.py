@@ -716,6 +716,35 @@ class TestHyperparameterSearch:
         assert all(value > 0 for value in losses.values())
         assert min(losses, key=losses.get) == pytest.approx(1.0)
 
+    def test_rms_gradient_drives_a_search_over_a_convolution_kernel(self, dataset4d):
+        """`variance_loss` is undefined for `ssb` here; the sharpness objective is not.
+
+        That is the reason it exists on this class: without it there is no way to tune
+        aberrations for the real-space SSB/OBF/MF kernels at all.
+        """
+        true_defocus = integer_shift_defocus(1)
+        _, montage = _build_pair(dataset4d, true_defocus)
+
+        montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=6, verbose=False)
+        with pytest.raises(NotImplementedError):
+            montage.variance_loss()
+
+        montage.grid_search_hyperparameters(
+            aberration_coefs={
+                "C10": OptimizationParameter(
+                    low=0.4 * true_defocus, high=1.6 * true_defocus, n_points=5
+                )
+            },
+            loss="rms_gradient",
+            deconvolution_kernel="ssb",
+            stencil_radius=6,
+            verbose=False,
+        )
+        best = montage.hyperparameter_state.optimized_aberrations["C10"]
+
+        step = (1.6 - 0.4) * true_defocus / 4
+        assert abs(best - true_defocus) <= step
+
 
 class TestSerialization:
     """Both classes must survive a save/load round-trip and stay usable afterwards."""
