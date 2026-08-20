@@ -1750,20 +1750,16 @@ class TestRealSpaceKernels:
 
         assert float(montage.variance_loss()) > 0
 
-    def test_icom_is_rejected_only_by_the_stencil(self, dataset4d):
-        """`k . q / |q|**2` is unbounded as q -> 0, so no box stencil captures it.
-
-        That is an objection to truncating, not to the kernel, so the FFT route runs it.
-        """
+    def test_icom_runs_in_either_mode(self, dataset4d):
         _, montage = self._pair(dataset4d)
-
-        with pytest.raises(ValueError, match="unbounded"):
+        for mode in ("fft", "stencil"):
             montage.reconstruct(
-                deconvolution_kernel="icom", convolution_mode="stencil", verbose=False
+                deconvolution_kernel="icom",
+                convolution_mode=mode,
+                stencil_radius=8,
+                verbose=False,
             )
-
-        montage.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
-        assert np.isfinite(montage.obj).all()
+            assert np.isfinite(montage.obj).all()
 
     def test_icom_ignores_an_empirical_probe(self, dataset4d):
         """It never reads psi, so an empirical probe changes nothing -- not even a bit.
@@ -1789,6 +1785,76 @@ class TestRealSpaceKernels:
             recon.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
 
         assert np.array_equal(empirical.obj, analytic.obj)
+
+    def test_truncated_icom_is_ricom(self):
+        """A truncated iCoM stencil *is* riCOM (Yu et al., Microsc Microanal 28, 1526).
+
+        riCOM cross-correlates the centre-of-mass shift map with a kernel
+        `(r_p - r_xy) / |r_p - r_xy|**2` truncated to an n x n box. That kernel is the
+        real-space form of the iCoM operator: for `G = ln|r| / 2pi`, `grad G = r / (2 pi
+        |r|**2)`, whose transform is `-i q / |q|**2`. Since each bright-field pixel's kernel
+        is linear in `k_m`, summing over the detector collapses the montage's per-pixel
+        convolutions into one convolution of the COM shift -- which is riCOM exactly.
+
+        Two consequences, both checked below: a kernel spanning the canvas reproduces
+        untruncated iCoM, and shrinking it acts as a high pass. The latter is riCOM's whole
+        point -- it is what suppresses the long-range drift that blurs an iCoM image.
+        """
+        vbf, bf_mask, _ = make_model_vbf_stack(MODEL_DEFOCUS, (0.0, 0.0), scan_gpts=(96, 96))
+        montage = ShadowMontagePtychography.from_virtual_bfs(
+            vbf, bf_mask, **model_vbf_kwargs(MODEL_DEFOCUS)
+        )
+
+        size = montage.scan_gpts[0]
+        axis = np.minimum(np.arange(size), size - np.arange(size))
+        radius = np.hypot(axis[:, None], axis[None, :]).astype(int)
+
+        def bands(image):
+            spectrum = np.abs(np.fft.fft2(image - image.mean()))
+            profile = np.bincount(radius.ravel(), spectrum.ravel()) / np.maximum(
+                np.bincount(radius.ravel()), 1
+            )
+            return profile[1:4].mean(), profile[10:25].mean()
+
+        common = dict(deconvolution_kernel="icom", boundary="wrap", verbose=False)
+        montage.reconstruct(convolution_mode="fft", **common)
+        untruncated = montage.obj.copy()
+
+        ratios = []
+        for stencil_radius in (5, 10, 20, 40):
+            montage.reconstruct(
+                convolution_mode="stencil", stencil_radius=stencil_radius, **common
+            )
+            low, high = bands(montage.obj)
+            ratios.append(high / low)
+            if stencil_radius == 40:  # spans the canvas, so nothing is truncated away
+                assert correlation(montage.obj, untruncated) > 0.99
+
+        # smaller kernel -> more weight at high frequency, monotonically
+        assert ratios == sorted(ratios, reverse=True)
+        assert ratios[0] > 1.2 * ratios[-1]
+
+    def test_the_icom_kernel_is_the_ricom_kernel(self):
+        """`ifft2(-i q / |q|**2)` is `r / (2 pi |r|**2)`, the kernel riCOM writes down."""
+        size = 128
+        frequency = np.fft.fftfreq(size)
+        qx, qy = frequency[:, None], frequency[None, :]
+        q_square = qx**2 + qy**2
+        q_square[0, 0] = 1.0
+        operator = -1j * qx / q_square
+        operator[0, 0] = 0.0
+        transformed = np.real(np.fft.ifft2(operator))
+
+        position = np.fft.fftfreq(size, 1 / size)
+        rx, ry = position[:, None], position[None, :]
+        r_square = rx**2 + ry**2
+        r_square[0, 0] = 1.0
+        analytic = rx / (2 * np.pi * r_square)
+
+        # away from the singular origin and the periodic seam
+        distance = np.hypot(rx, ry)
+        inside = (distance > 3) & (distance < size / 4)
+        assert np.corrcoef(transformed[inside], analytic[inside])[0, 1] > 0.98
 
     def test_phase_flip_is_not_applied_to_deconvolution_kernels(self, dataset4d):
         """The kernels already invert the contrast transfer, as in `DirectPtychography`."""

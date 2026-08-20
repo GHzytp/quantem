@@ -955,7 +955,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             "max_error": float(errors[:, column].max()),
         }
 
-        if info["mean_error"] > truncation_tolerance:
+        if info["mean_error"] > truncation_tolerance and kernel != "icom":
             warnings.warn(
                 f"A stencil radius of {radius} px leaves an estimated "
                 f"{info['mean_error']:.0%} truncation error (worst bright-field pixel "
@@ -968,6 +968,10 @@ class ShadowMontagePtychography(DirectPtychographyBase):
                 "one.",
                 stacklevel=3,
             )
+        # iCoM is deliberately excluded above. Truncating `k . q / |q|**2` is not a
+        # compromise but the method: it is riCOM (Yu et al., Microsc Microanal 28, 1526),
+        # where the radius is a high-pass cutoff chosen to suppress the long-range drift
+        # that blurs an iCoM image. Reporting that as error would be backwards.
 
         # second pass: crop to the chosen box
         window = (
@@ -1140,9 +1144,15 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         deconvolution_kernel : str
             ``"prlx"`` (and its aliases) is a pure translation and is exact. ``"ssb"``,
             ``"obf"`` and ``"mf"`` are convolutions, evaluated here with a truncated
-            real-space stencil -- see ``stencil_radius``. ``"icom"`` is rejected: its
-            ``k . q / |q|**2`` kernel is unbounded as ``q -> 0`` and has no useful
-            truncation.
+            real-space stencil -- see ``stencil_radius``.
+
+            ``"icom"`` is exact with ``convolution_mode="fft"``. Truncated with a stencil it
+            becomes **riCOM** (Yu et al., *Microsc Microanal* **28**, 1526): its real-space
+            kernel is ``r / (2 * pi * |r|**2)``, and since each bright-field pixel's copy is
+            linear in ``k``, the sum over the detector collapses to one convolution of the
+            centre-of-mass shift. There the radius is a deliberate high-pass cutoff -- the
+            thing that suppresses the long-range drift blurring an iCoM image -- rather than
+            an approximation error, so no truncation warning is raised for it.
         q_highpass, q_lowpass : float, optional
             Butterworth filter cutoffs, applied once to the finished image.
         parallax_flip_phase : bool
@@ -1311,17 +1321,6 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             # zero aberrations would give zero shifts and quietly sum the bright-field stack
             # into a plain incoherent image, which is not a parallax reconstruction
             self._require_analytic_probe("The parallax kernel")
-        if (
-            kernel == "icom"
-            and self._resolve_convolution_mode(convolution_mode, kernel, stencil_radius)
-            == "stencil"
-        ):
-            raise ValueError(
-                "The iCoM kernel `k . q / |q|**2` is unbounded as q -> 0, so its real-space "
-                "form has no useful truncation. Use convolution_mode='fft', which does not "
-                "truncate at all."
-            )
-
         if upsampling_factor is None:
             upsampling_factor = 1
         upsampling_factor = math.ceil(upsampling_factor)
