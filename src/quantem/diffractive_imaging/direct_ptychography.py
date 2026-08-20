@@ -219,6 +219,7 @@ class DirectPtychography(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        bf_mask: torch.Tensor | NDArray | None = None,
         scan_gpts: Tuple[int, int] | None = None,
         interpolation: Literal["nearest", "bilinear"] = "nearest",
         hole_fill: Literal["mean", "zero"] = "mean",
@@ -328,6 +329,7 @@ class DirectPtychography(DirectPtychographyBase):
             rotation_angle=rotation_angle,
             intensity_threshold=intensity_threshold,
             normalization_order=normalization_order,
+            bf_mask=bf_mask,
         )
 
         if scan_gpts is None:

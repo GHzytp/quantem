@@ -2038,13 +2038,35 @@ class TestSharedCanvas:
                 deconvolution_kernel="prlx", pad_px=4, obj_fov=(100.0, 100.0), verbose=False
             )
 
-    @pytest.mark.parametrize("kwargs", [{"obj_origin": (0.0, 0.0)}, {"obj_fov": (100.0, 100.0)}])
-    def test_wrap_boundary_rejects_a_pinned_canvas(self, dataset4d, kwargs):
+    def test_wrap_boundary_accepts_a_pinned_canvas(self, dataset4d):
+        """Pinning the canvas is orthogonal to the boundary rule.
+
+        ``"wrap"`` defaults to the scan grid, but that is a default rather than a
+        restriction: given a window, it wraps into that window instead. Needed whenever the
+        canvas has to be a particular size for reasons other than the scan -- matching an
+        empirical probe's reciprocal grid, say.
+        """
         montage = self._montage(dataset4d, integer_shift_defocus(1))
-        with pytest.raises(ValueError, match="boundary='wrap'"):
-            montage.reconstruct(
-                deconvolution_kernel="prlx", boundary="wrap", verbose=False, **kwargs
-            )
+        fov = (SCAN_SAMPLING * 20, SCAN_SAMPLING * 24)
+
+        montage.reconstruct(
+            deconvolution_kernel="prlx",
+            boundary="wrap",
+            obj_origin=(0.0, 0.0),
+            obj_fov=fov,
+            verbose=False,
+        )
+
+        assert montage.obj.shape == (20, 24)
+        assert montage.obj_origin == pytest.approx((0.0, 0.0), abs=1e-4)
+        assert np.isfinite(montage.obj).all()
+
+    def test_wrap_defaults_to_the_scan_grid(self, dataset4d):
+        """The default is unchanged: no window given, the canvas is the scan."""
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        montage.reconstruct(deconvolution_kernel="prlx", boundary="wrap", verbose=False)
+
+        assert montage.obj.shape == tuple(montage.scan_gpts)
 
     def test_obj_fov_must_be_positive(self, dataset4d):
         montage = self._montage(dataset4d, integer_shift_defocus(1))

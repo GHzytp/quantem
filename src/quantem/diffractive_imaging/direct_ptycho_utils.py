@@ -16,6 +16,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from quantem.core.utils.imaging_utils import cross_correlation_shift_torch, unwrap_phase_2d_torch
+from quantem.core.utils.validators import validate_tensor
 from quantem.diffractive_imaging.complex_probe import (
     spatial_frequencies,
 )
@@ -1046,6 +1047,7 @@ def build_vbf_stack_from_dataset3d(
     rotation_angle: float | None = None,
     intensity_threshold: float = 0.5,
     normalization_order: int = 0,
+    bf_mask=None,
 ):
     """
     Origin-correct and mask an ungridded diffraction stack into a flat vBF stack.
@@ -1110,7 +1112,15 @@ def build_vbf_stack_from_dataset3d(
         probe_positions=positions_ang,
     )
 
-    bf_mask = bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold)
+    if bf_mask is None:
+        bf_mask = bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold)
+    else:
+        bf_mask = validate_tensor(bf_mask, "bf_mask", dtype=torch.bool).to(shifted_tensor.device)
+        if tuple(bf_mask.shape) != tuple(shifted_tensor.shape[-2:]):
+            raise ValueError(
+                f"`bf_mask` has shape {tuple(bf_mask.shape)} but the detector is "
+                f"{tuple(shifted_tensor.shape[-2:])}."
+            )
     bf_mask_dataset = Dataset2d.from_array(
         bf_mask.cpu().numpy(),
         name="BF mask",

@@ -332,6 +332,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        bf_mask: torch.Tensor | NDArray | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
         mode: str = "bilinear",
@@ -392,6 +393,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             rotation_angle=rotation_angle,
             intensity_threshold=intensity_threshold,
             normalization_order=normalization_order,
+            bf_mask=bf_mask,
         )
 
         return cls(
@@ -1001,18 +1003,13 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             )
             return canvas_shape, origin, canvas_fov
 
-        if boundary == "wrap":
-            if obj_origin is not None or obj_fov is not None:
-                raise ValueError(
-                    "`obj_origin` and `obj_fov` pin the canvas, which boundary='wrap' fixes "
-                    "to the scan grid; use boundary='pad'."
-                )
+        if boundary == "wrap" and obj_origin is None and obj_fov is None:
             # spans exactly the scan field of view, at any upsampling factor
             canvas_shape = tuple(int(n) * upsampling_factor for n in self.scan_gpts)
             origin = torch.zeros(2, device=self.device, dtype=self._float_dtype)
             return with_fov(canvas_shape, origin)
 
-        if boundary != "pad":
+        if boundary not in ("wrap", "pad"):
             raise ValueError(f"`boundary` must be 'wrap' or 'pad', got {boundary!r}")
 
         if pad_px is not None and obj_fov is not None:
