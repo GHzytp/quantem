@@ -1834,6 +1834,44 @@ class TestRealSpaceKernels:
         assert ratios == sorted(ratios, reverse=True)
         assert ratios[0] > 1.2 * ratios[-1]
 
+    def test_collapsing_the_detector_changes_nothing(self, dataset4d):
+        """riCOM sums over the detector first; that must be an optimization, not a change.
+
+        The per-detector-pixel route still runs when a defocus gradient gives each position
+        its own shift, which the collapse cannot represent -- so a gradient small enough to
+        be physically negligible exercises the slow path and the two must agree.
+        """
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        montage = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+
+        montage.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
+        collapsed = montage.obj.copy()
+        montage.reconstruct(
+            deconvolution_kernel="icom",
+            convolution_mode="fft",
+            defocus_gradient=(1e-9, 0.0),
+            verbose=False,
+        )
+
+        assert _relative_error(montage.obj, collapsed) < 1e-5
+
+    def test_com_shift_is_the_k_weighted_first_moment(self, dataset4d):
+        """The collapse itself, against an explicit sum over the detector."""
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        montage = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        bf = montage._return_bf_context(montage.bf_mask)
+
+        collapsed = montage._return_com_shift(bf, 0.0, 1)
+
+        kxa, kya, _, _ = montage._return_k_grid(0.0)
+        k_vectors = torch.stack((kxa[bf.bf_mask], kya[bf.bf_mask]), dim=-1)
+        values = montage._vbf_stack[bf.vbf_index_mapping]
+        expected = torch.stack([(values * k_vectors[:, i : i + 1]).sum(0) for i in (0, 1)])
+
+        assert _relative_error(to_numpy(collapsed), to_numpy(expected)) < 1e-5
+
     def test_the_icom_kernel_is_the_ricom_kernel(self):
         """`ifft2(-i q / |q|**2)` is `r / (2 pi |r|**2)`, the kernel riCOM writes down."""
         size = 128

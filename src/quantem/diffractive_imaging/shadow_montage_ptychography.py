@@ -783,6 +783,59 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self._resampled_probe = (key, probe, refined)
         return refined
 
+    def _return_com_shift(self, bf, rotation_angle, upsampling_factor):
+        """``(2, N_pos)`` centre-of-mass shift, in upsampled canvas pixels.
+
+        The k-weighted first moment of each diffraction pattern, summed over the detector.
+        This is the collapse that makes riCOM cheap: the iCoM kernel is linear in ``k``, so
+
+            sum_m FFT(V_m) K_m(q) = A(q) FFT(splat(com_x)) + B(q) FFT(splat(com_y))
+
+        with ``A``, ``B`` the two components of ``-i q / |q|**2``. Summing over the detector
+        *before* convolving turns ``num_bf`` transforms into two -- 167k into two on the
+        X-ray data this was written against -- and is what the riCOM paper does.
+        """
+        kxa, kya, _, _ = self._return_k_grid(rotation_angle)
+        k_vectors = torch.stack((kxa[bf.bf_mask], kya[bf.bf_mask]), dim=-1).to(self._float_dtype)
+        values = self._vbf_stack[bf.vbf_index_mapping].to(self._float_dtype)
+        return torch.einsum("mn,md->dn", values, k_vectors)
+
+    def _return_icom_operators(self, qxa, qya):
+        """``(2, Ny, Nx)`` complex ``-i q / |q|**2``, the two halves of the iCoM kernel."""
+        q_square = qxa.square() + qya.square()
+        operators = torch.stack((-1.0j * qxa / q_square, -1.0j * qya / q_square), dim=0)
+        operators[:, 0, 0] = 0.0
+        return operators
+
+    def _truncate_icom_operators(self, operators, canvas_shape, stencil_radius, max_radius):
+        """``((2, S*S) weights, info)`` -- the riCOM box stencil, from the iCoM operators.
+
+        The real-space kernel is ``r / (2 * pi * |r|**2)``, centred at the origin, so the box
+        is taken about the origin rather than about a parallax shift: iCoM carries no shift
+        to divide out. The radius is riCOM's ``(n - 1) / 2``, and it is a high-pass cutoff by
+        intent, not a truncation error -- so nothing is reported as one.
+        """
+        n_rows, n_cols = canvas_shape
+        limit = max(1, min(n_rows, n_cols) // 2 - 1)
+        radius = limit if stencil_radius == "auto" else min(int(stencil_radius), limit)
+        radius = min(radius, max_radius) if stencil_radius == "auto" else radius
+
+        kappa = torch.fft.fftshift(torch.fft.ifft2(operators), dim=(-2, -1))
+        centre = (n_rows // 2, n_cols // 2)
+        window = (
+            slice(centre[0] - radius, centre[0] + radius + 1),
+            slice(centre[1] - radius, centre[1] + radius + 1),
+        )
+        weights = kappa[:, window[0], window[1]].reshape(2, -1)
+
+        inside = weights.abs().square().sum()
+        total = kappa.abs().square().sum()
+        return weights, {
+            "stencil_radius": radius,
+            "mean_error": float((1 - inside / total).clamp_min(0).sqrt()),
+            "max_error": float((1 - inside / total).clamp_min(0).sqrt()),
+        }
+
     def _return_kernel_context(
         self,
         bf,
@@ -1374,9 +1427,43 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         stencil_offsets = stencil_weights = kernel_args = norm = None
         fft_shape = canvas_shape
 
+        # riCOM: the iCoM kernel is linear in k, so the detector sum can be done first and
+        # the whole reconstruction becomes two convolutions of the centre-of-mass shift.
+        # Only valid when every bright-field pixel deposits at the same place, which a
+        # per-position defocus breaks.
+        collapse_icom = kernel == "icom" and delta_c10 is None
+
         if kernel == "prlx":
             deposit_shifts = shifts_px
             self._stencil_info = None
+        elif collapse_icom:
+            deposit_shifts = torch.zeros_like(shifts_px)
+            self._stencil_info = None
+            if boundary == "pad" and mode == "fft":
+                fft_shape = (canvas_shape[0] * 2, canvas_shape[1] * 2)
+            upsampled_sampling = tuple(s / upsampling_factor for s in self.scan_sampling)
+            qxa, qya = spatial_frequencies(
+                fft_shape if mode == "fft" else canvas_shape,
+                upsampled_sampling,
+                device=self.device,
+            )
+            icom_operators = self._return_icom_operators(qxa, qya)
+            icom_values = self._return_com_shift(bf, rotation_angle, upsampling_factor)
+            _, _, bf_weights = self._return_kernel_context(
+                bf,
+                kernel=kernel,
+                rotation_angle=rotation_angle,
+                aberration_coefs=aberration_coefs,
+                canvas_shape=canvas_shape,
+                upsampling_factor=upsampling_factor,
+                matched_filter_norm_epsilon=matched_filter_norm_epsilon,
+                kernel_batch_size=kernel_batch_size,
+                probe_oversample=probe_oversample,
+            )
+            if mode == "stencil":
+                icom_operators, self._stencil_info = self._truncate_icom_operators(
+                    icom_operators, canvas_shape, stencil_radius, max_stencil_radius
+                )
         elif mode == "fft":
             # nothing is truncated, so there is no reason to divide the shift out of the
             # kernel and add it back to the deposits
@@ -1436,8 +1523,11 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             else torch.zeros(fft_shape, device=self.device, dtype=torch.complex64)
         )
 
-        pbar = tqdm(range(bf.num_bf), disable=not verbose)
-        batcher = SimpleBatcher(bf.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng)
+        n_components = 0 if collapse_icom else bf.num_bf
+        pbar = tqdm(range(n_components), disable=not verbose)
+        batcher = SimpleBatcher(
+            n_components, batch_size=max_batch_size, shuffle=False, rng=self.rng
+        )
 
         for batch_idx in batcher:
             mapped_idx = bf.vbf_index_mapping[batch_idx]
@@ -1457,6 +1547,8 @@ class ShadowMontagePtychography(DirectPtychographyBase):
                     interpolation=interpolation,
                     out=buffers,
                 )
+            elif collapse_icom:
+                pass  # handled in one shot below, outside the bright-field loop
             elif mode == "fft":
                 stack = splat_stack(
                     values,
@@ -1479,6 +1571,28 @@ class ShadowMontagePtychography(DirectPtychographyBase):
                 ).sum(0)
             pbar.update(len(batch_idx))
         pbar.close()
+
+        if collapse_icom:
+            coords = coords_base[None].expand(2, -1, -1)
+            if mode == "fft":
+                stack = splat_stack(
+                    icom_values,
+                    coords,
+                    fft_shape,
+                    boundary="pad" if fft_shape != canvas_shape else boundary,
+                    interpolation=interpolation,
+                )
+                accumulator = convolve_stack_fourier(stack, icom_operators)
+            else:
+                accumulator = splat_and_convolve(
+                    icom_values,
+                    coords,
+                    canvas_shape,
+                    icom_operators,
+                    self._stencil_info["stencil_radius"],
+                    boundary=boundary,
+                    interpolation=interpolation,
+                ).sum(0)
 
         self._canvas_shape = canvas_shape
         self._canvas_origin_px = canvas_origin
