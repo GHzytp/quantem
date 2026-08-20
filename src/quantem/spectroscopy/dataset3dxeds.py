@@ -9,19 +9,19 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy import Dataset3dspectroscopy
 from quantem.spectroscopy.dataset3dxeds_fitting import (
-    _fit_mean_model_pytorch as _fit_mean_model_pytorch_impl,
-)
-from quantem.spectroscopy.dataset3dxeds_fitting import (
-    fit_spectrum_mean_pytorch as _fit_spectrum_mean_pytorch,
-)
-from quantem.spectroscopy.dataset3dxeds_fitting import (
-    fit_spectrum_pytorch as _fit_spectrum_pytorch,
-)
-from quantem.spectroscopy.dataset3dxeds_fitting import (
     peak_autoid as _peak_autoid,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     show_spectrum_images as _visualize_spectrum_images,
+)
+from quantem.spectroscopy.xeds_fitting import (
+    _fit_mean_model_pytorch as _fit_mean_model_pytorch_impl,
+)
+from quantem.spectroscopy.xeds_fitting import (
+    fit_spectrum_mean_pytorch as _fit_spectrum_mean_pytorch,
+)
+from quantem.spectroscopy.xeds_fitting import (
+    fit_spectrum_pytorch as _fit_spectrum_pytorch,
 )
 
 
