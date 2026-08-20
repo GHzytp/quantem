@@ -27,6 +27,7 @@ from quantem.diffractive_imaging.ptychography_lite import (
 from quantem.diffractive_imaging.complex_probe import (
     real_space_probe as real_space_probe,
     fourier_space_probe as fourier_space_probe,
+    FourierProbe as FourierProbe,
 )
 
 from quantem.diffractive_imaging.direct_ptychography import (

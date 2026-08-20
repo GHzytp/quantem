@@ -17,7 +17,7 @@ from quantem.diffractive_imaging import (
     OptimizationParameter,
     ShadowMontagePtychography,
 )
-from quantem.diffractive_imaging.complex_probe import spatial_frequencies
+from quantem.diffractive_imaging.complex_probe import FourierProbe, spatial_frequencies
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     allocate_splat_buffers,
     estimate_frame_drift,
@@ -35,6 +35,7 @@ from .conftest import (
     SCAN_SAMPLING,
     SEMIANGLE_CUTOFF,
     N,
+    analytic_probe_array,
     band_limited_phase,
     correlation,
     ctf_interleaved_frames,
@@ -846,6 +847,170 @@ class TestVisualization:
         _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
         with pytest.raises(RuntimeError, match="Run reconstruct"):
             montage.visualize()
+
+
+class TestFourierProbe:
+    """An empirical ``psi(k)`` in place of an aperture plus aberrations."""
+
+    DEFOCUS = staticmethod(lambda: integer_shift_defocus(1))
+
+    def _pair(self, dataset4d, cls, **probe_kwargs):
+        """The same reconstruction twice: analytic, and with its own probe fed back in."""
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
+        if cls is ShadowMontagePtychography:
+            kwargs["boundary"] = "wrap"
+
+        analytic = cls.from_dataset4d(dataset4d, **kwargs)
+        psi = analytic_probe_array(analytic, {"C10": defocus})
+        probe = FourierProbe.from_array(
+            psi, analytic.reciprocal_sampling, analytic.wavelength, **probe_kwargs
+        )
+        empirical = cls.from_dataset4d(dataset4d, fourier_probe=probe, **kwargs)
+        return analytic, empirical
+
+    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    def test_empirical_probe_reproduces_the_analytic_one(self, dataset4d, cls, kernel):
+        """The headline: the same probe, described two ways, must reconstruct the same.
+
+        This is what makes the empirical path trustworthy -- there is no ground truth for a
+        measured probe, so the only check available is that a probe we *can* write down
+        analytically goes through the array path unchanged.
+        """
+        analytic, empirical = self._pair(dataset4d, cls, normalize=False)
+        extra = {} if cls is DirectPtychography else {"stencil_radius": 5}
+
+        analytic.reconstruct(deconvolution_kernel=kernel, verbose=False, **extra)
+        expected = analytic.obj.copy()
+        empirical.reconstruct(deconvolution_kernel=kernel, verbose=False, **extra)
+
+        assert _relative_error(empirical.obj, expected) < 1e-5
+
+    def test_is_analytic_reports_which_path_is_live(self, dataset4d):
+        analytic, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+
+        assert analytic.fourier_probe is None
+        assert empirical.fourier_probe is not None
+        assert empirical.fourier_probe.is_analytic is False
+
+    def test_zero_outside_the_detector(self, dataset4d):
+        """Beyond the detector's Nyquist nothing was measured, so `psi` is zero there.
+
+        Wrapping instead would fold the opposite edge of the aperture back in, which moved
+        the reconstruction by 13% on this fixture before it was fixed -- the bright-field
+        mask is cropped tight to the disk, so `k -/+ q` leaves the grid constantly.
+        """
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        probe = empirical.fourier_probe
+        dq_row, dq_col = probe.reciprocal_sampling
+        n_rows = probe.array.shape[0]
+
+        just_outside = torch.tensor([(n_rows // 2 + 1) * dq_row])
+        zero = torch.zeros(1)
+
+        assert probe.at(just_outside, zero).abs().item() == 0.0
+        assert probe.at(-just_outside, zero).abs().item() == 0.0
+        # and the centre is emphatically not zero
+        assert probe.at(zero, zero).abs().item() > 0
+
+    def test_off_grid_sampling_raises(self, dataset4d):
+        """A canvas incommensurate with the probe would need interpolation; say so."""
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        probe = empirical.fourier_probe
+        half_pixel = torch.tensor([0.5 * probe.reciprocal_sampling[0]])
+
+        with pytest.raises(ValueError, match="own reciprocal grid"):
+            probe.at(half_pixel, torch.zeros(1))
+
+    def test_bilinear_accepts_off_grid_sampling(self, dataset4d):
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography, interpolation="bilinear")
+        probe = empirical.fourier_probe
+        dq_row = probe.reciprocal_sampling[0]
+
+        midpoint = probe.at(torch.tensor([0.5 * dq_row]), torch.zeros(1))
+        ends = probe.at(torch.tensor([0.0, dq_row]), torch.zeros(2))
+
+        assert midpoint.item() == pytest.approx(complex(ends.mean()), rel=1e-5)
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            ({"deconvolution_kernel": "prlx"}, "parallax kernel"),
+            (
+                {
+                    "deconvolution_kernel": "ssb",
+                    "stencil_radius": 5,
+                    "defocus_gradient": (1.0, 0.0),
+                },
+                "defocus gradient",
+            ),
+        ],
+    )
+    def test_aberration_only_features_raise(self, dataset4d, kwargs, match):
+        """Everything that reads chi(k) has no meaning without aberration coefficients."""
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+
+        with pytest.raises(NotImplementedError, match=match):
+            empirical.reconstruct(verbose=False, **kwargs)
+
+    def test_semiangle_cutoff_becomes_optional(self, dataset4d):
+        """The empirical probe carries its own aperture, whatever shape it is."""
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        psi = analytic_probe_array(analytic, {"C10": defocus})
+
+        kwargs["semiangle_cutoff"] = None
+        empirical = ShadowMontagePtychography.from_dataset4d(
+            dataset4d,
+            fourier_probe=FourierProbe.from_array(
+                psi, analytic.reciprocal_sampling, analytic.wavelength
+            ),
+            **kwargs,
+        )
+
+        assert empirical.semiangle_cutoff is None
+        empirical.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
+        assert np.isfinite(empirical.obj).all()
+
+    def test_normalize_gives_unit_intensity(self, dataset4d):
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography, normalize=True)
+
+        assert float(empirical.fourier_probe.array.abs().square().sum()) == pytest.approx(1.0)
+
+    @pytest.mark.parametrize(
+        "array, match",
+        [
+            (np.ones((8, 8)), "must be a complex probe"),
+            (np.ones((8, 8, 2), dtype=complex), "must be 2D"),
+        ],
+    )
+    def test_array_validation(self, array, match):
+        with pytest.raises(ValueError, match=match):
+            FourierProbe.from_array(array, (0.1, 0.1), 0.02)
+
+    def test_shape_must_match_the_detector(self, dataset4d):
+        analytic, _ = self._pair(dataset4d, ShadowMontagePtychography)
+        wrong = FourierProbe.from_array(
+            np.ones((4, 4), dtype=np.complex64), analytic.reciprocal_sampling, analytic.wavelength
+        )
+
+        with pytest.raises(ValueError, match="detector grid"):
+            analytic.fourier_probe = wrong
+
+    def test_survives_a_round_trip(self, dataset4d, tmp_path):
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        empirical.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
+        before = empirical.obj.copy()
+
+        path = str(tmp_path / "empirical.zip")
+        empirical.save(path, mode="o")
+        restored = load(path)
+
+        assert restored.fourier_probe is not None
+        restored.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
+        assert np.allclose(restored.obj, before)
 
 
 class TestWavelength:

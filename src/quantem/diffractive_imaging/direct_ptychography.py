@@ -14,11 +14,11 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.diffractive_imaging.complex_probe import (
+    FourierProbe,
     aberration_surface,
     aberration_surface_cartesian_basis,
     aberration_surface_cartesian_gradients,
     aperture,
-    evaluate_probe,
     gamma_factor,
     merge_aberration_coefficients,
     polar_coordinates,
@@ -70,6 +70,7 @@ class DirectPtychography(DirectPtychographyBase):
         device: str | int,
         verbose: int | bool,
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         _token: object | None = None,
     ):
         """ """
@@ -98,6 +99,7 @@ class DirectPtychography(DirectPtychographyBase):
         self.gpts = tuple(int(n) for n in self.bf_mask.shape[:2])
         self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
 
+        self.fourier_probe = fourier_probe
         self.semiangle_cutoff = semiangle_cutoff  # ty:ignore[invalid-assignment]
         self.soft_edges = soft_edges
         self.rng = rng
@@ -118,6 +120,7 @@ class DirectPtychography(DirectPtychographyBase):
         semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
         bf_mask_padding_px: int = 1,
@@ -135,6 +138,7 @@ class DirectPtychography(DirectPtychographyBase):
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
+            fourier_probe=fourier_probe,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -152,6 +156,7 @@ class DirectPtychography(DirectPtychographyBase):
         semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -192,6 +197,7 @@ class DirectPtychography(DirectPtychographyBase):
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
+            fourier_probe=fourier_probe,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -212,6 +218,7 @@ class DirectPtychography(DirectPtychographyBase):
         scan_sampling: Tuple[float, float] | Literal["auto"] = "auto",
         aberration_coefs: dict = {},
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         scan_gpts: Tuple[int, int] | None = None,
         interpolation: Literal["nearest", "bilinear"] = "nearest",
         hole_fill: Literal["mean", "zero"] = "mean",
@@ -372,6 +379,7 @@ class DirectPtychography(DirectPtychographyBase):
             rotation_angle=rotation_angle,
             semiangle_cutoff=semiangle_cutoff,
             aberration_coefs=aberration_coefs,
+            fourier_probe=fourier_probe,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -515,11 +523,7 @@ class DirectPtychography(DirectPtychographyBase):
                 (qmkxa, qmkya),
                 (qpkxa, qpkya),
                 cmplx_probe_at_k,
-                self.wavelength,
-                self.semiangle_cutoff,
-                self.soft_edges,
-                angular_sampling=self.angular_sampling,
-                aberration_coefs=aberration_coefs,
+                self._return_probe(aberration_coefs),
                 normalize=False,
             )
 
@@ -635,6 +639,8 @@ class DirectPtychography(DirectPtychographyBase):
             max_batch_size = num_bf
 
         deconvolution_kernel = self._normalize_kernel_name(deconvolution_kernel)
+        if deconvolution_kernel in ("prlx", "icom"):
+            self._require_analytic_probe(f"The {deconvolution_kernel} kernel")
 
         # Get upsampled q-space grid
         qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
@@ -673,14 +679,7 @@ class DirectPtychography(DirectPtychographyBase):
             sign_sin_chi_q = None
 
         # compute global / cheap functions for all
-        cmplx_probe_k = evaluate_probe(
-            k * self.wavelength,
-            phi,
-            self.semiangle_cutoff,
-            self.angular_sampling,
-            self.wavelength,
-            aberration_coefs=aberration_coefs,
-        )
+        cmplx_probe_k = self._return_probe_on_grid(k, phi, aberration_coefs)
         BF_weights = cmplx_probe_k[bf_mask].abs().square().sum()
 
         butterworth_env = torch.ones_like(q)

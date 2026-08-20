@@ -15,9 +15,9 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.diffractive_imaging.complex_probe import (
+    FourierProbe,
     aberration_surface,
     aberration_surface_cartesian_gradients,
-    evaluate_probe,
     gamma_factor,
     polar_coordinates,
     spatial_frequencies,
@@ -117,6 +117,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         defocus_gradient: Tuple[float, float] | None = None,
         scan_origin: Tuple[float, float] | None = None,
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         _token: object | None = None,
     ):
         """ """
@@ -155,6 +156,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         self.gpts = tuple(int(n) for n in self.bf_mask.shape[:2])
         self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
 
+        self.fourier_probe = fourier_probe
         self.semiangle_cutoff = semiangle_cutoff
         self.soft_edges = soft_edges
         self.boundary = boundary
@@ -199,6 +201,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         boundary: Literal["wrap", "pad"] = "wrap",
         defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
@@ -231,6 +234,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             scan_sampling=tuple(vbf_dataset.sampling[-2:]),
             scan_units=tuple(vbf_dataset.units[-2:]),
             scan_gpts=scan_gpts,
+            fourier_probe=fourier_probe,
             boundary=boundary,
             gridded_scan=True,
             defocus_gradient=defocus_gradient,
@@ -252,6 +256,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -301,6 +306,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             rotation_angle=rotation_angle,
             semiangle_cutoff=semiangle_cutoff,
             aberration_coefs=aberration_coefs,
+            fourier_probe=fourier_probe,
             boundary=boundary,
             defocus_gradient=defocus_gradient,
             subtract_frame_mean=subtract_frame_mean,
@@ -323,6 +329,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         scan_sampling: Tuple[float, float] | Literal["auto"] = "auto",
         aberration_coefs: dict = {},
         wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
         mode: str = "bilinear",
@@ -398,6 +405,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             scan_units=("A", "A"),
             scan_gpts=scan_gpts,
             scan_origin=scan_origin,
+            fourier_probe=fourier_probe,
             boundary=boundary,
             gridded_scan=False,
             defocus_gradient=defocus_gradient,
@@ -617,6 +625,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         ``aberration_surface_cartesian_gradients`` rather than hand-coding the analytic
         ``wavelength * k`` keeps it tied to the same expression the Fourier class uses.
         """
+        self._require_analytic_probe("A defocus gradient")
         _, _, k, phi = self._return_k_grid(rotation_angle)
         dx, dy = aberration_surface_cartesian_gradients(
             k * self.wavelength, phi, aberration_coefs={"C10": 1.0}
@@ -637,6 +646,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         """
         if defocus_gradient is None or (defocus_gradient[0] == 0.0 and defocus_gradient[1] == 0.0):
             return None
+        self._require_analytic_probe("A defocus gradient")
 
         scan_sampling = torch.as_tensor(
             tuple(self.scan_sampling), device=self.device, dtype=self._float_dtype
@@ -661,14 +671,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         # matches DirectPtychography.reconstruct: soft_edges is left at evaluate_probe's
         # default rather than taking self.soft_edges, so the two normalizations agree
-        cmplx_probe_k = evaluate_probe(
-            k * self.wavelength,
-            phi,
-            self.semiangle_cutoff,
-            self.angular_sampling,
-            self.wavelength,
-            aberration_coefs=aberration_coefs,
-        )
+        cmplx_probe_k = self._return_probe_on_grid(k, phi, aberration_coefs)
         bf_weights = cmplx_probe_k[bf_mask].abs().square().sum()
 
         return shifts_px, bf_weights
@@ -708,11 +711,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             (qxa.unsqueeze(0) - kx, qya.unsqueeze(0) - ky),
             (qxa.unsqueeze(0) + kx, qya.unsqueeze(0) + ky),
             cmplx_probe_k[ind_i, ind_j].view(-1, 1, 1),
-            self.wavelength,
-            self.semiangle_cutoff,
-            self.soft_edges,
-            angular_sampling=self.angular_sampling,
-            aberration_coefs=aberration_coefs,
+            self._return_probe(aberration_coefs),
             normalize=False,
         )
 
@@ -752,14 +751,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         qxa, qya = spatial_frequencies(canvas_shape, upsampled_sampling, device=self.device)
         kxa, kya, k, phi = self._return_k_grid(rotation_angle)
 
-        cmplx_probe_k = evaluate_probe(
-            k * self.wavelength,
-            phi,
-            self.semiangle_cutoff,
-            self.angular_sampling,
-            self.wavelength,
-            aberration_coefs=aberration_coefs,
-        )
+        cmplx_probe_k = self._return_probe_on_grid(k, phi, aberration_coefs)
         bf_weights = cmplx_probe_k[bf.bf_mask].abs().square().sum()
 
         n_rows, n_cols = canvas_shape
@@ -1132,6 +1124,10 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             rotation_angle = state.current_rotation_angle(override_rotation_angle)
 
         kernel = self._normalize_kernel_name(deconvolution_kernel)
+        if kernel == "prlx":
+            # zero aberrations would give zero shifts and quietly sum the bright-field stack
+            # into a plain incoherent image, which is not a parallax reconstruction
+            self._require_analytic_probe("The parallax kernel")
         if kernel == "icom":
             raise ValueError(
                 "The iCoM kernel `k . q / |q|**2` is unbounded as q -> 0, so its real-space "

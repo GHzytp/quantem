@@ -522,6 +522,30 @@ def ctf_radial_correlation(measured: np.ndarray, analytic: np.ndarray, pixel_siz
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def analytic_probe_array(reconstruction, aberration_coefs):
+    """The analytic probe of a reconstruction, materialized as a complex array.
+
+    Feeding this back in as a `FourierProbe.from_array` must reproduce the reconstruction it
+    came from -- which is what pins the empirical path against the analytic one.
+    """
+    from quantem.diffractive_imaging.complex_probe import (
+        evaluate_probe,
+        polar_spatial_frequencies,
+    )
+
+    k, phi = polar_spatial_frequencies(
+        reconstruction.gpts, reconstruction.sampling, device=reconstruction.device
+    )
+    return evaluate_probe(
+        k * reconstruction.wavelength,
+        phi,
+        reconstruction.semiangle_cutoff,
+        reconstruction.angular_sampling,
+        reconstruction.wavelength,
+        aberration_coefs=aberration_coefs,
+    )
+
+
 def ctf_interleaved_frames(
     complex_obj: np.ndarray,
     probe: np.ndarray,

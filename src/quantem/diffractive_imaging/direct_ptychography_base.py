@@ -19,7 +19,9 @@ from quantem.core.utils.validators import (
 )
 from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging.complex_probe import (
+    FourierProbe,
     aberration_surface_cartesian_gradients,
+    evaluate_probe,
     polar_coordinates,
     spatial_frequencies,
 )
@@ -236,6 +238,81 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     def wavelength(self, value: float) -> None:
         self._wavelength = float(validate_gt(value, 0.0, "wavelength"))
 
+    @property
+    def fourier_probe(self) -> "FourierProbe | None":
+        """An empirical complex probe, or ``None`` when the probe is analytic.
+
+        Set it to reconstruct with a measured ``psi(k)`` instead of an aperture plus
+        aberrations. Everything that reads the aberration surface -- the parallax kernel,
+        the ``sign(sin(chi))`` phase flip, the defocus gradient, any hyperparameter search
+        over aberrations -- has no meaning then, and raises.
+        """
+        return getattr(self, "_fourier_probe", None)
+
+    @fourier_probe.setter
+    def fourier_probe(self, value) -> None:
+        if value is None:
+            self._fourier_probe = None
+            return
+        if not isinstance(value, FourierProbe):
+            raise TypeError(
+                "`fourier_probe` must be a FourierProbe; build one with "
+                "`FourierProbe.from_array(psi, reciprocal_sampling, wavelength)`."
+            )
+        if value.array is None:
+            raise ValueError(
+                "`fourier_probe` is for an empirical probe; an analytic one is already "
+                "described by `semiangle_cutoff` and the aberration coefficients."
+            )
+        if tuple(value.array.shape) != tuple(self.gpts):
+            raise ValueError(
+                f"`fourier_probe` has shape {tuple(value.array.shape)} but the detector grid "
+                f"is {tuple(self.gpts)}. They must match -- crop the probe the same way the "
+                "diffraction patterns were cropped."
+            )
+        self._fourier_probe = value.to(self.device)
+
+    def _require_analytic_probe(self, what: str) -> None:
+        """Guard for everything that only means something for an aperture plus aberrations."""
+        if self.fourier_probe is not None:
+            raise NotImplementedError(
+                f"{what} is defined by the aberration surface chi(k), which an empirical "
+                "`fourier_probe` does not have. Use a deconvolution kernel that only needs "
+                "the probe itself -- 'ssb', 'obf' or 'mf'."
+            )
+
+    def _return_probe(self, aberration_coefs) -> "FourierProbe":
+        """The probe object the overlap function samples, empirical or analytic."""
+        probe = self.fourier_probe
+        if probe is not None:
+            return probe
+        return FourierProbe.from_aberrations(
+            self.wavelength,
+            self.semiangle_cutoff,
+            self.angular_sampling,
+            aberration_coefs,
+            self.soft_edges,
+        )
+
+    def _return_probe_on_grid(self, k, phi, aberration_coefs):
+        """``psi(k)`` on the detector grid, whose squared sum is the bright-field weight.
+
+        Note this deliberately leaves ``soft_edges`` at ``evaluate_probe``'s default rather
+        than taking ``self.soft_edges``, so that the normalization matches between the two
+        classes -- a long-standing wart preserved on purpose.
+        """
+        probe = self.fourier_probe
+        if probe is not None:
+            return probe.array
+        return evaluate_probe(
+            k * self.wavelength,
+            phi,
+            self.semiangle_cutoff,
+            self.angular_sampling,
+            self.wavelength,
+            aberration_coefs=aberration_coefs,
+        )
+
     @staticmethod
     def _resolve_wavelength(energy: float | None, wavelength: float | None) -> float:
         """Wavelength in Angstrom, from an electron accelerating voltage or given directly.
@@ -428,9 +505,14 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     @semiangle_cutoff.setter
     def semiangle_cutoff(self, value: float):
         if value is None:
+            # an empirical probe already carries its own aperture, whatever shape it is
+            if self.fourier_probe is not None:
+                self._semiangle_cutoff = None
+                return
             raise ValueError(
                 "`semiangle_cutoff` is required, in mrad: it sets the aperture used to build "
-                "the probe and the deconvolution kernels."
+                "the probe and the deconvolution kernels. Pass a `fourier_probe` instead if "
+                "the probe is measured rather than described by an aperture."
             )
         validate_gt(value, 0.0, "semiangle_cutoff")
         self._semiangle_cutoff = value
