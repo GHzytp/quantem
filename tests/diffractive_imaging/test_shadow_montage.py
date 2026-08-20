@@ -368,10 +368,13 @@ class TestFourierEquivalence:
 
         assert np.isfinite(obj).all()
 
-    def test_rejects_icom(self, dataset4d):
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-        with pytest.raises(ValueError, match="unbounded"):
-            montage.reconstruct(deconvolution_kernel="icom", verbose=False)
+    def test_icom_matches_the_fourier_class(self, dataset4d):
+        """iCoM has no compact real-space form, but the FFT route never truncates."""
+        fourier, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        fourier.reconstruct(deconvolution_kernel="icom", verbose=False)
+        montage.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
+
+        assert _relative_error(montage.obj, fourier.obj) < 1e-5
 
 
 class TestRotationConvention:
@@ -1747,11 +1750,45 @@ class TestRealSpaceKernels:
 
         assert float(montage.variance_loss()) > 0
 
-    def test_icom_is_rejected(self, dataset4d):
+    def test_icom_is_rejected_only_by_the_stencil(self, dataset4d):
+        """`k . q / |q|**2` is unbounded as q -> 0, so no box stencil captures it.
+
+        That is an objection to truncating, not to the kernel, so the FFT route runs it.
+        """
         _, montage = self._pair(dataset4d)
 
         with pytest.raises(ValueError, match="unbounded"):
-            montage.reconstruct(deconvolution_kernel="icom", verbose=False)
+            montage.reconstruct(
+                deconvolution_kernel="icom", convolution_mode="stencil", verbose=False
+            )
+
+        montage.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
+        assert np.isfinite(montage.obj).all()
+
+    def test_icom_ignores_an_empirical_probe(self, dataset4d):
+        """It never reads psi, so an empirical probe changes nothing -- not even a bit.
+
+        `normalize=False` matters only because the probe's total intensity sets
+        `bf_weights`, which scales the finished object; the image itself is identical
+        either way.
+        """
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        empirical = ShadowMontagePtychography.from_dataset4d(
+            dataset4d,
+            fourier_probe=FourierProbe.from_array(
+                analytic_probe_array(analytic, {"C10": defocus}),
+                analytic.reciprocal_sampling,
+                analytic.wavelength,
+                normalize=False,
+            ),
+            **kwargs,
+        )
+        for recon in (analytic, empirical):
+            recon.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
+
+        assert np.array_equal(empirical.obj, analytic.obj)
 
     def test_phase_flip_is_not_applied_to_deconvolution_kernels(self, dataset4d):
         """The kernels already invert the contrast transfer, as in `DirectPtychography`."""

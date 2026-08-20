@@ -641,8 +641,9 @@ class DirectPtychography(DirectPtychographyBase):
             max_batch_size = num_bf
 
         deconvolution_kernel = self._normalize_kernel_name(deconvolution_kernel)
-        if deconvolution_kernel in ("prlx", "icom"):
-            self._require_analytic_probe(f"The {deconvolution_kernel} kernel")
+        if deconvolution_kernel == "prlx":
+            # iCoM is exempt: `k . q / |q|**2` never reads the probe
+            self._require_analytic_probe("The prlx kernel")
 
         # Get upsampled q-space grid
         qxa, qya = self._return_upsampled_qgrid(upsampling_factor)

@@ -711,6 +711,16 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         kx = kxa[ind_i, ind_j].view(-1, 1, 1)
         ky = kya[ind_i, ind_j].view(-1, 1, 1)
 
+        if kernel == "icom":
+            # `k . q / |q|**2`, which never reads the probe -- so it needs no overlap
+            # function, and an empirical probe raises no sampling question here
+            q_square = qxa.square() + qya.square()
+            qx_op = -1.0j * qxa / q_square
+            qy_op = -1.0j * qya / q_square
+            qx_op[0, 0] = 0.0
+            qy_op[0, 0] = 0.0
+            return kx * qx_op.unsqueeze(0) + ky * qy_op.unsqueeze(0), None
+
         gamma = gamma_factor(
             (qxa.unsqueeze(0) - kx, qya.unsqueeze(0) - ky),
             (qxa.unsqueeze(0) + kx, qya.unsqueeze(0) + ky),
@@ -830,7 +840,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         # obf and mf normalize by a power spectrum summed over every bright-field pixel, so
         # they need a pass over all of them before any kernel is final
         norm = None
-        if kernel in ("obf", "mf"):
+        if kernel in ("obf", "mf"):  # icom needs no normalization pass
             power = torch.zeros(canvas_shape, device=self.device)
             batcher = SimpleBatcher(
                 bf.num_bf, batch_size=kernel_batch_size, shuffle=False, rng=self.rng
@@ -1271,10 +1281,15 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             # zero aberrations would give zero shifts and quietly sum the bright-field stack
             # into a plain incoherent image, which is not a parallax reconstruction
             self._require_analytic_probe("The parallax kernel")
-        if kernel == "icom":
+        if (
+            kernel == "icom"
+            and self._resolve_convolution_mode(convolution_mode, kernel, stencil_radius)
+            == "stencil"
+        ):
             raise ValueError(
                 "The iCoM kernel `k . q / |q|**2` is unbounded as q -> 0, so its real-space "
-                "form has no useful truncation; use DirectPtychography for it."
+                "form has no useful truncation. Use convolution_mode='fft', which does not "
+                "truncate at all."
             )
 
         if upsampling_factor is None:
