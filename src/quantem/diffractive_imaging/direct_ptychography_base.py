@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.rng import RNGMixin
-from quantem.core.utils.utils import to_numpy
+from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.core.utils.validators import (
     validate_aberration_coefficients,
     validate_gt,
@@ -220,13 +220,40 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
 
     # --- state the subclass __init__ must provide (annotation only, no default) ---
     hyperparameter_state: HyperparameterState
-    wavelength: float
     scan_units: Tuple[str, str]
     detector_units: Tuple[str, str]
     scan_gpts: Tuple[int, int]
     gpts: Tuple[int, int]
     sampling: Tuple[float, float]
     angular_sampling: Tuple[float, float]
+
+    @property
+    def wavelength(self) -> float:
+        """Probe wavelength in Angstrom."""
+        return self._wavelength
+
+    @wavelength.setter
+    def wavelength(self, value: float) -> None:
+        self._wavelength = float(validate_gt(value, 0.0, "wavelength"))
+
+    @staticmethod
+    def _resolve_wavelength(energy: float | None, wavelength: float | None) -> float:
+        """Wavelength in Angstrom, from an electron accelerating voltage or given directly.
+
+        ``energy`` goes through the relativistic electron de Broglie formula, which is what
+        every electron entry point wants. ``wavelength`` skips it, which is what anything
+        that is not an electron needs: for a 7.9 keV photon the electron formula returns
+        0.137 Angstrom against the correct ``hc/E`` = 1.569.
+        """
+        if (energy is None) == (wavelength is None):
+            raise ValueError(
+                "Pass exactly one of `energy` (electron accelerating voltage, in volts) or "
+                "`wavelength` (in Angstrom, for photons or anything else non-electron), "
+                f"got energy={energy!r} and wavelength={wavelength!r}."
+            )
+        if wavelength is not None:
+            return float(validate_gt(wavelength, 0.0, "wavelength"))
+        return electron_wavelength_angstrom(validate_gt(energy, 0.0, "energy"))
 
     # ------------------------------------------------------------------
     # subclass hooks

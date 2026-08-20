@@ -5,8 +5,6 @@ The headline check is equivalence with the Fourier-space parallax kernel of
 so on a raster scan with periodic wraparound they must agree.
 """
 
-import inspect
-
 import numpy as np
 import pytest
 import torch
@@ -850,15 +848,132 @@ class TestVisualization:
             montage.visualize()
 
 
+class TestWavelength:
+    """`wavelength` given directly, for anything that is not an electron."""
+
+    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    def test_energy_and_wavelength_agree(self, dataset4d, cls):
+        """The two routes must land on the same geometry, and hence the same image."""
+        common = dict(
+            semiangle_cutoff=SEMIANGLE_CUTOFF,
+            aberration_coefs={"C10": integer_shift_defocus(1)},
+            rotation_angle=0.0,
+            force_fitted_origin=ORIGIN,
+            edge_blend_pixels=0,
+            verbose=False,
+        )
+        from_energy = cls.from_dataset4d(dataset4d, energy=PROBE_ENERGY, **common)
+        from_wavelength = cls.from_dataset4d(
+            dataset4d, wavelength=from_energy.wavelength, **common
+        )
+
+        assert from_wavelength.wavelength == pytest.approx(from_energy.wavelength)
+        assert from_wavelength.angular_sampling == pytest.approx(from_energy.angular_sampling)
+
+        for recon in (from_energy, from_wavelength):
+            recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
+        assert np.array_equal(from_wavelength.obj, from_energy.obj)
+
+    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},  # neither
+            {"energy": PROBE_ENERGY, "wavelength": 0.02},  # both
+        ],
+    )
+    def test_exactly_one_of_energy_or_wavelength(self, dataset4d, cls, kwargs):
+        with pytest.raises(ValueError, match="exactly one of `energy`"):
+            cls.from_dataset4d(
+                dataset4d,
+                semiangle_cutoff=SEMIANGLE_CUTOFF,
+                rotation_angle=0.0,
+                force_fitted_origin=ORIGIN,
+                verbose=False,
+                **kwargs,
+            )
+
+    def test_photon_wavelength_is_not_the_electron_one(self):
+        """The reason this exists: the de Broglie formula is wrong for photons.
+
+        `electron_wavelength_angstrom` is relativistic and correct for electrons -- 0.019687
+        Angstrom at 300 kV -- but it is the wrong physics for a 7.9 keV photon, where the
+        answer is `hc/E` = 1.5694 rather than 0.1375.
+        """
+        from quantem.core.utils.utils import electron_wavelength_angstrom
+
+        assert electron_wavelength_angstrom(300e3) == pytest.approx(0.019687, abs=1e-6)
+
+        photon_energy_ev = 7900.08
+        assert electron_wavelength_angstrom(photon_energy_ev) == pytest.approx(0.1375, abs=1e-3)
+        assert 12398.42 / photon_energy_ev == pytest.approx(1.5694, abs=1e-3)
+
+    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    def test_wavelength_survives_a_round_trip(self, dataset4d, cls, tmp_path):
+        recon = cls.from_dataset4d(
+            dataset4d,
+            wavelength=1.5694,
+            semiangle_cutoff=SEMIANGLE_CUTOFF,
+            rotation_angle=0.0,
+            force_fitted_origin=ORIGIN,
+            edge_blend_pixels=0,
+            verbose=False,
+        )
+        recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
+
+        path = str(tmp_path / f"{cls.__name__}.zip")
+        recon.save(path, mode="o")
+        restored = load(path)
+
+        assert restored.wavelength == pytest.approx(1.5694)
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0])
+    def test_non_positive_wavelength_raises(self, dataset4d, bad):
+        with pytest.raises(ValueError):
+            ShadowMontagePtychography.from_dataset4d(
+                dataset4d,
+                wavelength=bad,
+                semiangle_cutoff=SEMIANGLE_CUTOFF,
+                rotation_angle=0.0,
+                force_fitted_origin=ORIGIN,
+                verbose=False,
+            )
+
+
 class TestSemiangleCutoff:
     """`semiangle_cutoff` sets the probe aperture and is never optional."""
 
     @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
-    def test_from_virtual_bfs_requires_it(self, cls):
-        signature = inspect.signature(cls.from_virtual_bfs)
-        parameter = signature.parameters["semiangle_cutoff"]
+    def test_from_virtual_bfs_requires_it(self, cls, dataset4d):
+        """Enforced at runtime rather than by the signature.
 
-        assert parameter.default is inspect.Parameter.empty
+        It used to be a required positional, but `wavelength` has to sit alongside `energy`
+        with a default, and Python will not take a defaulted parameter before an
+        undefaulted one. The guarantee is the error, so test the error.
+        """
+        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        vbf_dataset = Dataset3d.from_array(
+            to_numpy(montage.vbf_stack).reshape(montage.num_bf, N, N),
+            name="vBF stack",
+            units=("index", "A", "A"),
+            sampling=(1, SCAN_SAMPLING, SCAN_SAMPLING),
+        )
+        bf_mask_dataset = Dataset2d.from_array(
+            to_numpy(montage.bf_mask),
+            name="BF mask",
+            units=("A^-1", "A^-1"),
+            sampling=tuple(montage.reciprocal_sampling),
+        )
+
+        with pytest.raises(ValueError, match="`semiangle_cutoff` is required"):
+            cls.from_virtual_bfs(
+                vbf_dataset,
+                bf_mask_dataset,
+                energy=PROBE_ENERGY,
+                rotation_angle=0.0,
+                crop_bf_mask=False,
+                verbose=False,
+            )
 
     @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
     def test_none_raises_a_clear_error(self, dataset4d, cls):

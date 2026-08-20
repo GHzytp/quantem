@@ -9,7 +9,6 @@ from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d
-from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.core.utils.validators import (
     validate_aberration_coefficients,
     validate_tensor,
@@ -60,7 +59,7 @@ class DirectPtychography(DirectPtychographyBase):
         self,
         vbf_dataset: Dataset3d,
         bf_mask_dataset: Dataset2d,
-        energy: float,
+        energy: float | None,
         rotation_angle: float,
         aberration_coefs: dict,
         semiangle_cutoff: float,
@@ -70,6 +69,7 @@ class DirectPtychography(DirectPtychographyBase):
         rng: np.random.Generator | int | None,
         device: str | int,
         verbose: int | bool,
+        wavelength: float | None = None,
         _token: object | None = None,
     ):
         """ """
@@ -85,7 +85,7 @@ class DirectPtychography(DirectPtychographyBase):
         if crop_bf_mask:
             self.bf_mask = _crop_corner_centered_mask(self.bf_mask, bf_mask_padding_px)
 
-        self.wavelength = electron_wavelength_angstrom(energy)
+        self.wavelength = self._resolve_wavelength(energy, wavelength)
         self.scan_units = vbf_dataset.units[-2:]
         self.detector_units = bf_mask_dataset.units
 
@@ -113,10 +113,11 @@ class DirectPtychography(DirectPtychographyBase):
         cls,
         vbf_dataset: Dataset3d,
         bf_mask_dataset: Dataset2d,
-        energy: float,
-        rotation_angle: float,
-        semiangle_cutoff: float,
+        energy: float | None = None,
+        rotation_angle: float | None = None,
+        semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
+        wavelength: float | None = None,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
         bf_mask_padding_px: int = 1,
@@ -130,6 +131,7 @@ class DirectPtychography(DirectPtychographyBase):
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
@@ -146,9 +148,10 @@ class DirectPtychography(DirectPtychographyBase):
     def from_dataset4d(
         cls,
         dataset: Dataset4d,
-        energy: float,
-        semiangle_cutoff: float,
+        energy: float | None = None,
+        semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
+        wavelength: float | None = None,
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -185,6 +188,7 @@ class DirectPtychography(DirectPtychographyBase):
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
@@ -202,11 +206,12 @@ class DirectPtychography(DirectPtychographyBase):
         cls,
         dataset: Dataset3d,
         positions: Dataset2d | torch.Tensor | NDArray,
-        energy: float,
-        semiangle_cutoff: float,
-        rotation_angle: float,
-        scan_sampling: Tuple[float, float] | Literal["auto"],
+        energy: float | None = None,
+        semiangle_cutoff: float | None = None,
+        rotation_angle: float | None = None,
+        scan_sampling: Tuple[float, float] | Literal["auto"] = "auto",
         aberration_coefs: dict = {},
+        wavelength: float | None = None,
         scan_gpts: Tuple[int, int] | None = None,
         interpolation: Literal["nearest", "bilinear"] = "nearest",
         hole_fill: Literal["mean", "zero"] = "mean",
@@ -363,6 +368,7 @@ class DirectPtychography(DirectPtychographyBase):
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             semiangle_cutoff=semiangle_cutoff,
             aberration_coefs=aberration_coefs,

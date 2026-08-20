@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d
-from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
+from quantem.core.utils.utils import to_numpy
 from quantem.core.utils.validators import (
     validate_aberration_coefficients,
     validate_tensor,
@@ -98,7 +98,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         vbf_stack: torch.Tensor | NDArray,
         positions_px: torch.Tensor | NDArray,
         bf_mask_dataset: Dataset2d,
-        energy: float,
+        energy: float | None,
         rotation_angle: float,
         aberration_coefs: dict,
         semiangle_cutoff: float,
@@ -116,6 +116,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         verbose: int | bool,
         defocus_gradient: Tuple[float, float] | None = None,
         scan_origin: Tuple[float, float] | None = None,
+        wavelength: float | None = None,
         _token: object | None = None,
     ):
         """ """
@@ -133,7 +134,13 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         if crop_bf_mask:
             self.bf_mask = _crop_corner_centered_mask(self.bf_mask, bf_mask_padding_px)
 
-        self.wavelength = electron_wavelength_angstrom(energy)
+        if rotation_angle is None:
+            raise ValueError(
+                "`rotation_angle` is required, in degrees: it sets the detector rotation "
+                "relative to the scan. Pass 0.0 if the two frames already agree."
+            )
+
+        self.wavelength = self._resolve_wavelength(energy, wavelength)
         self.scan_units = scan_units
         self.detector_units = bf_mask_dataset.units
 
@@ -187,10 +194,11 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         cls,
         vbf_dataset: Dataset3d,
         bf_mask_dataset: Dataset2d,
-        energy: float,
-        rotation_angle: float,
-        semiangle_cutoff: float,
+        energy: float | None = None,
+        rotation_angle: float | None = None,
+        semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
+        wavelength: float | None = None,
         boundary: Literal["wrap", "pad"] = "wrap",
         defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
@@ -216,6 +224,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             positions_px=cls._raster_positions_px(scan_gpts),
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
@@ -239,9 +248,10 @@ class ShadowMontagePtychography(DirectPtychographyBase):
     def from_dataset4d(
         cls,
         dataset: Dataset4d,
-        energy: float,
-        semiangle_cutoff: float,
+        energy: float | None = None,
+        semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
+        wavelength: float | None = None,
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -287,6 +297,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             semiangle_cutoff=semiangle_cutoff,
             aberration_coefs=aberration_coefs,
@@ -306,11 +317,12 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         cls,
         dataset: Dataset3d,
         positions: Dataset2d | torch.Tensor | NDArray,
-        energy: float,
-        semiangle_cutoff: float,
-        rotation_angle: float,
-        scan_sampling: Tuple[float, float] | Literal["auto"],
+        energy: float | None = None,
+        semiangle_cutoff: float | None = None,
+        rotation_angle: float | None = None,
+        scan_sampling: Tuple[float, float] | Literal["auto"] = "auto",
         aberration_coefs: dict = {},
+        wavelength: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
         mode: str = "bilinear",
@@ -378,6 +390,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             positions_px=positions_px,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
