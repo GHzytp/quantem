@@ -1056,7 +1056,37 @@ class ShadowMontagePtychography(DirectPtychographyBase):
                 for f, s in zip(fov, self.scan_sampling)
             )
 
+        if boundary == "wrap":
+            self._warn_if_positions_wrap(positions_up, lo, canvas_shape, upsampling_factor)
+
         return with_fov(canvas_shape, lo)
+
+    def _warn_if_positions_wrap(self, positions_up, lo, canvas_shape, upsampling_factor):
+        """Warn when ``"wrap"`` folds part of the scan back over the object.
+
+        Wrapping a canvas that spans the whole scan is harmless -- it is what makes the
+        montage reproduce ``DirectPtychography``, which is periodic in the scan by
+        construction. Wrapping one that does *not* is a different thing entirely: the
+        positions outside come back on the opposite side and lay a second, offset copy of
+        the specimen over the first. It looks like a real reconstruction with a ghost in it,
+        which is easy to explain away as an artifact of something else.
+        """
+        shape = torch.as_tensor(canvas_shape, device=positions_up.device, dtype=lo.dtype)
+        below = (lo - positions_up.amin(0)).clamp_min(0)
+        above = (positions_up.amax(0) - (lo + shape)).clamp_min(0)
+        outside = torch.maximum(below, above)
+        if not bool((outside > 0.5).any()):
+            return
+
+        overhang = to_numpy(outside) / upsampling_factor * np.asarray(self.scan_sampling)
+        warnings.warn(
+            f"boundary='wrap' with a canvas of {tuple(canvas_shape)} px leaves scan positions "
+            f"up to {np.round(overhang, 1)} Angstrom outside it, which wrap around and lay a "
+            "second copy of the specimen over the reconstruction. Either widen `obj_fov` to "
+            "cover the scan -- for an empirical probe, to the next whole multiple of the "
+            "probe's field of view -- or use boundary='pad', which drops them instead.",
+            stacklevel=4,
+        )
 
     def reconstruct(
         self,

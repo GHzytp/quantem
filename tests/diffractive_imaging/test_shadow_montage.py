@@ -2098,6 +2098,39 @@ class TestSharedCanvas:
         assert montage.obj_origin == pytest.approx((0.0, 0.0), abs=1e-4)
         assert np.isfinite(montage.obj).all()
 
+    def test_a_wrapped_canvas_smaller_than_the_scan_warns(self, dataset4d):
+        """Positions outside a wrapped canvas fold a second copy of the specimen over it.
+
+        The failure looks like a real reconstruction with a ghost in it, which is easy to
+        blame on something else -- so it has to say so.
+        """
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        span = np.ptp(to_numpy(montage.positions_px), axis=0) * SCAN_SAMPLING
+
+        with pytest.warns(UserWarning, match="wrap around"):
+            montage.reconstruct(
+                deconvolution_kernel="prlx",
+                boundary="wrap",
+                obj_origin=tuple(np.asarray(montage.scan_origin)),
+                obj_fov=(span[0] / 2, span[1]),
+                verbose=False,
+            )
+
+    @pytest.mark.parametrize("boundary", ["wrap", "pad"])
+    def test_a_canvas_covering_the_scan_is_silent(self, dataset4d, boundary, recwarn):
+        montage = self._montage(dataset4d, integer_shift_defocus(1))
+        span = np.ptp(to_numpy(montage.positions_px), axis=0) * SCAN_SAMPLING
+
+        montage.reconstruct(
+            deconvolution_kernel="prlx",
+            boundary=boundary,
+            obj_origin=tuple(np.asarray(montage.scan_origin) - 4 * SCAN_SAMPLING),
+            obj_fov=tuple(span + 8 * SCAN_SAMPLING),
+            verbose=False,
+        )
+
+        assert not [w for w in recwarn if "wrap around" in str(w.message)]
+
     def test_wrap_defaults_to_the_scan_grid(self, dataset4d):
         """The default is unchanged: no window given, the canvas is the scan."""
         montage = self._montage(dataset4d, integer_shift_defocus(1))
