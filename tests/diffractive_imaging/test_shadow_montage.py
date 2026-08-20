@@ -957,36 +957,98 @@ class TestFourierProbe:
         _, _, refined = empirical._resampled_probe
         assert refined.array.shape == empirical.fourier_probe.array.shape
 
-    @pytest.mark.parametrize("rotation_angle", [15.0, 45.0, -30.0])
-    def test_rotation_off_the_detector_lattice_raises(self, dataset4d, rotation_angle):
-        """`_return_k_grid` rotates k into the scan frame; an array lives in the detector's.
+    def test_refined_sampling_converges_on_the_exact_shift(self):
+        """Bilinear on a refined grid must approach the exact band-limited evaluation.
 
-        Measured before this was guarded: 0 and 90 degrees reproduce the analytic
-        reconstruction to 1e-7, but 15 degrees was 7.6% wrong -- silently.
+        Isolated from any reconstruction, and on a probe whose real-space form really is
+        confined, so that zero-padding is exact and only the interpolation is under test.
+        Error falls as the square of the refinement.
         """
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        torch.manual_seed(0)
+        n = 64
+        real = torch.zeros(n, n, dtype=torch.complex64)
+        real[:10, :10] = torch.randn(10, 10, dtype=torch.complex64)
+        psi = torch.fft.fft2(real)
+        step = 0.25
 
-        with pytest.raises(NotImplementedError, match="rotation_angle"):
-            empirical.reconstruct(
-                deconvolution_kernel="ssb",
-                convolution_mode="fft",
-                override_rotation_angle=rotation_angle,
-                verbose=False,
+        # ground truth at a generic sub-pixel offset: a phase ramp in real space
+        drow, dcol = 0.31, 0.17
+        ramp_axis = torch.fft.fftfreq(n)
+        ramp = torch.exp(-2j * np.pi * (drow * ramp_axis[:, None] + dcol * ramp_axis[None, :]))
+        truth = torch.fft.fft2(real * ramp)
+
+        index = torch.arange(n)
+        centered = torch.where(index < n // 2, index, index - n).to(torch.float32)
+        kx = centered[:, None].expand(n, n) * step
+        ky = centered[None, :].expand(n, n) * step
+
+        errors = []
+        for oversample in (1, 4, 16):
+            probe = FourierProbe.from_array(
+                psi, (step, step), 0.02, normalize=False, interpolation="bilinear"
             )
+            if oversample > 1:
+                probe = probe.resampled_to((step / oversample, step / oversample))
+            sampled = probe.at(kx + drow * step, ky + dcol * step)
+            errors.append(float((sampled - truth).abs().max() / truth.abs().max()))
 
-    @pytest.mark.parametrize("rotation_angle", [0.0, 90.0, 180.0, -90.0])
-    def test_rotations_mapping_the_lattice_onto_itself_are_allowed(
-        self, dataset4d, rotation_angle
-    ):
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        assert errors[0] > errors[1] > errors[2]
+        assert errors[2] < 0.01
+
+    @pytest.mark.parametrize("rotation_angle", [15.0, -30.0])
+    def test_rotation_off_the_lattice_is_supported(self, dataset4d, rotation_angle):
+        """A rotation carries `q` off the probe's lattice, which is interpolated, not refused.
+
+        It is a real experimental parameter. What it costs is a sampling error that the
+        refinement controls -- and, on this fixture, a floor of about 6% that no refinement
+        removes: the aperture is cropped to an 11x11 grid, so its real-space probe is not
+        confined and the band-limited interpolant is not the true probe. That floor is a
+        property of the data, not of the method.
+        """
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        kwargs["rotation_angle"] = rotation_angle
+
+        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        psi = analytic_probe_array(analytic, {"C10": defocus})
+        analytic.reconstruct(deconvolution_kernel="ssb", convolution_mode="fft", verbose=False)
+
+        empirical = ShadowMontagePtychography.from_dataset4d(
+            dataset4d,
+            fourier_probe=FourierProbe.from_array(
+                psi, analytic.reciprocal_sampling, analytic.wavelength, normalize=False
+            ),
+            **kwargs,
+        )
         empirical.reconstruct(
-            deconvolution_kernel="ssb",
-            convolution_mode="fft",
-            override_rotation_angle=rotation_angle,
-            verbose=False,
+            deconvolution_kernel="ssb", convolution_mode="fft", probe_oversample=8, verbose=False
         )
 
         assert np.isfinite(empirical.obj).all()
+        assert correlation(empirical.obj, analytic.obj) > 0.99
+
+    def test_low_oversampling_warns(self, dataset4d):
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        kwargs["rotation_angle"] = 15.0
+        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        empirical = ShadowMontagePtychography.from_dataset4d(
+            dataset4d,
+            fourier_probe=FourierProbe.from_array(
+                analytic_probe_array(analytic, {"C10": defocus}),
+                analytic.reciprocal_sampling,
+                analytic.wavelength,
+            ),
+            **kwargs,
+        )
+
+        with pytest.warns(UserWarning, match="off the probe's reciprocal lattice"):
+            empirical.reconstruct(
+                deconvolution_kernel="ssb",
+                convolution_mode="fft",
+                probe_oversample=2,
+                verbose=False,
+            )
 
     def test_off_grid_sampling_raises(self, dataset4d):
         """A canvas incommensurate with the probe would need interpolation; say so."""

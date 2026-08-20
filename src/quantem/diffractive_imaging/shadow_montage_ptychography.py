@@ -739,40 +739,36 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             return convolution_mode
         return "stencil" if stencil_radius != "auto" else "fft"
 
-    def _check_probe_rotation(self, rotation_angle) -> None:
-        """An empirical probe is indexed in the detector's frame, so `k` must stay in it.
+    def _probe_rotation_is_exact(self, rotation_angle) -> bool:
+        """Whether a rotation leaves `k -/+ q` on the probe's own reciprocal lattice.
 
-        `_return_k_grid` rotates the k-grid into the scan frame, which is exactly what the
-        analytic aperture wants -- it is *evaluated* at those coordinates. An array can only
-        be *read* at its own lattice points, and a rotation takes `k -/+ q` off that lattice
-        unless it maps the lattice onto itself. Measured on the electron fixture: 0 and 90
-        degrees reproduce the analytic reconstruction to 1e-7, 15 degrees is 7.6% wrong.
-
-        X-rays have no Larmor rotation, so the physical value there is zero.
+        `_return_k_grid` rotates the k-grid into the scan frame, which is what the analytic
+        aperture wants -- it is *evaluated* there. An array can only be *read* on its lattice,
+        and while `k` itself stays put, the offset `q` arrives rotated. Only rotations that
+        map the lattice onto itself keep it there; everything else has to be interpolated,
+        which `_resample_probe` handles by refining the grid first.
         """
         turns = float(rotation_angle) / 90.0
         square = abs(self.reciprocal_sampling[0] - self.reciprocal_sampling[1]) < 1e-9
-        if abs(turns - round(turns)) > 1e-6 or (round(turns) % 2 and not square):
-            raise NotImplementedError(
-                f"An empirical `fourier_probe` is indexed on the detector grid, but "
-                f"rotation_angle={rotation_angle} would ask for it off that grid. Only "
-                "rotations that map the grid onto itself work -- multiples of 90 degrees, "
-                "and multiples of 180 unless the two reciprocal samplings are equal. Rotate "
-                "the probe array and the diffraction patterns together beforehand if you "
-                "need another angle."
-            )
+        return abs(turns - round(turns)) < 1e-6 and (round(turns) % 2 == 0 or square)
 
-    def _resample_probe(self, probe, q_step):
+    def _resample_probe(self, probe, q_step, oversample=1):
         """`probe` on the canvas's reciprocal grid, cached across reconstructions.
 
         Two transforms over a large detector are not free, and the canvas rarely changes
         between calls -- a defocus sweep or a hyperparameter search repeats the same one.
+
+        ``oversample`` refines further, which is what makes an off-lattice sampling accurate:
+        bilinear error falls as the square of the refinement. Measured on a speckled X-ray
+        probe at a generic sub-pixel offset: 21% unrefined, 7.5% at 2x, 1.7% at 4x, 0.52% at
+        8x, 0.064% at 16x -- against a memory cost that grows as the square.
         """
+        key = (q_step, int(oversample))
         cached = getattr(self, "_resampled_probe", None)
-        if cached is not None and cached[0] == q_step and cached[1] is probe:
+        if cached is not None and cached[0] == key and cached[1] is probe:
             return cached[2]
-        refined = probe.resampled_to(q_step)
-        self._resampled_probe = (q_step, probe, refined)
+        refined = probe.resampled_to(tuple(q / oversample for q in q_step))
+        self._resampled_probe = (key, probe, refined)
         return refined
 
     def _return_kernel_context(
@@ -786,6 +782,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         upsampling_factor,
         matched_filter_norm_epsilon,
         kernel_batch_size,
+        probe_oversample=1,
     ):
         """``(kernel_args, norm, bf_weights)``, everything a Fourier kernel needs but the batch.
 
@@ -801,11 +798,30 @@ class ShadowMontagePtychography(DirectPtychographyBase):
 
         probe = self._return_probe(aberration_coefs)
         if probe.array is not None:
-            self._check_probe_rotation(rotation_angle)
             # an empirical probe can only be read on its own reciprocal grid, so refine it
             # onto the canvas's -- exactly, by zero-padding in real space
             q_step = tuple(1 / (n * d) for n, d in zip(canvas_shape, upsampled_sampling))
-            probe = self._resample_probe(probe, q_step)
+            oversample = 1
+            if not self._probe_rotation_is_exact(rotation_angle):
+                # the rotation carries q off the lattice, so the probe has to be interpolated
+                oversample = max(1, int(probe_oversample))
+                probe = FourierProbe(
+                    probe.wavelength,
+                    array=probe.array,
+                    reciprocal_sampling=probe.reciprocal_sampling,
+                    interpolation="bilinear",
+                )
+                if oversample < 8:
+                    warnings.warn(
+                        f"rotation_angle={rotation_angle} takes q off the probe's reciprocal "
+                        f"lattice, so psi is interpolated. At probe_oversample={oversample} "
+                        "that costs roughly "
+                        f"{ {1: '20%', 2: '7%', 4: '2%'}.get(oversample, '<1%') } rms on a "
+                        "speckled probe; raise it (memory grows as its square) or use a "
+                        "rotation that maps the lattice onto itself.",
+                        stacklevel=3,
+                    )
+            probe = self._resample_probe(probe, q_step, oversample)
 
         kernel_args = (bf, kernel, qxa, qya, kxa, kya, cmplx_probe_k, probe)
 
@@ -844,6 +860,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         matched_filter_norm_epsilon,
         kernel_batch_size,
         verbose,
+        probe_oversample=1,
     ):
         """``(stencil_offsets, stencil_weights, bf_weights, info)`` for a convolution kernel.
 
@@ -865,6 +882,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             upsampling_factor=upsampling_factor,
             matched_filter_norm_epsilon=matched_filter_norm_epsilon,
             kernel_batch_size=kernel_batch_size,
+            probe_oversample=probe_oversample,
         )
 
         n_rows, n_cols = canvas_shape
@@ -1058,6 +1076,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         compute_variance=True,
         suppress_nyquist=False,
         convolution_mode="auto",
+        probe_oversample=8,
         stencil_radius="auto",
         truncation_tolerance=0.1,
         max_stencil_radius=32,
@@ -1189,6 +1208,14 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             With ``boundary="pad"`` the FFT route doubles the canvas and crops back, since a
             Fourier convolution is otherwise circular. That costs four times the transform
             area; ``boundary="wrap"`` wants the circular one anyway and pays nothing.
+        probe_oversample : int
+            How finely an empirical ``fourier_probe`` is refined before being sampled off its
+            own reciprocal lattice, which a ``rotation_angle`` that is not a multiple of 90
+            degrees forces. Bilinear error falls as the square of this and the probe array
+            grows as its square: measured on a speckled X-ray probe at a generic sub-pixel
+            offset, 21% unrefined, 7.5% at 2, 1.7% at 4, 0.52% at 8, 0.064% at 16. Ignored
+            for an analytic probe, which is evaluated rather than sampled, and for a rotation
+            that maps the lattice onto itself.
         stencil_radius : int or "auto"
             Half-width of the box stencil used by the ``ssb`` / ``obf`` / ``mf`` kernels,
             in canvas pixels. ``"auto"`` grows it until the estimated truncation error meets
@@ -1327,6 +1354,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
                 upsampling_factor=upsampling_factor,
                 matched_filter_norm_epsilon=matched_filter_norm_epsilon,
                 kernel_batch_size=kernel_batch_size,
+                probe_oversample=probe_oversample,
             )
             # each bright-field pixel now needs a canvas of its own, so size the batch by
             # canvas area rather than by scan positions
@@ -1350,6 +1378,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
                     matched_filter_norm_epsilon=matched_filter_norm_epsilon,
                     kernel_batch_size=kernel_batch_size,
                     verbose=verbose,
+                    probe_oversample=probe_oversample,
                 )
             )
             # a stencil of S taps costs S deposits per point, so shrink the batch to match
