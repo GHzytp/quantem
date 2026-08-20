@@ -916,6 +916,78 @@ class TestFourierProbe:
         # and the centre is emphatically not zero
         assert probe.at(zero, zero).abs().item() > 0
 
+    def test_resampling_is_exact_on_the_shared_lattice(self):
+        """Zero-padding a compact real-space probe refines `psi` without changing it."""
+        torch.manual_seed(0)
+        real = torch.zeros(32, 32, dtype=torch.complex64)
+        real[:8, :8] = torch.randn(8, 8, dtype=torch.complex64)  # confined, so band limited
+        psi = torch.fft.fft2(real)
+        probe = FourierProbe.from_array(psi, (0.25, 0.25), 0.02, normalize=False)
+
+        refined = probe.resampled_to((0.0625, 0.0625))
+
+        assert refined.array.shape == (128, 128)
+        # every fourth sample of the fine grid is the original, exactly
+        assert _relative_error(to_numpy(refined.array[::4, ::4]), to_numpy(psi)) < 1e-5
+
+    def test_resampling_handles_anisotropy_and_odd_sizes(self):
+        torch.manual_seed(0)
+        real = torch.zeros(31, 16, dtype=torch.complex64)
+        real[:6, :4] = torch.randn(6, 4, dtype=torch.complex64)
+        psi = torch.fft.fft2(real)
+        probe = FourierProbe.from_array(psi, (0.25, 0.5), 0.02, normalize=False)
+
+        refined = probe.resampled_to((0.125, 0.125))
+
+        assert refined.array.shape == (62, 64)
+        assert _relative_error(to_numpy(refined.array[::2, ::4]), to_numpy(psi)) < 1e-5
+
+    def test_resampling_rejects_a_non_integer_ratio(self):
+        probe = FourierProbe.from_array(
+            np.ones((8, 8), dtype=np.complex64), (0.25, 0.25), 0.02, normalize=False
+        )
+        with pytest.raises(ValueError, match="whole number"):
+            probe.resampled_to((0.1, 0.1))
+
+    def test_a_canvas_matching_the_probe_needs_no_resampling(self, dataset4d):
+        """Canvas field of view == probe field of view is the exact, assumption-free case."""
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography, normalize=False)
+        empirical.reconstruct(deconvolution_kernel="ssb", convolution_mode="fft", verbose=False)
+
+        _, _, refined = empirical._resampled_probe
+        assert refined.array.shape == empirical.fourier_probe.array.shape
+
+    @pytest.mark.parametrize("rotation_angle", [15.0, 45.0, -30.0])
+    def test_rotation_off_the_detector_lattice_raises(self, dataset4d, rotation_angle):
+        """`_return_k_grid` rotates k into the scan frame; an array lives in the detector's.
+
+        Measured before this was guarded: 0 and 90 degrees reproduce the analytic
+        reconstruction to 1e-7, but 15 degrees was 7.6% wrong -- silently.
+        """
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+
+        with pytest.raises(NotImplementedError, match="rotation_angle"):
+            empirical.reconstruct(
+                deconvolution_kernel="ssb",
+                convolution_mode="fft",
+                override_rotation_angle=rotation_angle,
+                verbose=False,
+            )
+
+    @pytest.mark.parametrize("rotation_angle", [0.0, 90.0, 180.0, -90.0])
+    def test_rotations_mapping_the_lattice_onto_itself_are_allowed(
+        self, dataset4d, rotation_angle
+    ):
+        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        empirical.reconstruct(
+            deconvolution_kernel="ssb",
+            convolution_mode="fft",
+            override_rotation_angle=rotation_angle,
+            verbose=False,
+        )
+
+        assert np.isfinite(empirical.obj).all()
+
     def test_off_grid_sampling_raises(self, dataset4d):
         """A canvas incommensurate with the probe would need interpolation; say so."""
         _, empirical = self._pair(dataset4d, ShadowMontagePtychography)

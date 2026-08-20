@@ -697,7 +697,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         )
 
     def _return_kernel_fourier(
-        self, batch_idx, bf, kernel, qxa, qya, kxa, kya, cmplx_probe_k, aberration_coefs, norm
+        self, batch_idx, bf, kernel, qxa, qya, kxa, kya, cmplx_probe_k, probe, norm
     ):
         """``(B, Ny, Nx)`` Fourier deconvolution kernel for a batch of bright-field pixels.
 
@@ -713,7 +713,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             (qxa.unsqueeze(0) - kx, qya.unsqueeze(0) - ky),
             (qxa.unsqueeze(0) + kx, qya.unsqueeze(0) + ky),
             cmplx_probe_k[ind_i, ind_j].view(-1, 1, 1),
-            self._return_probe(aberration_coefs),
+            probe,
             normalize=False,
         )
 
@@ -739,6 +739,42 @@ class ShadowMontagePtychography(DirectPtychographyBase):
             return convolution_mode
         return "stencil" if stencil_radius != "auto" else "fft"
 
+    def _check_probe_rotation(self, rotation_angle) -> None:
+        """An empirical probe is indexed in the detector's frame, so `k` must stay in it.
+
+        `_return_k_grid` rotates the k-grid into the scan frame, which is exactly what the
+        analytic aperture wants -- it is *evaluated* at those coordinates. An array can only
+        be *read* at its own lattice points, and a rotation takes `k -/+ q` off that lattice
+        unless it maps the lattice onto itself. Measured on the electron fixture: 0 and 90
+        degrees reproduce the analytic reconstruction to 1e-7, 15 degrees is 7.6% wrong.
+
+        X-rays have no Larmor rotation, so the physical value there is zero.
+        """
+        turns = float(rotation_angle) / 90.0
+        square = abs(self.reciprocal_sampling[0] - self.reciprocal_sampling[1]) < 1e-9
+        if abs(turns - round(turns)) > 1e-6 or (round(turns) % 2 and not square):
+            raise NotImplementedError(
+                f"An empirical `fourier_probe` is indexed on the detector grid, but "
+                f"rotation_angle={rotation_angle} would ask for it off that grid. Only "
+                "rotations that map the grid onto itself work -- multiples of 90 degrees, "
+                "and multiples of 180 unless the two reciprocal samplings are equal. Rotate "
+                "the probe array and the diffraction patterns together beforehand if you "
+                "need another angle."
+            )
+
+    def _resample_probe(self, probe, q_step):
+        """`probe` on the canvas's reciprocal grid, cached across reconstructions.
+
+        Two transforms over a large detector are not free, and the canvas rarely changes
+        between calls -- a defocus sweep or a hyperparameter search repeats the same one.
+        """
+        cached = getattr(self, "_resampled_probe", None)
+        if cached is not None and cached[0] == q_step and cached[1] is probe:
+            return cached[2]
+        refined = probe.resampled_to(q_step)
+        self._resampled_probe = (q_step, probe, refined)
+        return refined
+
     def _return_kernel_context(
         self,
         bf,
@@ -763,7 +799,15 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         cmplx_probe_k = self._return_probe_on_grid(k, phi, aberration_coefs)
         bf_weights = cmplx_probe_k[bf.bf_mask].abs().square().sum()
 
-        kernel_args = (bf, kernel, qxa, qya, kxa, kya, cmplx_probe_k, aberration_coefs)
+        probe = self._return_probe(aberration_coefs)
+        if probe.array is not None:
+            self._check_probe_rotation(rotation_angle)
+            # an empirical probe can only be read on its own reciprocal grid, so refine it
+            # onto the canvas's -- exactly, by zero-padding in real space
+            q_step = tuple(1 / (n * d) for n, d in zip(canvas_shape, upsampled_sampling))
+            probe = self._resample_probe(probe, q_step)
+
+        kernel_args = (bf, kernel, qxa, qya, kxa, kya, cmplx_probe_k, probe)
 
         # obf and mf normalize by a power spectrum summed over every bright-field pixel, so
         # they need a pass over all of them before any kernel is final

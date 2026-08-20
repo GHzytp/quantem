@@ -2,6 +2,7 @@ import math
 from collections import defaultdict
 from typing import Mapping, Tuple
 
+import numpy as np
 import torch
 from numpy.typing import NDArray
 
@@ -429,6 +430,67 @@ class FourierProbe:
             interpolation=self.interpolation,
         )
         return moved
+
+    def resampled_to(self, reciprocal_sampling: Tuple[float, float]) -> "FourierProbe":
+        """The same probe on a finer reciprocal grid, by zero-padding it in real space.
+
+        This is not an approximation. ``psi`` is the transform of a probe confined to the
+        field of view its sampling implies, so it is band limited, and zero-padding then
+        transforming back is exactly the sinc interpolation that band limit licenses --
+        unlike bilinear sampling, which is not.
+
+        The requested step must divide the current one by a whole number per axis: refining
+        by a non-integer factor would need the real-space probe resampled rather than merely
+        extended, which *is* an approximation.
+
+        This is what makes an empirical probe usable on a canvas larger than the probe's own
+        field of view: the canvas needs ``q`` spaced ``1 / canvas_fov``, and the probe
+        supplies ``1 / probe_fov``, so the padding factor is ``canvas_fov / probe_fov``.
+        """
+        if self.array is None:
+            return self  # analytic probes are evaluated, not sampled
+
+        current = np.asarray(self.reciprocal_sampling, dtype=float)
+        target = np.asarray(reciprocal_sampling, dtype=float)
+        ratio = current / target
+        rounded = np.round(ratio)
+        if np.any(rounded < 1) or np.any(np.abs(ratio - rounded) > 1e-6):
+            raise ValueError(
+                f"An empirical probe can only be refined onto a reciprocal grid whose step "
+                f"divides its own by a whole number, but "
+                f"{tuple(self.reciprocal_sampling)} / {tuple(float(t) for t in target)} = "  # ty:ignore[not-iterable]
+                f"{tuple(np.round(ratio, 4))}. Equivalently, the canvas field of view must "
+                f"be a whole multiple of the probe's."
+            )
+
+        factor = rounded.astype(int)
+        if np.all(factor == 1):
+            return self
+
+        shape = tuple(int(n * f) for n, f in zip(self.array.shape, factor))
+        real_space = torch.fft.ifft2(self.array)
+        padded = torch.zeros(shape, dtype=real_space.dtype, device=real_space.device)
+        # keep the corner-centered quadrants where they belong on the larger grid
+        n_rows, n_cols = self.array.shape
+        for row_slice, row_source in (
+            (slice(0, (n_rows + 1) // 2), slice(0, (n_rows + 1) // 2)),
+            (slice(shape[0] - n_rows // 2, shape[0]), slice((n_rows + 1) // 2, n_rows)),
+        ):
+            for col_slice, col_source in (
+                (slice(0, (n_cols + 1) // 2), slice(0, (n_cols + 1) // 2)),
+                (slice(shape[1] - n_cols // 2, shape[1]), slice((n_cols + 1) // 2, n_cols)),
+            ):
+                padded[row_slice, col_slice] = real_space[row_source, col_source]
+
+        # no rescaling: the padded transform evaluated on the coarse sub-lattice is
+        # `sum_m real[m] exp(-2i.pi.k.m/n)`, which is the original psi exactly
+        refined = torch.fft.fft2(padded)
+        return FourierProbe(
+            self.wavelength,
+            array=refined,
+            reciprocal_sampling=tuple(float(t) for t in target),  # ty:ignore[not-iterable]
+            interpolation=self.interpolation,
+        )
 
     def at(self, kx: torch.Tensor, ky: torch.Tensor) -> torch.Tensor:
         """``psi`` at the given spatial frequencies, in inverse Angstrom.
