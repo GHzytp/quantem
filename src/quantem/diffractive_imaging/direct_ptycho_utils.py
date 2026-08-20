@@ -796,6 +796,125 @@ def scatter_add_splat(
     return sum_w, sum_wv, sum_wv2
 
 
+def splat_stack(
+    values: torch.Tensor,
+    coords: torch.Tensor,
+    canvas_shape: tuple[int, int],
+    *,
+    boundary: Literal["wrap", "pad"] = "wrap",
+    interpolation: Literal["bilinear", "nearest"] = "nearest",
+) -> torch.Tensor:
+    """
+    Splat each row of a batch onto its **own** canvas: ``(B, T)`` values -> ``(B, n_rows, n_cols)``.
+
+    :func:`scatter_add_splat` accumulates a whole batch into one shared canvas, which is what
+    the parallax kernel wants. A convolution kernel needs each bright-field image separately,
+    so that it can be convolved with that image's own kernel before the sum -- see
+    :func:`convolve_stack` and :func:`convolve_stack_fourier`.
+
+    Deposition matches :func:`scatter_add_splat` exactly, so splatting and then convolving is
+    the same operator as :func:`scatter_add_convolve`, only reorganized.
+    """
+    n_rows, n_cols = int(canvas_shape[0]), int(canvas_shape[1])
+    batch = int(values.shape[0])
+    dtype = values.dtype if values.is_floating_point() else torch.float32
+
+    flat = torch.zeros(batch * n_rows * n_cols, device=values.device, dtype=dtype)
+    values = values.to(dtype)
+    coords = coords.to(dtype)
+
+    base, frac, corners = _deposition_corners(coords, interpolation)
+    base_row = base[..., 0].to(torch.int64)
+    base_col = base[..., 1].to(torch.int64)
+    # offset each batch element into its own slab of the flat buffer
+    slab = (
+        torch.arange(batch, device=values.device, dtype=torch.int64).view(-1, 1) * n_rows * n_cols
+    )
+
+    for d_row, d_col in corners:
+        if frac is None:
+            weights = torch.ones_like(values)
+        else:
+            w_row = frac[..., 0] if d_row else 1 - frac[..., 0]
+            w_col = frac[..., 1] if d_col else 1 - frac[..., 1]
+            weights = w_row * w_col
+            weights = weights.expand_as(values) if weights.shape != values.shape else weights
+
+        indices, weights = _resolve_indices(
+            base_row + d_row, base_col + d_col, weights, n_rows, n_cols, boundary
+        )
+        indices = (indices.view(batch, -1) + slab).reshape(-1)
+        flat.index_add_(0, indices, (weights * values).reshape(-1))
+
+    return flat.view(batch, n_rows, n_cols)
+
+
+def splat_and_convolve(
+    values: torch.Tensor,
+    coords: torch.Tensor,
+    canvas_shape: tuple[int, int],
+    stencil_weights: torch.Tensor,
+    radius: int,
+    *,
+    boundary: Literal["wrap", "pad"] = "wrap",
+    interpolation: Literal["bilinear", "nearest"] = "nearest",
+) -> torch.Tensor:
+    """
+    Splat each bright-field image, then convolve it with its own square kernel.
+
+    The same operator as :func:`scatter_add_convolve`, reorganized so the convolution is a
+    grouped ``conv2d`` rather than a loop over taps -- far better optimized. Measured on MPS
+    with 167k bright-field pixels and a 180x140 canvas, a radius-8 stencil takes 5.4 s here
+    against 78 s there.
+
+    ``stencil_weights`` is ``(B, (2 * radius + 1) ** 2)``, ordered as the ``"ij"`` meshgrid
+    :meth:`ShadowMontagePtychography._return_kernel_stencil` builds.
+
+    Returns ``(B, n_rows, n_cols)``; sum over the batch to accumulate.
+    """
+    n_rows, n_cols = int(canvas_shape[0]), int(canvas_shape[1])
+    size = 2 * radius + 1
+
+    if boundary == "wrap":
+        stack = splat_stack(
+            values, coords, canvas_shape, boundary="wrap", interpolation=interpolation
+        )
+        stack = torch.nn.functional.pad(stack.unsqueeze(0), (radius,) * 4, mode="circular")
+    else:
+        # `scatter_add_convolve` tests the boundary at the *deposit* position, so a point
+        # just outside the canvas still contributes inward through the kernel. Splatting
+        # onto a canvas grown by the stencil radius keeps those points, and the unpadded
+        # convolution below crops back to the requested shape.
+        grown = (n_rows + 2 * radius, n_cols + 2 * radius)
+        stack = splat_stack(
+            values, coords + radius, grown, boundary="pad", interpolation=interpolation
+        ).unsqueeze(0)
+
+    batch = int(values.shape[0])
+    # torch conv2d correlates rather than convolves, so flip the kernel
+    weight = torch.flip(stencil_weights.reshape(batch, 1, size, size), dims=(-2, -1))
+    convolved = torch.nn.functional.conv2d(stack.to(weight.dtype), weight, groups=batch)
+    return convolved.view(batch, n_rows, n_cols)
+
+
+def convolve_stack_fourier(
+    stack: torch.Tensor,
+    kernel_fourier: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Multiply each canvas's transform by its own Fourier kernel, and return the sum in ``q``.
+
+    Exact, where a stencil is truncated -- which matters because the SSB, OBF and
+    matched-filter kernels are never compact in real space (their transforms have ``r**-1.5``
+    tails). It is also asymptotically cheaper for a kernel that spans the canvas: one FFT per
+    bright-field image against ``(2 * radius + 1) ** 2`` taps per point.
+
+    The convolution is circular, as it is for any Fourier method -- ``DirectPtychography``
+    included. Zero-pad the canvas beforehand to get a linear one.
+    """
+    return (torch.fft.fft2(stack) * kernel_fourier).sum(0)
+
+
 def scatter_add_convolve(
     values: torch.Tensor,
     coords: torch.Tensor,

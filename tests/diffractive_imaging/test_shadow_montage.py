@@ -23,6 +23,8 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     estimate_frame_drift,
     scatter_add_convolve,
     scatter_add_splat,
+    splat_and_convolve,
+    splat_stack,
 )
 
 from .conftest import (
@@ -1580,6 +1582,7 @@ class TestRealSpaceKernels:
         with pytest.warns(UserWarning, match="truncation error"):
             montage.reconstruct(
                 deconvolution_kernel="ssb",
+                convolution_mode="stencil",
                 stencil_radius="auto",
                 max_stencil_radius=3,
                 verbose=False,
@@ -1589,7 +1592,7 @@ class TestRealSpaceKernels:
 
     def test_auto_reports_what_it_chose(self, dataset4d):
         _, montage = self._pair(dataset4d)
-        montage.reconstruct(deconvolution_kernel="ssb", verbose=False)
+        montage.reconstruct(deconvolution_kernel="ssb", convolution_mode="stencil", verbose=False)
 
         info = montage._stencil_info
         assert info["stencil_radius"] >= 1
@@ -1629,16 +1632,168 @@ class TestRealSpaceKernels:
     def test_stencil_covers_the_parallax_shift_without_growing(self, dataset4d):
         """The shift is divided out of the kernel, so the stencil sizes the residual only."""
         _, montage = self._pair(dataset4d)
-        montage.reconstruct(deconvolution_kernel="ssb", verbose=False)
+        montage.reconstruct(deconvolution_kernel="ssb", convolution_mode="stencil", verbose=False)
         modest_defocus = montage._stencil_info["stencil_radius"]
 
         montage.reconstruct(
             deconvolution_kernel="ssb",
+            convolution_mode="stencil",
             override_aberration_coefs={"C10": integer_shift_defocus(3)},
             verbose=False,
         )
 
         assert montage._stencil_info["stencil_radius"] <= modest_defocus + 2
+
+
+class TestConvolutionModes:
+    """`convolution_mode` picks how the SSB / OBF / MF convolutions are evaluated.
+
+    `"fft"` multiplies in `q`, which is exact; `"stencil"` truncates to a box, which is not.
+    Both are the same operator, so the only differences that may appear are the truncation
+    and the circular-versus-linear boundary.
+    """
+
+    KERNELS = ("ssb", "obf", "mf")
+
+    @staticmethod
+    def _pair(dataset4d, boundary="wrap"):
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
+        return (
+            DirectPtychography.from_dataset4d(dataset4d, **kwargs),
+            ShadowMontagePtychography.from_dataset4d(dataset4d, boundary=boundary, **kwargs),
+        )
+
+    @pytest.mark.parametrize("kernel", KERNELS)
+    def test_fft_mode_is_exact(self, dataset4d, kernel):
+        """The headline: no truncation at all, so it must equal the Fourier class.
+
+        For contrast, the truncated stencil on this fixture is 20-34% off at radius 5 and
+        still 2-5% off at radius 12 -- these kernels are not compact and never converge fast.
+        """
+        fourier, montage = self._pair(dataset4d)
+        fourier.reconstruct(deconvolution_kernel=kernel, verbose=False)
+        montage.reconstruct(deconvolution_kernel=kernel, convolution_mode="fft", verbose=False)
+
+        assert _relative_error(montage.obj, fourier.obj) < 1e-5
+
+    @pytest.mark.parametrize("kernel", KERNELS)
+    def test_fft_mode_beats_a_truncated_stencil(self, dataset4d, kernel):
+        fourier, montage = self._pair(dataset4d)
+        fourier.reconstruct(deconvolution_kernel=kernel, verbose=False)
+        reference = fourier.obj.copy()
+
+        montage.reconstruct(deconvolution_kernel=kernel, convolution_mode="fft", verbose=False)
+        exact = _relative_error(montage.obj, reference)
+        montage.reconstruct(
+            deconvolution_kernel=kernel,
+            convolution_mode="stencil",
+            stencil_radius=5,
+            verbose=False,
+        )
+        truncated = _relative_error(montage.obj, reference)
+
+        assert exact < 0.01 * truncated
+
+    def test_pad_boundary_stays_linear(self, dataset4d):
+        """A Fourier convolution wraps; `"pad"` doubles the canvas so that it does not.
+
+        Compared against a stencil wide enough that its own truncation is the larger error.
+        """
+        _, montage = self._pair(dataset4d, boundary="pad")
+        montage.reconstruct(
+            deconvolution_kernel="ssb",
+            convolution_mode="stencil",
+            stencil_radius=14,
+            pad_px=4,
+            verbose=False,
+        )
+        stencil = montage.obj.copy()
+        montage.reconstruct(
+            deconvolution_kernel="ssb", convolution_mode="fft", pad_px=4, verbose=False
+        )
+
+        assert montage.obj.shape == stencil.shape
+        assert _relative_error(montage.obj, stencil) < 0.05
+
+    @pytest.mark.parametrize("interpolation", ["nearest", "bilinear"])
+    @pytest.mark.parametrize("boundary", ["wrap", "pad"])
+    def test_conv2d_stencil_matches_the_scatter(self, dataset4d, boundary, interpolation):
+        """`splat_and_convolve` is a reorganization of `scatter_add_convolve`, not a change.
+
+        The subtlety it has to reproduce is that the scatter tests the boundary at the
+        *deposit* position, so a point outside the canvas still contributes inward through
+        the kernel -- which is why the splat happens on a canvas grown by the radius.
+        """
+        torch.manual_seed(0)
+        radius = 3
+        span = torch.arange(-radius, radius + 1)
+        offsets = torch.stack(torch.meshgrid(span, span, indexing="ij"), dim=-1).reshape(-1, 2)
+        weights = torch.randn(4, offsets.shape[0], dtype=torch.complex64)
+        values = torch.randn(4, 30)
+        # deliberately spill outside the canvas on both sides
+        coords = torch.rand(4, 30, 2) * torch.tensor([28.0, 24.0]) - torch.tensor([4.0, 4.0])
+        shape = (20, 16)
+
+        scattered = torch.zeros(shape[0] * shape[1], dtype=torch.complex64)
+        scatter_add_convolve(
+            values,
+            coords,
+            shape,
+            offsets,
+            weights,
+            boundary=boundary,
+            interpolation=interpolation,
+            out=scattered,
+        )
+        convolved = splat_and_convolve(
+            values,
+            coords,
+            shape,
+            weights,
+            radius,
+            boundary=boundary,
+            interpolation=interpolation,
+        ).sum(0)
+
+        assert _relative_error(to_numpy(convolved), to_numpy(scattered.view(shape))) < 1e-5
+
+    def test_splat_stack_matches_a_shared_canvas(self):
+        """Summing the per-image canvases must give what the shared-canvas splat gives."""
+        torch.manual_seed(1)
+        values = torch.randn(6, 25)
+        coords = torch.rand(6, 25, 2) * 12.0
+        shape = (12, 12)
+
+        stack = splat_stack(values, coords, shape, boundary="wrap", interpolation="bilinear")
+        _, shared, _ = scatter_add_splat(
+            values, coords, shape, boundary="wrap", interpolation="bilinear"
+        )
+
+        assert _relative_error(to_numpy(stack.sum(0)), to_numpy(shared.view(shape))) < 1e-5
+
+    @pytest.mark.parametrize("stencil_radius, expected", [("auto", "fft"), (6, "stencil")])
+    def test_auto_reads_the_stencil_radius(self, stencil_radius, expected):
+        """Naming a radius is a request to truncate; leaving it 'auto' takes the exact route."""
+        resolve = ShadowMontagePtychography._resolve_convolution_mode
+        assert resolve("auto", "ssb", stencil_radius) == expected
+
+    def test_parallax_ignores_the_mode(self):
+        resolve = ShadowMontagePtychography._resolve_convolution_mode
+        assert resolve("fft", "prlx", "auto") == "splat"
+
+    def test_unknown_mode_raises(self, dataset4d):
+        _, montage = self._pair(dataset4d)
+        with pytest.raises(ValueError, match="must be 'auto', 'fft' or 'stencil'"):
+            montage.reconstruct(
+                deconvolution_kernel="ssb", convolution_mode="direct", verbose=False
+            )
+
+    def test_fft_mode_leaves_no_stencil_info(self, dataset4d):
+        _, montage = self._pair(dataset4d)
+        montage.reconstruct(deconvolution_kernel="ssb", convolution_mode="fft", verbose=False)
+
+        assert montage._stencil_info is None
 
 
 class TestSharedCanvas:
