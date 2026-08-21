@@ -277,8 +277,9 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         if self.fourier_probe is not None:
             raise NotImplementedError(
                 f"{what} is defined by the aberration surface chi(k), which an empirical "
-                "`fourier_probe` does not have. Use a deconvolution kernel that only needs "
-                "the probe itself -- 'ssb', 'obf' or 'mf'."
+                "`fourier_probe` does not have. Use a deconvolution kernel that does not "
+                "need it -- 'ssb', 'obf' and 'mf' read only the probe itself, and 'icom' "
+                "does not read the probe at all."
             )
 
     def _return_probe(self, aberration_coefs) -> "FourierProbe":
@@ -350,14 +351,11 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         large gradient, a mis-set aberration blurs them. Negated so that, like
         :meth:`variance_loss`, it is minimized.
 
-        It is far better conditioned than the variance loss. Over a defocus series on the
-        hexagonal apoferritin dataset it swings **28%** where the variance loss swings
-        0.08%, and the two agree on the optimum to within one step of a 250 Angstrom grid.
-        The gap is structural: the variance loss compares bright-field images with each
-        other and saturates once they agree, while this measures the image you actually
-        want. Measured across ``boundary="wrap"``, an automatic ``"pad"`` canvas, a frozen
-        ``pad_px`` and a pinned ``obj_fov``, the optimum moved by at most one grid step, so
-        it does not need the canvas held still the way a patch fit does.
+        It is far better conditioned than the variance loss -- 28% dynamic range against
+        0.08% over a defocus series, agreeing on the optimum -- because the variance loss
+        compares bright-field images with each other and saturates once they agree, while
+        this measures the image you actually want. It is also insensitive to how the canvas
+        is sized, so it needs no pinning the way a patch fit does.
 
         Two things to know before reaching for it:
 
@@ -755,12 +753,8 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             conditioned -- 28% dynamic range against 0.08% over a defocus series -- and is
             defined for every deconvolution kernel. A callable is passed the reconstruction
             and must return a float to minimize.
-        direction : str
-            "minimize" or "maximize" (default: "minimize").
-        show_progress_bar : bool
-            Show progress bar during optimization.
-        add_fixed_to_hyperparameter_state: bool
-            fixed aberrations included will be passed on to hyperparameter state
+        verbose : bool, optional
+            Report the search and show Optuna's progress bar. Defaults to :attr:`verbose`.
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
         """

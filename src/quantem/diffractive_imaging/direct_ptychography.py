@@ -51,7 +51,28 @@ from quantem.diffractive_imaging.direct_ptychography_base import (
 
 
 class DirectPtychography(DirectPtychographyBase):
-    """ """
+    """
+    Direct ptychography in the scan-space Fourier domain.
+
+    Every kernel here -- SSB, OBF, matched-filter, iCoM and parallax -- is a multiplier on
+    ``G(k, q)``, the virtual bright-field stack Fourier transformed over the scan. The
+    object is recovered by summing those multipliers over bright-field pixels and
+    transforming back once.
+
+    Because the multiplication happens in ``q``, the scan **must** lie on a regular grid.
+    :meth:`from_dataset4d` and :meth:`from_virtual_bfs` are given one; :meth:`from_dataset3d`
+    resamples ungridded positions onto one, which is where its caveats come from.
+
+    The alternative is
+    :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
+    which accumulates the scan onto a canvas in real space and so never needs a grid. Its
+    class docstring carries the rule for choosing between the two; the short version is that
+    this class is exact and cheapest on a gridded scan, and that a bright-field mask of more
+    than a few tens of thousands of pixels will not fit in memory here.
+
+    Instantiate with :meth:`from_dataset4d`, :meth:`from_virtual_bfs` or
+    :meth:`from_dataset3d`.
+    """
 
     _token = object()
 
@@ -299,14 +320,14 @@ class DirectPtychography(DirectPtychographyBase):
         low-frequency mask the deconvolution spreads everywhere.
 
         A masked scan and an upsampled one want opposite treatments -- filled holes versus
-        deliberate gaps -- and ``hole_fill`` cannot do both at once. When a scan is both
-        masked and upsampled, prefer
-        :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
-        which needs no grid and so has neither problem.
+        deliberate gaps -- and ``hole_fill`` cannot do both at once.
 
-        :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`
-        needs no grid at all, and is the better choice for a sparse or strongly irregular
-        scan -- at the cost of the parallax kernel being the only exact one there.
+        Both failure modes are properties of the regridding, not of the deconvolution, so
+        both disappear in
+        :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
+        which accumulates the positions as measured and never builds a grid. Prefer it for a
+        scan that is sparse, strongly irregular, or both masked and upsampled; see its class
+        docstring for the full comparison.
         """
         (
             vbf_stack,
@@ -335,9 +356,8 @@ class DirectPtychography(DirectPtychographyBase):
         if scan_gpts is None:
             scan_gpts = fitted_gpts
         else:
-            # `scan_sampling` stays authoritative, so the grid can only be padded, never
-            # rescaled -- silently changing the pixel size to fill a requested shape would
-            # contradict the sampling the caller asked for
+            # `scan_sampling` stays authoritative, so the grid is padded, never rescaled:
+            # resizing the pixel to fill a requested shape would contradict the caller
             scan_gpts = tuple(int(n) for n in scan_gpts)
             if any(n < f for n, f in zip(scan_gpts, fitted_gpts)):
                 raise ValueError(
@@ -393,11 +413,9 @@ class DirectPtychography(DirectPtychographyBase):
         # this is what lets `obj_origin` be read in the caller's own coordinates
         reconstruction.scan_origin = scan_origin
 
-        # regridding is where an ungridded reconstruction goes wrong, and the failure is
-        # visible in these long before it is visible in the reconstruction
         # how far the positions sit from the grid they were binned onto. Upsampling unfolds
-        # aliased detail using where each probe actually was, and regridding discards exactly
-        # that, so this predicts whether `upsampling_factor` can work at all.
+        # aliased detail from where each probe actually was, which regridding discards, so
+        # this predicts whether `upsampling_factor` can work at all
         subpixel = positions_px - np.round(positions_px)
         lattice_rms_px = float(np.sqrt((subpixel**2).sum(axis=1).mean()))
 

@@ -662,10 +662,6 @@ def preferred_float_dtype(device) -> torch.dtype:
     return torch.float32 if torch.device(device).type == "mps" else torch.float64
 
 
-#: kept as the older name for the accumulator-specific use
-preferred_accumulator_dtype = preferred_float_dtype
-
-
 def allocate_splat_buffers(
     canvas_shape: tuple[int, int],
     device,
@@ -674,7 +670,7 @@ def allocate_splat_buffers(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Flat, zeroed ``(sum_w, sum_wv, sum_wv2)`` accumulators for :func:`scatter_add_splat`."""
     if dtype is None:
-        dtype = preferred_accumulator_dtype(device)
+        dtype = preferred_float_dtype(device)
     numel = canvas_shape[0] * canvas_shape[1]
 
     def _zeros():
@@ -811,7 +807,7 @@ def splat_stack(
     :func:`scatter_add_splat` accumulates a whole batch into one shared canvas, which is what
     the parallax kernel wants. A convolution kernel needs each bright-field image separately,
     so that it can be convolved with that image's own kernel before the sum -- see
-    :func:`convolve_stack` and :func:`convolve_stack_fourier`.
+    :func:`splat_and_convolve` and :func:`convolve_stack_fourier`.
 
     Deposition matches :func:`scatter_add_splat` exactly, so splatting and then convolving is
     the same operator as :func:`scatter_add_convolve`, only reorganized.
@@ -883,9 +879,8 @@ def splat_and_convolve(
         stack = torch.nn.functional.pad(stack.unsqueeze(0), (radius,) * 4, mode="circular")
     else:
         # `scatter_add_convolve` tests the boundary at the *deposit* position, so a point
-        # just outside the canvas still contributes inward through the kernel. Splatting
-        # onto a canvas grown by the stencil radius keeps those points, and the unpadded
-        # convolution below crops back to the requested shape.
+        # just outside still contributes inward through the kernel. Growing the canvas by
+        # the radius keeps those points; the unpadded conv2d below crops back.
         grown = (n_rows + 2 * radius, n_cols + 2 * radius)
         stack = splat_stack(
             values, coords + radius, grown, boundary="pad", interpolation=interpolation
@@ -1241,11 +1236,10 @@ def regrid_vbf_stack(
         occupied_mean = gridded[:, occupied].mean(dim=1)
         gridded[:, ~occupied] = occupied_mean[:, None]
 
-    # Empty pixels are only a problem when there were enough positions to fill the grid and
-    # they still did not. On a deliberately finer grid the gaps are the point, and with
-    # `nearest` deposition even a same-size grid legitimately leaves ~30% empty -- a
-    # configuration that measures *better* than a gapless bilinear one, so warning at a low
-    # threshold would push callers the wrong way.
+    # Empty pixels only matter when there were enough positions to fill the grid and they
+    # still did not: on a deliberately finer grid the gaps are the point, and `nearest`
+    # deposition leaves ~30% empty even at the same size -- a configuration that measures
+    # *better* than a gapless bilinear one, so a low threshold would mislead.
     positions_per_pixel = len(positions_px) / (scan_gpts[0] * scan_gpts[1])
     if positions_per_pixel >= 1.0 and hole_fraction > 0.5:
         warnings.warn(

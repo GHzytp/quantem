@@ -62,17 +62,32 @@ def _snap_to_integer(values: torch.Tensor, tolerance: float = 1e-4) -> torch.Ten
 
 class DirectPtychographyMontage(DirectPtychographyBase):
     """
-    Real-space ("shadow montage") direct ptychography.
+    Direct ptychography that montages the scan onto a shared canvas.
 
-    Each virtual bright-field image is translated by its own aberration-dependent lateral
-    shift and accumulated onto a shared canvas -- the real-space dual of the ``"parallax"``
-    (tilt-corrected bright field) kernel of
-    :class:`~quantem.diffractive_imaging.direct_ptychography.DirectPtychography`.
+    Every kernel of
+    :class:`~quantem.diffractive_imaging.direct_ptychography.DirectPtychography` is a
+    multiplier on the *scan-space* Fourier transform. Here that transform is never taken:
+    each virtual bright-field image is deposited onto one canvas at its own probe position
+    instead. The detector axis is handled identically in both -- summed over bright-field
+    pixels, each carrying its own kernel.
 
-    The two formulations are equivalent: the parallax Fourier multiplier
-    ``exp(-1j * grad_chi . q)`` is exactly a translation by ``grad_chi / (2 * pi)`` Angstrom,
-    and Fourier-space tiling by ``U`` is exactly real-space zero-insertion at every ``U``-th
-    pixel. Working in real space instead buys three things:
+    Kernels
+    -------
+    ``prlx``
+        A pure translation by ``grad_chi / (2 * pi)`` Angstrom, exact, one deposit per
+        point. This is the **shadow montage** (tilt-corrected bright field) construction,
+        and is what the class used to be named for.
+    ``ssb``, ``obf``, ``mf``
+        Convolutions rather than translations. Exact with ``convolution_mode="fft"`` (the
+        default); truncated to a box stencil with ``"stencil"``.
+    ``icom``
+        Exact by FFT. Truncated it is **riCOM**, where the radius is a deliberate high-pass
+        cutoff rather than an error. Being linear in ``k``, it collapses to two convolutions
+        of the centre-of-mass shift however many bright-field pixels there are.
+
+    The parallax equivalence is exact both ways: ``exp(-1j * grad_chi . q)`` is a
+    translation, and Fourier-space tiling by ``U`` is real-space zero-insertion at every
+    ``U``-th pixel. Working in real space instead buys three things:
 
     - no scan-space FFT is needed, so the scan positions need not lie on a grid --
       see :meth:`from_dataset3d`;
@@ -82,15 +97,50 @@ class DirectPtychographyMontage(DirectPtychographyBase):
       see :attr:`defocus_gradient` and :meth:`fit_defocus_gradient`. A Fourier multiplier is
       global over the scan by construction and cannot express this.
 
-    The parallax kernel is a pure translation and is exact. SSB, OBF and matched-filter
-    deconvolutions are convolutions rather than translations, and are available here through
-    a truncated real-space stencil -- correct in the limit, but slowly converging and far
-    more expensive than the FFT they replace. On a gridded scan prefer
-    ``DirectPtychography``, which computes them exactly; the reason they exist here is an
-    ungridded scan.
+    Choosing between the two classes
+    --------------------------------
+    ==================================  ==========================================
+    gridded scan                        ``DirectPtychography`` -- exact and
+                                        cheapest, one scan FFT
+    ungridded scan                      either: ``from_dataset3d`` regrids onto a
+                                        lattice first, this class never grids
+    sub-pixel positions matter          here -- regridding discards them (0.997
+                                        against 0.982 CTF correlation, quoted in
+                                        ``DirectPtychography.from_dataset3d``)
+    scan both masked and upsampled      here -- ``hole_fill`` cannot serve filled
+                                        holes and deliberate gaps at once
+    position-dependent defocus          here only
+    very large bright-field mask        here -- see below
+    ==================================  ==========================================
+
+    The last is a hard limit rather than a preference. ``DirectPtychography._preprocess``
+    materializes the scan transform as ``(N_bf, Ry, Rx)`` complex64, which at 167k
+    bright-field pixels on a 128x170 canvas is **34 GB**; this class streams over detector
+    pixels into one canvas, for roughly 800 MB. That is what an X-ray dataset with a
+    1024-pixel detector looks like, and why it can only be reconstructed here.
 
     Instantiate with :meth:`from_dataset4d`, :meth:`from_virtual_bfs` or
     :meth:`from_dataset3d`.
+
+    References
+    ----------
+    The shadow-montage (parallax) construction:
+
+    .. [1] *Microscopy and Microanalysis* **32**(1), ozaf126 (2026).
+       https://doi.org/10.1093/mam/ozaf126
+
+    riCOM, the truncated iCoM stencil:
+
+    .. [2] Yu et al., *Microscopy and Microanalysis* **28**, 1526 (2022).
+
+    Related, though neither is the kernel implemented here -- the first convolves a WDD
+    kernel where this convolves SSB/OBF/MF kernels, and the second uses a segmented
+    detector rather than a pixelated one:
+
+    .. [3] Convolution WDD: *Ultramicroscopy* **285**, 114411 (2026).
+       https://doi.org/10.1016/j.ultramic.2026.114411
+    .. [4] Segmented-detector OBF: *Ultramicroscopy* **220**, 113133 (2021).
+       https://doi.org/10.1016/j.ultramic.2020.113133
     """
 
     _token = object()
@@ -1021,10 +1071,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
                 "one.",
                 stacklevel=3,
             )
-        # iCoM is deliberately excluded above. Truncating `k . q / |q|**2` is not a
-        # compromise but the method: it is riCOM (Yu et al., Microsc Microanal 28, 1526),
-        # where the radius is a high-pass cutoff chosen to suppress the long-range drift
-        # that blurs an iCoM image. Reporting that as error would be backwards.
+        # iCoM is excluded above: truncating it is riCOM, not an approximation of iCoM.
 
         # second pass: crop to the chosen box
         window = (
@@ -1094,12 +1141,9 @@ class DirectPtychographyMontage(DirectPtychographyBase):
 
         if obj_origin is not None:
             # Angstrom in the caller's frame -> upsampled canvas pixels, deliberately *not*
-            # rounded to a whole pixel. Each acquisition anchors its scan grid at its own
-            # bounding box, so the per-frame pixel lattices are already offset from one
-            # another; snapping to them would put the same requested window a fraction of a
-            # pixel apart in each frame, which is the very misregistration this removes.
-            # The positions then land at fractional canvas coordinates, which is what the
-            # splat already handles for an ungridded scan.
+            # rounded: each frame anchors its grid at its own bounding box, so snapping
+            # would leave the same window a fraction of a pixel apart per frame -- the very
+            # misregistration this removes. Fractional coordinates are fine for the splat.
             offset = np.asarray(obj_origin, dtype=np.float64) - np.asarray(self.scan_origin)
             lo_np = offset / np.asarray(self.scan_sampling) * upsampling_factor
             lo = torch.as_tensor(lo_np, device=self.device, dtype=self._float_dtype)
@@ -1178,7 +1222,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         kernel_batch_size=16,
     ):
         """
-        Accumulate the shadow montage and apply the post-hoc Fourier filters.
+        Accumulate the canvas and apply the post-hoc Fourier filters.
 
         Parameters
         ----------
@@ -1195,17 +1239,17 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             Number of bright-field pixels splatted at once. Defaults to a memory-bounded
             chunk of roughly four million ``(BF pixel, scan position)`` points.
         deconvolution_kernel : str
-            ``"prlx"`` (and its aliases) is a pure translation and is exact. ``"ssb"``,
-            ``"obf"`` and ``"mf"`` are convolutions, evaluated here with a truncated
-            real-space stencil -- see ``stencil_radius``.
+            ``"prlx"`` (and its aliases) is a pure translation and is exact.
 
-            ``"icom"`` is exact with ``convolution_mode="fft"``. Truncated with a stencil it
-            becomes **riCOM** (Yu et al., *Microsc Microanal* **28**, 1526): its real-space
-            kernel is ``r / (2 * pi * |r|**2)``, and since each bright-field pixel's copy is
-            linear in ``k``, the sum over the detector collapses to one convolution of the
-            centre-of-mass shift. There the radius is a deliberate high-pass cutoff -- the
-            thing that suppresses the long-range drift blurring an iCoM image -- rather than
-            an approximation error, so no truncation warning is raised for it.
+            ``"ssb"``, ``"obf"``, ``"mf"`` and ``"icom"`` are convolutions. They are exact
+            by default, evaluated by FFT on the canvas; ``convolution_mode="stencil"``
+            truncates them to a box instead.
+
+            Truncating ``"icom"`` is the exception that is not an approximation: it gives
+            **riCOM**, whose real-space kernel is ``r / (2 * pi * |r|**2)`` and whose radius
+            is a deliberate high-pass cutoff, so no truncation warning is raised for it.
+            Being linear in ``k``, it also collapses the detector sum into two convolutions
+            of the centre-of-mass shift.
         q_highpass, q_lowpass : float, optional
             Butterworth filter cutoffs, applied once to the finished image.
         parallax_flip_phase : bool
@@ -1317,9 +1361,11 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             for an analytic probe, which is evaluated rather than sampled, and for a rotation
             that maps the lattice onto itself.
         stencil_radius : int or "auto"
-            Half-width of the box stencil used by the ``ssb`` / ``obf`` / ``mf`` kernels,
-            in canvas pixels. ``"auto"`` grows it until the estimated truncation error meets
-            ``truncation_tolerance``, capped at ``max_stencil_radius``.
+            Half-width of the box stencil used by the ``ssb`` / ``obf`` / ``mf`` / ``icom``
+            kernels, in canvas pixels. ``"auto"`` grows it until the estimated truncation
+            error meets ``truncation_tolerance``, capped at ``max_stencil_radius``. For
+            ``icom`` this is riCOM's ``(n - 1) / 2``, and setting it is the whole point
+            rather than a compromise.
 
             A box is used deliberately, with no taper: tapering measures consistently
             *worse* at equal radius (0.40 versus 0.29 relative error at radius 8, 20 mrad in
@@ -1341,10 +1387,10 @@ class DirectPtychographyMontage(DirectPtychographyBase):
 
         Notes
         -----
-        The convolution kernels are far more expensive than the parallax one -- a stencil of
-        radius ``R`` costs ``(2R+1)**2`` deposits per point against 1 -- and they converge
-        slowly, so on a gridded scan ``DirectPtychography`` is both exact and faster. Their
-        reason to exist here is an ungridded scan.
+        The convolution kernels cost more than the parallax one either way: an FFT per
+        bright-field image, or ``(2 * stencil_radius + 1) ** 2`` deposits per point. On a
+        gridded scan ``DirectPtychography`` computes the same thing with a single scan FFT
+        and is faster; see the class docstring for when to prefer which.
         """
         state = self.hyperparameter_state
 
@@ -1427,10 +1473,10 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         stencil_offsets = stencil_weights = kernel_args = norm = None
         fft_shape = canvas_shape
 
-        # riCOM: the iCoM kernel is linear in k, so the detector sum can be done first and
-        # the whole reconstruction becomes two convolutions of the centre-of-mass shift.
-        # Only valid when every bright-field pixel deposits at the same place, which a
-        # per-position defocus breaks.
+        # riCOM: the iCoM kernel is linear in k, so summing the detector first turns the
+        # whole reconstruction into two convolutions of the centre-of-mass shift. Needs
+        # every bright-field pixel to deposit at the same place, which a per-position
+        # defocus breaks.
         collapse_icom = kernel == "icom" and delta_c10 is None
 
         if kernel == "prlx":
@@ -1621,9 +1667,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             q_lowpass=q_lowpass,
             q_highpass=q_highpass,
             butterworth_order=butterworth_order,
-            # the phase flip corrects the parallax kernel's contrast transfer; the
-            # deconvolution kernels already invert it, and DirectPtychography likewise
-            # applies it only to `prlx`
+            # only `prlx` needs the phase flip -- the deconvolution kernels already invert
+            # the contrast transfer, and DirectPtychography draws the same line
             parallax_flip_phase=parallax_flip_phase and kernel == "prlx",
             suppress_nyquist=suppress_nyquist,
         )
@@ -1664,10 +1709,9 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         qxa, qya = spatial_frequencies(obj.shape, upsampled_sampling, device=self.device)
         q, theta = polar_coordinates(qxa, qya)
 
-        # the filter is deliberately built at the grid's native precision rather than the
-        # accumulator's: chi(q) reaches tens of radians, so sign(sin(chi)) is ill-conditioned
-        # at its zero crossings and evaluating it in float64 would flip a handful of pixels
-        # relative to DirectPtychography, which is a large perturbation per flipped mode
+        # built at the grid's native precision, not the accumulator's: chi(q) reaches tens
+        # of radians, so sign(sin(chi)) is ill-conditioned at its zero crossings and float64
+        # would flip a handful of pixels relative to DirectPtychography
         filt = torch.ones_like(q)
         if parallax_flip_phase:
             chi_q = aberration_surface(
@@ -1758,8 +1802,9 @@ class DirectPtychographyMontage(DirectPtychographyBase):
                 f"variance_loss is only defined for the parallax kernel, not {self._kernel!r}: "
                 "the convolution kernels deposit complex weights that are not a partition of "
                 "unity, so there is no per-pixel spread across bright-field images to take. "
-                "Drive hyperparameter searches with the parallax kernel, as "
-                "DirectPtychography.fit_hyperparameters_cross_correlation does."
+                "To drive a hyperparameter search on this kernel pass loss='rms_gradient', "
+                "which measures the reconstructed image instead and is defined for every "
+                "kernel."
             )
         if self._sum_w is None or self._sum_wv2 is None:
             return None
@@ -1844,12 +1889,9 @@ class DirectPtychographyMontage(DirectPtychographyBase):
                 out=buffers,
             )
 
-        # Scoring only pixels near the *peak* weight, as this used to, is a trap on an
-        # ungridded scan: the weight map is uneven everywhere, not just at the edges, so a
-        # 90%-of-peak cut kept 14% of the canvas -- the few spots where positions happened
-        # to pile up densest -- and which spots those are moves with the defocus. On the
-        # hexagonal apoferritin dataset that put the minimum at C10 = 9.5 kA against 13.0 kA
-        # for the weighted mean, the global `variance_loss`, and peak image contrast alike.
+        # Score the whole patch, not its densest spots. An ungridded weight map is uneven
+        # everywhere, so a 90%-of-peak cut kept 14% of the canvas and moved with the
+        # defocus -- putting the apoferritin minimum at C10 = 9.5 kA against a true 13.0 kA.
         return float(self._variance_loss_from_buffers(*buffers))
 
     @staticmethod
