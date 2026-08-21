@@ -272,7 +272,7 @@ class DirectPtychography(DirectPtychographyBase):
             and may only be larger than that -- ``scan_sampling`` stays authoritative, so
             this pads the canvas rather than rescaling the positions into it.
         interpolation : {"nearest", "bilinear"}
-            Deposition scheme, matching ``ShadowMontagePtychography.reconstruct``.
+            Deposition scheme, matching ``DirectPtychographyMontage.reconstruct``.
             ``"nearest"`` by default; see :func:`regrid_vbf_stack`.
         hole_fill : {"mean", "zero"}
             What to put in grid pixels no probe position reached. Defaults to each
@@ -301,10 +301,10 @@ class DirectPtychography(DirectPtychographyBase):
         A masked scan and an upsampled one want opposite treatments -- filled holes versus
         deliberate gaps -- and ``hole_fill`` cannot do both at once. When a scan is both
         masked and upsampled, prefer
-        :class:`~quantem.diffractive_imaging.shadow_montage_ptychography.ShadowMontagePtychography`,
+        :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
         which needs no grid and so has neither problem.
 
-        :class:`~quantem.diffractive_imaging.shadow_montage_ptychography.ShadowMontagePtychography`
+        :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`
         needs no grid at all, and is the better choice for a sparse or strongly irregular
         scan -- at the cost of the parallax kernel being the only exact one there.
         """
@@ -443,7 +443,7 @@ class DirectPtychography(DirectPtychographyBase):
             "of the contrast-transfer function rather than an extension of it. Rebuild with "
             f"a `scan_sampling` {upsampling_factor}x finer instead, which keeps the probe "
             "positions on the grid rather than binning them away first, or use "
-            "ShadowMontagePtychography, which needs no grid at all.",
+            "DirectPtychographyMontage, which needs no grid at all.",
             stacklevel=2,
         )
 

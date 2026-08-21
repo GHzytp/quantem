@@ -869,7 +869,7 @@ def splat_and_convolve(
     against 78 s there.
 
     ``stencil_weights`` is ``(B, (2 * radius + 1) ** 2)``, ordered as the ``"ij"`` meshgrid
-    :meth:`ShadowMontagePtychography._return_kernel_stencil` builds.
+    :meth:`DirectPtychographyMontage._return_kernel_stencil` builds.
 
     Returns ``(B, n_rows, n_cols)``; sum over the batch to accumulate.
     """
@@ -1053,7 +1053,7 @@ def build_vbf_stack_from_dataset3d(
     Origin-correct and mask an ungridded diffraction stack into a flat vBF stack.
 
     The ungridded counterpart of :func:`build_vbf_stack_from_dataset4d`, shared by
-    ``ShadowMontagePtychography.from_dataset3d`` and ``DirectPtychography.from_dataset3d``
+    ``DirectPtychographyMontage.from_dataset3d`` and ``DirectPtychography.from_dataset3d``
     so the two entry points cannot drift apart.
 
     Returns
@@ -1171,7 +1171,7 @@ def regrid_vbf_stack(
     Parameters
     ----------
     interpolation : {"nearest", "bilinear"}
-        Deposition scheme, matching ``ShadowMontagePtychography.reconstruct``. ``"nearest"``
+        Deposition scheme, matching ``DirectPtychographyMontage.reconstruct``. ``"nearest"``
         by default: it keeps each measurement on one pixel, where bilinear smears it over
         four and blurs away the sub-pixel detail a finer grid exists to capture (radial CTF
         correlation 0.997 versus 0.986 on a scattered scan).
@@ -1253,7 +1253,7 @@ def regrid_vbf_stack(
             f"probe position, despite {len(positions_px)} positions being available to cover "
             f"{scan_gpts[0] * scan_gpts[1]} pixels, so the positions are clustered rather "
             f"than merely sparse. Those pixels were filled with `hole_fill={hole_fill!r}`. "
-            "Use a coarser `scan_sampling`, or ShadowMontagePtychography, which needs no "
+            "Use a coarser `scan_sampling`, or DirectPtychographyMontage, which needs no "
             "grid at all.",
             stacklevel=3,
         )

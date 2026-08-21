@@ -366,7 +366,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
           this is safe for the searches here, but a hyperparameter that could inflate the
           object would game it.
         - It is defined for every deconvolution kernel, where
-          ``ShadowMontagePtychography.variance_loss`` is defined only for the parallax one.
+          ``DirectPtychographyMontage.variance_loss`` is defined only for the parallax one.
           That makes it the way to drive a search over ``"ssb"`` or ``"obf"``.
 
         Returns

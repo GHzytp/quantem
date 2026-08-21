@@ -4,7 +4,7 @@ Mirrors the simulation idiom in ``test_ptychography.py`` (white-noise phase obje
 soft-aperture defocused probe, ``|FFT(obj_patch * probe)|**2``) but on a smaller grid and
 with a probe small enough that parallax shifts stay well inside the scan.
 
-Imported by ``test_direct_ptychography.py`` and ``test_shadow_montage.py`` via
+Imported by ``test_direct_ptychography.py`` and ``test_direct_ptychography_montage.py`` via
 ``from .conftest import ...``, matching the pattern used by the tomography suite.
 """
 
@@ -142,7 +142,7 @@ def make_dataset4d(defocus: float | None = None, seed: int = 42) -> Dataset4d:
 def defocus_per_position(mean_defocus: float, defocus_gradient: tuple[float, float]) -> np.ndarray:
     """``(N_pos,)`` local defocus for a tilted sample, mean-zero about the scan centroid.
 
-    Matches ``ShadowMontagePtychography._return_delta_c10``: the offset is measured from the
+    Matches ``DirectPtychographyMontage._return_delta_c10``: the offset is measured from the
     centroid of the scan positions in Angstrom, in the unrotated scan frame.
     """
     positions_ang = scan_positions_px() * SCAN_SAMPLING

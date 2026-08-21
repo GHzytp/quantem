@@ -60,7 +60,7 @@ def _snap_to_integer(values: torch.Tensor, tolerance: float = 1e-4) -> torch.Ten
     return torch.where((values - rounded).abs() < tolerance, rounded, values)
 
 
-class ShadowMontagePtychography(DirectPtychographyBase):
+class DirectPtychographyMontage(DirectPtychographyBase):
     """
     Real-space ("shadow montage") direct ptychography.
 
@@ -125,7 +125,7 @@ class ShadowMontagePtychography(DirectPtychographyBase):
         """ """
         if _token is not self._token:
             raise RuntimeError(
-                "Use ShadowMontagePtychography.from_dataset4d(), .from_virtual_bfs() or "
+                "Use DirectPtychographyMontage.from_dataset4d(), .from_virtual_bfs() or "
                 ".from_dataset3d() to instantiate this class."
             )
 

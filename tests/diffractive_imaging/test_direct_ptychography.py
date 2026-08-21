@@ -423,11 +423,11 @@ class TestLossFunctions:
 
     def test_the_two_classes_agree(self, dataset4d):
         """`prlx` is the same operator in both, so the objective must match."""
-        from quantem.diffractive_imaging import ShadowMontagePtychography
+        from quantem.diffractive_imaging import DirectPtychographyMontage
 
         kwargs = dict(direct_ptycho_kwargs(TRUE_C10), edge_blend_pixels=0)
         fourier = DirectPtychography.from_dataset4d(dataset4d, **kwargs)
-        montage = ShadowMontagePtychography.from_dataset4d(dataset4d, boundary="wrap", **kwargs)
+        montage = DirectPtychographyMontage.from_dataset4d(dataset4d, boundary="wrap", **kwargs)
         for recon in (fourier, montage):
             recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
 
@@ -839,7 +839,7 @@ class TestFromDataset3d:
 
     def test_mean_fill_matches_the_montage_on_a_masked_scan(self, dataset4d):
         """With holes filled, the two formulations agree on data neither was built for."""
-        from quantem.diffractive_imaging import ShadowMontagePtychography
+        from quantem.diffractive_imaging import DirectPtychographyMontage
 
         dataset3d, positions, keep = self._disk_masked(dataset4d)
         rows_cols = scan_positions_px()[keep].astype(int)
@@ -849,7 +849,7 @@ class TestFromDataset3d:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             fourier = self._build(dataset3d, positions)
-        montage = ShadowMontagePtychography.from_dataset3d(
+        montage = DirectPtychographyMontage.from_dataset3d(
             dataset3d,
             positions,
             energy=PROBE_ENERGY,
@@ -1061,11 +1061,11 @@ class TestUnfolding:
 
     def test_montage_unfolds_without_any_regridding(self, ctf_scene):
         """The reference: the montage never bins, so irregularity costs it nothing."""
-        from quantem.diffractive_imaging import ShadowMontagePtychography
+        from quantem.diffractive_imaging import DirectPtychographyMontage
 
         obj, _, probe, ctf_full, _ = ctf_scene
         positions = ctf_jittered_positions(1.0)
-        montage = ShadowMontagePtychography.from_dataset3d(
+        montage = DirectPtychographyMontage.from_dataset3d(
             ctf_dataset3d(ctf_simulate(obj, probe, positions)),
             positions * CTF_SAMPLING,
             scan_sampling=(CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),

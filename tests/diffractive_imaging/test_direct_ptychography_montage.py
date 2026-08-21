@@ -14,8 +14,8 @@ from quantem.core.io.serialize import load
 from quantem.core.utils.utils import to_numpy
 from quantem.diffractive_imaging import (
     DirectPtychography,
+    DirectPtychographyMontage,
     OptimizationParameter,
-    ShadowMontagePtychography,
 )
 from quantem.diffractive_imaging.complex_probe import FourierProbe, spatial_frequencies
 from quantem.diffractive_imaging.direct_ptycho_utils import (
@@ -62,16 +62,16 @@ MODEL_C10_GRID = np.linspace(1500.0, 4500.0, 13)
 def _model_montage(defocus_gradient, defocus=MODEL_DEFOCUS):
     """A montage over a model vBF stack with a seeded defocus plane, plus the ground truth."""
     vbf, bf_mask, obj = make_model_vbf_stack(defocus, defocus_gradient, scan_gpts=MODEL_SCAN_GPTS)
-    montage = ShadowMontagePtychography.from_virtual_bfs(vbf, bf_mask, **model_vbf_kwargs(defocus))
+    montage = DirectPtychographyMontage.from_virtual_bfs(vbf, bf_mask, **model_vbf_kwargs(defocus))
     return montage, obj
 
 
 def _build_pair(dataset4d, defocus):
-    """A `DirectPtychography` and a `ShadowMontagePtychography` over the same data."""
+    """A `DirectPtychography` and a `DirectPtychographyMontage` over the same data."""
     fourier = DirectPtychography.from_dataset4d(
         dataset4d, edge_blend_pixels=0, **_common_kwargs(defocus)
     )
-    montage = ShadowMontagePtychography.from_dataset4d(
+    montage = DirectPtychographyMontage.from_dataset4d(
         dataset4d, edge_blend_pixels=0, boundary="wrap", **_common_kwargs(defocus)
     )
     return fourier, montage
@@ -234,7 +234,7 @@ class TestIntegerShiftConstruction:
     @pytest.mark.parametrize("pixel_shift", [1, 2])
     def test_shifts_land_on_pixel_centers(self, dataset4d, upsampling_factor, pixel_shift):
         defocus = integer_shift_defocus(pixel_shift, upsampling_factor)
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, boundary="wrap", **_common_kwargs(defocus)
         )
         shifts, _ = montage._return_shifts_px(
@@ -247,7 +247,7 @@ class TestIntegerShiftConstruction:
 
 
 class TestFourierEquivalence:
-    """`ShadowMontagePtychography` must reproduce `DirectPtychography`'s parallax kernel."""
+    """`DirectPtychographyMontage` must reproduce `DirectPtychography`'s parallax kernel."""
 
     @pytest.mark.parametrize("upsampling_factor", [1, 2])
     @pytest.mark.parametrize("pixel_shift", [1, 2])
@@ -451,7 +451,7 @@ class TestReconstructDefaults:
 
     def test_weight_normalize_defaults_on_for_an_ungridded_scan(self, dataset4d):
         dataset3d, positions = TestNonGridScan._dataset3d_and_positions(dataset4d)
-        recon = ShadowMontagePtychography.from_dataset3d(
+        recon = DirectPtychographyMontage.from_dataset3d(
             dataset3d,
             positions,
             scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -543,10 +543,10 @@ class TestNonGridScan:
         defocus = integer_shift_defocus(1)
         dataset3d, positions = self._dataset3d_and_positions(dataset4d)
 
-        gridded = ShadowMontagePtychography.from_dataset4d(
+        gridded = DirectPtychographyMontage.from_dataset4d(
             dataset4d, edge_blend_pixels=0, boundary="wrap", **_common_kwargs(defocus)
         )
-        ungridded = ShadowMontagePtychography.from_dataset3d(
+        ungridded = DirectPtychographyMontage.from_dataset3d(
             dataset3d,
             positions,
             scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -583,8 +583,8 @@ class TestNonGridScan:
             **_common_kwargs(defocus),
         )
 
-        straight = ShadowMontagePtychography.from_dataset3d(dataset3d, positions, **common)
-        swapped = ShadowMontagePtychography.from_dataset3d(
+        straight = DirectPtychographyMontage.from_dataset3d(dataset3d, positions, **common)
+        swapped = DirectPtychographyMontage.from_dataset3d(
             dataset3d, positions[:, ::-1].copy(), **common
         )
         straight.reconstruct(**recon_kwargs)
@@ -609,7 +609,7 @@ class TestNonGridScan:
             sampling=dataset3d.sampling,
         )
 
-        recon = ShadowMontagePtychography.from_dataset3d(
+        recon = DirectPtychographyMontage.from_dataset3d(
             shuffled,
             jittered,
             scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -625,7 +625,7 @@ class TestNonGridScan:
         dataset3d, positions = self._dataset3d_and_positions(dataset4d)
 
         with pytest.warns(UserWarning, match="Inferred scan_sampling"):
-            recon = ShadowMontagePtychography.from_dataset3d(
+            recon = DirectPtychographyMontage.from_dataset3d(
                 dataset3d,
                 positions,
                 scan_sampling="auto",
@@ -638,7 +638,7 @@ class TestNonGridScan:
         dataset3d, positions = self._dataset3d_and_positions(dataset4d)
         positions_dataset = Dataset2d.from_array(positions, name="positions", units=("A", "A"))
 
-        recon = ShadowMontagePtychography.from_dataset3d(
+        recon = DirectPtychographyMontage.from_dataset3d(
             dataset3d,
             positions_dataset,
             scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -653,7 +653,7 @@ class TestNonGridScan:
         )
 
         with pytest.raises(ValueError, match="must be given in 'A'"):
-            ShadowMontagePtychography.from_dataset3d(
+            DirectPtychographyMontage.from_dataset3d(
                 dataset3d,
                 positions_dataset,
                 scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -664,7 +664,7 @@ class TestNonGridScan:
         dataset3d, positions = self._dataset3d_and_positions(dataset4d)
 
         with pytest.raises(ValueError, match="rows but `dataset` has"):
-            ShadowMontagePtychography.from_dataset3d(
+            DirectPtychographyMontage.from_dataset3d(
                 dataset3d,
                 positions[:-1],
                 scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -677,7 +677,7 @@ class TestNonGridScan:
         kwargs["rotation_angle"] = None
 
         with pytest.raises(ValueError, match="must be given for non-raster scans"):
-            ShadowMontagePtychography.from_dataset3d(
+            DirectPtychographyMontage.from_dataset3d(
                 dataset3d,
                 positions,
                 scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -863,7 +863,7 @@ class TestFourierProbe:
         """The same reconstruction twice: analytic, and with its own probe fed back in."""
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
-        if cls is ShadowMontagePtychography:
+        if cls is DirectPtychographyMontage:
             kwargs["boundary"] = "wrap"
 
         analytic = cls.from_dataset4d(dataset4d, **kwargs)
@@ -874,7 +874,7 @@ class TestFourierProbe:
         empirical = cls.from_dataset4d(dataset4d, fourier_probe=probe, **kwargs)
         return analytic, empirical
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
     @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
     def test_empirical_probe_reproduces_the_analytic_one(self, dataset4d, cls, kernel):
         """The headline: the same probe, described two ways, must reconstruct the same.
@@ -893,7 +893,7 @@ class TestFourierProbe:
         assert _relative_error(empirical.obj, expected) < 1e-5
 
     def test_is_analytic_reports_which_path_is_live(self, dataset4d):
-        analytic, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        analytic, empirical = self._pair(dataset4d, DirectPtychographyMontage)
 
         assert analytic.fourier_probe is None
         assert empirical.fourier_probe is not None
@@ -906,7 +906,7 @@ class TestFourierProbe:
         the reconstruction by 13% on this fixture before it was fixed -- the bright-field
         mask is cropped tight to the disk, so `k -/+ q` leaves the grid constantly.
         """
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        _, empirical = self._pair(dataset4d, DirectPtychographyMontage)
         probe = empirical.fourier_probe
         dq_row, dq_col = probe.reciprocal_sampling
         n_rows = probe.array.shape[0]
@@ -954,7 +954,7 @@ class TestFourierProbe:
 
     def test_a_canvas_matching_the_probe_needs_no_resampling(self, dataset4d):
         """Canvas field of view == probe field of view is the exact, assumption-free case."""
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography, normalize=False)
+        _, empirical = self._pair(dataset4d, DirectPtychographyMontage, normalize=False)
         empirical.reconstruct(deconvolution_kernel="ssb", convolution_mode="fft", verbose=False)
 
         _, _, refined = empirical._resampled_probe
@@ -1012,11 +1012,11 @@ class TestFourierProbe:
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
         kwargs["rotation_angle"] = rotation_angle
 
-        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
         psi = analytic_probe_array(analytic, {"C10": defocus})
         analytic.reconstruct(deconvolution_kernel="ssb", convolution_mode="fft", verbose=False)
 
-        empirical = ShadowMontagePtychography.from_dataset4d(
+        empirical = DirectPtychographyMontage.from_dataset4d(
             dataset4d,
             fourier_probe=FourierProbe.from_array(
                 psi, analytic.reciprocal_sampling, analytic.wavelength, normalize=False
@@ -1034,8 +1034,8 @@ class TestFourierProbe:
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
         kwargs["rotation_angle"] = 15.0
-        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
-        empirical = ShadowMontagePtychography.from_dataset4d(
+        analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
+        empirical = DirectPtychographyMontage.from_dataset4d(
             dataset4d,
             fourier_probe=FourierProbe.from_array(
                 analytic_probe_array(analytic, {"C10": defocus}),
@@ -1055,7 +1055,7 @@ class TestFourierProbe:
 
     def test_off_grid_sampling_raises(self, dataset4d):
         """A canvas incommensurate with the probe would need interpolation; say so."""
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        _, empirical = self._pair(dataset4d, DirectPtychographyMontage)
         probe = empirical.fourier_probe
         half_pixel = torch.tensor([0.5 * probe.reciprocal_sampling[0]])
 
@@ -1063,7 +1063,7 @@ class TestFourierProbe:
             probe.at(half_pixel, torch.zeros(1))
 
     def test_bilinear_accepts_off_grid_sampling(self, dataset4d):
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography, interpolation="bilinear")
+        _, empirical = self._pair(dataset4d, DirectPtychographyMontage, interpolation="bilinear")
         probe = empirical.fourier_probe
         dq_row = probe.reciprocal_sampling[0]
 
@@ -1088,7 +1088,7 @@ class TestFourierProbe:
     )
     def test_aberration_only_features_raise(self, dataset4d, kwargs, match):
         """Everything that reads chi(k) has no meaning without aberration coefficients."""
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        _, empirical = self._pair(dataset4d, DirectPtychographyMontage)
 
         with pytest.raises(NotImplementedError, match=match):
             empirical.reconstruct(verbose=False, **kwargs)
@@ -1097,11 +1097,11 @@ class TestFourierProbe:
         """The empirical probe carries its own aperture, whatever shape it is."""
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
-        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
         psi = analytic_probe_array(analytic, {"C10": defocus})
 
         kwargs["semiangle_cutoff"] = None
-        empirical = ShadowMontagePtychography.from_dataset4d(
+        empirical = DirectPtychographyMontage.from_dataset4d(
             dataset4d,
             fourier_probe=FourierProbe.from_array(
                 psi, analytic.reciprocal_sampling, analytic.wavelength
@@ -1114,7 +1114,7 @@ class TestFourierProbe:
         assert np.isfinite(empirical.obj).all()
 
     def test_normalize_gives_unit_intensity(self, dataset4d):
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography, normalize=True)
+        _, empirical = self._pair(dataset4d, DirectPtychographyMontage, normalize=True)
 
         assert float(empirical.fourier_probe.array.abs().square().sum()) == pytest.approx(1.0)
 
@@ -1130,7 +1130,7 @@ class TestFourierProbe:
             FourierProbe.from_array(array, (0.1, 0.1), 0.02)
 
     def test_shape_must_match_the_detector(self, dataset4d):
-        analytic, _ = self._pair(dataset4d, ShadowMontagePtychography)
+        analytic, _ = self._pair(dataset4d, DirectPtychographyMontage)
         wrong = FourierProbe.from_array(
             np.ones((4, 4), dtype=np.complex64), analytic.reciprocal_sampling, analytic.wavelength
         )
@@ -1139,7 +1139,7 @@ class TestFourierProbe:
             analytic.fourier_probe = wrong
 
     def test_survives_a_round_trip(self, dataset4d, tmp_path):
-        _, empirical = self._pair(dataset4d, ShadowMontagePtychography)
+        _, empirical = self._pair(dataset4d, DirectPtychographyMontage)
         empirical.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
         before = empirical.obj.copy()
 
@@ -1155,7 +1155,7 @@ class TestFourierProbe:
 class TestWavelength:
     """`wavelength` given directly, for anything that is not an electron."""
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
     def test_energy_and_wavelength_agree(self, dataset4d, cls):
         """The two routes must land on the same geometry, and hence the same image."""
         common = dict(
@@ -1178,7 +1178,7 @@ class TestWavelength:
             recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
         assert np.array_equal(from_wavelength.obj, from_energy.obj)
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
     @pytest.mark.parametrize(
         "kwargs",
         [
@@ -1212,7 +1212,7 @@ class TestWavelength:
         assert electron_wavelength_angstrom(photon_energy_ev) == pytest.approx(0.1375, abs=1e-3)
         assert 12398.42 / photon_energy_ev == pytest.approx(1.5694, abs=1e-3)
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
     def test_wavelength_survives_a_round_trip(self, dataset4d, cls, tmp_path):
         recon = cls.from_dataset4d(
             dataset4d,
@@ -1234,7 +1234,7 @@ class TestWavelength:
     @pytest.mark.parametrize("bad", [0.0, -1.0])
     def test_non_positive_wavelength_raises(self, dataset4d, bad):
         with pytest.raises(ValueError):
-            ShadowMontagePtychography.from_dataset4d(
+            DirectPtychographyMontage.from_dataset4d(
                 dataset4d,
                 wavelength=bad,
                 semiangle_cutoff=SEMIANGLE_CUTOFF,
@@ -1247,7 +1247,7 @@ class TestWavelength:
 class TestSemiangleCutoff:
     """`semiangle_cutoff` sets the probe aperture and is never optional."""
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
     def test_from_virtual_bfs_requires_it(self, cls, dataset4d):
         """Enforced at runtime rather than by the signature.
 
@@ -1279,7 +1279,7 @@ class TestSemiangleCutoff:
                 verbose=False,
             )
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
     def test_none_raises_a_clear_error(self, dataset4d, cls):
         with pytest.raises(ValueError, match="`semiangle_cutoff` is required"):
             cls.from_dataset4d(
@@ -1291,7 +1291,7 @@ class TestSemiangleCutoff:
                 verbose=False,
             )
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, ShadowMontagePtychography])
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
     def test_non_positive_raises(self, dataset4d, cls):
         with pytest.raises(ValueError):
             cls.from_dataset4d(
@@ -1317,8 +1317,8 @@ class TestDefocusGradient:
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
 
-        without = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
-        with_zero = ShadowMontagePtychography.from_dataset4d(
+        without = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
+        with_zero = DirectPtychographyMontage.from_dataset4d(
             dataset4d, defocus_gradient=(0.0, 0.0), **kwargs
         )
 
@@ -1329,7 +1329,7 @@ class TestDefocusGradient:
 
     def test_defocus_rate_is_the_analytic_lambda_k(self, dataset4d):
         """`d shift / d C10 = wavelength * k`, independent of the other aberrations."""
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, **_common_kwargs(integer_shift_defocus(1))
         )
         rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
@@ -1348,7 +1348,7 @@ class TestDefocusGradient:
 
     def test_defocus_rate_ignores_other_aberrations(self, dataset4d):
         """chi is linear in every magnitude, so the rate cannot depend on the rest."""
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, **_common_kwargs(integer_shift_defocus(1))
         )
         rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
@@ -1361,7 +1361,7 @@ class TestDefocusGradient:
 
     def test_delta_defocus_is_mean_zero(self, dataset4d):
         """Measuring from the centroid keeps the gradient orthogonal to the global C10."""
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, **_common_kwargs(integer_shift_defocus(1))
         )
         delta = montage._return_delta_c10((7.0, -3.0))
@@ -1371,7 +1371,7 @@ class TestDefocusGradient:
         assert float(delta.abs().max()) > 0
 
     def test_zero_gradient_short_circuits(self, dataset4d):
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, **_common_kwargs(integer_shift_defocus(1))
         )
         assert montage._return_delta_c10(None) is None
@@ -1382,8 +1382,8 @@ class TestDefocusGradient:
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
 
-        flat = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
-        tilted = ShadowMontagePtychography.from_dataset4d(
+        flat = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
+        tilted = DirectPtychographyMontage.from_dataset4d(
             dataset4d, defocus_gradient=(30.0, -10.0), **kwargs
         )
 
@@ -1395,7 +1395,7 @@ class TestDefocusGradient:
 
     def test_shift_extrema_match_a_brute_force_scan(self, dataset4d):
         """The closed form must bound every (BF pixel, position) pair, with no slack."""
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, **_common_kwargs(integer_shift_defocus(1))
         )
         gradient = (30.0, -10.0)
@@ -1403,7 +1403,7 @@ class TestDefocusGradient:
         rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
         delta = montage._return_delta_c10(gradient)
 
-        lo, hi = ShadowMontagePtychography._return_shift_extrema(shifts, rate, delta)
+        lo, hi = DirectPtychographyMontage._return_shift_extrema(shifts, rate, delta)
         brute = shifts[:, None, :] + rate[:, None, :] * delta[None, :, None]
 
         assert torch.allclose(lo, brute.amin((0, 1)))
@@ -1424,7 +1424,7 @@ class TestDefocusGradient:
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
 
         def corr(g):
-            montage = ShadowMontagePtychography.from_dataset4d(
+            montage = DirectPtychographyMontage.from_dataset4d(
                 dataset, defocus_gradient=g, **kwargs
             )
             return correlation(montage.reconstruct(verbose=False).obj, band_limited_phase())
@@ -1577,14 +1577,14 @@ class TestDefocusGradient:
         assert abs(fitted - MODEL_DEFOCUS) < 0.2 * MODEL_DEFOCUS
 
     def test_rejects_a_malformed_gradient(self, dataset4d):
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, **_common_kwargs(integer_shift_defocus(1))
         )
         with pytest.raises(ValueError, match="must be a \\(row, col\\) pair"):
             montage.defocus_gradient = (1.0, 2.0, 3.0)
 
     def test_survives_a_serialization_round_trip(self, dataset4d, tmp_path):
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, defocus_gradient=(7.0, -3.0), **_common_kwargs(integer_shift_defocus(1))
         )
         path = tmp_path / "montage.zip"
@@ -1614,7 +1614,7 @@ class TestRealSpaceKernels:
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
         return (
             DirectPtychography.from_dataset4d(dataset4d, **kwargs),
-            ShadowMontagePtychography.from_dataset4d(dataset4d, boundary="wrap", **kwargs),
+            DirectPtychographyMontage.from_dataset4d(dataset4d, boundary="wrap", **kwargs),
         )
 
     @pytest.mark.parametrize("kernel", KERNELS)
@@ -1770,8 +1770,8 @@ class TestRealSpaceKernels:
         """
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
-        analytic = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
-        empirical = ShadowMontagePtychography.from_dataset4d(
+        analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
+        empirical = DirectPtychographyMontage.from_dataset4d(
             dataset4d,
             fourier_probe=FourierProbe.from_array(
                 analytic_probe_array(analytic, {"C10": defocus}),
@@ -1801,7 +1801,7 @@ class TestRealSpaceKernels:
         point -- it is what suppresses the long-range drift that blurs an iCoM image.
         """
         vbf, bf_mask, _ = make_model_vbf_stack(MODEL_DEFOCUS, (0.0, 0.0), scan_gpts=(96, 96))
-        montage = ShadowMontagePtychography.from_virtual_bfs(
+        montage = DirectPtychographyMontage.from_virtual_bfs(
             vbf, bf_mask, **model_vbf_kwargs(MODEL_DEFOCUS)
         )
 
@@ -1843,7 +1843,7 @@ class TestRealSpaceKernels:
         """
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
-        montage = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        montage = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
 
         montage.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
         collapsed = montage.obj.copy()
@@ -1860,7 +1860,7 @@ class TestRealSpaceKernels:
         """The collapse itself, against an explicit sum over the detector."""
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
-        montage = ShadowMontagePtychography.from_dataset4d(dataset4d, **kwargs)
+        montage = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
         bf = montage._return_bf_context(montage.bf_mask)
 
         collapsed = montage._return_com_shift(bf, 0.0, 1)
@@ -1936,7 +1936,7 @@ class TestConvolutionModes:
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
         return (
             DirectPtychography.from_dataset4d(dataset4d, **kwargs),
-            ShadowMontagePtychography.from_dataset4d(dataset4d, boundary=boundary, **kwargs),
+            DirectPtychographyMontage.from_dataset4d(dataset4d, boundary=boundary, **kwargs),
         )
 
     @pytest.mark.parametrize("kernel", KERNELS)
@@ -2050,11 +2050,11 @@ class TestConvolutionModes:
     @pytest.mark.parametrize("stencil_radius, expected", [("auto", "fft"), (6, "stencil")])
     def test_auto_reads_the_stencil_radius(self, stencil_radius, expected):
         """Naming a radius is a request to truncate; leaving it 'auto' takes the exact route."""
-        resolve = ShadowMontagePtychography._resolve_convolution_mode
+        resolve = DirectPtychographyMontage._resolve_convolution_mode
         assert resolve("auto", "ssb", stencil_radius) == expected
 
     def test_parallax_ignores_the_mode(self):
-        resolve = ShadowMontagePtychography._resolve_convolution_mode
+        resolve = DirectPtychographyMontage._resolve_convolution_mode
         assert resolve("fft", "prlx", "auto") == "splat"
 
     def test_unknown_mode_raises(self, dataset4d):
@@ -2090,7 +2090,7 @@ class TestSharedCanvas:
         n_scan = dataset4d.shape[0]
         positions = scan_positions_px()[: n_scan * n_scan] * SCAN_SAMPLING
         positions = positions + np.asarray(position_offset, dtype=np.float64)
-        return ShadowMontagePtychography.from_dataset3d(
+        return DirectPtychographyMontage.from_dataset3d(
             dataset3d,
             positions,
             scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
@@ -2280,7 +2280,7 @@ class TestFrameDrift:
 
         montages = []
         for dataset, pos in zip(datasets, positions):
-            montage = ShadowMontagePtychography.from_dataset3d(
+            montage = DirectPtychographyMontage.from_dataset3d(
                 dataset,
                 pos,
                 scan_sampling=(CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
@@ -2328,7 +2328,7 @@ class TestFrameDrift:
         )
 
         def reconstruct(position_list):
-            montage = ShadowMontagePtychography.from_dataset3d(
+            montage = DirectPtychographyMontage.from_dataset3d(
                 combined,
                 np.concatenate(position_list),
                 scan_sampling=(CTF_SCAN_SAMPLING, CTF_SCAN_SAMPLING),
@@ -2438,7 +2438,7 @@ class TestAccelerators:
     @pytest.mark.parametrize("boundary", ["wrap", "pad"])
     def test_montage_matches_cpu(self, dataset4d, device, boundary):
         def run(where):
-            montage = ShadowMontagePtychography.from_dataset4d(
+            montage = DirectPtychographyMontage.from_dataset4d(
                 dataset4d, device=where, boundary=boundary, **self._kwargs(dataset4d)
             )
             return montage.reconstruct(verbose=False).obj
@@ -2450,7 +2450,7 @@ class TestAccelerators:
 
     def test_montage_upsampled_matches_cpu(self, dataset4d, device):
         def run(where):
-            montage = ShadowMontagePtychography.from_dataset4d(
+            montage = DirectPtychographyMontage.from_dataset4d(
                 dataset4d, device=where, **self._kwargs(dataset4d)
             )
             return montage.reconstruct(
@@ -2461,7 +2461,7 @@ class TestAccelerators:
 
     def test_defocus_gradient_matches_cpu(self, dataset4d, device):
         def run(where):
-            montage = ShadowMontagePtychography.from_dataset4d(
+            montage = DirectPtychographyMontage.from_dataset4d(
                 dataset4d,
                 device=where,
                 boundary="pad",
@@ -2476,7 +2476,7 @@ class TestAccelerators:
         assert np.abs(on_device - on_cpu).max() / np.abs(on_cpu).max() < 1e-4
 
     def test_real_space_kernel_runs(self, dataset4d, device):
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, device=device, **self._kwargs(dataset4d)
         )
         obj = montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=4, verbose=False).obj
@@ -2484,7 +2484,7 @@ class TestAccelerators:
         assert np.isfinite(obj).all()
 
     def test_variance_loss_and_search_run(self, dataset4d, device):
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, device=device, **self._kwargs(dataset4d)
         )
         montage.reconstruct(verbose=False)
@@ -2492,7 +2492,7 @@ class TestAccelerators:
         assert np.isfinite(float(montage.variance_loss()))
 
     @pytest.mark.parametrize(
-        "cls", [DirectPtychography, ShadowMontagePtychography], ids=["fourier", "montage"]
+        "cls", [DirectPtychography, DirectPtychographyMontage], ids=["fourier", "montage"]
     )
     def test_ungridded_fits_the_origin_on_device(self, dataset4d, device, cls):
         """Regression: probe positions arrive as numpy and met the measured origin on MPS."""
@@ -2519,7 +2519,7 @@ def test_padded_canvas_shape_is_device_independent(dataset4d, device):
     """Float noise must not push a canvas bound across an integer on one device only."""
 
     def shape(where):
-        montage = ShadowMontagePtychography.from_dataset4d(
+        montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d,
             device=where,
             boundary="pad",
