@@ -226,6 +226,38 @@ def _print_top_elements(element_names, amplitudes, max_items=10):
         print(f"{rank:2d}. {element_names[idx]:>3s}: {amplitudes_np[idx]:.4g}")
 
 
+def _plot_loss_history(ax, loss_history, *, x=None, label=None):
+    """Plot a loss curve on a log scale, shifting it only when needed."""
+    loss_history = np.asarray(loss_history, dtype=float)
+    if x is None:
+        x = np.arange(len(loss_history))
+    else:
+        x = np.asarray(x)
+
+    finite = np.isfinite(loss_history)
+    if not np.any(finite):
+        ax.plot(
+            x, np.zeros_like(x, dtype=float), color="k" if label is None else None, label=label
+        )
+        ax.set_ylabel("Loss")
+        return
+
+    loss_min = float(np.min(loss_history[finite]))
+    shifted = loss_history.copy()
+    ylabel = "Loss"
+    legend_label = label
+    if loss_min <= 0:
+        offset = abs(loss_min) + 1e-8
+        shifted = shifted + offset
+        ylabel = f"Shifted loss (+{offset:.3g})"
+        if legend_label is not None:
+            legend_label = f"{legend_label} (shifted)"
+
+    ax.plot(x, shifted, color="k" if label is None else None, label=legend_label)
+    ax.set_ylabel(ylabel)
+    ax.set_yscale("log")
+
+
 def _plot_fit_summary(
     energy_axis,
     input_spectrum,
@@ -242,11 +274,9 @@ def _plot_fit_summary(
         axes = [ax]
     else:
         fig, axes = plt.subplots(2, 1, figsize=(10, 6))
-        axes[0].plot(np.arange(len(loss_history)), loss_history, color="k")
+        _plot_loss_history(axes[0], loss_history)
         axes[0].set_title("Loss")
         axes[0].set_xlabel("Iteration")
-        axes[0].set_ylabel("Loss")
-        axes[0].set_yscale("log")
 
     spec_ax = axes[-1]
     spec_ax.plot(energy_axis, input_spectrum, "k-", label="Data", linewidth=1.0)
@@ -273,13 +303,11 @@ def _plot_global_and_local_losses(global_loss_history, local_loss_history):
     fig, ax = plt.subplots(1, 1, figsize=(8, 4))
     global_x = np.arange(len(global_loss_history))
     local_x = np.arange(len(local_loss_history)) + len(global_loss_history)
-    ax.plot(global_x, global_loss_history, label="Mean stage")
-    ax.plot(local_x, local_loss_history, label="Cube stage")
+    _plot_loss_history(ax, global_loss_history, x=global_x, label="Mean stage")
+    _plot_loss_history(ax, local_loss_history, x=local_x, label="Cube stage")
     ax.axvline(len(global_loss_history) - 0.5, color="gray", linestyle="--", linewidth=1.0)
     ax.set_title("Loss")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Loss")
-    ax.set_yscale("log")
     ax.legend()
     plt.tight_layout()
     plt.show()
