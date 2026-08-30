@@ -26,6 +26,9 @@ from quantem.diffractive_imaging.complex_probe import (
     spatial_frequencies,
 )
 from quantem.diffractive_imaging.direct_ptycho_utils import _rotation_degrees_to_radians
+from quantem.diffractive_imaging.ptycho_utils import (
+    OptimizationParameter as OptimizationParameter,  # re-export: the documented path
+)
 
 if TYPE_CHECKING:
     import torch
@@ -34,23 +37,6 @@ else:
         import torch
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-
-@dataclass
-class OptimizationParameter:
-    low: float
-    high: float
-    log: bool = False
-    n_points: int | None = None
-
-    def grid_values(self):
-        """Return an array of grid values for this parameter."""
-        if self.n_points is None:
-            raise ValueError("n_points must be specified for grid search parameters.")
-        if self.log:
-            return np.geomspace(self.low, self.high, self.n_points)
-        else:
-            return np.linspace(self.low, self.high, self.n_points)
 
 
 @dataclass

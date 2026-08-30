@@ -1078,3 +1078,40 @@ class TestUnfolding:
         ).obj
 
         assert self._scores(result, ctf_full, 2)[1] > 0.95
+
+
+class TestOptimizationParameterIsOneClass:
+    """`OptimizationParameter` used to be defined twice, identically.
+
+    One copy lived in ``direct_ptychography`` and the other in
+    ``optimize_hyperparameters``. Both searches test candidate specifications with
+    ``isinstance``, so a value built from one module was silently ignored by the other
+    rather than raising. These pin the single definition in place.
+    """
+
+    def test_every_import_path_is_the_same_class(self):
+        from quantem.diffractive_imaging import OptimizationParameter as package
+        from quantem.diffractive_imaging.direct_ptychography import (
+            OptimizationParameter as direct,
+        )
+        from quantem.diffractive_imaging.direct_ptychography_base import (
+            OptimizationParameter as base,
+        )
+        from quantem.diffractive_imaging.optimize_hyperparameters import (
+            OptimizationParameter as iterative,
+        )
+        from quantem.diffractive_imaging.ptycho_utils import (
+            OptimizationParameter as canonical,
+        )
+
+        assert package is direct is base is iterative is canonical
+        assert canonical.__module__ == "quantem.diffractive_imaging.ptycho_utils"
+
+    def test_a_spec_built_anywhere_is_accepted_everywhere(self):
+        """The failure the duplicate caused: isinstance across the two searches."""
+        from quantem.diffractive_imaging import OptimizationParameter
+        from quantem.diffractive_imaging.optimize_hyperparameters import (
+            OptimizationParameter as iterative,
+        )
+
+        assert isinstance(OptimizationParameter(0.0, 1.0), iterative)

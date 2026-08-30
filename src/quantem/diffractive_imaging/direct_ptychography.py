@@ -49,6 +49,12 @@ from quantem.diffractive_imaging.direct_ptychography_base import (
     HyperparameterState,
 )
 
+# re-exported because this was `OptimizationParameter`'s public path in v0.1.9, and
+# published notebooks still import it from this module
+from quantem.diffractive_imaging.direct_ptychography_base import (
+    OptimizationParameter as OptimizationParameter,
+)
+
 
 class DirectPtychography(DirectPtychographyBase):
     """
