@@ -66,42 +66,41 @@ class DirectPtychographyMontage(DirectPtychographyBase):
 
     Every kernel of
     :class:`~quantem.diffractive_imaging.direct_ptychography.DirectPtychography` is a
-    multiplier on the *scan-space* Fourier transform. Here that transform is never taken:
-    each virtual bright-field image is deposited onto one canvas at its own probe position
-    instead. The detector axis is handled identically in both -- summed over bright-field
-    pixels, each carrying its own kernel.
+    multiplier on the scan-space Fourier transform. Here that transform is not taken:
+    each virtual bright-field image is deposited onto one canvas at its own probe position.
+    The detector axis is handled the same way in both classes, summed over bright-field
+    pixels each carrying its own kernel.
 
     Kernels
     -------
     ``prlx``
         A pure translation by ``grad_chi / (2 * pi)`` Angstrom, exact, one deposit per
-        point. This is the **shadow montage** (tilt-corrected bright field) construction,
-        and is what the class used to be named for.
+        point. The shadow-montage (tilt-corrected bright field) construction [1]_.
     ``ssb``, ``obf``, ``mf``
         Convolutions rather than translations. Exact with ``convolution_mode="fft"`` (the
         default); truncated to a box stencil with ``"stencil"``.
     ``icom``
-        Exact by FFT. Truncated it is **riCOM**, where the radius is a deliberate high-pass
-        cutoff rather than an error. Being linear in ``k``, it collapses to two convolutions
-        of the centre-of-mass shift however many bright-field pixels there are.
+        Exact by FFT. Truncated it is riCOM [2]_, where the radius is a high-pass cutoff
+        rather than an error. Being linear in ``k``, it collapses to two convolutions of
+        the centre-of-mass shift regardless of the number of bright-field pixels.
 
-    The parallax equivalence is exact both ways: ``exp(-1j * grad_chi . q)`` is a
-    translation, and Fourier-space tiling by ``U`` is real-space zero-insertion at every
-    ``U``-th pixel. Working in real space instead buys three things:
+    The parallax equivalence holds both ways: ``exp(-1j * grad_chi . q)`` is a translation,
+    and Fourier-space tiling by ``U`` is real-space zero-insertion at every ``U``-th pixel.
+    Working in real space instead gives:
 
-    - no scan-space FFT is needed, so the scan positions need not lie on a grid --
+    - no scan-space FFT, so the scan positions need not lie on a grid --
       see :meth:`from_dataset3d`;
     - the phase-flip and Butterworth filters, which do not depend on the bright-field index,
       collapse into a single post-hoc filter on the finished image;
-    - each scan position can carry its *own* defocus, which models a tilted sample --
-      see :attr:`defocus_gradient` and :meth:`fit_defocus_gradient`. A Fourier multiplier is
-      global over the scan by construction and cannot express this.
+    - a per-position defocus, which models a tilted sample -- see :attr:`defocus_gradient`
+      and :meth:`fit_defocus_gradient`. A Fourier multiplier is global over the scan and
+      cannot express this.
 
     Choosing between the two classes
     --------------------------------
     ==================================  ==========================================
-    gridded scan                        ``DirectPtychography`` -- exact and
-                                        cheapest, one scan FFT
+    gridded scan                        ``DirectPtychography`` -- exact, and
+                                        cheapest at one scan FFT
     ungridded scan                      either: ``from_dataset3d`` regrids onto a
                                         lattice first, this class never grids
     sub-pixel positions matter          here -- regridding discards them (0.997
@@ -110,36 +109,30 @@ class DirectPtychographyMontage(DirectPtychographyBase):
     scan both masked and upsampled      here -- ``hole_fill`` cannot serve filled
                                         holes and deliberate gaps at once
     position-dependent defocus          here only
-    very large bright-field mask        here -- see below
+    large bright-field mask             here -- see below
     ==================================  ==========================================
 
-    The last is a hard limit rather than a preference. ``DirectPtychography._preprocess``
-    materializes the scan transform as ``(N_bf, Ry, Rx)`` complex64, which at 167k
-    bright-field pixels on a 128x170 canvas is **34 GB**; this class streams over detector
-    pixels into one canvas, for roughly 800 MB. That is what an X-ray dataset with a
-    1024-pixel detector looks like, and why it can only be reconstructed here.
+    The last is a memory limit rather than a preference. ``DirectPtychography._preprocess``
+    materializes the scan transform as ``(N_bf, Ry, Rx)`` complex64 -- 34 GB at 167k
+    bright-field pixels on a 128x170 canvas -- where this class streams over detector pixels
+    into one canvas for roughly 800 MB.
 
     Instantiate with :meth:`from_dataset4d`, :meth:`from_virtual_bfs` or
     :meth:`from_dataset3d`.
 
     References
     ----------
-    The shadow-montage (parallax) construction:
-
-    .. [1] *Microscopy and Microanalysis* **32**(1), ozaf126 (2026).
+    .. [1] *Microscopy and Microanalysis* 32(1), ozaf126 (2026).
        https://doi.org/10.1093/mam/ozaf126
+    .. [2] Yu et al., *Microscopy and Microanalysis* 28, 1526 (2022). riCOM.
 
-    riCOM, the truncated iCoM stencil:
-
-    .. [2] Yu et al., *Microscopy and Microanalysis* **28**, 1526 (2022).
-
-    Related, though neither is the kernel implemented here -- the first convolves a WDD
+    Related, though neither is the kernel implemented here: the first convolves a WDD
     kernel where this convolves SSB/OBF/MF kernels, and the second uses a segmented
-    detector rather than a pixelated one:
+    detector rather than a pixelated one.
 
-    .. [3] Convolution WDD: *Ultramicroscopy* **285**, 114411 (2026).
+    .. [3] Convolution WDD: *Ultramicroscopy* 285, 114411 (2026).
        https://doi.org/10.1016/j.ultramic.2026.114411
-    .. [4] Segmented-detector OBF: *Ultramicroscopy* **220**, 113133 (2021).
+    .. [4] Segmented-detector OBF: *Ultramicroscopy* 220, 113133 (2021).
        https://doi.org/10.1016/j.ultramic.2020.113133
     """
 
@@ -694,7 +687,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
     def _return_delta_c10(self, defocus_gradient) -> torch.Tensor | None:
         """``(N_pos,)`` local defocus offset in Angstrom, or ``None`` for no gradient.
 
-        The positions are taken in the **unrotated** scan frame: defocus varies with physical
+        The positions are taken in the unrotated scan frame: defocus varies with physical
         position on the specimen, whereas the detector rotation belongs to the k-grid in
         :meth:`_return_defocus_rate_px`. Rotating here as well would double-count it.
         """
@@ -1165,12 +1158,10 @@ class DirectPtychographyMontage(DirectPtychographyBase):
     def _warn_if_positions_wrap(self, positions_up, lo, canvas_shape, upsampling_factor):
         """Warn when ``"wrap"`` folds part of the scan back over the object.
 
-        Wrapping a canvas that spans the whole scan is harmless -- it is what makes the
-        montage reproduce ``DirectPtychography``, which is periodic in the scan by
-        construction. Wrapping one that does *not* is a different thing entirely: the
-        positions outside come back on the opposite side and lay a second, offset copy of
-        the specimen over the first. It looks like a real reconstruction with a ghost in it,
-        which is easy to explain away as an artifact of something else.
+        Wrapping a canvas that spans the whole scan is harmless, and is what makes the
+        montage reproduce ``DirectPtychography``, which is periodic in the scan. Wrapping a
+        smaller one is not: the positions outside come back on the opposite side and lay a
+        second, offset copy of the specimen over the first.
         """
         shape = torch.as_tensor(canvas_shape, device=positions_up.device, dtype=lo.dtype)
         below = (lo - positions_up.amin(0)).clamp_min(0)
@@ -1246,10 +1237,10 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             truncates them to a box instead.
 
             Truncating ``"icom"`` is the exception that is not an approximation: it gives
-            **riCOM**, whose real-space kernel is ``r / (2 * pi * |r|**2)`` and whose radius
-            is a deliberate high-pass cutoff, so no truncation warning is raised for it.
-            Being linear in ``k``, it also collapses the detector sum into two convolutions
-            of the centre-of-mass shift.
+            riCOM, whose real-space kernel is ``r / (2 * pi * |r|**2)`` and whose radius is a
+            high-pass cutoff, so no truncation warning is raised for it. Being linear in
+            ``k``, it also collapses the detector sum into two convolutions of the
+            centre-of-mass shift.
         q_highpass, q_lowpass : float, optional
             Butterworth filter cutoffs, applied once to the finished image.
         parallax_flip_phase : bool
@@ -1263,37 +1254,32 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             whose defocus varies across the field of view. Defaults to
             :attr:`defocus_gradient`; pass ``(0.0, 0.0)`` to disable it for one call.
 
-            Each scan position is then shifted by its *own* local defocus, which no Fourier
-            formulation can express -- ``exp(-1j * grad_chi . q)`` is a global multiplier,
-            and a position-dependent shift is not a Fourier multiplier at all.
-
-            The post-hoc ``sign(sin(chi(q)))`` phase flip still uses the global (aplanatic)
-            ``C10``; a space-variant contrast-transfer correction is not attempted.
+            Each scan position is then shifted by its own local defocus, which a Fourier
+            formulation cannot express: ``exp(-1j * grad_chi . q)`` is global over the scan.
+            The post-hoc phase flip still uses the aplanatic ``C10``; a space-variant
+            contrast-transfer correction is not attempted.
         interpolation : {"nearest", "bilinear"}
             Sub-pixel deposition scheme.
 
-            ``"nearest"`` (default) snaps each shift to the closest canvas pixel, which on a
-            raster scan is exactly a roll of the virtual bright-field image by
-            ``round(shift)`` -- the quantization error is ``1/(2*upsampling_factor)`` scan
-            pixels, so it shrinks as you upsample. Measured against the exact Fourier shift
-            on a 4 mrad apoferritin dataset, it retains 0.81 / 0.95 / 0.99 / 1.00 of the
-            in-band power at ``upsampling_factor`` 1 / 2 / 4 / 8.
+            ``"nearest"`` (default) snaps each shift to the closest canvas pixel, a roll of
+            the bright-field image by ``round(shift)`` on a raster scan. The quantization
+            error is ``1/(2*upsampling_factor)`` scan pixels, so it shrinks as you upsample:
+            against the exact Fourier shift on a 4 mrad apoferritin dataset it retains
+            0.81 / 0.95 / 0.99 / 1.00 of the in-band power at ``upsampling_factor``
+            1 / 2 / 4 / 8.
 
-            Switch to ``"bilinear"`` if the result looks blocky: it spreads each shift over
-            the four neighbouring pixels instead, at the cost of some smoothing (0.67 / 0.90
-            / 0.97 / 0.99 of the in-band power over the same series). Prefer it for scans
-            whose positions are not on a lattice, where snapping leaves parts of the canvas
-            unvisited -- on a jittered scan ``"nearest"`` left 17-31% of the canvas empty
-            against 10-15% for ``"bilinear"``, and the gap widens with upsampling.
+            ``"bilinear"`` spreads each shift over the four neighbouring pixels, trading
+            some smoothing (0.67 / 0.90 / 0.97 / 0.99 over the same series) for coverage.
+            Prefer it for positions off a lattice, where snapping leaves parts of the canvas
+            unvisited -- 17-31% empty against 10-15% on a jittered scan.
         weight_normalize : bool, optional
             Divide by the accumulated weight rather than by the total bright-field weight.
             Defaults to ``True`` for an ungridded scan and ``False`` otherwise.
 
-            Weight normalization corrects for uneven sampling density, which is what an
-            ungridded scan needs. On a raster scan the density is already uniform, so it only
-            rescales the edges of a padded canvas -- dividing the few contributions there by
-            a small weight amplifies their noise. Leaving it ``False`` instead lets those
-            edges fade out, which is usually what you want to look at.
+            This corrects for uneven sampling density, which an ungridded scan needs. On a
+            raster scan the density is already uniform, so it only rescales the edges of a
+            padded canvas, amplifying the noise of the few contributions there; leaving it
+            ``False`` lets those edges fade out instead.
 
             For ``"wrap"`` with ``upsampling_factor > 1`` the accumulated weight is a comb of
             ones and zeros, so normalizing by it is meaningless -- leave it ``False``.
@@ -1307,24 +1293,22 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             automatic size would otherwise change with the shifts. Contributions landing
             beyond ``pad_px`` are dropped, so choose it larger than the shifts you expect.
         obj_origin : tuple of float, optional
-            Pin the canvas corner to this ``(row, col)`` coordinate, in Angstrom, **in the
-            same frame as the probe positions passed to** :meth:`from_dataset3d`. Defaults
-            to whatever ``pad_px`` or the shifts imply, which follows each acquisition's own
+            Pin the canvas corner to this ``(row, col)`` coordinate in Angstrom, in the same
+            frame as the probe positions passed to :meth:`from_dataset3d`. Defaults to
+            whatever ``pad_px`` or the shifts imply, which follows each acquisition's own
             bounding box and so differs between them.
         obj_fov : tuple of float, optional
             Pin the canvas extent to ``(rows, cols)`` Angstrom, rather than sizing it from
             the positions. Mutually exclusive with ``pad_px``.
 
-            Together, ``obj_origin`` and ``obj_fov`` name a fixed window in the specimen's
-            own coordinates, so separate acquisitions -- successive frames of a multi-frame
-            scan, say -- reconstruct onto pixel-identical canvases that can be stacked,
-            differenced or cross-correlated. Without them, each frame's canvas follows its
-            own position bounding box, and two frames covering the same region can be a few
-            pixels apart for no physical reason. Both are read back from :attr:`obj_origin`
-            and :attr:`_obj_sampling`, which map object pixels onto probe positions.
+            Together these name a fixed window in the specimen's coordinates, so separate
+            acquisitions -- successive frames of a multi-frame scan, say -- reconstruct onto
+            pixel-identical canvases that can be stacked, differenced or cross-correlated.
+            Without them each frame's canvas follows its own bounding box, leaving two frames
+            of the same region a few pixels apart. Both are read back from
+            :attr:`obj_origin` and :attr:`_obj_sampling`.
 
-            Neither applies to ``boundary="wrap"``, whose canvas is the scan grid by
-            definition.
+            Neither applies to ``boundary="wrap"``, whose canvas is the scan grid.
         compute_variance : bool
             Accumulate the sum of squares needed by :meth:`variance_loss`.
         suppress_nyquist : bool
@@ -1335,19 +1319,18 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             How the ``ssb`` / ``obf`` / ``mf`` convolutions are evaluated.
 
             ``"fft"`` splats each bright-field image onto the canvas and multiplies by the
-            kernel in ``q``. **Exact** -- nothing is truncated -- and asymptotically cheaper
-            for a kernel that spans the canvas: one transform per bright-field image against
+            kernel in ``q``. Nothing is truncated, and it is asymptotically cheaper for a
+            kernel that spans the canvas: one transform per bright-field image against
             ``(2 * stencil_radius + 1) ** 2`` taps per scan point. On a gridded scan it
             reproduces ``DirectPtychography`` to float precision, where a radius-5 stencil is
             20-34% off and a radius-12 one still 2-5% off.
 
-            ``"stencil"`` keeps the truncated box, evaluated as a grouped convolution. Worth
-            it only when the kernel really is local, where it avoids a canvas-sized transform.
+            ``"stencil"`` keeps the truncated box, evaluated as a grouped convolution.
+            Worth it when the kernel is local, where it avoids a canvas-sized transform.
 
-            ``"auto"`` reads ``stencil_radius``: naming one is a request to truncate and
-            takes the stencil, leaving it at ``"auto"`` takes the FFT. Measuring which is
-            actually faster would cost a full pass over the kernels, so the rule is a cheap
-            reading of intent rather than a benchmark.
+            ``"auto"`` reads ``stencil_radius``: naming one takes the stencil, leaving it at
+            ``"auto"`` takes the FFT. Measuring which is faster would cost a full pass over
+            the kernels, so this reads intent rather than benchmarking.
 
             With ``boundary="pad"`` the FFT route doubles the canvas and crops back, since a
             Fourier convolution is otherwise circular. That costs four times the transform
@@ -1355,22 +1338,21 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         probe_oversample : int
             How finely an empirical ``fourier_probe`` is refined before being sampled off its
             own reciprocal lattice, which a ``rotation_angle`` that is not a multiple of 90
-            degrees forces. Bilinear error falls as the square of this and the probe array
-            grows as its square: measured on a speckled X-ray probe at a generic sub-pixel
-            offset, 21% unrefined, 7.5% at 2, 1.7% at 4, 0.52% at 8, 0.064% at 16. Ignored
-            for an analytic probe, which is evaluated rather than sampled, and for a rotation
-            that maps the lattice onto itself.
+            degrees forces. Both the accuracy and the memory cost scale as its square:
+            measured on a speckled X-ray probe at a generic sub-pixel offset, 21% unrefined,
+            7.5% at 2, 1.7% at 4, 0.52% at 8, 0.064% at 16. Ignored for an analytic probe,
+            which is evaluated rather than sampled, and for a rotation that maps the lattice
+            onto itself.
         stencil_radius : int or "auto"
             Half-width of the box stencil used by the ``ssb`` / ``obf`` / ``mf`` / ``icom``
             kernels, in canvas pixels. ``"auto"`` grows it until the estimated truncation
             error meets ``truncation_tolerance``, capped at ``max_stencil_radius``. For
-            ``icom`` this is riCOM's ``(n - 1) / 2``, and setting it is the whole point
-            rather than a compromise.
+            ``icom`` this is riCOM's ``(n - 1) / 2``, where setting it is the intent rather
+            than a compromise.
 
-            A box is used deliberately, with no taper: tapering measures consistently
-            *worse* at equal radius (0.40 versus 0.29 relative error at radius 8, 20 mrad in
-            focus), because it discards mid-radius content that matters more than the ringing
-            it suppresses.
+            The box carries no taper: tapering measures worse at equal radius (0.40 against
+            0.29 relative error at radius 8, 20 mrad in focus), since it discards mid-radius
+            content that matters more than the ringing it suppresses.
         truncation_tolerance : float
             Target relative operator error for ``stencil_radius="auto"``. A warning reports
             the achieved error whenever it cannot be met.
@@ -1944,8 +1926,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             least three patches -- :meth:`fit_defocus_gradient` enforces that.
         interpolation : {"bilinear", "nearest"}
             Defaults to ``"bilinear"`` here, unlike :meth:`reconstruct`. Snapping to the
-            nearest pixel makes the loss a staircase in ``C10``, and small defocus changes
-            then produce *no* change at all, so the minimum cannot be located.
+            nearest pixel makes the loss a staircase in ``C10``, so small defocus changes
+            produce no change at all and the minimum cannot be located.
         min_patch_positions : int
             Patches with fewer positions than this are flagged invalid.
 

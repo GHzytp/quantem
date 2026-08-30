@@ -59,16 +59,16 @@ class DirectPtychography(DirectPtychographyBase):
     object is recovered by summing those multipliers over bright-field pixels and
     transforming back once.
 
-    Because the multiplication happens in ``q``, the scan **must** lie on a regular grid.
+    Because the multiplication happens in ``q``, the scan has to lie on a regular grid.
     :meth:`from_dataset4d` and :meth:`from_virtual_bfs` are given one; :meth:`from_dataset3d`
     resamples ungridded positions onto one, which is where its caveats come from.
 
     The alternative is
     :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
-    which accumulates the scan onto a canvas in real space and so never needs a grid. Its
-    class docstring carries the rule for choosing between the two; the short version is that
-    this class is exact and cheapest on a gridded scan, and that a bright-field mask of more
-    than a few tens of thousands of pixels will not fit in memory here.
+    which accumulates the scan onto a real-space canvas and needs no grid. See its class
+    docstring for the full comparison; in short, this class is exact and cheapest on a
+    gridded scan, but a bright-field mask beyond a few tens of thousands of pixels will not
+    fit in memory here.
 
     Instantiate with :meth:`from_dataset4d`, :meth:`from_virtual_bfs` or
     :meth:`from_dataset3d`.
@@ -281,8 +281,8 @@ class DirectPtychography(DirectPtychographyBase):
             Grid pixel size in Angstrom. ``"auto"`` uses the median nearest-neighbour
             position spacing and warns with the inferred value.
 
-            **This, not** ``reconstruct(upsampling_factor=...)``\\ **, is how to sample more
-            finely than the scan.** Pass a fraction of the position spacing and the empty
+            This, rather than ``reconstruct(upsampling_factor=...)``, is how to sample more
+            finely than the scan. Pass a fraction of the position spacing and the empty
             pixels in between become the sparse comb the deconvolution unfolds, with its
             teeth on the real probe positions. Measured against the analytical parallax CTF
             on a scan scattered by a full pixel, correlation over the band above the scan
@@ -297,37 +297,35 @@ class DirectPtychography(DirectPtychographyBase):
             ``"nearest"`` by default; see :func:`regrid_vbf_stack`.
         hole_fill : {"mean", "zero"}
             What to put in grid pixels no probe position reached. Defaults to each
-            bright-field image's mean over the visited pixels, which matters a great deal on
-            a masked or irregular scan, and is also what centers a comb's gaps -- see
+            bright-field image's mean over the visited pixels, which matters on a masked or
+            irregular scan and is also what centers a comb's gaps -- see
             :func:`regrid_vbf_stack`.
 
         Notes
         -----
-        **Do not combine this with** ``reconstruct(upsampling_factor > 1)`` **on an irregular
-        scan** -- pass a finer ``scan_sampling`` instead. Upsampling at reconstruct time
-        recovers detail above the scan Nyquist from where each probe actually sat, and
-        binning the measurements onto a grid first discards exactly that, so the extra band
-        comes back as a replica of the contrast-transfer function rather than an extension of
-        it. With no holes at all, correlation over the extension band falls 0.997 -> 0.822 ->
-        0.711 as the sub-pixel scatter grows from 0 to 0.5 to 1.0 grid pixels. A warning
-        fires when this applies.
+        Regridding has two failure modes, both of which raise a warning.
 
-        The other failure mode is holes: a grid pixel no probe reached has to be invented.
-        ``hole_fill`` keeps that from becoming a hard-edged step, but a large filled region
-        still biases the result, so a warning reports the fraction and a coarser
-        ``scan_gpts`` is the usual fix. Contiguous holes are much worse than scattered ones
-        at equal fraction: scattered holes behave like noise, while an excluded region is a
-        low-frequency mask the deconvolution spreads everywhere.
+        Avoid combining this with ``reconstruct(upsampling_factor > 1)`` on an irregular
+        scan; pass a finer ``scan_sampling`` instead. Upsampling at reconstruct time recovers
+        detail above the scan Nyquist from where each probe sat, which binning onto a grid
+        discards, so the extra band returns as a replica of the contrast-transfer function
+        rather than an extension of it. With no holes, correlation over the extension band
+        falls 0.997 -> 0.822 -> 0.711 as the sub-pixel scatter grows from 0 to 0.5 to 1.0
+        grid pixels.
 
-        A masked scan and an upsampled one want opposite treatments -- filled holes versus
-        deliberate gaps -- and ``hole_fill`` cannot do both at once.
+        The second is holes: a grid pixel no probe reached has to be invented. ``hole_fill``
+        keeps that from becoming a hard-edged step, but a large filled region still biases
+        the result, and a coarser ``scan_gpts`` is the usual fix. Contiguous holes are worse
+        than scattered ones at equal fraction -- scattered holes behave like noise, while an
+        excluded region is a low-frequency mask the deconvolution spreads everywhere. Note
+        that a masked scan and an upsampled one want opposite treatments, filled holes versus
+        deliberate gaps, and ``hole_fill`` cannot do both at once.
 
-        Both failure modes are properties of the regridding, not of the deconvolution, so
-        both disappear in
+        Both are properties of the regridding rather than the deconvolution, so neither
+        applies to
         :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
-        which accumulates the positions as measured and never builds a grid. Prefer it for a
-        scan that is sparse, strongly irregular, or both masked and upsampled; see its class
-        docstring for the full comparison.
+        which uses the positions as measured. Prefer it for a scan that is sparse, strongly
+        irregular, or both masked and upsampled; see its class docstring for the comparison.
         """
         (
             vbf_stack,

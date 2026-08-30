@@ -379,7 +379,7 @@ class FourierProbe:
         Parameters
         ----------
         array : complex array
-            ``psi(k)``, **corner-centered** to match :func:`spatial_frequencies`. A probe
+            ``psi(k)``, corner-centered to match :func:`spatial_frequencies`. A probe
             saved with its maximum at the array centre needs ``ifftshift`` first.
         reciprocal_sampling : tuple of float
             ``dq`` per axis, in inverse Angstrom. Its reciprocal, ``1 / (n * dq)`` per axis,
@@ -507,7 +507,7 @@ class FourierProbe:
         every lookup is an exact gather. When it is not, ``interpolation="exact"`` raises
         rather than quietly interpolating: a speckled probe varies over a few detector pixels
         (0.83 amplitude spread pixel-to-pixel on the X-ray data this was written for), so
-        bilinear sampling is a real approximation and worth opting into deliberately.
+        bilinear sampling is an approximation worth opting into explicitly.
 
         The usual fix is to zero-pad the probe in real space -- which refines its reciprocal
         grid without changing the probe -- until the ratio is an integer.

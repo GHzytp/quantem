@@ -802,7 +802,7 @@ def splat_stack(
     interpolation: Literal["bilinear", "nearest"] = "nearest",
 ) -> torch.Tensor:
     """
-    Splat each row of a batch onto its **own** canvas: ``(B, T)`` values -> ``(B, n_rows, n_cols)``.
+    Splat each row of a batch onto its own canvas: ``(B, T)`` -> ``(B, n_rows, n_cols)``.
 
     :func:`scatter_add_splat` accumulates a whole batch into one shared canvas, which is what
     the parallax kernel wants. A convolution kernel needs each bright-field image separately,
@@ -860,9 +860,8 @@ def splat_and_convolve(
     Splat each bright-field image, then convolve it with its own square kernel.
 
     The same operator as :func:`scatter_add_convolve`, reorganized so the convolution is a
-    grouped ``conv2d`` rather than a loop over taps -- far better optimized. Measured on MPS
-    with 167k bright-field pixels and a 180x140 canvas, a radius-8 stencil takes 5.4 s here
-    against 78 s there.
+    grouped ``conv2d`` rather than a loop over taps. Measured on MPS with 167k bright-field
+    pixels and a 180x140 canvas, a radius-8 stencil takes 5.4 s here against 78 s there.
 
     ``stencil_weights`` is ``(B, (2 * radius + 1) ** 2)``, ordered as the ``"ij"`` meshgrid
     :meth:`DirectPtychographyMontage._return_kernel_stencil` builds.
@@ -1153,15 +1152,14 @@ def regrid_vbf_stack(
     """
     Resample a flat ``(N_bf, N)`` vBF stack onto a regular scan grid.
 
-    Splats each bright-field image at its probe positions with *no* aberration shift and
-    divides by the accumulated weight, which is what lets the scan-Fourier formulation
-    accept an ungridded acquisition.
+    Splats each bright-field image at its probe positions with no aberration shift and
+    divides by the accumulated weight, which lets the scan-Fourier formulation accept an
+    ungridded acquisition.
 
-    Asking for a grid *finer* than the scan is a legitimate and useful thing to do: the empty
-    pixels between the probe positions are then exactly the sparse comb that
-    ``upsampling_factor`` would build by Fourier tiling, except that the teeth land on the
-    real probe positions instead of a lattice, and the deconvolution unfolds them from the
-    bright-field shifts.
+    A grid finer than the scan is a supported case: the empty pixels between the probe
+    positions are then the sparse comb that ``upsampling_factor`` would build by Fourier
+    tiling, except that the teeth land on the real probe positions rather than a lattice,
+    and the deconvolution unfolds them from the bright-field shifts.
 
     Parameters
     ----------
@@ -1173,24 +1171,20 @@ def regrid_vbf_stack(
     hole_fill : {"mean", "zero"}
         What to put in grid pixels no probe position reached.
 
-        ``"mean"`` (default) uses each bright-field image's mean over the pixels that *were*
-        visited. This matters far more than it looks. ``DirectPtychography._preprocess``
-        zeroes the DC bin, which subtracts the mean over the *whole* grid, holes included --
-        so zero-filled holes end up sitting at ``-mean``, a hard-edged step that the
-        deconvolution then smears across the reconstruction. Filling with the occupied mean
-        puts them exactly at the zero level instead and the step disappears.
+        ``"mean"`` (default) uses each bright-field image's mean over the visited pixels.
+        ``DirectPtychography._preprocess`` zeroes the DC bin, which subtracts the mean over
+        the whole grid, holes included -- so zero-filled holes sit at ``-mean``, a hard-edged
+        step the deconvolution then smears across the reconstruction. Filling with the
+        occupied mean puts them at the zero level and the step disappears. Measured on a
+        masked disk-shaped scan with 20% holes, correlation with ground truth goes from 0.25
+        (zero-filled) to 0.69 (mean-filled), against 0.69 for the montage on the same data.
 
-        Measured on a masked disk-shaped scan with 20% holes, correlation with ground truth
-        goes from 0.25 (zero-filled) to 0.69 (mean-filled), against 0.69 for the montage on
-        the same data. Nearest-neighbour filling was also tried and is a wash, so it is not
-        offered.
+        The same choice serves a finer-than-scan grid: filling the comb's gaps with the
+        occupied mean and then zeroing the DC bin leaves them at zero, which is what the
+        unfolding needs.
 
-        The same choice does double duty on a finer-than-scan grid: filling the comb's gaps
-        with the occupied mean and then zeroing the DC bin leaves them at exactly zero, which
-        is what the unfolding needs.
-
-        ``"zero"`` leaves them at zero *without* that centering, and inverts the
-        reconstruction. Kept only for comparison.
+        ``"zero"`` leaves them at zero without that centering, and inverts the
+        reconstruction. Kept for comparison.
 
     Returns
     -------

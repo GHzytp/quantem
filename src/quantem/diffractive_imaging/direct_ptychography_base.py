@@ -298,9 +298,9 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     def _return_probe_on_grid(self, k, phi, aberration_coefs):
         """``psi(k)`` on the detector grid, whose squared sum is the bright-field weight.
 
-        Note this deliberately leaves ``soft_edges`` at ``evaluate_probe``'s default rather
-        than taking ``self.soft_edges``, so that the normalization matches between the two
-        classes -- a long-standing wart preserved on purpose.
+        Leaves ``soft_edges`` at ``evaluate_probe``'s default rather than taking
+        ``self.soft_edges``, so the normalization matches between the two classes. This is
+        an inconsistency, kept for compatibility.
         """
         probe = self.fourier_probe
         if probe is not None:
@@ -351,13 +351,13 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         large gradient, a mis-set aberration blurs them. Negated so that, like
         :meth:`variance_loss`, it is minimized.
 
-        It is far better conditioned than the variance loss -- 28% dynamic range against
-        0.08% over a defocus series, agreeing on the optimum -- because the variance loss
-        compares bright-field images with each other and saturates once they agree, while
-        this measures the image you actually want. It is also insensitive to how the canvas
-        is sized, so it needs no pinning the way a patch fit does.
+        It is better conditioned than the variance loss -- 28% dynamic range against 0.08%
+        over a defocus series, agreeing on the optimum -- because the variance loss compares
+        bright-field images with each other and saturates once they agree, while this
+        measures the reconstruction. It is also insensitive to how the canvas is sized, so it
+        needs no pinning the way a patch fit does.
 
-        Two things to know before reaching for it:
+        Two caveats:
 
         - It rewards *amplitude*, not only sharpness, since it is not normalized by the
           image's own spread. Aberrations and rotation barely change the overall scale, so
@@ -749,7 +749,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         loss : {"variance", "rms_gradient"} or callable
             Objective to minimize. ``"variance"`` is :meth:`variance_loss`, the spread
             between bright-field images. ``"rms_gradient"`` is
-            :meth:`rms_gradient_loss`, an image-sharpness objective that is far better
+            :meth:`rms_gradient_loss`, an image-sharpness objective that is better
             conditioned -- 28% dynamic range against 0.08% over a defocus series -- and is
             defined for every deconvolution kernel. A callable is passed the reconstruction
             and must return a float to minimize.
