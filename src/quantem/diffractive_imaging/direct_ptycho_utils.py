@@ -2808,6 +2808,7 @@ def woa_kernel_terms(
     aperture_floor: float,
     peak_intensity: float = 1.0,
     alias_factor: int = 1,
+    slice_phases=None,
 ) -> dict:
     """One batch's contribution to the sums of the weak-object kernels: ``ssb``, ``obf``,
     ``wiener`` and ``wdd``.
@@ -2836,6 +2837,10 @@ def woa_kernel_terms(
     on the scan's own grid, with the columns of all ``U^2`` alias tiles of each frequency side
     by side (:func:`alias_tiles`), so that the solve separates the tiles jointly rather than
     treating the others as noise. SSB's own sums stay on the fine grid.
+
+    ``slice_phases``, ``(N, H, W)``, multiplies every column of slice ``n`` by a phase that
+    depends on ``q`` alone: a lateral displacement of that slice, such as a specimen tilt gives
+    each depth in a tilt series.
     """
     t_minus, t_plus, psi_minus, psi_plus = overlap_terms(
         probe, cmplx_probe_at_k, kx, ky, qxa, qya, partial_coherence=False
@@ -2849,6 +2854,10 @@ def woa_kernel_terms(
         t_plus = t_plus * env_plus.to(t_plus.real.dtype)
     factors = depth_phase_factors(qxa, qya, kx, ky, wavelength, depths)
     columns = woa_columns(t_minus, t_plus, factors, complex_obj)
+    if slice_phases is not None:
+        # the columns are the slices' phase columns, then their amplitude columns
+        repeat = columns.shape[-1] // slice_phases.shape[0]
+        columns = columns * slice_phases.repeat(repeat, 1, 1).permute(1, 2, 0).to(columns.dtype)
     data = vbf_fourier
     if alias_factor > 1:
         columns = alias_tiles(columns, alias_factor)

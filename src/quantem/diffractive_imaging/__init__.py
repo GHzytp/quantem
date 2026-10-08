@@ -34,6 +34,10 @@ from quantem.diffractive_imaging.direct_ptychography import (
     DirectPtychography as DirectPtychography,
 )
 
+from quantem.diffractive_imaging.direct_ptychography_tilt_series import (
+    DirectPtychographyTiltSeries as DirectPtychographyTiltSeries,
+)
+
 from quantem.diffractive_imaging.direct_ptychography_base import (
     OptimizationParameter as OptimizationParameter,
 )

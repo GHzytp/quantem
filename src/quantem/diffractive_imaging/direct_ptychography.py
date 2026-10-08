@@ -1,7 +1,7 @@
 import gc
 import math
 import warnings
-from typing import TYPE_CHECKING, Literal, Tuple
+from typing import TYPE_CHECKING, Literal, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -264,6 +264,52 @@ class DirectPtychography(DirectPtychographyBase):
             verbose=verbose,
             _token=cls._token,
         )
+
+    @classmethod
+    def from_tilt_series(
+        cls,
+        datasets: Sequence[Dataset4d],
+        tilt_angles,
+        per_dataset_kwargs: Sequence[dict] | None = None,
+        **kwargs,
+    ):
+        """A tilt series: one reconstruction per acquisition, solved jointly for its slices.
+
+        Returns a
+        :class:`~quantem.diffractive_imaging.direct_ptychography_tilt_series.DirectPtychographyTiltSeries`,
+        whose ``reconstruct`` solves every acquisition's normal equations together and whose
+        acquisitions are ordinary reconstructions that can be fitted on their own first.
+
+        Parameters
+        ----------
+        datasets : sequence of Dataset4d
+            The acquisitions, on one scan grid.
+        tilt_angles : array-like
+            ``(T, 2)`` tilts in mrad, in the scan frame: a layer ``z`` Angstrom downstream of
+            the reference plane appears displaced by ``z * theta * 1e-3`` Angstrom.
+        per_dataset_kwargs : sequence of dict, optional
+            Keyword arguments for each dataset's :meth:`from_dataset4d` that override the
+            shared ``kwargs``, for example its own ``aberration_coefs``.
+        **kwargs
+            Passed to :meth:`from_dataset4d` for every dataset.
+        """
+        from quantem.diffractive_imaging.direct_ptychography_tilt_series import (
+            DirectPtychographyTiltSeries,
+        )
+
+        datasets = list(datasets)
+        if per_dataset_kwargs is None:
+            per_dataset_kwargs = [{}] * len(datasets)
+        if len(per_dataset_kwargs) != len(datasets):
+            raise ValueError(
+                f"`per_dataset_kwargs` has {len(per_dataset_kwargs)} entries for "
+                f"{len(datasets)} datasets."
+            )
+        reconstructions = [
+            cls.from_dataset4d(dataset, **{**kwargs, **own})
+            for dataset, own in zip(datasets, per_dataset_kwargs)
+        ]
+        return DirectPtychographyTiltSeries(reconstructions, tilt_angles)
 
     @classmethod
     def from_dataset3d(
@@ -688,11 +734,15 @@ class DirectPtychography(DirectPtychographyBase):
             dim=-2,
         )
 
-    def _accumulate_kernel_sums(self, ctx, depths, obj_type, max_batch_size, verbose):
+    def _accumulate_kernel_sums(
+        self, ctx, depths, obj_type, max_batch_size, verbose, slice_phases=None
+    ):
         """One pass over the bright-field pixels, summing what the kernel needs in Fourier space.
 
         Nothing per bright-field pixel is kept: every kernel is a multiplier on ``G(q, k)``
         summed over ``k``, so the sums are taken here and transformed back once.
+        ``slice_phases`` (``(num_slices, Ny, Nx)``) displaces each slice laterally, as a tilt
+        series needs; see :func:`~quantem.diffractive_imaging.direct_ptycho_utils.woa_kernel_terms`.
         """
         bf, kernel = ctx["bf"], ctx["kernel"]
         qxa, qya = ctx["qxa"], ctx["qya"]
@@ -777,6 +827,7 @@ class DirectPtychography(DirectPtychographyBase):
                         aperture_floor,
                         peak_amplitude**2,
                         alias_factor,
+                        slice_phases,
                     )
                 )
 
