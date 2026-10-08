@@ -1,4 +1,3 @@
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -16,11 +15,12 @@ import warnings
 import numpy as np
 from tqdm.auto import tqdm
 
-from quantem.core.utils.imaging_utils import cross_correlation_shift_torch, unwrap_phase_2d_torch
+from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
 from quantem.core.utils.validators import validate_tensor
 from quantem.diffractive_imaging.complex_probe import (
     aberration_surface_cartesian_basis,
     cartesian_to_polar_aberrations,
+    overlap_terms,
     polar_coordinates,
     spatial_frequencies,
 )
@@ -50,9 +50,12 @@ ABERRATION_PRESETS = {
 # fmt: on
 
 
-def _rotation_degrees_to_radians(rotation_angle: float | None) -> float | None:
+def _rotation_degrees_to_radians(rotation_angle):
+    """Degrees to radians, keeping a tensor that requires grad as a tensor."""
     if rotation_angle is None:
         return None
+    if isinstance(rotation_angle, torch.Tensor) and rotation_angle.requires_grad:
+        return torch.deg2rad(rotation_angle)
     return math.radians(float(rotation_angle))
 
 
@@ -698,88 +701,6 @@ def _torch_polar(m: torch.Tensor):
     return u, p
 
 
-def unwrap_bf_overlap_phase_torch(
-    complex_data_bf,  # (N_k,)
-    mask_bf,  # (N_k,)
-    bf_mask,  # (N_kx, N_ky)
-    *,
-    method="reliability-sorting",
-    two_pass=True,
-    **unwrap_kwargs,
-):
-    phase_bf = torch.angle(complex_data_bf)
-    phase_grid = torch.zeros_like(bf_mask, dtype=torch.float32)
-    mask_grid = torch.zeros_like(bf_mask, dtype=torch.bool)
-
-    phase_grid[bf_mask] = phase_bf
-    mask_grid[bf_mask] = mask_bf
-
-    if mask_grid.any():
-        if phase_grid.max() - phase_grid.min() > math.pi:
-            phase_grid = unwrap_phase_2d_torch(
-                phase_grid * mask_grid,
-                method=method,
-                mask=mask_grid,
-                **unwrap_kwargs,
-            )
-            phase_grid = phase_grid * mask_grid
-
-            if two_pass:
-                phase_grid = unwrap_phase_2d_torch(
-                    phase_grid,
-                    method=method,
-                    mask=mask_grid,
-                    **unwrap_kwargs,
-                )
-                phase_grid = phase_grid * mask_grid
-
-    return phase_grid[bf_mask]
-
-
-def group_basis_by_method(
-    basis_list: list[str],
-    fit_method: str,
-) -> list[list[str]]:
-    """
-    Group basis functions according to fit method.
-
-    Args:
-        basis_list: Flat list of basis function names
-        fit_method: "global", "recursive", or "sequential"
-
-    Returns:
-        List of basis groups for iterative fitting
-    """
-    if fit_method == "global":
-        return [basis_list]
-
-    radial_groups = defaultdict(list)
-
-    for basis_name in basis_list:
-        if basis_name.startswith("C"):
-            radial_order = int(basis_name[1])  # First digit after 'C'
-            radial_groups[radial_order].append(basis_name)
-        else:
-            raise ValueError()
-
-    # Sort by radial order
-    sorted_orders = sorted(radial_groups.keys())
-
-    if fit_method == "recursive":
-        groups = []
-        accumulated = []
-        for order in sorted_orders:
-            accumulated.extend(radial_groups[order])
-            groups.append(accumulated.copy())
-        return groups
-
-    elif fit_method == "sequential":
-        return [radial_groups[order] for order in sorted_orders]
-
-    else:
-        raise ValueError(f"Unknown fit_method: {fit_method}")
-
-
 def _crop_corner_centered_mask(mask: torch.Tensor, bf_mask_padding_px: int):
     mask_c = torch.fft.fftshift(mask)
     ys, xs = torch.where(mask_c)
@@ -1037,9 +958,8 @@ def convolve_stack_fourier(
     """
     Multiply each canvas's transform by its own Fourier kernel, and return the sum in ``q``.
 
-    Exact, where a stencil is truncated -- which matters because the SSB, OBF and
-    matched-filter kernels are never compact in real space (their transforms have ``r**-1.5``
-    tails). It is also asymptotically cheaper for a kernel that spans the canvas: one FFT per
+    Exact, where a stencil is truncated -- which matters because the SSB and OBF kernels are
+    never compact in real space (their transforms have ``r**-1.5`` tails). It is also asymptotically cheaper for a kernel that spans the canvas: one FFT per
     bright-field image against ``(2 * radius + 1) ** 2`` taps per point.
 
     The convolution is circular, as it is for any Fourier method -- ``DirectPtychography``
@@ -1071,7 +991,7 @@ def scatter_add_convolve(
 
     Kept separate from :func:`scatter_add_splat` rather than folded into it: the accumulator
     here is complex, and the weight and sum-of-squares buffers that drive
-    ``variance_loss`` have no meaning when the taps are kernel weights rather than a
+    ``residual_loss`` have no meaning when the taps are kernel weights rather than a
     partition of unity.
 
     Parameters
@@ -1686,7 +1606,7 @@ def build_event_stack_from_vector(
     # Collapse rows that share a (bright-field pixel, position) cell, so a weight holds that
     # cell's measured intensity rather than one electron's contribution to it. Two electrons in
     # one cell are not the same as one electron of twice the weight wherever the value is
-    # squared, which is what `variance_loss` accumulates. Sorting the key also sorts by
+    # squared, which is what `residual_loss` accumulates. Sorting the key also sorts by
     # bright-field pixel, so a contiguous batch of the detector stays a contiguous slice.
     cell = bf_index * num_positions + position_index
     occupied, inverse = np.unique(cell, return_inverse=True)
@@ -2142,3 +2062,359 @@ def build_vbf_stack_from_dataset4d(
     )
 
     return vbf_dataset, bf_mask_dataset, rotation_angle
+
+
+# ---------------------------------------------------------------------------
+# per-frequency normal equations: complex-valued and multislice reconstructions
+# ---------------------------------------------------------------------------
+
+#: values of ``obj_type`` the direct reconstructions accept
+OBJ_TYPES = ("pure_phase", "complex")
+
+
+def slice_depths(num_slices: int, slice_thicknesses=None, device="cpu") -> "torch.Tensor":
+    """Depths of ``num_slices`` thin slices in Angstrom, downstream positive, centred on C10.
+
+    ``slice_thicknesses`` are the ``num_slices - 1`` gaps between consecutive slices, as in the
+    multislice object models. A single value is used for every gap. The stack is centred on
+    the plane the aberration coefficients refer to, so one slice sits exactly there and a
+    ``C10`` fitted with one slice carries over to several.
+
+    A tensor that requires grad keeps it, which is how a gradient fit reaches the thicknesses.
+    """
+    num_slices = int(num_slices)
+    if num_slices < 1:
+        raise ValueError(f"`num_slices` must be at least 1, got {num_slices}")
+    if num_slices == 1:
+        if slice_thicknesses is not None and torch.as_tensor(slice_thicknesses).numel() > 1:
+            raise ValueError("`slice_thicknesses` has no meaning for a single slice")
+        return torch.zeros(1, dtype=torch.float32, device=device)
+    if slice_thicknesses is None:
+        raise ValueError(f"num_slices = {num_slices}, so `slice_thicknesses` cannot be None")
+
+    gaps = torch.as_tensor(slice_thicknesses, dtype=torch.float32, device=device).reshape(-1)
+    if gaps.numel() == 1:
+        gaps = gaps.expand(num_slices - 1)
+    if gaps.numel() != num_slices - 1:
+        raise ValueError(
+            f"`slice_thicknesses` must hold one value or num_slices - 1 = {num_slices - 1}, "
+            f"got {gaps.numel()}"
+        )
+    if bool((gaps.detach() <= 0).any()):
+        raise ValueError(f"`slice_thicknesses` must be positive, got {gaps.detach().tolist()}")
+
+    positions = torch.cat([gaps.new_zeros(1), torch.cumsum(gaps, 0)])
+    return positions - positions.mean()
+
+
+def depth_phase_factors(qxa, qya, kx, ky, wavelength: float, depths):
+    """``(e_minus, e_plus)``, each ``(N, B, H, W)``, or ``None`` when every depth is zero.
+
+    A thin slice ``z`` downstream of the reference plane sees the probe at ``C10 + z``, which
+    multiplies ``t_minus`` by ``exp(i pi lambda z (|k|^2 - |q - k|^2))`` and ``t_plus`` by
+    ``exp(i pi lambda z (|q + k|^2 - |k|^2))``. Applying the free-space propagator this way
+    rather than through the aberration surface works for an empirical probe too.
+    """
+    depths = torch.as_tensor(depths, device=qxa.device)
+    if not depths.requires_grad and bool((depths == 0).all()):
+        return None
+    qx, qy = qxa.unsqueeze(0), qya.unsqueeze(0)
+    k2 = kx.square() + ky.square()
+    d_minus = k2 - ((qx - kx).square() + (qy - ky).square())
+    d_plus = ((qx + kx).square() + (qy + ky).square()) - k2
+    z = depths.to(d_minus.dtype).view(-1, 1, 1, 1) * (math.pi * wavelength)
+    return torch.exp(1j * z * d_minus.unsqueeze(0)), torch.exp(1j * z * d_plus.unsqueeze(0))
+
+
+def woa_columns(t_minus, t_plus, depth_factors=None, complex_obj: bool = False):
+    """``(B, H, W, K)`` weak-object columns: ``Gamma-`` per slice, then ``Gamma+`` per slice.
+
+    The data model is ``G = sum_n Gamma+_n Psi_a,n + Gamma-_n i Psi_phi,n``, so ``K`` is the
+    number of slices for a phase object and twice that for a complex one.
+    """
+    if depth_factors is None:
+        minus, plus = t_minus.unsqueeze(0), t_plus.unsqueeze(0)
+    else:
+        e_minus, e_plus = depth_factors
+        minus, plus = t_minus.unsqueeze(0) * e_minus, t_plus.unsqueeze(0) * e_plus
+    columns = [minus - plus]
+    if complex_obj:
+        columns.append(minus + plus)
+    return torch.cat(columns, 0).permute(1, 2, 3, 0)
+
+
+def accumulate_normal_equations(columns, vbf_fourier, intensity=None):
+    """``(gram, numerator)`` summed over the bright-field batch: ``(H, W, K, K)`` and ``(H, W, K)``.
+
+    Each bright-field image is normalized by its mean, which is ``|psi(k)|^2`` for a weak
+    object, so the data at pixel ``k`` are ``c_k x / |psi(k)|^2`` rather than ``c_k x``, and
+    their Poisson variance goes as ``1 / |psi(k)|^2``. Passing that ``intensity`` (``(B, 1, 1)``)
+    weights the Gram matrix by ``1 / |psi(k)|^2``, which makes the estimate unbiased and its
+    noise normalization exact. The numerator needs no weight. Where the aperture is flat the
+    weight is one; it matters at the soft edge, which is where the double overlaps that
+    separate amplitude from phase at low ``q`` sit, so without it the two channels leak about
+    1% into each other there.
+    """
+    numerator = torch.einsum("bhwi,bhw->hwi", columns.conj(), vbf_fourier)
+    return weighted_gram(columns, intensity), numerator
+
+
+def weighted_gram(columns, intensity=None):
+    """``sum_k c_k^H c_k / |psi(k)|^2`` over the batch, ``(H, W, K, K)``.
+
+    Without ``intensity`` it is the unweighted ``sum_k c_k^H c_k``.
+    """
+    if intensity is not None:
+        nonzero = intensity > 0
+        weight = torch.where(
+            nonzero, torch.rsqrt(torch.where(nonzero, intensity, torch.ones_like(intensity))), 0
+        )
+        columns = columns * weight[..., None]
+    return torch.einsum("bhwi,bhwj->hwij", columns.conj(), columns)
+
+
+def double_overlap_mask(psi_k, psi_minus, psi_plus, floor: float):
+    """Pixels inside the aperture that overlap exactly one of its two displaced copies.
+
+    On these double-overlap (sideband) pixels ``Gamma+ = +-Gamma-``, so amplitude and phase
+    separate exactly for any aberration.
+    """
+    inside = psi_k.abs() > floor
+    return inside & ((psi_minus.abs() > floor) ^ (psi_plus.abs() > floor))
+
+
+def _solver_device(tensor) -> "torch.device":
+    """Where the small per-frequency solves run: float64 needs the CPU on MPS, which has none."""
+    return torch.device("cpu") if tensor.device.type == "mps" else tensor.device
+
+
+def _pseudo_inverse(gram, eigenvalue_floor: float):
+    """Per-frequency regularized inverse of a Hermitian ``(..., K, K)`` Gram matrix.
+
+    The matrix is first scaled to unit diagonal, so its eigenvalues measure how parallel the
+    columns are rather than how large: at low ``q`` the phase column is orders of magnitude
+    weaker than the amplitude one, and a regularizer on the raw matrix would suppress it for
+    that alone. A ridge of ``eigenvalue_floor`` is then added before inverting. Directions
+    whose eigenvalue falls well below it, columns too parallel to tell apart in float32 data,
+    are suppressed rather than amplified, and everywhere else the inverse is exact to that
+    order. Unlike a hard eigenvalue cut this stays differentiable when eigenvalues coincide,
+    which they do wherever a frequency carries no signal at all.
+    """
+    if gram.shape[-1] == 1:
+        g = gram[..., 0, 0].real
+        nonzero = g > 0
+        safe = torch.where(nonzero, g, torch.ones_like(g))
+        return torch.where(nonzero, 1 / safe, torch.zeros_like(g))[..., None, None].to(gram.dtype)
+    diagonal = torch.diagonal(gram, dim1=-2, dim2=-1).real
+    nonzero = diagonal > 0
+    scale = torch.where(
+        nonzero, torch.rsqrt(torch.where(nonzero, diagonal, torch.ones_like(diagonal))), 0
+    )
+    outer = (scale[..., :, None] * scale[..., None, :]).to(gram.dtype)
+    eye = torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
+    inverse = torch.linalg.inv(gram * outer + eigenvalue_floor * eye)
+    return inverse * outer
+
+
+#: An overlap below this fraction of the probe's peak intensity, or a column power below its
+#: square times the column's peak power, is round-off rather than signal. An analytic aperture
+#: is exactly zero outside itself; a sampled probe leaves values near 1e-7 there, which a
+#: normalization would otherwise divide by. Upsampling past the band is where that happens.
+OVERLAP_FLOOR = 1e-6
+
+
+def unit_overlap(gamma, peak_intensity: float = 1.0):
+    """``gamma* / |gamma|``, and zero where ``|gamma|`` is round-off (see :data:`OVERLAP_FLOOR`)."""
+    magnitude = gamma.abs()
+    live = magnitude > OVERLAP_FLOOR * peak_intensity
+    safe = torch.where(live, magnitude, torch.ones_like(magnitude))
+    return torch.where(live, gamma.conj() / safe, torch.zeros_like(gamma))
+
+
+#: ridge added to the unit-diagonal Gram matrix before inverting. Float32 rounding sits below
+#: about 1e-6; two slices 3.35 A apart at 300 kV and 20 mrad still separate with 1e-4 and fail
+#: at 1e-3, so this keeps a decade on either side.
+EIGENVALUE_FLOOR = 1e-5
+
+
+def normal_equation_operator(
+    gram,
+    bf_weights,
+    num_phase: int,
+    eigenvalue_floor: float = EIGENVALUE_FLOOR,
+    amplitude_factor: float = 0.5,
+):
+    """``A``, ``(..., K, K)``, with which every channel's Fourier coefficients are ``A @ b``.
+
+    ``b = sum_k c_k^* G_k`` is the numerator of the normal equations, so the reconstruction is
+    linear in the data, and a per-pixel kernel ``sum_m A_nm c_{k,m}^*`` gives the same result
+    pixel by pixel. That is what lets the montage truncate it to a real-space stencil. See
+    :func:`solve_normal_equations` for the gains.
+    """
+    gain, factors, pinv = _channel_scales(
+        gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor
+    )
+    return (gain * factors)[..., :, None] * pinv
+
+
+def _channel_scales(
+    gram,
+    bf_weights,
+    num_phase: int,
+    eigenvalue_floor: float,
+    amplitude_factor: float,
+):
+    """``(gain, factors, M^+)``: each channel's OBF gain ``(..., K)``, its constant factor
+    ``(K,)`` (``-i`` on the phase channels) and the regularized inverse, in complex128."""
+    solver = _solver_device(gram)
+    gram = gram.to(solver, torch.complex128)
+    pinv = _pseudo_inverse(gram, eigenvalue_floor)
+    d = torch.diagonal(pinv, dim1=-2, dim2=-1).real.clamp_min(0)
+    if gram.shape[-1] == 1:
+        # one column: the inverse is exact, so the transfer is one
+        transfer = torch.ones_like(d)
+    else:
+        # with a ridge, x = M^+ b has transfer diag(M^+ M)
+        transfer = torch.diagonal(pinv @ gram, dim1=-2, dim2=-1).real.clamp_min(0)
+
+    # Whitening with the exact variance would undo the ridge along every direction it
+    # shrinks, amplifying again the combinations float32 data cannot tell apart. (M^+)_nn
+    # keeps them suppressed; one scale per channel then undoes the ridge's overall
+    # shrinkage, so that a large ridge tends to the OBF sweep rather than a dimmed copy.
+    safe = torch.where(d > 0, d, torch.ones_like(d))
+    weight = float(torch.as_tensor(bf_weights).detach())  # |psi| does not depend on chi
+    level = transfer.reshape(-1, transfer.shape[-1]).amax(0)
+    level = torch.where(level > 0, level, torch.ones_like(level))
+    gain = torch.where(d > 0, torch.rsqrt(safe * weight * level), torch.zeros_like(d))
+    # frequencies whose columns hold only round-off carry no signal, whatever the gain says
+    power = torch.diagonal(gram, dim1=-2, dim2=-1).real
+    peak = power.reshape(-1, power.shape[-1]).amax(0)
+    gain = torch.where(power > OVERLAP_FLOOR**2 * peak, gain, torch.zeros_like(gain))
+
+    k = gram.shape[-1]
+    factors = torch.ones(k, dtype=torch.complex128, device=gram.device)
+    factors[:num_phase] = -1j
+    factors[num_phase:] = amplitude_factor
+    return gain, factors, pinv
+
+
+def solve_normal_equations(
+    gram,
+    numerator,
+    bf_weights,
+    num_phase: int,
+    eigenvalue_floor: float = EIGENVALUE_FLOOR,
+    amplitude_factor: float = 0.5,
+):
+    """Fourier coefficients ``(H, W, K)`` of every channel, from the per-frequency normal equations.
+
+    The least-squares estimate ``x = M^+ b`` separates the channels exactly wherever the
+    columns are independent, with ``M^+`` the inverse of :func:`_pseudo_inverse` after a ridge
+    of ``eigenvalue_floor`` on the unit-diagonal Gram matrix. It is the only estimate here with
+    a transfer of one, values in radians and nepers, but its noise grows without bound where a
+    column's power vanishes. Each channel is therefore scaled to optimum bright field: divided
+    by its noise standard deviation, ``x_n / sqrt((M^+)_nn W)``, so the noise is white at the
+    default ridge and the transfer follows the signal-to-noise ratio. For one column this is
+    ``b / sqrt(M W)``, the classic optimum bright field.
+
+    The ridge enters the projection: it shrinks the combinations of columns the data barely
+    tell apart, trading their separation for noise. As it grows, every channel tends to its
+    own column's projection alone, a sweep of independent planes for several slices. One scale
+    per channel, the largest transfer ``(M^+ M)_nn`` over frequencies, undoes its overall
+    shrinkage, so the gain tends to that sweep's OBF rather than a dimmed copy.
+
+    The first ``num_phase`` channels are phase columns, whose unknown carries a factor ``i``,
+    so they are multiplied by ``-i``. The amplitude channels are halved, since ``Gamma+``
+    reaches ``2 |psi|^2`` as ``q -> 0`` where ``Gamma-`` reaches ``|psi|^2`` on a sideband,
+    which gives both channels the same transfer there.
+    """
+    device, out_dtype = numerator.device, numerator.dtype
+    operator = normal_equation_operator(
+        gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor
+    )
+    numerator = numerator.to(operator.device, torch.complex128)
+    return torch.einsum("...ij,...j->...i", operator, numerator).to(device, out_dtype)
+
+
+def explained_energy(gram, numerator, mask=None, eigenvalue_floor: float = EIGENVALUE_FLOOR):
+    """``sum_q Re(b^H M^+ b)``, the data energy a set of columns explains, by Parseval.
+
+    Subtracted from ``sum_q sum_k |G|^2`` it is the least-squares residual, so the ratio of
+    the two is what :meth:`residual_loss` reports.
+    """
+    if gram.dim() == numerator.dim():
+        gram = gram[..., None, None]
+        numerator = numerator[..., None]
+    solver = _solver_device(numerator)
+    pinv = _pseudo_inverse(gram.to(solver, torch.complex128), eigenvalue_floor)
+    numerator = numerator.to(solver, torch.complex128)
+    energy = torch.einsum("...i,...ij,...j->...", numerator.conj(), pinv, numerator).real
+    if mask is not None:
+        energy = energy * mask.to(solver)
+    return energy.sum()
+
+
+def woa_kernel_terms(
+    kernel: str,
+    vbf_fourier,
+    probe,
+    cmplx_probe_at_k,
+    kx,
+    ky,
+    qxa,
+    qya,
+    wavelength: float,
+    depths,
+    complex_obj: bool,
+    aperture_floor: float,
+    peak_intensity: float = 1.0,
+) -> dict:
+    """One batch's contribution to the sums of the weak-object kernels, ``ssb`` and ``obf``.
+
+    Shared by both direct-ptychography classes, which differ only in where ``vbf_fourier``
+    (``(B, Ny, Nx)``, the bright-field spectra on the reconstruction's q-grid) comes from: one
+    scan FFT, or a splat and an FFT per bright-field image.
+
+    Returns ``gram`` and ``numerator`` for the normal equations, which ``obf`` solves and
+    every kernel's residual reads, and for ``ssb`` its own per-pixel sums ``phase`` and,
+    for a complex object, ``amplitude``.
+
+    ``peak_intensity`` is the largest ``|psi(k)|^2`` over the aperture. The Gram weights are
+    taken relative to it, so they are one where the aperture is flat whatever the probe's
+    normalization. The estimate does not depend on it, but the explained energy, and so the
+    residual, would otherwise scale with it.
+
+    The residual always uses the weighted model, whatever the number of columns, so it is a
+    least-squares residual for a measured probe, whose ``|psi(k)|^2`` can vary severalfold
+    across the aperture, and comparable between one slice and several. Its sums are
+    ``residual_gram``, for one column only (with several it is ``gram``), and
+    ``weighted_energy``, ``sum_k |psi(k)|^2 |G_k|^2`` relative to the peak.
+    """
+    t_minus, t_plus, psi_minus, psi_plus = overlap_terms(probe, cmplx_probe_at_k, kx, ky, qxa, qya)
+    factors = depth_phase_factors(qxa, qya, kx, ky, wavelength, depths)
+    columns = woa_columns(t_minus, t_plus, factors, complex_obj)
+    # one column only rescales each frequency, so the single-plane phase keeps the unweighted
+    # Gram it has always had; several columns need the exact weights
+    intensity = cmplx_probe_at_k.abs().square() / peak_intensity
+    several = columns.shape[-1] > 1
+    terms = {}
+    terms["gram"], terms["numerator"] = accumulate_normal_equations(
+        columns, vbf_fourier, intensity if several else None
+    )
+    if not several:
+        terms["residual_gram"] = weighted_gram(columns, intensity)
+    terms["weighted_energy"] = (intensity * vbf_fourier.abs().square()).sum(0)
+
+    if kernel == "ssb":
+        unit = unit_overlap(t_minus - t_plus, peak_intensity)
+        if not complex_obj:
+            terms["phase"] = (-1.0j * vbf_fourier * unit).sum(0)
+        else:
+            # strategy D: on the two double-overlap sidebands Gamma+ = +-Gamma-, so their
+            # phase-compensated sum and difference separate the two channels
+            double = double_overlap_mask(cmplx_probe_at_k, psi_minus, psi_plus, aperture_floor)
+            terms["phase"] = (double * vbf_fourier * unit).sum(0)
+            terms["amplitude"] = (
+                double * vbf_fourier * unit_overlap(t_minus + t_plus, peak_intensity)
+            ).sum(0)
+    return terms

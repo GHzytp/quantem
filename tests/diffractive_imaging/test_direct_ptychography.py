@@ -1,7 +1,7 @@
 """Tests for the Fourier-space direct-ptychography reconstruction.
 
 Covers all five deconvolution kernels, the aberration/rotation conventions they share, the
-four hyperparameter-fitting routines, and save/load. Synthetic data comes from
+hyperparameter-fitting routines, and save/load. Synthetic data comes from
 ``conftest.py``: a white-noise pure-phase object imaged with a defocused soft aperture.
 """
 
@@ -21,11 +21,18 @@ from .conftest import (
     CTF_SAMPLING,
     CTF_SCAN_SAMPLING,
     DECONVOLUTION_KERNELS,
+    ML_ABERRATIONS,
+    ML_K_PROBE,
+    ML_N_DET,
+    ML_RECIPROCAL_SAMPLING,
+    ML_SAMPLING,
     PROBE_ENERGY,
     Q_PROBE,
     SCAN_SAMPLING,
     SEMIANGLE_CUTOFF,
     N,
+    analytic_probe_array,
+    analytic_psi,
     band_limited_phase,
     correlation,
     ctf_band_scores,
@@ -38,9 +45,16 @@ from .conftest import (
     ctf_simulate,
     direct_ptycho_kwargs,
     integer_shift_defocus,
+    layer_purity,
+    library_probe_fourier,
     make_dataset4d,
     measured_ctf,
+    ml_kwargs,
     scan_positions_px,
+    thin_layer_4dstem,
+    twisted_honeycomb_cell,
+    twisted_square_cell,
+    white_noise_object_2D,
 )
 
 TRUE_C10 = integer_shift_defocus(1)
@@ -150,7 +164,6 @@ class TestDeconvolutionKernels:
         aliases = {
             "ssb": "single-sideband",
             "obf": "optimum-bright-field",
-            "mf": "matched-filter",
             "prlx": "tilt-corrected-bright-field",
             "icom": "center-of-mass",
         }
@@ -158,6 +171,11 @@ class TestDeconvolutionKernels:
         by_alias = recon.reconstruct(deconvolution_kernel=aliases[kernel], verbose=False).obj
 
         assert np.array_equal(by_short, by_alias)
+
+    @pytest.mark.parametrize("kernel", ["mf", "matched-filter"])
+    def test_the_matched_filter_has_been_removed(self, recon, kernel):
+        with pytest.raises(ValueError, match="matched-filter kernel has been removed"):
+            recon.reconstruct(deconvolution_kernel=kernel, verbose=False)
 
     @pytest.mark.parametrize("upsampling_factor", [1, 2, 3])
     def test_upsampling_preserves_the_field_of_view(self, recon, upsampling_factor):
@@ -168,15 +186,17 @@ class TestDeconvolutionKernels:
         assert recon.obj.shape == (N * upsampling_factor, N * upsampling_factor)
         assert recon.obj.shape[0] * recon._obj_sampling[0] == pytest.approx(N * SCAN_SAMPLING)
 
-    def test_corrected_stack_sums_to_corrected_bf(self, recon):
+    def test_no_per_pixel_stack_is_kept(self, recon):
+        """The kernels are summed over bright-field pixels in Fourier space, never stored."""
         recon.reconstruct(deconvolution_kernel="ssb", verbose=False)
 
-        assert recon.corrected_stack.shape == (recon.num_bf, N, N)
-        assert torch.allclose(recon.corrected_stack.sum(0), recon.corrected_bf)
+        assert recon.corrected_bf.shape == (N, N)
+        assert not hasattr(recon, "corrected_stack")
+        assert not hasattr(recon, "variance_loss")
 
     def test_unknown_kernel_raises(self, recon):
         with pytest.raises(ValueError, match="Unknown deconvolution kernel"):
-            recon.reconstruct(deconvolution_kernel="wiener", verbose=False)
+            recon.reconstruct(deconvolution_kernel="maximum-entropy", verbose=False)
 
 
 class TestLateralShifts:
@@ -232,7 +252,7 @@ class TestBrightFieldSubsets:
                 parallax_flip_phase=False,
                 verbose=False,
             )
-            halves.append(recon.corrected_bf.clone() * recon.corrected_stack.shape[0])
+            halves.append(recon.corrected_bf.clone() * int(mask.sum()))
 
         # each half is normalized by its own BF weight; undo that before comparing
         combined = to_numpy(halves[0] + halves[1]) / recon.num_bf
@@ -246,10 +266,13 @@ class TestBrightFieldSubsets:
 
     def test_subset_uses_fewer_bright_field_pixels(self, recon):
         mask = recon._make_checkerboard_bf_masks(recon.gpts, recon.bf_mask)[0]
+        recon.reconstruct(deconvolution_kernel="ssb", verbose=False)
+        full = recon.corrected_bf.clone()
         recon.reconstruct(bf_mask=mask, deconvolution_kernel="ssb", verbose=False)
 
-        assert recon.corrected_stack.shape[0] == int(mask.sum())
-        assert int(mask.sum()) < recon.num_bf
+        assert recon._return_bf_context(mask).num_bf == int(mask.sum()) < recon.num_bf
+        assert not torch.equal(recon.corrected_bf, full)
+        assert correlation(to_numpy(recon.corrected_bf), to_numpy(full)) > 0.9
 
 
 class TestFilters:
@@ -300,24 +323,61 @@ class TestFilters:
         assert np.ptp(recon.obj) > 0.0
 
 
-class TestVarianceLoss:
-    def test_is_positive_after_reconstructing(self, recon):
-        recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
+class TestResidualLoss:
+    """The least-squares residual of each kernel's forward model, as a hyperparameter objective."""
 
-        assert float(recon.variance_loss()) > 0
+    def test_is_none_before_reconstructing(self, dataset4d):
+        assert _build(dataset4d).residual_loss() is None
 
-    def test_is_minimized_at_the_true_defocus(self, recon):
+    @pytest.mark.parametrize("kernel", DECONVOLUTION_KERNELS)
+    def test_is_a_fraction(self, recon, kernel):
+        recon.reconstruct(deconvolution_kernel=kernel, verbose=False)
+
+        assert 0.0 < recon.residual_loss() < 1.0
+
+    @pytest.mark.parametrize("kernel", ("ssb", "obf", "prlx"))
+    def test_is_minimized_at_the_true_defocus(self, recon, kernel):
         losses = {}
         for scale in (0.5, 0.8, 1.0, 1.2, 1.5):
             recon.reconstruct(
-                deconvolution_kernel="prlx",
+                deconvolution_kernel=kernel,
                 override_aberration_coefs={"C10": scale * TRUE_C10},
-                parallax_flip_phase=False,
                 verbose=False,
             )
-            losses[scale] = float(recon.variance_loss())
+            losses[scale] = recon.residual_loss()
 
         assert min(losses, key=losses.get) == pytest.approx(1.0)
+
+    def test_the_weak_object_kernels_share_one_model(self, recon):
+        """ssb, obf and mf differ in how they normalize, not in what they model."""
+        values = []
+        for kernel in ("ssb", "obf"):
+            recon.reconstruct(deconvolution_kernel=kernel, verbose=False)
+            values.append(recon.residual_loss())
+
+        assert values[1] == pytest.approx(values[0], rel=1e-6)
+
+    def test_parallax_residual_is_the_spread_of_the_corrected_images(self, recon):
+        """By Parseval, the parallax residual is the spread of the aligned images about their mean."""
+        recon.reconstruct(
+            deconvolution_kernel="prlx", parallax_flip_phase=False, band_limit=False, verbose=False
+        )
+        stack = recon._return_parallax_stack(band_limit=False).double()
+        deviation = torch.fft.fft2(stack - stack.mean(0)).abs().square().sum(0)
+        # a shift has unit modulus, so the aligned stack carries the data energy unchanged
+        energy = torch.fft.fft2(stack).abs().square().sum(0)
+
+        qx = torch.fft.fftfreq(N, SCAN_SAMPLING, dtype=torch.float64)
+        q = torch.hypot(qx[:, None], qx[None, :])
+        mask = (q > 0) & (q <= recon._return_band_limit())
+
+        expected = float((deviation * mask).sum() / (energy * mask).sum())
+        assert recon.residual_loss() == pytest.approx(expected, rel=1e-4)
+
+    def test_variance_loss_has_been_removed(self, recon):
+        recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
+        with pytest.raises(ValueError, match="loss='residual'"):
+            recon._return_loss_value("variance")
 
 
 class TestHyperparameterFitting:
@@ -336,15 +396,6 @@ class TestHyperparameterFitting:
 
         step = (1.6 - 0.4) * TRUE_C10 / 6
         assert abs(fitted - TRUE_C10) <= step
-
-    def test_least_squares(self, dataset4d):
-        recon = _build(dataset4d, aberration_coefs={})
-        recon.fit_hyperparameters_least_squares(
-            cartesian_basis="defocus", fit_method="global", verbose=False
-        )
-        fitted = recon.hyperparameter_state.optimized_aberrations["C10"]
-
-        assert fitted == pytest.approx(TRUE_C10, rel=0.15)
 
     def test_cross_correlation(self, dataset4d):
         recon = _build(dataset4d, aberration_coefs={})
@@ -483,7 +534,7 @@ class TestLossFunctions:
             verbose=False,
         )
 
-        # the RMS gradient loss is negative; the variance loss is positive
+        # the RMS gradient loss is negative; the residual loss is positive
         assert all(loss < 0 for _, loss in recon._grid_search_results)
 
     @pytest.mark.parametrize("bad", ["sharpness", 3, None])
@@ -577,6 +628,16 @@ class TestReconstructAllPermutations:
         assert all(image.shape == (N, N) for image in images)
         assert all(np.isfinite(image).all() for image in images)
 
+    @pytest.mark.parametrize(
+        "kwargs, count",
+        [
+            (dict(obj_type="complex"), 3),
+            (dict(num_slices=2, slice_thicknesses=5.0), 1),
+        ],
+    )
+    def test_leaves_out_the_kernels_that_cannot_take_the_settings(self, recon, kwargs, count):
+        assert len(recon._reconstruct_all_permutations(verbose=False, **kwargs)) == count
+
 
 class TestNormalizationOrder:
     def test_linear_background_normalization_runs(self, dataset4d):
@@ -618,7 +679,7 @@ class TestDatasetVariants:
                 parallax_flip_phase=False,
                 verbose=False,
             )
-            losses[scale] = float(recon.variance_loss())
+            losses[scale] = recon.residual_loss()
 
         assert min(losses, key=losses.get) == pytest.approx(1.0)
 
@@ -1122,3 +1183,880 @@ class TestOptimizationParameterIsOneClass:
         )
 
         assert isinstance(OptimizationParameter(0.0, 1.0), iterative)
+
+
+# ---------------------------------------------------------------------------
+# complex-valued objects
+# ---------------------------------------------------------------------------
+
+WEAK = 0.02  # white-noise strength: first order in the object, second-order terms ~1e-4
+
+
+def _white_noise_scene(channel, aberrations=ML_ABERRATIONS):
+    """``(reconstruction, truth)`` for a weak pure-phase or pure-amplitude white-noise object."""
+    truth = WEAK * white_noise_object_2D(n=64, phi0=1.0)
+    log_t = 1j * truth if channel == "phase" else truth + 0j
+    dataset = thin_layer_4dstem([log_t], [0.0], aberrations)
+    return DirectPtychography.from_dataset4d(dataset, **ml_kwargs(aberrations)), truth
+
+
+@pytest.fixture(scope="module")
+def phase_scene():
+    return _white_noise_scene("phase")
+
+
+@pytest.fixture(scope="module")
+def amplitude_scene():
+    return _white_noise_scene("amplitude")
+
+
+def _analytic_complex_transfer(recon, aberrations):
+    """Per-frequency ``(phase, amplitude)`` transfer of the two-column solve, in numpy.
+
+    Written independently of the library: the overlap functions from the closed-form probe,
+    the Gram matrix and its pseudo-inverse, and the gains. The data are normalized per
+    bright-field pixel by the mean intensity ``|psi(k)|^2``, so the Gram matrix carries the
+    weight ``1 / |psi(k)|^2`` and the estimate is the truth; each channel's transfer is then
+    just its gain.
+    """
+    wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+    kxa, kya = spatial_frequencies(recon.gpts, recon.sampling)
+    mask = to_numpy(recon.bf_mask)
+    kx = to_numpy(kxa)[mask].astype(np.float64)
+    ky = to_numpy(kya)[mask].astype(np.float64)
+    psi_k = analytic_psi(kx, ky, aberrations, wavelength)
+
+    q = np.fft.fftfreq(recon.corrected_bf.shape[0], ML_SAMPLING)
+    qx, qy = np.meshgrid(q, q, indexing="ij")
+    qx, qy = qx[..., None], qy[..., None]
+    t_minus = analytic_psi(qx - kx, qy - ky, aberrations, wavelength) * psi_k.conj()
+    t_plus = analytic_psi(qx + kx, qy + ky, aberrations, wavelength).conj() * psi_k
+    columns = np.stack([t_minus - t_plus, t_minus + t_plus], -1)
+
+    weights = np.abs(psi_k) ** 2
+    gram = np.einsum("abki,abkj->abij", columns.conj(), columns / weights[:, None])
+
+    # the library's conditioning: scale to unit diagonal, add a 1e-5 ridge, invert
+    diagonal = np.real(np.diagonal(gram, axis1=-2, axis2=-1))
+    scale = np.where(diagonal > 0, 1 / np.sqrt(np.where(diagonal > 0, diagonal, 1)), 0)
+    scaled = gram * scale[..., :, None] * scale[..., None, :]
+    inverse = np.linalg.inv(scaled + 1e-5 * np.eye(2))
+    d = np.real(np.diagonal(inverse, axis1=-2, axis2=-1)) * scale**2
+    s = np.where(d > 0, 1 / np.where(d > 0, d, 1), 0)
+    gain = np.sqrt(s / weights.sum()) * np.array([1.0, 0.5])
+    return gain[..., 0], gain[..., 1]
+
+
+def _band(shape, sampling=ML_SAMPLING, lo=0.0, hi=2 * ML_K_PROBE):
+    qx = np.fft.fftfreq(shape[0], sampling)
+    qy = np.fft.fftfreq(shape[1], sampling)
+    q = np.hypot(qx[:, None], qy[None, :])
+    return (q > lo) & (q < hi)
+
+
+class TestComplexObject:
+    """``obj_type="complex"`` recovers the log-amplitude alongside the phase."""
+
+    @pytest.mark.parametrize("channel", ["phase", "amplitude"])
+    def test_transfer_matches_the_analytic_solve(self, phase_scene, amplitude_scene, channel):
+        recon, truth = phase_scene if channel == "phase" else amplitude_scene
+        recon.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+        image = recon.corrected_bf if channel == "phase" else recon.corrected_amplitude
+        measured = np.abs(np.fft.fft2(to_numpy(image))) / np.abs(np.fft.fft2(truth))
+
+        phase_t, amplitude_t = _analytic_complex_transfer(recon, ML_ABERRATIONS)
+        expected = phase_t if channel == "phase" else amplitude_t
+        sel = _band(truth.shape) & (expected > 0.05 * expected.max())
+
+        assert np.corrcoef(measured[sel], expected[sel])[0, 1] > 0.999
+        assert np.median(measured[sel] / expected[sel]) == pytest.approx(1.0, abs=0.02)
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_the_channels_do_not_leak(self, phase_scene, amplitude_scene, kernel):
+        """With an aberrated probe the overlap functions are parallel on the triple overlap,
+        so an independent kernel per channel would leak. The joint solve does not."""
+        for (recon, _), own_is_phase in ((phase_scene, True), (amplitude_scene, False)):
+            recon.reconstruct(deconvolution_kernel=kernel, obj_type="complex", verbose=False)
+            phase = to_numpy(recon.corrected_bf)
+            amplitude = to_numpy(recon.corrected_amplitude)
+            own, other = (phase, amplitude) if own_is_phase else (amplitude, phase)
+            assert other.std() < 1e-3 * own.std()
+
+    def test_ssb_amplitude_transfer_is_aberration_independent(self, amplitude_scene):
+        """Strategy D reads only the double overlaps, where ``Gamma+ = +-Gamma-``."""
+        aberrated, truth = amplitude_scene
+        in_focus, _ = _white_noise_scene("amplitude", {"C10": 0.0})
+        transfers = []
+        for recon in (aberrated, in_focus):
+            recon.reconstruct(deconvolution_kernel="ssb", obj_type="complex", verbose=False)
+            spectrum = np.abs(np.fft.fft2(to_numpy(recon.corrected_amplitude)))
+            transfers.append(spectrum / np.abs(np.fft.fft2(truth)))
+        sel = _band(truth.shape) & (transfers[1] > 0.05 * transfers[1].max())
+
+        assert np.median(transfers[0][sel] / transfers[1][sel]) == pytest.approx(1.0, abs=0.02)
+
+    def test_icom_amplitude_is_the_bright_field_sum(self, amplitude_scene):
+        recon, _ = amplitude_scene
+        recon.reconstruct(
+            deconvolution_kernel="icom", obj_type="complex", band_limit=False, verbose=False
+        )
+        from quantem.diffractive_imaging.complex_probe import polar_coordinates
+
+        stack = recon.vbf_stack.double()
+        bf_sum = (stack - stack.mean((-2, -1), keepdim=True)).sum(0)
+        k, phi = polar_coordinates(
+            *spatial_frequencies(recon.gpts, recon.sampling, rotation_angle=0.0)
+        )
+        weights = recon._return_probe_on_grid(k, phi, ML_ABERRATIONS)[recon.bf_mask]
+        expected = to_numpy(bf_sum / 2 / weights.abs().square().sum().double())
+
+        amplitude = to_numpy(recon.corrected_amplitude)
+        assert np.abs(amplitude - expected).max() < 1e-3 * np.abs(expected).max()
+
+    def test_obj_is_the_complex_transmission(self, amplitude_scene):
+        recon, _ = amplitude_scene
+        recon.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+        obj = recon.obj
+
+        assert np.iscomplexobj(obj)
+        assert np.allclose(np.abs(obj), np.exp(to_numpy(recon.corrected_amplitude)), rtol=1e-6)
+        assert np.allclose(np.angle(obj), to_numpy(recon.corrected_bf), atol=1e-6)
+        assert recon.obj_type == "complex"
+
+    def test_a_defocused_phase_layer_appears_as_amplitude(self):
+        """Free-space propagation turns phase into amplitude, which the complex solve reports
+        at the wrong plane and not at the right one."""
+        truth = WEAK * white_noise_object_2D(n=64, phi0=1.0)
+        depth = 40.0
+        dataset = thin_layer_4dstem([1j * truth], [depth], ML_ABERRATIONS)
+        recon = DirectPtychography.from_dataset4d(dataset, **ml_kwargs(ML_ABERRATIONS))
+
+        amplitudes = {}
+        for label, c10 in (
+            ("at the layer", ML_ABERRATIONS["C10"] + depth),
+            ("off it", ML_ABERRATIONS["C10"]),
+        ):
+            recon.reconstruct(
+                deconvolution_kernel="obf",
+                obj_type="complex",
+                override_aberration_coefs={"C10": c10},
+                verbose=False,
+            )
+            amplitudes[label] = (
+                to_numpy(recon.corrected_amplitude).std() / to_numpy(recon.corrected_bf).std()
+            )
+
+        assert amplitudes["off it"] > 10 * amplitudes["at the layer"]
+
+    def test_parallax_rejects_complex(self, recon):
+        with pytest.raises(ValueError, match="cannot separate amplitude from phase"):
+            recon.reconstruct(deconvolution_kernel="prlx", obj_type="complex", verbose=False)
+
+    def test_unknown_obj_type_raises(self, recon):
+        with pytest.raises(ValueError, match="obj_type"):
+            recon.reconstruct(deconvolution_kernel="obf", obj_type="potential", verbose=False)
+
+    def test_pure_phase_has_no_amplitude(self, recon):
+        recon.reconstruct(deconvolution_kernel="obf", verbose=False)
+
+        assert recon.corrected_amplitude is None
+        assert not np.iscomplexobj(recon.obj)
+        assert recon.obj_type == "pure_phase"
+
+    def test_visualize_shows_both_channels(self, amplitude_scene):
+        import matplotlib
+
+        matplotlib.use("Agg")
+        recon, _ = amplitude_scene
+        recon.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+        fig, axs = recon.visualize(return_fig=True)
+
+        assert np.size(axs) == 4
+
+    def test_round_trip_preserves_both_channels(self, amplitude_scene, tmp_path):
+        recon, _ = amplitude_scene
+        recon.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+        before = recon.obj.copy()
+
+        path = str(tmp_path / "complex.zip")
+        recon.save(path, mode="o")
+        restored = load(path)
+
+        assert np.array_equal(restored.obj, before)
+        assert restored.obj_type == "complex"
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_an_empirical_probe_reproduces_the_analytic_one(self, dataset4d, kernel):
+        from quantem.diffractive_imaging.complex_probe import FourierProbe
+
+        analytic = _build(dataset4d)
+        psi = analytic_probe_array(analytic, {"C10": TRUE_C10})
+        probe = FourierProbe.from_array(
+            psi, analytic.reciprocal_sampling, analytic.wavelength, normalize=False
+        )
+        empirical = _build(dataset4d, fourier_probe=probe)
+
+        kwargs = dict(deconvolution_kernel=kernel, obj_type="complex", verbose=False)
+        expected = analytic.reconstruct(**kwargs).obj.copy()
+        assert np.allclose(empirical.reconstruct(**kwargs).obj, expected, rtol=1e-5, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# multislice
+# ---------------------------------------------------------------------------
+
+
+def _twisted_scene(kind):
+    """``(reconstruction, true layers, spacing)`` for two twisted layers about the C10 plane."""
+    if kind == "square":
+        _, layers, _ = twisted_square_cell()
+        layers, spacing = [0.3 * layer for layer in layers], 6.0
+    else:
+        _, layers, _ = twisted_honeycomb_cell()
+        layers, spacing = [0.1 * layer for layer in layers], 3.35
+    depths = [-spacing / 2, spacing / 2]
+    dataset = thin_layer_4dstem([1j * layer for layer in layers], depths, ML_ABERRATIONS)
+    recon = DirectPtychography.from_dataset4d(dataset, **ml_kwargs(ML_ABERRATIONS))
+    return recon, layers, spacing
+
+
+@pytest.fixture(scope="module")
+def square_scene():
+    return _twisted_scene("square")
+
+
+@pytest.fixture(scope="module")
+def honeycomb_scene():
+    return _twisted_scene("honeycomb")
+
+
+class TestMultislice:
+    """Several thin slices solved jointly at each spatial frequency."""
+
+    @pytest.mark.parametrize("scene", ["square_scene", "honeycomb_scene"])
+    def test_twisted_layers_separate(self, scene, request):
+        """Layers far closer than ``lambda / alpha**2`` (51 A here) come apart, which a C10
+        sweep cannot do at any defocus."""
+        recon, layers, spacing = request.getfixturevalue(scene)
+        recon.reconstruct(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=spacing, verbose=False
+        )
+        purity, corr = layer_purity(to_numpy(recon.corrected_bf), layers)
+        assert purity > 0.95
+        assert corr > 0.9
+
+        c10 = ML_ABERRATIONS["C10"]
+        sweep = [
+            to_numpy(
+                recon.reconstruct(
+                    deconvolution_kernel="obf",
+                    override_aberration_coefs={"C10": c10 + z},
+                    verbose=False,
+                ).corrected_bf
+            )
+            for z in (-spacing / 2, spacing / 2)
+        ]
+        assert layer_purity(sweep, layers)[0] < 0.6
+
+    def test_each_slice_holds_one_rotation(self, square_scene):
+        """Each lattice's (11) reflection sits on an integer pixel, (5, 5) and (1, 7)."""
+        recon, _, spacing = square_scene
+        recon.reconstruct(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=spacing, verbose=False
+        )
+        spectra = np.abs(np.fft.fft2(to_numpy(recon.corrected_bf)))
+
+        assert spectra[0, 5, 5] > 10 * spectra[0, 1, 7]
+        assert spectra[1, 1, 7] > 10 * spectra[1, 5, 5]
+
+    def test_amplitude_columns_help_a_strong_layer(self, square_scene):
+        """Strong layers carry a second-order pseudo-amplitude that phase columns mis-fit."""
+        recon, layers, spacing = square_scene
+        corr = {}
+        for obj_type in ("pure_phase", "complex"):
+            recon.reconstruct(
+                deconvolution_kernel="obf",
+                obj_type=obj_type,
+                num_slices=2,
+                slice_thicknesses=spacing,
+                verbose=False,
+            )
+            corr[obj_type] = layer_purity(to_numpy(recon.corrected_bf), layers)[1]
+
+        assert corr["complex"] > corr["pure_phase"] + 0.01
+
+    def test_a_reference_plane_one_spacing_off_swaps_the_layers(self, square_scene):
+        recon, layers, spacing = square_scene
+        recon.reconstruct(
+            deconvolution_kernel="obf",
+            num_slices=2,
+            slice_thicknesses=spacing,
+            override_aberration_coefs={"C10": ML_ABERRATIONS["C10"] + spacing},
+            verbose=False,
+        )
+
+        assert layer_purity(to_numpy(recon.corrected_bf), layers)[0] < 0.5
+
+    def test_shapes_and_depths(self, square_scene):
+        recon, _, spacing = square_scene
+        recon.reconstruct(
+            deconvolution_kernel="obf",
+            obj_type="complex",
+            num_slices=3,
+            slice_thicknesses=[6.0, 12.0],
+            verbose=False,
+        )
+
+        assert recon.corrected_bf.shape == recon.corrected_amplitude.shape == (3, 64, 64)
+        assert recon.obj.shape == (3, 64, 64)
+        # gaps of 6 and 12 A put the slices at 0, 6 and 18 A, centred on their mean
+        assert np.allclose(recon.slice_depths, [-8.0, -2.0, 10.0])
+        assert recon.num_slices == 3
+
+    def test_one_slice_is_the_single_plane(self, recon):
+        recon.reconstruct(deconvolution_kernel="obf", verbose=False)
+        single = recon.obj.copy()
+        recon.reconstruct(deconvolution_kernel="obf", num_slices=1, verbose=False)
+
+        assert np.array_equal(recon.obj, single)
+
+    @pytest.mark.parametrize("kernel", ["ssb", "prlx", "icom"])
+    def test_kernels_without_a_joint_solve_raise(self, recon, kernel):
+        with pytest.raises(ValueError, match="only 'obf'"):
+            recon.reconstruct(
+                deconvolution_kernel=kernel, num_slices=2, slice_thicknesses=5.0, verbose=False
+            )
+
+    @pytest.mark.parametrize(
+        ("thicknesses", "match"),
+        [(None, "cannot be None"), ([1.0, 2.0, 3.0], "num_slices - 1"), (-1.0, "positive")],
+    )
+    def test_slice_thicknesses_are_validated(self, recon, thicknesses, match):
+        with pytest.raises(ValueError, match=match):
+            recon.reconstruct(
+                deconvolution_kernel="obf",
+                num_slices=2,
+                slice_thicknesses=thicknesses,
+                verbose=False,
+            )
+
+    def test_an_empirical_probe_reproduces_the_analytic_one(self, dataset4d):
+        from quantem.diffractive_imaging.complex_probe import FourierProbe
+
+        analytic = _build(dataset4d)
+        psi = analytic_probe_array(analytic, {"C10": TRUE_C10})
+        probe = FourierProbe.from_array(
+            psi, analytic.reciprocal_sampling, analytic.wavelength, normalize=False
+        )
+        empirical = _build(dataset4d, fourier_probe=probe)
+
+        kwargs = dict(
+            deconvolution_kernel="obf",
+            obj_type="complex",
+            num_slices=2,
+            slice_thicknesses=20.0,
+            verbose=False,
+        )
+        expected = analytic.reconstruct(**kwargs).obj.copy()
+        # two descriptions of one probe differ by float32 rounding, which the near-parallel
+        # slice columns at low q amplify up to the eigenvalue floor
+        error = np.abs(empirical.reconstruct(**kwargs).obj - expected).max()
+        assert error < 1e-4 * np.abs(expected).max()
+
+    def test_the_residual_ignores_the_probe_normalization(self, dataset4d):
+        """A measured probe normalized to unit power gives the analytic probe's residual."""
+        from quantem.diffractive_imaging.complex_probe import FourierProbe
+
+        analytic = _build(dataset4d)
+        psi = analytic_probe_array(analytic, {"C10": TRUE_C10})
+        psi = psi / psi.abs().square().sum().sqrt()
+        probe = FourierProbe.from_array(
+            psi, analytic.reciprocal_sampling, analytic.wavelength, normalize=False
+        )
+        empirical = _build(dataset4d, fourier_probe=probe)
+
+        kwargs = dict(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=20.0, verbose=False
+        )
+        expected = analytic.reconstruct(**kwargs).residual_loss()
+        assert empirical.reconstruct(**kwargs).residual_loss() == pytest.approx(expected, abs=1e-4)
+
+    def test_visualize_shows_one_row_per_slice(self, square_scene):
+        import matplotlib
+
+        matplotlib.use("Agg")
+        recon, _, spacing = square_scene
+        recon.reconstruct(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=spacing, verbose=False
+        )
+        fig, axs = recon.visualize(return_fig=True)
+
+        assert np.shape(axs) == (2, 2)
+
+    @pytest.mark.parametrize("kernel", ["obf"])
+    def test_a_large_ridge_is_the_sweep(self, square_scene, kernel):
+        """With the ridge far above every eigenvalue each slice is its own plane alone."""
+        recon, _, spacing = square_scene
+        recon.reconstruct(
+            deconvolution_kernel=kernel,
+            num_slices=2,
+            slice_thicknesses=spacing,
+            ridge=1e8,
+            verbose=False,
+        )
+        slices = to_numpy(recon.corrected_bf)
+        for image, z in zip(slices, (-spacing / 2, spacing / 2)):
+            override = {"C10": ML_ABERRATIONS["C10"] + z}
+            recon.reconstruct(
+                deconvolution_kernel=kernel, override_aberration_coefs=override, verbose=False
+            )
+            plane = to_numpy(recon.corrected_bf)
+            # the two differ only in how the soft aperture edge is weighted
+            assert correlation(image, plane) > 0.999
+            assert np.std(image) == pytest.approx(np.std(plane), rel=0.05)
+
+    def test_the_ridge_trades_separation_for_noise(self, square_scene):
+        recon, layers, spacing = square_scene
+        purities = []
+        for ridge in (1e-5, 3e-2, 1e2):
+            recon.reconstruct(
+                deconvolution_kernel="obf",
+                num_slices=2,
+                slice_thicknesses=spacing,
+                ridge=ridge,
+                verbose=False,
+            )
+            purities.append(layer_purity(to_numpy(recon.corrected_bf), layers)[0])
+
+        assert purities[0] > purities[1] > purities[2]
+        assert purities[0] > 0.95
+        assert purities[2] < 0.6
+
+    def test_one_slice_finds_the_mean_plane(self, square_scene):
+        """Fit C10 with one slice, then add slices about it.
+
+        One slice pins the plane: its residual changes by about a fifth over +-3 A. Two slices
+        span nearly the same columns at any offset, so theirs changes by well under a percent
+        and is a poor guide to the reference plane.
+        """
+        recon, _, spacing = square_scene
+        offsets = np.arange(-3.0, 3.01, 0.5)
+        losses = {1: [], 2: []}
+        for offset in offsets:
+            override = {"C10": ML_ABERRATIONS["C10"] + offset}
+            recon.reconstruct(
+                deconvolution_kernel="obf", override_aberration_coefs=override, verbose=False
+            )
+            losses[1].append(recon.residual_loss())
+            recon.reconstruct(
+                deconvolution_kernel="obf",
+                num_slices=2,
+                slice_thicknesses=spacing,
+                override_aberration_coefs=override,
+                verbose=False,
+            )
+            losses[2].append(recon.residual_loss())
+
+        # the minimum is flat to 1e-4 between 0 and +0.5 A, so allow one grid step
+        assert abs(offsets[int(np.argmin(losses[1]))]) <= 0.5
+        spread = {n: (max(v) - min(v)) / min(v) for n, v in losses.items()}
+        assert spread[1] > 10 * spread[2]
+
+
+# ---------------------------------------------------------------------------
+# empirical probes: the overlap convention and mixed states
+# ---------------------------------------------------------------------------
+
+
+def _empirical(array):
+    from quantem.diffractive_imaging.complex_probe import FourierProbe
+
+    return FourierProbe.from_array(
+        torch.as_tensor(np.asarray(array), dtype=torch.complex64),
+        (ML_RECIPROCAL_SAMPLING, ML_RECIPROCAL_SAMPLING),
+        electron_wavelength_angstrom(PROBE_ENERGY),
+    )
+
+
+def _full_detector(dataset, aberrations=ML_ABERRATIONS):
+    """A reconstruction on the whole detector window, so a probe array matches its grid."""
+    return DirectPtychography.from_dataset4d(dataset, crop_bf_mask=False, **ml_kwargs(aberrations))
+
+
+#: two equal modes 60 A apart in focus, a crude focal spread
+FOCAL_SPREAD_MODES = np.stack(
+    [
+        np.sqrt(0.5) * library_probe_fourier(dict(ML_ABERRATIONS, C10=20.0)),
+        np.sqrt(0.5) * library_probe_fourier(dict(ML_ABERRATIONS, C10=80.0)),
+    ]
+)
+
+
+@pytest.fixture(scope="module")
+def weak_scene():
+    return thin_layer_4dstem([1j * 0.02 * white_noise_object_2D(n=64, phi0=1.0)], [0.0])
+
+
+class TestOverlapConvention:
+    """``t_minus = psi(k - q) psi*(k)``, which matters only for a non-centrosymmetric probe."""
+
+    def test_a_shifted_probe_only_shifts_the_object(self, weak_scene):
+        """Shifting the probe relabels the scan, so the residual cannot change.
+
+        With ``psi(q - k)`` the two halves of the overlap function pick up different phases
+        and a two-pixel shift ruins the fit.
+        """
+        recon = _full_detector(weak_scene)
+        psi = library_probe_fourier(ML_ABERRATIONS)
+        recon.fourier_probe = _empirical(psi)
+        recon.reconstruct(deconvolution_kernel="obf", verbose=False)
+        expected, residual = to_numpy(recon.corrected_bf), recon.residual_loss()
+
+        k = np.fft.fftfreq(ML_N_DET, ML_SAMPLING)
+        kx, ky = np.meshgrid(k, k, indexing="ij")
+        ramp = np.exp(2j * np.pi * (kx * 2 - ky * 3) * ML_SAMPLING)
+        recon.fourier_probe = _empirical(psi * ramp)
+        recon.reconstruct(deconvolution_kernel="obf", verbose=False)
+
+        assert recon.residual_loss() == pytest.approx(residual, abs=1e-6)
+        shifted = np.roll(expected, (-2, 3), axis=(0, 1))
+        assert correlation(to_numpy(recon.corrected_bf), shifted) > 0.9999
+
+    @pytest.mark.parametrize("aberration", ["C21", "C23"])
+    def test_odd_aberrations_are_fitted_with_their_sign(self, aberration):
+        angle = aberration.replace("C", "phi")
+        truth = {"C10": 50.0, aberration: 300.0, angle: 0.4}
+        dataset = thin_layer_4dstem(
+            [1j * 0.02 * white_noise_object_2D(n=64, phi0=1.0)],
+            [0.0],
+            probe_modes=library_probe_fourier(truth)[None],
+        )
+        recon = DirectPtychography.from_dataset4d(dataset, **ml_kwargs(truth))
+        losses = {}
+        for name, override in (
+            ("true", truth),
+            ("inverted", dict(truth, **{angle: 0.4 + np.pi})),
+            ("absent", {"C10": 50.0, aberration: 0.0}),
+        ):
+            recon.reconstruct(
+                deconvolution_kernel="obf", override_aberration_coefs=override, verbose=False
+            )
+            losses[name] = recon.residual_loss()
+
+        # the inverted sign is worse than leaving the aberration out altogether
+        assert losses["true"] < 1e-5
+        assert losses["absent"] > 100 * losses["true"]
+        assert losses["inverted"] > 2 * losses["absent"]
+
+
+class TestRefinedProbe:
+    """A probe refined by zero-padding is the same probe, sampled more finely off the grid."""
+
+    def test_a_refined_probe_matches_the_native_one(self, weak_scene):
+        recon = _full_detector(weak_scene)
+        probe = _empirical(library_probe_fourier(ML_ABERRATIONS))
+        recon.fourier_probe = probe
+        recon.reconstruct(deconvolution_kernel="obf", verbose=False)
+        expected = recon.obj.copy()
+        step = ML_RECIPROCAL_SAMPLING / 2
+        recon.fourier_probe = probe.resampled_to((step, step))
+        recon.reconstruct(deconvolution_kernel="obf", verbose=False)
+
+        assert np.allclose(recon.obj, expected, atol=1e-5 * np.abs(expected).max())
+
+    def test_refinement_makes_rotated_sampling_accurate(self, weak_scene):
+        """A rotation puts ``k - q`` between grid points, where bilinear sampling is only as
+        good as the grid is fine."""
+        recon = _full_detector(weak_scene)
+        kwargs = dict(deconvolution_kernel="obf", override_rotation_angle=7.0, verbose=False)
+        recon.reconstruct(**kwargs)
+        analytic = to_numpy(recon.corrected_bf)
+
+        from quantem.diffractive_imaging.complex_probe import FourierProbe
+
+        # unnormalized, so the object's scale matches the analytic probe's
+        probe = FourierProbe.from_array(
+            torch.as_tensor(library_probe_fourier(ML_ABERRATIONS), dtype=torch.complex64),
+            (ML_RECIPROCAL_SAMPLING, ML_RECIPROCAL_SAMPLING),
+            electron_wavelength_angstrom(PROBE_ENERGY),
+            normalize=False,
+            interpolation="bilinear",
+        )
+        errors = {}
+        for factor in (1, 4):
+            step = ML_RECIPROCAL_SAMPLING / factor
+            recon.fourier_probe = probe.resampled_to((step, step))
+            recon.reconstruct(**kwargs)
+            errors[factor] = np.abs(to_numpy(recon.corrected_bf) - analytic).max()
+
+        scale = np.abs(analytic).max()
+        assert errors[4] < 0.05 * scale
+        assert errors[4] < errors[1] / 3
+
+    def test_upsampling_stops_at_the_band(self):
+        """Past the band a refined probe's overlap is round-off; upsampling must not divide by it.
+
+        Without :data:`OVERLAP_FLOOR` this correlation is 0.63.
+        """
+        from quantem.diffractive_imaging.complex_probe import FourierProbe
+
+        noisy = thin_layer_4dstem(
+            [1j * 0.02 * white_noise_object_2D(n=64, phi0=1.0)], [0.0], dose=1e4
+        )
+        recon = _full_detector(noisy)
+        kwargs = dict(deconvolution_kernel="obf", upsampling_factor=2, verbose=False)
+        recon.reconstruct(**kwargs)
+        analytic = to_numpy(recon.corrected_bf)
+        probe = FourierProbe.from_array(
+            torch.as_tensor(library_probe_fourier(ML_ABERRATIONS), dtype=torch.complex64),
+            (ML_RECIPROCAL_SAMPLING, ML_RECIPROCAL_SAMPLING),
+            electron_wavelength_angstrom(PROBE_ENERGY),
+            normalize=False,
+        )
+        step = ML_RECIPROCAL_SAMPLING / 2
+        recon.fourier_probe = probe.resampled_to((step, step))
+        recon.reconstruct(**kwargs)
+
+        assert correlation(to_numpy(recon.corrected_bf), analytic) > 0.98
+
+    def test_a_probe_on_another_grid_is_refused(self, weak_scene):
+        recon = _full_detector(weak_scene)
+        wrong = _empirical(np.ones((ML_N_DET + 3, ML_N_DET + 3), dtype=complex))
+        with pytest.raises(ValueError, match="refined by a whole number"):
+            recon.fourier_probe = wrong
+
+
+class TestMixedStateProbe:
+    """Incoherent probe modes: the overlap function is summed over them."""
+
+    def test_from_array_takes_modes(self):
+        modes = FOCAL_SPREAD_MODES
+        probe = _empirical(modes)
+
+        assert probe.num_modes == 2
+        assert not probe.is_analytic
+        assert float(probe.modes.abs().square().sum()) == pytest.approx(1.0, rel=1e-5)
+        intensity = np.abs(modes) ** 2
+        expected = np.sqrt(intensity.sum(0) / intensity.sum())
+        assert np.allclose(to_numpy(probe.array.abs()), expected, atol=1e-6)
+        with pytest.raises(ValueError, match="no single psi"):
+            probe.at(torch.zeros(1), torch.zeros(1))
+
+    def test_resampling_refines_every_mode(self):
+        probe = _empirical(FOCAL_SPREAD_MODES)
+        step = ML_RECIPROCAL_SAMPLING / 2
+        refined = probe.resampled_to((step, step))
+
+        assert refined.num_modes == 2
+        for mode, fine in zip(probe.coherent_modes(), refined.coherent_modes()):
+            expected = mode.resampled_to((step, step)).array
+            assert torch.allclose(fine.array, expected)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{}, {"obj_type": "complex"}, {"num_slices": 2, "slice_thicknesses": 10.0}],
+    )
+    def test_one_mode_is_the_coherent_probe(self, weak_scene, kwargs):
+        recon = _full_detector(weak_scene)
+        psi = library_probe_fourier(ML_ABERRATIONS)
+        results = []
+        for array in (psi, psi[None]):
+            recon.fourier_probe = _empirical(array)
+            recon.reconstruct(deconvolution_kernel="obf", verbose=False, **kwargs)
+            results.append((recon.obj.copy(), recon.residual_loss()))
+
+        assert np.allclose(results[0][0], results[1][0])
+        assert results[0][1] == pytest.approx(results[1][1])
+
+    def test_the_mode_sum_explains_a_focal_spread(self):
+        """No single focus describes two incoherent ones; their mode sum does exactly."""
+        dataset = thin_layer_4dstem(
+            [1j * 0.02 * white_noise_object_2D(n=64, phi0=1.0)],
+            [0.0],
+            probe_modes=FOCAL_SPREAD_MODES,
+        )
+        recon = _full_detector(dataset)
+        coherent = []
+        for c10 in (20.0, 50.0, 80.0):
+            recon.reconstruct(
+                deconvolution_kernel="obf", override_aberration_coefs={"C10": c10}, verbose=False
+            )
+            coherent.append(recon.residual_loss())
+        recon.fourier_probe = _empirical(FOCAL_SPREAD_MODES)
+        recon.reconstruct(deconvolution_kernel="obf", verbose=False)
+
+        assert recon.residual_loss() < 1e-5
+        assert min(coherent) > 0.05
+
+    def test_layers_separate_under_a_mixed_state(self):
+        """A coherent model of a mixed-state probe cannot place the layers; the mode sum can."""
+        _, layers, _ = twisted_square_cell()
+        layers, spacing = [0.3 * layer for layer in layers], 6.0
+        dataset = thin_layer_4dstem(
+            [1j * layer for layer in layers],
+            [-spacing / 2, spacing / 2],
+            probe_modes=FOCAL_SPREAD_MODES,
+        )
+        recon = _full_detector(dataset)
+        kwargs = dict(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=spacing, verbose=False
+        )
+        recon.reconstruct(**kwargs)
+        coherent, _ = layer_purity(to_numpy(recon.corrected_bf), layers)
+        recon.fourier_probe = _empirical(FOCAL_SPREAD_MODES)
+        recon.reconstruct(**kwargs)
+        purity, corr = layer_purity(to_numpy(recon.corrected_bf), layers)
+
+        assert purity > 0.99
+        assert corr > 0.9
+        assert coherent < 0.6
+
+
+# ---------------------------------------------------------------------------
+# differentiability and gradient fitting
+# ---------------------------------------------------------------------------
+
+
+def _residual_at(
+    recon, kernel, c10, rotation=0.0, thickness=None, obj_type="pure_phase", grad=False
+):
+    kwargs = dict(
+        deconvolution_kernel=kernel,
+        obj_type=obj_type,
+        override_aberration_coefs={"C10": c10},
+        override_rotation_angle=rotation,
+        differentiable=grad,
+        verbose=False,
+    )
+    if thickness is not None:
+        kwargs.update(num_slices=2, slice_thicknesses=thickness)
+    recon.reconstruct(**kwargs)
+    return recon.residual_loss()
+
+
+class TestGradients:
+    """Autograd through the reconstruction, checked against finite differences."""
+
+    C10 = ML_ABERRATIONS["C10"] + 7.0
+
+    @pytest.mark.parametrize(
+        ("kernel", "obj_type", "parameter"),
+        [
+            ("obf", "pure_phase", "C10"),
+            ("prlx", "pure_phase", "C10"),
+            ("obf", "pure_phase", "rotation"),
+            ("icom", "pure_phase", "rotation"),
+            ("obf", "complex", "C10"),
+            ("obf", "complex", "thickness"),
+        ],
+    )
+    def test_residual_gradient_matches_finite_differences(
+        self, square_scene, kernel, obj_type, parameter
+    ):
+        recon, _, spacing = square_scene
+        thickness = spacing + 1.0 if parameter == "thickness" else None
+        values = {"C10": self.C10, "rotation": 1.0, "thickness": thickness}
+        leaf = torch.tensor(values[parameter], requires_grad=True)
+        args = dict(values, **{parameter: leaf})
+
+        _residual_at(
+            recon, kernel, args["C10"], args["rotation"], args["thickness"], obj_type, grad=True
+        ).backward()
+
+        step = {"C10": 0.5, "rotation": 0.05, "thickness": 0.25}[parameter]
+        shifted = []
+        for sign in (1, -1):
+            point = dict(values, **{parameter: values[parameter] + sign * step})
+            shifted.append(
+                _residual_at(
+                    recon, kernel, point["C10"], point["rotation"], point["thickness"], obj_type
+                )
+            )
+        finite_difference = (shifted[0] - shifted[1]) / (2 * step)
+
+        assert leaf.grad.item() == pytest.approx(finite_difference, rel=0.05)
+
+    def test_reconstruct_keeps_no_graph_by_default(self, square_scene):
+        recon, _, _ = square_scene
+        c10 = torch.tensor(self.C10, requires_grad=True)
+        recon.reconstruct(
+            deconvolution_kernel="obf", override_aberration_coefs={"C10": c10}, verbose=False
+        )
+
+        assert not recon.corrected_bf.requires_grad
+        assert isinstance(recon.residual_loss(), float)
+
+    def test_differentiable_reconstruction_backpropagates_through_the_image(self, square_scene):
+        recon, _, _ = square_scene
+        c10 = torch.tensor(self.C10, requires_grad=True)
+        recon.reconstruct(
+            deconvolution_kernel="obf",
+            obj_type="complex",
+            override_aberration_coefs={"C10": c10},
+            differentiable=True,
+            verbose=False,
+        )
+        recon.rms_gradient_loss().backward()
+
+        assert recon.corrected_amplitude.requires_grad
+        assert torch.isfinite(c10.grad)
+
+    @pytest.mark.parametrize("kernel", ["obf", "ssb"])
+    def test_gradient_fit_recovers_the_defocus(self, kernel):
+        _, layers, _ = twisted_square_cell()
+        dataset = thin_layer_4dstem([0.3j * layer for layer in layers], [-3.0, 3.0])
+        kwargs = ml_kwargs()
+        kwargs["aberration_coefs"] = dict(ML_ABERRATIONS, C10=ML_ABERRATIONS["C10"] + 30.0)
+        recon = DirectPtychography.from_dataset4d(dataset, **kwargs)
+
+        recon.fit_hyperparameters_gradient(("C10",), deconvolution_kernel=kernel)
+        state = recon.hyperparameter_state
+
+        assert state.optimized_aberrations["C10"] == pytest.approx(ML_ABERRATIONS["C10"], abs=0.5)
+        assert state.optimized_aberrations["C12"] == pytest.approx(ML_ABERRATIONS["C12"])
+        assert "C10" in state.optimized_keys
+
+    def test_gradient_fit_recovers_the_rotation(self, square_scene):
+        recon, _, _ = square_scene
+        recon.hyperparameter_state.optimized_rotation_angle = 3.0
+        recon.fit_hyperparameters_gradient(("rotation_angle",), deconvolution_kernel="obf")
+
+        assert recon.hyperparameter_state.optimized_rotation_angle == pytest.approx(0.0, abs=0.05)
+        recon.hyperparameter_state.clear_optimized()
+
+    def test_gradient_fit_rejects_an_empty_request(self, square_scene):
+        recon, _, _ = square_scene
+        with pytest.raises(ValueError, match="Nothing to fit"):
+            recon.fit_hyperparameters_gradient((), deconvolution_kernel="obf")
+
+
+class TestSliceThicknessSearch:
+    def test_grid_search_stores_the_thickness(self, square_scene):
+        recon, _, _ = square_scene
+        recon.grid_search_hyperparameters(
+            slice_thicknesses=OptimizationParameter(low=4.0, high=8.0, n_points=3),
+            deconvolution_kernel="obf",
+            num_slices=2,
+            verbose=False,
+        )
+        stored = recon.hyperparameter_state.optimized_slice_thicknesses
+
+        assert stored is not None and len(stored) == 1
+        assert stored[0] in (4.0, 6.0, 8.0)
+        # a later reconstruction with several slices picks it up
+        recon.reconstruct(deconvolution_kernel="obf", num_slices=2, verbose=False)
+        assert np.ptp(recon.slice_depths) == pytest.approx(stored[0])
+        recon.hyperparameter_state.clear_optimized()
+
+    def test_optuna_searches_the_thickness(self, square_scene):
+        recon, _, _ = square_scene
+        recon.optimize_hyperparameters(
+            slice_thicknesses=OptimizationParameter(low=4.0, high=8.0),
+            n_trials=3,
+            deconvolution_kernel="obf",
+            num_slices=2,
+            verbose=False,
+        )
+
+        assert "slice_thicknesses" in recon.hyperparameter_state.study.best_params
+        recon.hyperparameter_state.clear_optimized()

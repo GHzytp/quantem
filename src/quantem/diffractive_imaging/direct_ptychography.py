@@ -16,11 +16,7 @@ from quantem.core.utils.validators import (
 from quantem.diffractive_imaging.complex_probe import (
     FourierProbe,
     aberration_surface,
-    aberration_surface_cartesian_basis,
     aberration_surface_cartesian_gradients,
-    aperture,
-    gamma_factor,
-    merge_aberration_coefficients,
     polar_coordinates,
     spatial_frequencies,
 )
@@ -33,16 +29,17 @@ else:
         import torch
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
-    ABERRATION_PRESETS,
+    EIGENVALUE_FLOOR,
     _crop_corner_centered_mask,
     _rotation_degrees_to_radians,
     align_vbf_stack_multiscale,
     build_vbf_stack_from_dataset3d,
     build_vbf_stack_from_dataset4d,
     fit_aberrations_from_shifts,
-    group_basis_by_method,
+    preferred_float_dtype,
     regrid_vbf_stack,
-    unwrap_bf_overlap_phase_torch,
+    slice_depths,
+    woa_kernel_terms,
 )
 from quantem.diffractive_imaging.direct_ptychography_base import (
     DirectPtychographyBase,
@@ -60,10 +57,16 @@ class DirectPtychography(DirectPtychographyBase):
     """
     Direct ptychography in the scan-space Fourier domain.
 
-    Every kernel here -- SSB, OBF, matched-filter, iCoM and parallax -- is a multiplier on
+    Every kernel here -- SSB, OBF, iCoM and parallax -- is a multiplier on
     ``G(k, q)``, the virtual bright-field stack Fourier transformed over the scan. The
     object is recovered by summing those multipliers over bright-field pixels and
     transforming back once.
+
+    ``obj_type="complex"`` and ``num_slices > 1`` extend this: ``"obf"`` then solves
+    a small least-squares problem at every frequency, with a column per slice for the phase and,
+    for a complex object, one for the log-amplitude, and the other kernels gain what they can
+    support. :meth:`residual_loss` scores any reconstruction by how much of the data its model
+    leaves unexplained, and :meth:`fit_hyperparameters_gradient` minimizes it by autograd.
 
     Because the multiplication happens in ``q``, the scan has to lie on a regular grid.
     :meth:`from_dataset4d` and :meth:`from_virtual_bfs` are given one; :meth:`from_dataset3d`
@@ -270,7 +273,7 @@ class DirectPtychography(DirectPtychographyBase):
         Every kernel here is a multiplier on the scan-space Fourier transform, which needs a
         regular grid. So the bright-field images are resampled onto one first, by splatting
         them at their probe positions with no aberration shift and dividing by the
-        accumulated weight. Once gridded, SSB, OBF, matched-filter and iCoM all run exactly
+        accumulated weight. Once gridded, SSB, OBF and iCoM all run exactly
         as they do for a raster scan.
 
         Parameters
@@ -477,7 +480,9 @@ class DirectPtychography(DirectPtychographyBase):
         self._vbf_fourier = torch.fft.fft2(self.vbf_stack, dim=(-2, -1))
         self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
-        self._corrected_stack = None
+        self._corrected_bf = None
+        self._corrected_amplitude = None
+        self._residual = None
         self._q_signal_power = self._vbf_fourier.abs().square().sum(dim=0)  # (N_qx, N_qy)
 
         return self
@@ -511,127 +516,26 @@ class DirectPtychography(DirectPtychographyBase):
             device=self.device
         )
 
-    def _return_kernel_contributions(
+    #: elements of one ``(batch, Ny, Nx, columns)`` buffer, which bounds the default batch size
+    _ELEMENTS_PER_BATCH = 2**25
+
+    def _reconstruction_context(
         self,
-        bf,
+        bf_mask,
+        override_aberration_coefs,
+        upsampling_factor,
+        override_rotation_angle,
         deconvolution_kernel,
-        vbf_fourier,
-        kxa,
-        kya,
-        qxa,
-        qya,
-        cmplx_probe_k,
-        grad_k,
-        sign_sin_chi_q,
-        aberration_coefs,
-        batch_idx,
-    ):
-        """ """
-        ind_i = bf.bf_inds_i[batch_idx]
-        ind_j = bf.bf_inds_j[batch_idx]
-
-        kx = kxa[ind_i, ind_j].view(-1, 1, 1)
-        ky = kya[ind_i, ind_j].view(-1, 1, 1)
-
-        power = None
-
-        if deconvolution_kernel in ("ssb", "obf", "mf"):
-            qmkxa = qxa.unsqueeze(0) - kx
-            qmkya = qya.unsqueeze(0) - ky
-            qpkxa = qxa.unsqueeze(0) + kx
-            qpkya = qya.unsqueeze(0) + ky
-
-            cmplx_probe_at_k = cmplx_probe_k[ind_i, ind_j].view(-1, 1, 1)
-
-            gamma = gamma_factor(
-                (qmkxa, qmkya),
-                (qpkxa, qpkya),
-                cmplx_probe_at_k,
-                self._return_probe(aberration_coefs),
-                normalize=False,
-            )
-
-            fourier_factor = -1.0j * vbf_fourier * gamma.conj()
-            abs_gamma = gamma.abs()
-
-            if deconvolution_kernel == "ssb":
-                fourier_factor = fourier_factor / abs_gamma.clip(1e-8)
-            else:
-                power = abs_gamma.square().sum(0)
-
-        elif deconvolution_kernel == "prlx":
-            qvec = torch.stack((qxa, qya), 0)
-            grad_kq = torch.einsum("na,amp->nmp", grad_k[batch_idx], qvec)
-            operator = torch.exp(-1j * grad_kq) * sign_sin_chi_q
-            fourier_factor = vbf_fourier * operator
-
-        else:
-            q2 = qxa.square() + qya.square()
-            qx_op = -1.0j * qxa / q2
-            qy_op = -1.0j * qya / q2
-            qx_op[0, 0] = 0.0
-            qy_op[0, 0] = 0.0
-
-            operator = kx * qx_op + ky * qy_op
-            fourier_factor = vbf_fourier * operator
-
-        return fourier_factor, power
-
-    def reconstruct(
-        self,
-        bf_mask=None,
-        override_aberration_coefs=None,
-        upsampling_factor=None,
-        override_rotation_angle=None,
-        max_batch_size=None,
-        deconvolution_kernel="single-sideband",
-        q_highpass=None,
-        q_lowpass=None,
-        butterworth_order=12,
-        band_limit=True,
-        matched_filter_norm_epsilon=1e-1,
-        parallax_flip_phase=True,
-        verbose=None,
-        use_initial_state=False,
-    ):
-        """
-        Unified reconstruction method supporting multiple deconvolution techniques.
-
-        Parameters
-        ----------
-        bf_mask: torch.Tensor, optional
-            Subset of bright field mask to use for reconstruction. Note this must be
-            strictly smaller than the bf_mask used for initialization.
-        override_aberration_coefs : dict, optional
-            Aberration coefficients for the probe
-        upsampling_factor : int, optional
-            Factor by which to upsample the reconstruction
-        override_rotation_angle : float, optional
-            Rotation angle for coordinate system, in degrees
-        max_batch_size : int, optional
-            Maximum batch size for processing
-        deconvolution_kernel : str, one of ['ssb', 'obf', 'mf','prlx','icom']
-        q_highpass : float, optional
-            High-pass filter cutoff
-        q_lowpass : float, optional
-            Low-pass filter cutoff. For ``"prlx"`` and ``"icom"`` it is clamped to at most
-            ``2 * semiangle_cutoff / wavelength``, past which ``G(k, q)`` holds no signal.
-            ``"ssb"``, ``"obf"`` and ``"mf"`` impose that cutoff through ``gamma`` already.
-        band_limit : bool
-            Apply that clamp. Turn it off to inspect the raw kernel.
-        verbose : bool, optional
-            If True, show progress bar
-
-        Returns
-        -------
-        self
-            Returns self with corrected_stack attribute set
-        """
-
+        q_highpass,
+        q_lowpass,
+        butterworth_order,
+        band_limit,
+        parallax_flip_phase,
+        verbose,
+        use_initial_state,
+    ) -> dict:
+        """Everything a pass over the bright-field pixels needs except the data itself."""
         state = self.hyperparameter_state
-
-        if verbose is None:
-            verbose = self.verbose
 
         if use_initial_state:
             if verbose:
@@ -660,23 +564,14 @@ class DirectPtychography(DirectPtychographyBase):
             bf_mask = self.bf_mask
         bf = self._return_bf_context(bf_mask)
 
-        num_bf = bf.num_bf
-        bf_mask = bf.bf_mask
-        vbf_index_mapping = bf.vbf_index_mapping
-
-        if max_batch_size is None:
-            max_batch_size = num_bf
-
-        deconvolution_kernel = self._normalize_kernel_name(deconvolution_kernel)
-        if deconvolution_kernel == "prlx":
+        kernel = self._normalize_kernel_name(deconvolution_kernel)
+        if kernel == "prlx":
             # iCoM is exempt: `k . q / |q|**2` never reads the probe
             self._require_analytic_probe("The prlx kernel", aberration_coefs)
 
-        # Get upsampled q-space grid
+        # upsampled q-space grid and the (rotated) k-space grid
         qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
         q, theta = polar_coordinates(qxa, qya)
-
-        # Get k-space grid
         kxa, kya = spatial_frequencies(
             self.gpts,
             self.sampling,
@@ -685,15 +580,14 @@ class DirectPtychography(DirectPtychographyBase):
         )
         k, phi = polar_coordinates(kxa, kya)
 
-        # compute global / cheap functions for prlx
-        if deconvolution_kernel == "prlx":
+        grad_k = sign_sin_chi_q = None
+        if kernel == "prlx":
             dx, dy = aberration_surface_cartesian_gradients(
                 k * self.wavelength,
                 phi,
                 aberration_coefs=aberration_coefs,
             )
-            grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
-
+            grad_k = torch.stack((dx[bf.bf_mask], dy[bf.bf_mask]), -1)
             if parallax_flip_phase:
                 chi_q = aberration_surface(
                     q * self.wavelength,
@@ -704,93 +598,388 @@ class DirectPtychography(DirectPtychographyBase):
                 sign_sin_chi_q = torch.sign(torch.sin(chi_q))
             else:
                 sign_sin_chi_q = torch.ones_like(q)
-        else:
-            grad_k = None
-            sign_sin_chi_q = None
 
-        # compute global / cheap functions for all
         cmplx_probe_k = self._return_probe_on_grid(k, phi, aberration_coefs)
-        BF_weights = cmplx_probe_k[bf_mask].abs().square().sum()
+        bf_weights = cmplx_probe_k[bf.bf_mask].abs().square().sum()
 
-        q_lowpass = self._resolve_q_lowpass(q_lowpass, deconvolution_kernel, band_limit)
+        q_lowpass = self._resolve_q_lowpass(q_lowpass, kernel, band_limit)
         butterworth_env = torch.ones_like(q)
         if q_lowpass:
             butterworth_env *= 1 / (1 + (q / q_lowpass) ** (2 * butterworth_order))
         if q_highpass:
             butterworth_env *= 1 - 1 / (1 + (q / q_highpass) ** (2 * butterworth_order))
 
-        # Process batches
-        pbar = tqdm(range(num_bf), disable=not verbose)
-        batcher = SimpleBatcher(num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng)
+        residual_mask = self._residual_mask(qxa, qya)
 
-        fourier_factor = torch.empty(
-            (num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
+        return dict(
+            aberration_coefs=aberration_coefs,
+            rotation_angle=rotation_angle,
+            upsampling_factor=upsampling_factor,
+            bf=bf,
+            kernel=kernel,
+            qxa=qxa,
+            qya=qya,
+            kxa=kxa,
+            kya=kya,
+            grad_k=grad_k,
+            sign_sin_chi_q=sign_sin_chi_q,
+            cmplx_probe_k=cmplx_probe_k,
+            bf_weights=bf_weights,
+            butterworth_env=butterworth_env,
+            residual_mask=residual_mask,
         )
-        if deconvolution_kernel in ("obf", "mf"):
-            power = torch.zeros(qxa.shape, device=self.device)
-        else:
-            power = None
 
-        # first pass
-        for batch_idx in batcher:
-            mapped_idx = vbf_index_mapping[batch_idx]
-            vbf_fourier = self._vbf_fourier[mapped_idx]
+    def _tiled_vbf_fourier(self, bf, batch_idx, upsampling_factor):
+        """The bright-field spectra of one batch, tiled onto the upsampled q-grid."""
+        vbf_fourier = self._vbf_fourier[bf.vbf_index_mapping[batch_idx]]
+        return torch.cat(
+            [torch.cat([vbf_fourier] * upsampling_factor, dim=-1)] * upsampling_factor,
+            dim=-2,
+        )
 
-            # Fourier-space tiling
-            vbf_fourier = torch.cat(
-                [torch.cat([vbf_fourier] * upsampling_factor, dim=-1)] * upsampling_factor,
-                dim=-2,
+    def _accumulate_kernel_sums(self, ctx, depths, obj_type, max_batch_size, verbose):
+        """One pass over the bright-field pixels, summing what the kernel needs in Fourier space.
+
+        Nothing per bright-field pixel is kept: every kernel is a multiplier on ``G(q, k)``
+        summed over ``k``, so the sums are taken here and transformed back once.
+        """
+        bf, kernel = ctx["bf"], ctx["kernel"]
+        qxa, qya = ctx["qxa"], ctx["qya"]
+        kxa, kya = ctx["kxa"], ctx["kya"]
+        cmplx_probe_k = ctx["cmplx_probe_k"]
+        upsampling_factor = ctx["upsampling_factor"]
+        shape = qxa.shape
+        complex_obj = obj_type == "complex"
+        num_columns = len(depths) * (2 if complex_obj else 1)
+
+        if max_batch_size is None:
+            max_batch_size = max(
+                1, min(bf.num_bf, self._ELEMENTS_PER_BATCH // (shape[0] * shape[1] * num_columns))
             )
 
-            num, pow = self._return_kernel_contributions(
-                bf,
-                deconvolution_kernel,
-                vbf_fourier,
-                kxa,
-                kya,
-                qxa,
-                qya,
-                cmplx_probe_k,
-                grad_k,
-                sign_sin_chi_q,
-                aberration_coefs,
-                batch_idx,
-            )
-            if power is None:
-                num *= butterworth_env
-                # num[:, 0, 0] = self._dc_per_image
+        # the widest precision the device has: float64 sums, except on MPS
+        real_dtype = preferred_float_dtype(self.device)
+        complex_dtype = torch.complex128 if real_dtype == torch.float64 else torch.complex64
 
-                fourier_factor[batch_idx] = torch.fft.ifft2(num)
+        sums = {"energy": torch.zeros(shape, device=self.device, dtype=real_dtype)}
+        woa = kernel in self._WOA_KERNELS
+        if woa:
+            sums["gram"] = torch.zeros(
+                (*shape, num_columns, num_columns), device=self.device, dtype=complex_dtype
+            )
+            sums["numerator"] = torch.zeros(
+                (*shape, num_columns), device=self.device, dtype=complex_dtype
+            )
+            if num_columns == 1:
+                sums["residual_gram"] = torch.zeros_like(sums["gram"])
+            sums["weighted_energy"] = torch.zeros_like(sums["energy"])
+            probe = self._return_probe(ctx["aberration_coefs"])
+            peak_amplitude = float(cmplx_probe_k.detach().abs().max())
+            aperture_floor = 1e-6 * peak_amplitude
+        if kernel in ("ssb", "prlx", "icom"):
+            sums["phase"] = torch.zeros(shape, device=self.device, dtype=complex_dtype)
+        if complex_obj and kernel in ("ssb", "icom"):
+            sums["amplitude"] = torch.zeros(shape, device=self.device, dtype=complex_dtype)
+        if kernel == "icom":
+            sums["power"] = torch.zeros(shape, device=self.device, dtype=real_dtype)
+            q2 = qxa.square() + qya.square()
+            qx_op = -1.0j * qxa / q2
+            qy_op = -1.0j * qya / q2
+            qx_op[0, 0] = 0.0
+            qy_op[0, 0] = 0.0
+        if kernel == "prlx":
+            qvec = torch.stack((qxa, qya), 0)
+
+        keys = list(sums)
+
+        def batch_terms(batch_idx):
+            """Every sum's contribution from one batch of bright-field pixels, in ``keys`` order."""
+            vbf_fourier = self._tiled_vbf_fourier(bf, batch_idx, upsampling_factor)
+            terms = {"energy": vbf_fourier.abs().square().sum(0)}
+
+            ind_i = bf.bf_inds_i[batch_idx]
+            ind_j = bf.bf_inds_j[batch_idx]
+            kx = kxa[ind_i, ind_j].view(-1, 1, 1)
+            ky = kya[ind_i, ind_j].view(-1, 1, 1)
+
+            if woa:
+                terms.update(
+                    woa_kernel_terms(
+                        kernel,
+                        vbf_fourier,
+                        probe,
+                        cmplx_probe_k[ind_i, ind_j].view(-1, 1, 1),
+                        kx,
+                        ky,
+                        qxa,
+                        qya,
+                        self.wavelength,
+                        depths,
+                        complex_obj,
+                        aperture_floor,
+                        peak_amplitude**2,
+                    )
+                )
+
+            elif kernel == "prlx":
+                grad_kq = torch.einsum("na,amp->nmp", ctx["grad_k"][batch_idx], qvec)
+                terms["phase"] = (vbf_fourier * torch.exp(-1j * grad_kq)).sum(0)
+
             else:
-                fourier_factor[batch_idx] = num
-                power += pow
+                operator = kx * qx_op + ky * qy_op
+                terms["phase"] = (vbf_fourier * operator).sum(0)
+                terms["power"] = operator.abs().square().sum(0)
+                if complex_obj:
+                    terms["amplitude"] = vbf_fourier.sum(0)
 
+            return tuple(terms[key] for key in keys)
+
+        # recompute each batch in the backward pass rather than keeping it, so a gradient
+        # costs one batch of memory instead of one (num_bf, Ny, Nx, columns) buffer
+        differentiable = torch.is_grad_enabled() and any(
+            isinstance(value, torch.Tensor) and value.requires_grad
+            for value in (cmplx_probe_k, kxa, depths, ctx["grad_k"])
+        )
+
+        pbar = tqdm(range(bf.num_bf), disable=not verbose)
+        batcher = SimpleBatcher(bf.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng)
+        for batch_idx in batcher:
+            if differentiable:
+                terms = torch.utils.checkpoint.checkpoint(
+                    batch_terms, batch_idx, use_reentrant=False
+                )
+            else:
+                terms = batch_terms(batch_idx)
+            for key, term in zip(keys, terms):
+                sums[key] = sums[key] + term
             pbar.update(len(batch_idx))
         pbar.close()
+        return sums
 
-        if power is not None:
-            power /= BF_weights
+    def reconstruct(
+        self,
+        bf_mask=None,
+        override_aberration_coefs=None,
+        upsampling_factor=None,
+        override_rotation_angle=None,
+        max_batch_size=None,
+        deconvolution_kernel="single-sideband",
+        q_highpass=None,
+        q_lowpass=None,
+        butterworth_order=12,
+        band_limit=True,
+        parallax_flip_phase=True,
+        verbose=None,
+        use_initial_state=False,
+        obj_type="pure_phase",
+        num_slices=1,
+        slice_thicknesses=None,
+        differentiable=False,
+        ridge=None,
+    ):
+        """
+        Unified reconstruction method supporting multiple deconvolution techniques.
 
-            if deconvolution_kernel == "obf":
-                norm = power.sqrt().clamp_min(1e-8)
-            elif deconvolution_kernel == "mf":
-                norm = (power + matched_filter_norm_epsilon * power.max()).clamp_min(1e-8)
+        Parameters
+        ----------
+        bf_mask: torch.Tensor, optional
+            Subset of bright field mask to use for reconstruction. Note this must be
+            strictly smaller than the bf_mask used for initialization.
+        override_aberration_coefs : dict, optional
+            Aberration coefficients for the probe
+        upsampling_factor : int, optional
+            Factor by which to upsample the reconstruction
+        override_rotation_angle : float, optional
+            Rotation angle for coordinate system, in degrees
+        max_batch_size : int, optional
+            Number of bright-field pixels processed at once. Defaults to as many as keep one
+            ``(batch, Ny, Nx, columns)`` buffer near 32 million elements.
+        deconvolution_kernel : str, one of ['ssb', 'obf', 'prlx', 'icom']
+            ``"obf"`` solves the per-frequency least-squares problem and divides each channel
+            by its noise standard deviation, so the noise is white and the transfer follows the
+            signal-to-noise ratio. Its values are not calibrated radians: on a weak
+            white-noise object the median transfer over the band was 0.7-0.9 for OBF, 0.5-0.8
+            for SSB, and depended on the aberrations for both. At ``upsampling_factor > 1``
+            the output of every kernel carries an extra ``1 / U**2``.
+        q_highpass : float, optional
+            High-pass filter cutoff
+        q_lowpass : float, optional
+            Low-pass filter cutoff. For ``"prlx"`` and ``"icom"`` it is clamped to at most
+            ``2 * semiangle_cutoff / wavelength``, past which ``G(k, q)`` holds no signal.
+            ``"ssb"`` and ``"obf"`` impose that cutoff through ``gamma`` already.
+        band_limit : bool
+            Apply that clamp. Turn it off to inspect the raw kernel.
+        ridge : float, optional
+            The deconvolution's ridge, relative to the scale of what it inverts. Defaults to
+            1e-5.
 
-            # second pass
-            for batch_idx in batcher:
-                ff = fourier_factor[batch_idx]
+            For ``"obf"`` it is the ridge on the unit-diagonal Gram matrix when it solves for
+            several columns: several slices, or phase and amplitude. Near zero, the
+            default, is the joint least-squares solve, which separates the columns wherever
+            they differ at all, at a noise cost of ``1 / (1 - rho^2)`` for columns with
+            correlation ``rho``. Larger values shrink the combinations the data barely tell
+            apart; as it grows every slice tends to its own plane's reconstruction, a sweep of
+            independent planes with no separation and no noise cost. Raise it at low dose:
+            for two slices 0.1 ``lambda / alpha^2`` apart, 0.01 kept a purity of 0.94 and
+            lifted each slice's correlation with its layer from 0.78 to 0.85 at 1e4 electrons
+            per pattern, while at 1e5 the default was best.
+        parallax_flip_phase : bool
+            Apply the ``sign(sin(chi))`` phase flip to ``"prlx"``.
+        verbose : bool, optional
+            If True, show progress bar
+        use_initial_state : bool
+            Reconstruct with the initial rather than the optimized hyperparameters.
+        obj_type : {"pure_phase", "complex"}
+            ``"complex"`` also recovers the weak-object log-amplitude ``ln|t|``, stored in
+            :attr:`corrected_amplitude`, from the symmetric overlap ``Gamma+``. Both channels
+            are zero-mean.
 
-                if power is not None:
-                    ff /= norm
+            - ``"obf"`` solves for the two channels jointly at each frequency, so
+              neither leaks into the other. In the triple overlap of an aberrated probe the
+              two overlap functions are nearly parallel, which costs some signal-to-noise
+              ratio there but not separation.
+            - ``"ssb"`` uses only the two double-overlap sidebands, where
+              ``Gamma+ = +-Gamma-``: their phase-compensated sum is the amplitude and their
+              difference the phase. This separates exactly for any aberration, but drops the
+              triple overlap, so its phase differs slightly from the pure-phase SSB.
+            - ``"icom"`` returns the zeroth moment, the plain bright-field sum, which carries
+              no phase for any aberration but is not deconvolved.
+            - ``"prlx"`` raises: tilt-corrected bright field sums the two sidebands and records
+              only ``cos(chi) Psi_a + sin(chi) Psi_phi`` at each frequency.
 
-                ff *= butterworth_env
-                # ff[:, 0, 0] = self._dc_per_image
+            At low frequencies the two channels are told apart by the double overlaps at the
+            aperture edge, a crescent about one detector pixel wide, so two things in the data
+            matter more here than for the phase alone. Fitting the diffraction origin
+            resamples every pattern bilinearly, which blurs that crescent; on a white-noise
+            object this raised the amplitude-to-phase leakage from 0.3% with
+            ``force_fitted_origin`` to 4.7% without. And a scan coarser than the band
+            ``2 * semiangle_cutoff / wavelength`` aliases frequencies the per-frequency model
+            does not include, which leaked 1-10% at a scan twice too coarse even with
+            upsampling.
+        num_slices : int
+            Number of thin slices to solve for jointly, ``"obf"`` only. A slice a
+            distance ``z`` downstream of the plane the aberrations refer to sees the probe at
+            ``C10 + z``, and the slices are solved together at each frequency rather than one
+            defocus at a time, which separates layers far closer than ``lambda / alpha**2``.
+            :attr:`corrected_bf` and :attr:`corrected_amplitude` are then
+            ``(num_slices, Ny, Nx)``.
+        slice_thicknesses : float or sequence of float, optional
+            The ``num_slices - 1`` gaps between consecutive slices in Angstrom, or one value
+            for all of them. Defaults to those a hyperparameter fit stored, if any. The stack is centred on the plane ``C10`` refers to, so one slice
+            sits exactly there. The reference plane matters most: it must be right to about a
+            quarter of the spacing, while a spacing wrong by 0.5-1.5 times costs little. Fit
+            ``C10`` with one slice and :meth:`residual_loss`, which places the mean plane of
+            the specimen to a fraction of an Angstrom, then add slices about it. With several
+            slices the residual barely depends on the offset or the spacing, because slices
+            far closer than ``lambda / alpha**2`` span nearly the same columns whatever their
+            positions: an assumed spacing ``s`` times too small mostly rescales the difference
+            between the slices by ``1 / s``.
+        differentiable : bool
+            Keep the autograd graph, so that :attr:`corrected_bf`, :attr:`corrected_amplitude`
+            and :meth:`residual_loss` (then a tensor) can be backpropagated to aberration
+            coefficients, a rotation angle or slice thicknesses passed as tensors that require
+            grad. Each batch of bright-field pixels is recomputed in the backward pass rather
+            than stored. :meth:`fit_hyperparameters_gradient` drives this.
 
-                fourier_factor[batch_idx] = torch.fft.ifft2(ff)
+        Returns
+        -------
+        self
+        """
+        if verbose is None:
+            verbose = self.verbose
 
-        self.corrected_stack = fourier_factor.real / BF_weights
+        with torch.set_grad_enabled(bool(differentiable)):
+            return self._reconstruct(
+                bf_mask,
+                override_aberration_coefs,
+                upsampling_factor,
+                override_rotation_angle,
+                max_batch_size,
+                deconvolution_kernel,
+                q_highpass,
+                q_lowpass,
+                butterworth_order,
+                band_limit,
+                parallax_flip_phase,
+                verbose,
+                use_initial_state,
+                obj_type,
+                num_slices,
+                slice_thicknesses,
+                differentiable,
+                ridge,
+            )
+
+    def _reconstruct(
+        self,
+        bf_mask,
+        override_aberration_coefs,
+        upsampling_factor,
+        override_rotation_angle,
+        max_batch_size,
+        deconvolution_kernel,
+        q_highpass,
+        q_lowpass,
+        butterworth_order,
+        band_limit,
+        parallax_flip_phase,
+        verbose,
+        use_initial_state,
+        obj_type,
+        num_slices,
+        slice_thicknesses,
+        differentiable,
+        ridge=None,
+    ):
+        """The body of :meth:`reconstruct`, run with gradients on or off."""
+        ctx = self._reconstruction_context(
+            bf_mask,
+            override_aberration_coefs,
+            upsampling_factor,
+            override_rotation_angle,
+            deconvolution_kernel,
+            q_highpass,
+            q_lowpass,
+            butterworth_order,
+            band_limit,
+            parallax_flip_phase,
+            verbose,
+            use_initial_state,
+        )
+        kernel = ctx["kernel"]
+        self._validate_reconstruction_mode(kernel, obj_type, num_slices)
+        if ridge is None:
+            ridge = EIGENVALUE_FLOOR
+        if num_slices > 1:
+            slice_thicknesses = self.hyperparameter_state.current_slice_thicknesses(
+                slice_thicknesses
+            )
+        depths = slice_depths(num_slices, slice_thicknesses, device=self.device)
+
+        sums = self._accumulate_kernel_sums(ctx, depths, obj_type, max_batch_size, verbose)
+        env = ctx["butterworth_env"]
+        phase_q, amplitude_q = self._fourier_channels(ctx, sums, num_slices, obj_type, ridge)
+        phase = torch.fft.ifft2(phase_q * env).real.to(torch.float32)
+        amplitude = (
+            None
+            if amplitude_q is None
+            else torch.fft.ifft2(amplitude_q * env).real.to(torch.float32)
+        )
+        if num_slices == 1:
+            phase = phase[0]
+            amplitude = None if amplitude is None else amplitude[0]
+
+        self._corrected_bf = phase
+        self._corrected_amplitude = amplitude
+        self._obj_type = obj_type
+        self._num_slices = int(num_slices)
+        self._slice_depths = [float(z) for z in depths.detach().cpu()]
+        self._kernel = kernel
+        residual = self._residual_from_sums(ctx, sums)
+        self._residual = residual if differentiable else float(residual)
 
         # memory management
+        del sums
         gc.collect()
         torch.cuda.empty_cache()
         if hasattr(torch, "mps") and torch.backends.mps.is_available():
@@ -799,34 +988,275 @@ class DirectPtychography(DirectPtychographyBase):
 
         return self
 
-    @property
-    def corrected_stack(self):
-        return self._corrected_stack
+    def _return_parallax_stack(self, bf_mask=None, max_batch_size=None, **reconstruct_kwargs):
+        """``(num_bf, Ny, Nx)`` parallax-corrected bright-field images, without the phase flip.
 
-    @corrected_stack.setter
-    def corrected_stack(self, value: torch.Tensor):
-        self._corrected_stack = validate_tensor(value, "corrected_stack", dtype=torch.float32).to(
-            device=self.device
+        The one place a per-pixel stack is still needed: the cross-correlation fit aligns the
+        images to each other.
+        """
+        ctx = self._reconstruction_context(
+            bf_mask,
+            reconstruct_kwargs.get("override_aberration_coefs"),
+            reconstruct_kwargs.get("upsampling_factor"),
+            reconstruct_kwargs.get("override_rotation_angle"),
+            "prlx",
+            reconstruct_kwargs.get("q_highpass"),
+            reconstruct_kwargs.get("q_lowpass"),
+            reconstruct_kwargs.get("butterworth_order", 12),
+            reconstruct_kwargs.get("band_limit", True),
+            False,
+            False,
+            reconstruct_kwargs.get("use_initial_state", False),
         )
+        bf = ctx["bf"]
+        qvec = torch.stack((ctx["qxa"], ctx["qya"]), 0)
+        stack = torch.empty(
+            (bf.num_bf,) + ctx["qxa"].shape, device=self.device, dtype=torch.float32
+        )
+        batcher = SimpleBatcher(
+            bf.num_bf, batch_size=max_batch_size or bf.num_bf, shuffle=False, rng=self.rng
+        )
+        for batch_idx in batcher:
+            vbf_fourier = self._tiled_vbf_fourier(bf, batch_idx, ctx["upsampling_factor"])
+            grad_kq = torch.einsum("na,amp->nmp", ctx["grad_k"][batch_idx], qvec)
+            shifted = vbf_fourier * torch.exp(-1j * grad_kq) * ctx["butterworth_env"]
+            stack[batch_idx] = torch.fft.ifft2(shifted).real / ctx["bf_weights"]
+        return stack
 
     @property
     def corrected_bf(self):
-        if self.corrected_stack is None:
-            return None
-        return self.corrected_stack.sum(dim=0)
+        """The reconstructed phase: ``(Ny, Nx)``, or ``(num_slices, Ny, Nx)`` for several slices."""
+        return getattr(self, "_corrected_bf", None)
 
-    def variance_loss(self):
-        """ """
-        if self.corrected_stack is None:
-            return None
-        if self.corrected_stack.abs().sum() > 0:
-            mean_corrected_bf = self.corrected_stack.mean(dim=0)
-            variance_loss = ((self.corrected_stack - mean_corrected_bf).abs().square()).mean()
+    def fit_hyperparameters_gradient(
+        self,
+        parameters=("C10",),
+        loss="residual",
+        optimizer: Literal["lbfgs", "adam"] = "lbfgs",
+        num_iterations: int | None = None,
+        learning_rate: float | None = None,
+        use_initial_state: bool = False,
+        verbose=None,
+        **reconstruct_kwargs,
+    ):
+        """
+        Fit aberrations, the rotation angle and slice thicknesses by gradient descent.
+
+        The reconstruction is differentiable in all three, so the loss is minimized with
+        autograd rather than sampled as :meth:`optimize_hyperparameters` does. Each step
+        reconstructs once with gradients on and recomputes every batch of bright-field pixels
+        in the backward pass, which costs about three reconstructions in time and one batch in
+        memory.
+
+        Every parameter is moved in natural units, which keeps the optimizer well scaled: an
+        aberration ``C_nm`` by the amount that changes ``chi`` by one radian at the aperture
+        edge, an angle ``phi_nm`` by 0.1 rad, the rotation by one degree, and each slice
+        thickness by a factor ``exp(1)`` (it is fitted on a log scale, so it stays positive).
+
+        Parameters
+        ----------
+        parameters : sequence of str
+            What to fit, each starting from the current state: aberration coefficients such
+            as ``"C10"``, ``"C12"`` or ``"phi12"``, ``"rotation_angle"`` for the detector
+            rotation, and ``"slice_thicknesses"`` for the gaps between slices when
+            ``num_slices > 1`` is in ``reconstruct_kwargs``. The gaps start from
+            ``reconstruct_kwargs["slice_thicknesses"]`` or the state. When the spacing is far
+            below ``lambda / alpha**2`` the residual barely depends on it, so expect a slow,
+            weakly determined fit there, and fit ``C10`` with one slice first.
+        loss : {"residual", "rms_gradient"} or callable
+            Objective to minimize. A callable is passed the reconstruction after a
+            differentiable :meth:`reconstruct` and must return a scalar tensor.
+        optimizer : {"lbfgs", "adam"}
+            L-BFGS with a strong-Wolfe line search, or Adam.
+        num_iterations : int, optional
+            Iterations of L-BFGS (default 20) or Adam steps (default 100).
+        learning_rate : float, optional
+            Step in the natural units above: 1.0 for L-BFGS, 0.1 for Adam.
+        use_initial_state : bool
+            Start from the initial rather than the current hyperparameters.
+        verbose : bool, optional
+            Print the fitted values.
+        **reconstruct_kwargs
+            Passed to every :meth:`reconstruct`, e.g. ``deconvolution_kernel``, ``obj_type``,
+            ``num_slices``, ``bf_mask`` or ``upsampling_factor``.
+
+        Returns
+        -------
+        self
+            With the fitted values written to :attr:`hyperparameter_state` and a final
+            reconstruction made with them. ``_gradient_fit_history`` holds the loss and
+            parameters after every evaluation.
+        """
+        if verbose is None:
+            verbose = self.verbose
+        state = self.hyperparameter_state
+        reconstruct_kwargs = dict(reconstruct_kwargs)
+        reconstruct_kwargs.pop("use_initial_state", None)
+        reconstruct_kwargs.pop("differentiable", None)
+
+        if use_initial_state:
+            start = dict(state.initial_aberrations)
+            start_rotation = state.initial_rotation_angle
         else:
-            variance_loss = torch.tensor(
-                torch.inf, dtype=self.corrected_stack.dtype, device=self.device
+            start = state.current_aberrations()
+            start_rotation = state.current_rotation_angle()
+        start_rotation = 0.0 if start_rotation is None else float(start_rotation)
+        parameters = [parameters] if isinstance(parameters, str) else list(parameters)
+        rotation_angle = "rotation_angle" in parameters
+        slice_thicknesses = "slice_thicknesses" in parameters
+        names = list(
+            validate_aberration_coefficients(
+                {name: 0.0 for name in parameters if name not in HyperparameterState._OTHER_KEYS}
             )
-        return variance_loss
+        )
+        if names and self.fourier_probe is not None:
+            self._require_analytic_probe("A gradient fit of the aberrations", start)
+
+        num_slices = int(reconstruct_kwargs.get("num_slices", 1))
+        start_thicknesses = state.current_slice_thicknesses(
+            reconstruct_kwargs.pop("slice_thicknesses", None)
+        )
+        if slice_thicknesses:
+            if num_slices < 2:
+                raise ValueError("Fitting `slice_thicknesses` needs `num_slices > 1`.")
+            if start_thicknesses is None:
+                raise ValueError(
+                    "Pass a starting `slice_thicknesses` to fit, or run a search that stores one."
+                )
+
+        # natural units: the change in each coefficient that moves chi by one radian at alpha
+        alpha = (
+            self.semiangle_cutoff * 1e-3
+            if self.semiangle_cutoff is not None
+            else self._return_band_limit() / 2 * self.wavelength
+        )
+
+        def unit(name):
+            if name.startswith("phi"):
+                return 0.1
+            order = int(name[1])
+            return self.wavelength * (order + 1) / (2 * math.pi * alpha ** (order + 1))
+
+        offsets = {name: torch.zeros((), device=self.device, requires_grad=True) for name in names}
+        trainable = list(offsets.values())
+        rotation_offset = None
+        if rotation_angle:
+            rotation_offset = torch.zeros((), device=self.device, requires_grad=True)
+            trainable.append(rotation_offset)
+        log_thicknesses = None
+        if slice_thicknesses:
+            base = torch.as_tensor(start_thicknesses, dtype=torch.float32, device=self.device)
+            base = base.reshape(-1).expand(num_slices - 1).clone()
+            log_thicknesses = torch.zeros_like(base, requires_grad=True)
+            trainable.append(log_thicknesses)
+        if not trainable:
+            raise ValueError(
+                "Nothing to fit: name aberrations, 'rotation_angle' or 'slice_thicknesses'."
+            )
+
+        def current():
+            coefs = dict(start)
+            for name, offset in offsets.items():
+                coefs[name] = float(start.get(name, 0.0)) + offset * unit(name)
+            rotation = (
+                start_rotation if rotation_offset is None else start_rotation + rotation_offset
+            )
+            thicknesses = (
+                start_thicknesses if log_thicknesses is None else base * torch.exp(log_thicknesses)
+            )
+            return coefs, rotation, thicknesses
+
+        def scalar(value):
+            return float(value.detach()) if isinstance(value, torch.Tensor) else float(value)
+
+        def snapshot(coefs, rotation, thicknesses):
+            values = {name: scalar(coefs[name]) for name in names}
+            if rotation_offset is not None:
+                values["rotation_angle"] = scalar(rotation)
+            if log_thicknesses is not None:
+                values["slice_thicknesses"] = [float(t) for t in thicknesses.detach().cpu()]
+            return values
+
+        history = []
+
+        def evaluate():
+            coefs, rotation, thicknesses = current()
+            kwargs = dict(reconstruct_kwargs)
+            if thicknesses is not None:
+                kwargs["slice_thicknesses"] = thicknesses
+            self.reconstruct(
+                override_aberration_coefs=coefs,
+                override_rotation_angle=rotation,
+                differentiable=True,
+                verbose=False,
+                **kwargs,
+            )
+            if callable(loss):
+                value = loss(self)
+            elif loss in ("residual", "rms_gradient"):
+                value = self.residual_loss() if loss == "residual" else self.rms_gradient_loss()
+            else:
+                raise ValueError(
+                    f"`loss` must be 'residual', 'rms_gradient' or a callable, got {loss!r}"
+                )
+            if not isinstance(value, torch.Tensor) or not value.requires_grad:
+                raise ValueError(
+                    "The loss is not connected to the fitted parameters; a callable loss must "
+                    "return a tensor computed from the reconstruction."
+                )
+            history.append({"loss": scalar(value), **snapshot(coefs, rotation, thicknesses)})
+            return value
+
+        if optimizer == "lbfgs":
+            opt = torch.optim.LBFGS(
+                trainable,
+                lr=1.0 if learning_rate is None else learning_rate,
+                max_iter=20 if num_iterations is None else num_iterations,
+                line_search_fn="strong_wolfe",
+            )
+
+            def closure():
+                opt.zero_grad()
+                value = evaluate()
+                value.backward()
+                return value
+
+            opt.step(closure)
+        elif optimizer == "adam":
+            opt = torch.optim.Adam(trainable, lr=0.1 if learning_rate is None else learning_rate)
+            for _ in tqdm(
+                range(100 if num_iterations is None else num_iterations), disable=not verbose
+            ):
+                opt.zero_grad()
+                evaluate().backward()
+                opt.step()
+        else:
+            raise ValueError(f"`optimizer` must be 'lbfgs' or 'adam', got {optimizer!r}")
+
+        best = min(history, key=lambda entry: entry["loss"])
+        fitted = {name: best[name] for name in names}
+        state.clear_optimized()
+        state.optimized_aberrations = {**start, **fitted}
+        state.optimized_keys = set(names)
+        if rotation_offset is not None:
+            state.optimized_rotation_angle = best["rotation_angle"]
+            state.optimized_keys.add("rotation_angle")
+        elif not use_initial_state:
+            state.optimized_rotation_angle = start_rotation
+        if log_thicknesses is not None:
+            state.optimized_slice_thicknesses = best["slice_thicknesses"]
+            state.optimized_keys.add("slice_thicknesses")
+        elif start_thicknesses is not None:
+            state.optimized_slice_thicknesses = [
+                float(t) for t in np.atleast_1d(np.asarray(start_thicknesses, dtype=float))
+            ]
+        self._gradient_fit_history = history
+
+        if verbose:
+            print("Optimized state:\n\n", self.hyperparameter_state)
+
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
+        return self
 
     def fit_hyperparameters_cross_correlation(
         self,
@@ -895,27 +1325,31 @@ class DirectPtychography(DirectPtychographyBase):
             self.scan_sampling, device=self.device, dtype=torch.float32
         )
 
-        # initial reconstruction
+        # initial parallax-corrected stack, which the alignment refines
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "parallax_flip_phase"]
+            if k
+            not in [
+                "deconvolution_kernel",
+                "parallax_flip_phase",
+                "obj_type",
+                "num_slices",
+                "slice_thicknesses",
+                "verbose",
+            ]
         }
 
         state = self.hyperparameter_state
         state.clear_optimized()
 
-        self.reconstruct(
+        vbf_stack = self._return_parallax_stack(
+            bf_mask=bf_mask,
             override_rotation_angle=rotation_angle,
             override_aberration_coefs=aberration_coefs,
-            deconvolution_kernel="parallax",
-            parallax_flip_phase=False,
-            verbose=False,
             use_initial_state=use_initial_state,
             **safe_kwargs,
         )
-
-        vbf_stack = self.corrected_stack.clone()
 
         # Get initial shifts
         lateral_shifts = self._return_lateral_shifts(rotation_angle, aberration_coefs, bf_mask)
@@ -962,8 +1396,6 @@ class DirectPtychography(DirectPtychographyBase):
             self.sampling,
         )
 
-        self.corrected_stack = vbf_stack
-
         fitted_aberration_coefs = fit_results.copy()
         fitted_rotation_angle = fitted_aberration_coefs.pop("rotation_angle", None)
 
@@ -978,332 +1410,13 @@ class DirectPtychography(DirectPtychographyBase):
 
         return self
 
-    def _select_q_modes(self, num_q_modes, signal_weight=0.5, proximity_sharpness=2.0):
-        """
-        Args:
-            signal_weight: 0 = pure proximity, 1 = pure signal, 0.5 = balanced
-            proximity_sharpness: higher = more concentrated around alpha_optimal
-        """
-        qxa, qya = self._return_upsampled_qgrid()
-        alpha = torch.sqrt(qxa**2 + qya**2) * self.wavelength
-        alpha_optimal = self.semiangle_cutoff * 1e-3
-
-        # Normalize both metrics to [0, 1]
-        signal_normalized = self._q_signal_power / self._q_signal_power.max()
-
-        distance_penalty = torch.abs(alpha - alpha_optimal) / alpha_optimal
-        proximity_score = torch.exp(-proximity_sharpness * distance_penalty**2)
-
-        # Weighted geometric mean (more robust than arithmetic)
-        selection_metric = (signal_normalized**signal_weight) * (
-            proximity_score ** (1 - signal_weight)
-        )
-
-        flat_inds = torch.argsort(selection_metric.flatten(), descending=True)
-        qi = flat_inds // selection_metric.shape[1]
-        qj = flat_inds % selection_metric.shape[1]
-
-        return qi[:num_q_modes], qj[:num_q_modes]
-
-    def _fit_hyperparameters_least_squares_inner(
-        self,
-        bf_mask: torch.Tensor,
-        aberration_coefs: dict[str, int | float | torch.Tensor] = {},
-        rotation_angle: float | None = None,
-        cartesian_basis: str | list[str] = "low_order",
-        num_q_modes: int = 6,
-        q_signal_weight: float = 0.05,
-        unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
-        two_pass_unwrapping: bool = False,
-    ):
-        """
-        Phase-only least-squares aberration fit from vBF Fourier data.
-        Returns delta aberrations in cartesian form.
-        """
-        if isinstance(cartesian_basis, str):
-            cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
-
-        device = self.device
-        wavelength = self.wavelength
-
-        # ---------------------------------------------------------
-        # Select strongest spatial frequencies
-        # ---------------------------------------------------------
-        qi, qj = self._select_q_modes(num_q_modes, signal_weight=q_signal_weight)
-        qxa, qya = self._return_upsampled_qgrid()
-        qx = qxa[qi, qj]  # (N_q,)
-        qy = qya[qi, qj]  # (N_q,)
-
-        N_q = qx.numel()
-        P = len(cartesian_basis)
-
-        # ---------------------------------------------------------
-        # k-space BF pixels
-        # ---------------------------------------------------------
-        kxa, kya = spatial_frequencies(
-            self.gpts,
-            self.sampling,
-            rotation_angle=_rotation_degrees_to_radians(rotation_angle),
-            device=device,
-        )
-
-        kx = kxa[bf_mask]  # (N_k,)
-        ky = kya[bf_mask]  # (N_k,)
-
-        # reshape for broadcasting
-        kx = kx[:, None]  # (N_k, 1)
-        ky = ky[:, None]
-        qx = qx[None, :]  # (1, N_q)
-        qy = qy[None, :]
-
-        # ---------------------------------------------------------
-        # k, k+q, k−q coordinates
-        # ---------------------------------------------------------
-        k0, phi0 = polar_coordinates(kx, ky)
-        kp, phip = polar_coordinates(kx + qx, ky + qy)
-        km, phim = polar_coordinates(kx - qx, ky - qy)
-
-        # ---------------------------------------------------------
-        # Aperture + chi (prior aberrations)
-        # ---------------------------------------------------------
-        ap0 = aperture(
-            k0 * wavelength, phi0, self.semiangle_cutoff, self.angular_sampling, soft_edges=True
-        )
-        app = aperture(
-            kp * wavelength, phip, self.semiangle_cutoff, self.angular_sampling, soft_edges=True
-        )
-        apm = aperture(
-            km * wavelength, phim, self.semiangle_cutoff, self.angular_sampling, soft_edges=True
-        )
-
-        chi0 = aberration_surface(k0 * wavelength, phi0, wavelength, aberration_coefs)
-        chip = aberration_surface(kp * wavelength, phip, wavelength, aberration_coefs)
-        chim = aberration_surface(km * wavelength, phim, wavelength, aberration_coefs)
-
-        # ---------------------------------------------------------
-        # Overlap-only masks
-        # ---------------------------------------------------------
-        def ap_to_mask(ap, eps=1e-6):
-            return ap > eps
-
-        m0 = ap_to_mask(ap0)
-        mp = ap_to_mask(app)
-        mm = ap_to_mask(apm)
-
-        plus_mask = m0 & mp & ~mm
-        minus_mask = m0 & mm & ~mp
-
-        # ---------------------------------------------------------
-        # Gamma and phase deconvolution
-        # ---------------------------------------------------------
-        psi0 = ap0 * torch.exp(-1j * chi0)
-        psip = app * torch.exp(-1j * chip)
-        psim = apm * torch.exp(-1j * chim)
-
-        gamma = psim * psi0.conj() - psip.conj() * psi0
-
-        valid = gamma.abs() > 1e-6
-        plus_mask &= valid
-        minus_mask &= valid
-
-        gamma_angle = torch.angle(gamma)
-        measured = self._vbf_fourier[:, qi, qj]  # (N_k, N_q)
-        deconv = measured * torch.exp(-1j * gamma_angle)
-
-        # ---------------------------------------------------------
-        # Pre-compute all basis functions (vectorized)
-        # ---------------------------------------------------------
-        chi_0_basis = aberration_surface_cartesian_basis(
-            k0[:, 0] * wavelength,
-            phi0[:, 0],
-            wavelength,
-            cartesian_basis,
-        )  # (N_k, P)
-
-        # For k+q and k-q (depends on q)
-        chi_p_basis = aberration_surface_cartesian_basis(
-            kp.flatten() * wavelength,
-            phip.flatten(),
-            wavelength,
-            cartesian_basis,
-        ).reshape(kp.shape[0], kp.shape[1], P)  # (N_k, N_q, P)
-
-        chi_m_basis = aberration_surface_cartesian_basis(
-            km.flatten() * wavelength,
-            phim.flatten(),
-            wavelength,
-            cartesian_basis,
-        ).reshape(km.shape[0], km.shape[1], P)  # (N_k, N_q, P)
-
-        # Pre-allocate unwrapped phases
-        phi_plus_all = torch.zeros_like(deconv, dtype=torch.float32)
-        phi_minus_all = torch.zeros_like(deconv, dtype=torch.float32)
-
-        for j in range(N_q):
-            phi_plus_all[:, j] = unwrap_bf_overlap_phase_torch(
-                complex_data_bf=deconv[:, j],
-                mask_bf=plus_mask[:, j],
-                bf_mask=bf_mask,
-                method=unwrap_method,
-                two_pass=two_pass_unwrapping,
-            )
-
-            phi_minus_all[:, j] = unwrap_bf_overlap_phase_torch(
-                complex_data_bf=deconv[:, j],
-                mask_bf=minus_mask[:, j],
-                bf_mask=bf_mask,
-                method=unwrap_method,
-                two_pass=two_pass_unwrapping,
-            )
-
-        mask_plus_flat = plus_mask.reshape(-1)
-        mask_minus_flat = minus_mask.reshape(-1)
-
-        # dchi_plus_flat: (N_k*N_q, P)
-        dchi_plus_flat = (chi_p_basis - chi_0_basis[:, None, :]).reshape(-1, P)
-        dchi_minus_flat = (chi_0_basis[:, None, :] - chi_m_basis).reshape(-1, P)
-
-        # rhs
-        phi_plus_flat = phi_plus_all.reshape(-1)
-        phi_minus_flat = phi_minus_all.reshape(-1)
-
-        A_plus = torch.cat(
-            [
-                dchi_plus_flat[mask_plus_flat],
-                torch.eye(N_q, device=device).repeat_interleave(plus_mask.sum(0), dim=0),
-            ],
-            dim=1,
-        )
-
-        b_plus = phi_plus_flat[mask_plus_flat]
-
-        A_minus = torch.cat(
-            [
-                dchi_minus_flat[mask_minus_flat],
-                torch.eye(N_q, device=device).repeat_interleave(minus_mask.sum(0), dim=0),
-            ],
-            dim=1,
-        )
-
-        b_minus = phi_minus_flat[mask_minus_flat]
-
-        A = torch.cat([A_plus, A_minus], dim=0)
-        b = torch.cat([b_plus, b_minus], dim=0)
-
-        # ---------------------------------------------------------
-        # Solve LS
-        # ---------------------------------------------------------
-        # Fall back to CPU (to support MPS), as fit_linear_plane does for eigh
-        sol = torch.linalg.lstsq(A.cpu(), b.cpu()).solution.to(A.device)
-
-        delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
-
-        return merge_aberration_coefficients(aberration_coefs, delta_cartesian)
-
-    def fit_hyperparameters_least_squares(
-        self,
-        aberration_coefs: dict[str, int | float] | None = None,
-        rotation_angle: float | None = None,
-        cartesian_basis: str | list[str] | list[list[str]] = "low_order",
-        num_q_modes: int = 6,
-        q_signal_weight: float = 0.5,
-        fit_method: Literal["global", "recursive", "sequential"] = "recursive",
-        unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
-        two_pass_unwrapping: bool = False,
-        verbose=None,
-        use_initial_state=False,
-        bf_mask=None,
-        **reconstruct_kwargs,
-    ):
-        """
-        Fit aberration coefficients using least squares.
-
-        Args:
-            aberration_coefs: Initial aberration coefficients to deconvolve
-            rotation_angle: Rotation angle for basis functions, in degrees
-            cartesian_basis: Aberration basis to fit. Can be:
-                - str: preset name like "low_order"
-                - list[str]: explicit list like ["C10", "C12_a", "C12_b", ...]
-                - list[list[str]]: custom grouping for sequential fitting
-            num_q_modes: Number of spatial frequency modes to use
-            q_signal_weight: Balance between signal (1.0) and proximity to α_optimal (0.0)
-            fit_method: How to iterate through basis functions:
-                - "global": fit all coefficients simultaneously
-                - "recursive": fit by radial order, accumulating previous orders
-                - "sequential": fit by radial order, only current order each pass
-            unwrap_method: Phase unwrapping algorithm
-            two_pass_unwrapping: Whether to use two-pass unwrapping
-
-        Returns:
-            Updated aberration coefficients dictionary
-        """
-
-        state = self.hyperparameter_state
-
-        if verbose is None:
-            verbose = self.verbose
-
-        if use_initial_state:
-            aberration_coefs = state.initial_aberrations
-            rotation_angle = state.initial_rotation_angle
-        else:
-            aberration_coefs = state.current_aberrations(aberration_coefs)
-            rotation_angle = state.current_rotation_angle(rotation_angle)
-
-        if bf_mask is None:
-            bf_mask = self.bf_mask
-        bf = self._return_bf_context(bf_mask)
-        bf_mask = bf.bf_mask
-
-        # Parse cartesian_basis into list of coefficient groups
-        if isinstance(cartesian_basis, str):
-            cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
-
-        if len(cartesian_basis) > 0 and isinstance(cartesian_basis[0], list):
-            basis_groups = cartesian_basis
-        else:
-            basis_groups = group_basis_by_method(
-                cartesian_basis,  # ty:ignore[invalid-argument-type]
-                fit_method,
-            )
-
-        state.clear_optimized()
-        current_coefs = aberration_coefs.copy()
-        # Convert all values to tensors
-        current_coefs = {
-            k: torch.as_tensor(v, device=self.device, dtype=torch.float32)
-            for k, v in aberration_coefs.items()
-        }
-
-        # Iterate through basis groups
-        pbar = tqdm(basis_groups, desc="Fitting aberrations", unit="order", disable=not verbose)
-        for i, basis_group in enumerate(pbar):
-            pbar.set_postfix_str(f"{basis_group}"[:50])
-
-            current_coefs = self._fit_hyperparameters_least_squares_inner(
-                bf_mask,
-                aberration_coefs=current_coefs,
-                rotation_angle=rotation_angle,
-                cartesian_basis=basis_group,
-                num_q_modes=num_q_modes,
-                q_signal_weight=q_signal_weight,
-                unwrap_method=unwrap_method,
-                two_pass_unwrapping=two_pass_unwrapping,
-            )
-        pbar.close()
-
-        optimized_coefs = {k: float(v) for k, v in current_coefs.items() if v != 0.0}
-        state.optimized_aberrations = validate_aberration_coefficients(optimized_coefs)
-
-        if verbose:
-            print("Optimized state:\n\n", self.hyperparameter_state)
-
-        self.reconstruct(verbose=False, **reconstruct_kwargs)
-
-        return self
+    #: every kernel, in the order :meth:`_reconstruct_all_permutations` returns them
+    _PERMUTATION_KERNELS = ("ssb", "obf", "prlx", "icom")
 
     def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
-        """ """
+        """Every kernel's :attr:`obj` with the same settings, in :attr:`_PERMUTATION_KERNELS`
+        order, leaving out those that cannot take them: ``"prlx"`` for a complex object and all
+        but ``"obf"`` for several slices."""
 
         if verbose is None:
             verbose = self.verbose
@@ -1312,7 +1425,12 @@ class DirectPtychography(DirectPtychographyBase):
             k: v for k, v in reconstruct_kwargs.items() if k not in ["deconvolution_kernel"]
         }
 
-        kernels = ["ssb", "obf", "mf", "prlx", "icom"]
+        # only the kernels that support the requested object type and number of slices
+        kernels = list(self._PERMUTATION_KERNELS)
+        if safe_kwargs.get("obj_type", "pure_phase") == "complex":
+            kernels.remove("prlx")
+        if safe_kwargs.get("num_slices", 1) > 1:
+            kernels = [k for k in kernels if k in self._MULTISLICE_KERNELS]
 
         recons = [
             self.reconstruct(

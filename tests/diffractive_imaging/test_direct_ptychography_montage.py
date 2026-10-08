@@ -5,6 +5,8 @@ The headline check is equivalence with the Fourier-space parallax kernel of
 so on a raster scan with periodic wraparound they must agree.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -327,13 +329,12 @@ class TestFourierEquivalence:
         rescaled = normalized * montage.num_bf / bf_weights
         assert _relative_error(rescaled, unnormalized) < 1e-4
 
-    def test_variance_loss_tracks_the_fourier_one(self, dataset4d):
-        """The two accumulators agree per bright-field image, not just on the sum.
+    def test_residual_loss_tracks_the_fourier_one(self, dataset4d):
+        """Both measure the spread of the parallax-corrected images about their mean.
 
-        ``band_limit=False`` because the two classes filter at different stages. The Fourier
-        class multiplies the envelope into each bright-field image before its inverse
-        transform, while the montage applies it once to the finished canvas. Those agree on
-        the sum but not image by image, which is what the variance reads.
+        At the integer-shift defocus the montage's nearest-pixel deposit is the exact shift,
+        so the two agree up to the frequencies past the band limit that only the montage
+        counts. ``band_limit=False`` because the two classes filter at different stages.
         """
         defocus = integer_shift_defocus(1)
         fourier, montage = _build_pair(dataset4d, defocus)
@@ -347,9 +348,7 @@ class TestFourierEquivalence:
         fourier.reconstruct(**recon_kwargs)
         montage.reconstruct(weight_normalize=False, **recon_kwargs)
 
-        bf_weights = float(montage._bf_weights)
-        expected = float(fourier.variance_loss()) * bf_weights**2
-        assert float(montage.variance_loss()) == pytest.approx(expected, rel=1e-3)
+        assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), rel=5e-3)
 
     def test_bf_mask_subsets_are_additive(self, dataset4d):
         """Checkerboard half-sets, rescaled by their BF weights, sum to the whole."""
@@ -372,7 +371,7 @@ class TestFourierEquivalence:
 
         assert _relative_error(halves[0] + halves[1], full) < 1e-4
 
-    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
     def test_accepts_the_deconvolution_kernels(self, dataset4d, kernel):
         """Available as truncated real-space convolutions; see `TestRealSpaceKernels`."""
         _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
@@ -721,7 +720,7 @@ class TestHyperparameterSearch:
         step = (1.6 - 0.4) * true_defocus / 6
         assert abs(best - true_defocus) <= step
 
-    def test_variance_loss_is_minimized_at_the_true_defocus(self, dataset4d):
+    def test_residual_loss_is_minimized_at_the_true_defocus(self, dataset4d):
         true_defocus = integer_shift_defocus(1)
         _, montage = _build_pair(dataset4d, true_defocus)
 
@@ -732,23 +731,23 @@ class TestHyperparameterSearch:
                 parallax_flip_phase=False,
                 verbose=False,
             )
-            losses[scale] = float(montage.variance_loss())
+            losses[scale] = montage.residual_loss()
 
         assert all(value > 0 for value in losses.values())
         assert min(losses, key=losses.get) == pytest.approx(1.0)
 
     def test_rms_gradient_drives_a_search_over_a_convolution_kernel(self, dataset4d):
-        """`variance_loss` is undefined for `ssb` here; the sharpness objective is not.
+        """`residual_loss` is undefined for the `ssb` stencil here; the sharpness objective is not.
 
         That is the reason it exists on this class: without it there is no way to tune
-        aberrations for the real-space SSB/OBF/MF kernels at all.
+        aberrations for the real-space SSB/OBF kernels at all.
         """
         true_defocus = integer_shift_defocus(1)
         _, montage = _build_pair(dataset4d, true_defocus)
 
         montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=6, verbose=False)
         with pytest.raises(NotImplementedError):
-            montage.variance_loss()
+            montage.residual_loss()
 
         montage.grid_search_hyperparameters(
             aberration_coefs={
@@ -838,7 +837,7 @@ class TestSparseEvents:
         a, b = self._both(dense, sparse, deconvolution_kernel="prlx", parallax_flip_phase=False)
         assert _relative_error(b, a) < 1e-5
 
-    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
     def test_deconvolution_stencils_match_dense(self, dataset4d, kernel):
         dense, sparse = self._pair(dataset4d, integer_shift_defocus(1))
         a, b = self._both(
@@ -919,13 +918,11 @@ class TestSparseEvents:
         a, b = self._both(dense, sparse, deconvolution_kernel="prlx", parallax_flip_phase=False)
         assert _relative_error(b, a) < 1e-5
 
-    def test_variance_loss_matches_dense(self, dataset4d):
+    def test_residual_loss_matches_dense(self, dataset4d):
         """The sum of squares is quadratic, so it takes the three-term expansion."""
         dense, sparse = self._pair(dataset4d, integer_shift_defocus(1))
         self._both(dense, sparse, deconvolution_kernel="prlx", parallax_flip_phase=False)
-        assert float(sparse.variance_loss()) == pytest.approx(
-            float(dense.variance_loss()), rel=1e-5
-        )
+        assert sparse.residual_loss() == pytest.approx(dense.residual_loss(), rel=1e-5)
 
     def test_bright_field_subset_matches_dense(self, dataset4d):
         """`reconstruct(bf_mask=...)` re-indexes the event table onto the subset."""
@@ -1198,7 +1195,7 @@ class TestSerialization:
         assert restored.hyperparameter_state.optimized_aberrations == {"C10": 123.0}
         assert restored.hyperparameter_state.optimized_rotation_angle == 7.5
         assert restored.gpts == recon.gpts
-        assert float(restored.variance_loss()) == pytest.approx(float(recon.variance_loss()))
+        assert restored.residual_loss() == pytest.approx(recon.residual_loss())
 
         # and it must still be able to reconstruct
         restored.reconstruct(deconvolution_kernel="prlx", verbose=False)
@@ -1300,7 +1297,7 @@ class TestFourierProbe:
         return analytic, empirical
 
     @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
     def test_empirical_probe_reproduces_the_analytic_one(self, dataset4d, cls, kernel):
         """The headline: the same probe, described two ways, must reconstruct the same.
 
@@ -1569,7 +1566,7 @@ class TestFourierProbe:
         "array, match",
         [
             (np.ones((8, 8)), "must be a complex probe"),
-            (np.ones((8, 8, 2), dtype=complex), "must be 2D"),
+            (np.ones((2, 8, 8, 2), dtype=complex), "must be 2D"),
         ],
     )
     def test_array_validation(self, array, match):
@@ -2041,7 +2038,7 @@ class TestDefocusGradient:
 
 
 class TestRealSpaceKernels:
-    """SSB / OBF / MF as truncated real-space convolutions.
+    """SSB / OBF as truncated real-space convolutions.
 
     `obj = sum_m ifft2(G_m * K_m) = sum_m (v_m conv kappa_m)` is an identity, so truncating
     `kappa_m` to a box stencil is the *only* approximation: with a large enough stencil these
@@ -2052,7 +2049,7 @@ class TestRealSpaceKernels:
     being in focus does not help, since there is no chirp to concentrate the kernel.
     """
 
-    KERNELS = ("ssb", "obf", "mf")
+    KERNELS = ("ssb", "obf")
     MAX_RADIUS = 15  # canvas half-width for the 32x32 fixture
 
     @staticmethod
@@ -2128,7 +2125,6 @@ class TestRealSpaceKernels:
             stencil_radius=radius,
             truncation_tolerance=1.0,
             max_stencil_radius=radius,
-            matched_filter_norm_epsilon=1e-1,
             kernel_batch_size=16,
             verbose=False,
         )
@@ -2183,19 +2179,19 @@ class TestRealSpaceKernels:
         assert 0.0 <= info["mean_error"] <= info["max_error"]
 
     @pytest.mark.parametrize("kernel", KERNELS)
-    def test_variance_loss_is_undefined(self, dataset4d, kernel):
+    def test_residual_loss_is_undefined(self, dataset4d, kernel):
         _, montage = self._pair(dataset4d)
         montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=4, verbose=False)
 
         with pytest.raises(NotImplementedError, match="only defined for the parallax"):
-            montage.variance_loss()
+            montage.residual_loss()
 
-    def test_variance_loss_returns_after_a_parallax_reconstruction(self, dataset4d):
+    def test_residual_loss_returns_after_a_parallax_reconstruction(self, dataset4d):
         _, montage = self._pair(dataset4d)
         montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=4, verbose=False)
         montage.reconstruct(verbose=False)
 
-        assert float(montage.variance_loss()) > 0
+        assert montage.residual_loss() > 0
 
     def test_icom_runs_in_either_mode(self, dataset4d):
         _, montage = self._pair(dataset4d)
@@ -2368,14 +2364,14 @@ class TestRealSpaceKernels:
 
 
 class TestConvolutionModes:
-    """`convolution_mode` picks how the SSB / OBF / MF convolutions are evaluated.
+    """`convolution_mode` picks how the SSB / OBF convolutions are evaluated.
 
     `"fft"` multiplies in `q`, which is exact; `"stencil"` truncates to a box, which is not.
     Both are the same operator, so the only differences that may appear are the truncation
     and the circular-versus-linear boundary.
     """
 
-    KERNELS = ("ssb", "obf", "mf")
+    KERNELS = ("ssb", "obf")
 
     @staticmethod
     def _pair(dataset4d, boundary="wrap"):
@@ -2930,13 +2926,13 @@ class TestAccelerators:
 
         assert np.isfinite(obj).all()
 
-    def test_variance_loss_and_search_run(self, dataset4d, device):
+    def test_residual_loss_and_search_run(self, dataset4d, device):
         montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, device=device, **self._kwargs(dataset4d)
         )
         montage.reconstruct(verbose=False)
 
-        assert np.isfinite(float(montage.variance_loss()))
+        assert np.isfinite(montage.residual_loss())
 
     @pytest.mark.parametrize(
         "cls", [DirectPtychography, DirectPtychographyMontage], ids=["fourier", "montage"]
@@ -3118,7 +3114,7 @@ class TestBandLimit:
         expected = 2 * montage.semiangle_cutoff * 1e-3 / montage.wavelength
         assert montage._return_band_limit() == pytest.approx(expected)
 
-    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
     def test_deconvolution_kernels_are_untouched(self, dataset4d, kernel):
         """``gamma`` already vanishes past the band limit, so the clamp must be a no-op."""
         montage = self._recon(dataset4d)
@@ -3183,3 +3179,208 @@ class TestBandLimit:
         assert empirical._return_band_limit() == pytest.approx(
             analytic._return_band_limit(), rel=0.25
         )
+
+
+# ---------------------------------------------------------------------------
+# complex-valued and multislice reconstructions
+# ---------------------------------------------------------------------------
+
+
+def _correlation(a, b):
+    a = np.asarray(a, dtype=np.float64) - np.mean(a)
+    b = np.asarray(b, dtype=np.float64) - np.mean(b)
+    return float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum()))
+
+
+@pytest.fixture(scope="module")
+def complex_pair():
+    """Both classes over one weak object with independent amplitude and phase."""
+    from .conftest import ml_kwargs, thin_layer_4dstem, white_noise_object_2D
+
+    noise = 0.02 * white_noise_object_2D(n=64, phi0=1.0)
+    dataset = thin_layer_4dstem([noise + 0.5j * noise[::-1]], [0.0])
+    fourier = DirectPtychography.from_dataset4d(dataset, **ml_kwargs())
+    montage = DirectPtychographyMontage.from_dataset4d(dataset, boundary="wrap", **ml_kwargs())
+    return fourier, montage
+
+
+@pytest.fixture(scope="module")
+def mixed_pair():
+    """Both classes over a weak object imaged with a two-mode probe, and that probe."""
+    from quantem.core.utils.utils import electron_wavelength_angstrom
+
+    from .conftest import (
+        ML_ABERRATIONS,
+        ML_RECIPROCAL_SAMPLING,
+        library_probe_fourier,
+        ml_kwargs,
+        thin_layer_4dstem,
+        white_noise_object_2D,
+    )
+
+    modes = np.stack(
+        [
+            np.sqrt(0.5) * library_probe_fourier(dict(ML_ABERRATIONS, C10=20.0)),
+            np.sqrt(0.5) * library_probe_fourier(dict(ML_ABERRATIONS, C10=80.0)),
+        ]
+    )
+    noise = 0.02 * white_noise_object_2D(n=64, phi0=1.0)
+    dataset = thin_layer_4dstem([noise + 0.5j * noise[::-1]], [0.0], probe_modes=modes)
+    probe = FourierProbe.from_array(
+        torch.as_tensor(modes, dtype=torch.complex64),
+        (ML_RECIPROCAL_SAMPLING, ML_RECIPROCAL_SAMPLING),
+        electron_wavelength_angstrom(PROBE_ENERGY),
+    )
+    kwargs = dict(ml_kwargs(), crop_bf_mask=False, fourier_probe=probe)
+    fourier = DirectPtychography.from_dataset4d(dataset, **kwargs)
+    montage = DirectPtychographyMontage.from_dataset4d(dataset, boundary="wrap", **kwargs)
+    return fourier, montage
+
+
+class TestMixedStateMontage:
+    """The montage sums the overlap function over probe modes exactly as the Fourier class."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"obj_type": "complex"},
+            {"obj_type": "complex", "num_slices": 2, "slice_thicknesses": 10.0},
+        ],
+    )
+    def test_the_fft_route_matches_the_fourier_class(self, mixed_pair, kwargs):
+        fourier, montage = mixed_pair
+        kwargs = dict(deconvolution_kernel="obf", verbose=False, **kwargs)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        expected = to_numpy(fourier.corrected_bf)
+        assert _relative_error(to_numpy(montage.corrected_bf), expected) < 1e-3
+        assert fourier.residual_loss() < 1e-4
+        assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), abs=1e-5)
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_the_stencil_route_reads_the_modes(self, mixed_pair, kernel):
+        fourier, montage = mixed_pair
+        fourier.reconstruct(deconvolution_kernel=kernel, verbose=False)
+        montage.reconstruct(deconvolution_kernel=kernel, convolution_mode="stencil", verbose=False)
+
+        expected = to_numpy(fourier.corrected_bf)
+        assert correlation(to_numpy(montage.corrected_bf), expected) > 0.99
+
+
+class TestComplexAndMultislice:
+    """The montage reaches the same solves, by FFT exactly and by stencil approximately."""
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_the_fft_route_matches_the_fourier_class(self, complex_pair, kernel):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel=kernel, obj_type="complex", verbose=False)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        # float32 precision over 777 bright-field pixels and 4096 positions; the pure-phase
+        # reconstructions of this fixture already differ by 2e-5
+        for attribute in ("corrected_bf", "corrected_amplitude"):
+            expected = to_numpy(getattr(fourier, attribute))
+            assert _relative_error(to_numpy(getattr(montage, attribute)), expected) < 1e-4
+        # the data are noiseless and weak, so the residual is about 1e-5 and the float32
+        # energies, which agree to 3e-7, set how well it can match
+        assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), abs=1e-6)
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    def test_the_fft_route_solves_several_slices(self, complex_pair, obj_type):
+        fourier, montage = complex_pair
+        kwargs = dict(
+            deconvolution_kernel="obf",
+            obj_type=obj_type,
+            num_slices=2,
+            slice_thicknesses=8.0,
+            verbose=False,
+        )
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        assert montage.corrected_bf.shape == (2, 64, 64)
+        # near-parallel slice columns amplify float32 differences up to the eigenvalue floor
+        assert (
+            _relative_error(to_numpy(montage.corrected_bf), to_numpy(fourier.corrected_bf)) < 1e-3
+        )
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_complex_stencils_converge_to_the_fft_route(self, complex_pair, kernel):
+        """Phase and log-amplitude are packed as ``Re + i Re`` into one stencil per pixel."""
+        fourier, montage = complex_pair
+        fourier.reconstruct(deconvolution_kernel=kernel, obj_type="complex", verbose=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            montage.reconstruct(
+                deconvolution_kernel=kernel,
+                obj_type="complex",
+                convolution_mode="stencil",
+                stencil_radius=20,
+                verbose=False,
+            )
+
+        for attribute in ("corrected_bf", "corrected_amplitude"):
+            measured = to_numpy(getattr(montage, attribute))
+            assert _correlation(measured, to_numpy(getattr(fourier, attribute))) > 0.999
+        assert "amplitude_mean_error" in montage._stencil_info
+
+    @pytest.mark.parametrize("convolution_mode", ["fft", "stencil"])
+    def test_ricom_amplitude_is_the_zeroth_moment(self, complex_pair, convolution_mode):
+        fourier, montage = complex_pair
+        fourier.reconstruct(deconvolution_kernel="icom", obj_type="complex", verbose=False)
+        extra = {"stencil_radius": 8} if convolution_mode == "stencil" else {}
+        montage.reconstruct(
+            deconvolution_kernel="icom",
+            obj_type="complex",
+            convolution_mode=convolution_mode,
+            verbose=False,
+            **extra,
+        )
+
+        expected = to_numpy(fourier.corrected_amplitude)
+        assert _relative_error(to_numpy(montage.corrected_amplitude), expected) < 1e-4
+
+    def test_several_slices_need_the_fft_route(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(NotImplementedError, match="convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="obf",
+                num_slices=2,
+                slice_thicknesses=5.0,
+                convolution_mode="stencil",
+                stencil_radius=4,
+                verbose=False,
+            )
+
+    def test_parallax_rejects_complex(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(ValueError, match="cannot separate amplitude from phase"):
+            montage.reconstruct(deconvolution_kernel="prlx", obj_type="complex", verbose=False)
+
+    def test_frame_mean_subtraction_rejects_complex(self, dataset4d):
+        montage = DirectPtychographyMontage.from_dataset4d(
+            dataset4d,
+            boundary="wrap",
+            subtract_frame_mean=True,
+            edge_blend_pixels=0,
+            **_common_kwargs(integer_shift_defocus(1)),
+        )
+        with pytest.raises(ValueError, match="zeroth moment"):
+            montage.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+
+    @pytest.mark.parametrize("kernel", ["obf", "icom"])
+    def test_sparse_frames_match_dense(self, dataset4d, kernel):
+        dense, sparse = TestSparseEvents._pair(dataset4d, integer_shift_defocus(1))
+        kwargs = dict(
+            deconvolution_kernel=kernel,
+            obj_type="complex",
+            convolution_mode="stencil",
+            stencil_radius=4,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a, b = TestSparseEvents._both(dense, sparse, **kwargs)
+
+        assert _relative_error(b, a) < 1e-4

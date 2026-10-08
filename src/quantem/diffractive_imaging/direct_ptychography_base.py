@@ -25,7 +25,13 @@ from quantem.diffractive_imaging.complex_probe import (
     polar_coordinates,
     spatial_frequencies,
 )
-from quantem.diffractive_imaging.direct_ptycho_utils import _rotation_degrees_to_radians
+from quantem.diffractive_imaging.direct_ptycho_utils import (
+    EIGENVALUE_FLOOR,
+    OBJ_TYPES,
+    _rotation_degrees_to_radians,
+    explained_energy,
+    solve_normal_equations,
+)
 from quantem.diffractive_imaging.ptycho_utils import (
     OptimizationParameter as OptimizationParameter,  # re-export: the documented path
 )
@@ -47,6 +53,10 @@ class HyperparameterState:
     optimized_rotation_angle: float | None = None
     optimized_keys: set[str] = field(default_factory=set)
     study: optuna.Study | None = None
+    optimized_slice_thicknesses: list[float] | None = None
+
+    #: optimized keys that are not aberration coefficients
+    _OTHER_KEYS = ("rotation_angle", "slice_thicknesses")
 
     def __post_init__(self):
         self.initial_aberrations = validate_aberration_coefficients(dict(self.initial_aberrations))
@@ -54,10 +64,10 @@ class HyperparameterState:
 
         if self.optimized_keys:
             canonical = validate_aberration_coefficients(
-                {k: 0.0 for k in self.optimized_keys if k != "rotation_angle"}
+                {k: 0.0 for k in self.optimized_keys if k not in self._OTHER_KEYS}
             )
             self.optimized_keys = set(canonical.keys()) | {
-                k for k in self.optimized_keys if k == "rotation_angle"
+                k for k in self.optimized_keys if k in self._OTHER_KEYS
             }
 
     def __repr__(self) -> str:
@@ -83,10 +93,17 @@ class HyperparameterState:
             return self.initial_rotation_angle
         return 0.0
 
+    def current_slice_thicknesses(self, override_fixed=None):
+        """Slice thicknesses to reconstruct with: the override, else the optimized ones, else ``None``."""
+        if override_fixed is not None:
+            return override_fixed
+        return self.optimized_slice_thicknesses
+
     def clear_optimized(self):
-        """Clear all optimized aberrations and rotation angle."""
+        """Clear all optimized aberrations, rotation angle and slice thicknesses."""
         self.optimized_aberrations.clear()
         self.optimized_rotation_angle = None
+        self.optimized_slice_thicknesses = None
         self.optimized_keys.clear()
         self.study = None
 
@@ -105,6 +122,7 @@ class HyperparameterState:
             optimized_rotation_angle=self.optimized_rotation_angle,
             optimized_keys=self.optimized_keys,
             study=self.study,
+            optimized_slice_thicknesses=self.optimized_slice_thicknesses,
         )
 
     def summarize(
@@ -131,6 +149,8 @@ class HyperparameterState:
                 add("optimized_aberrations", self.optimized_aberrations)
             if self.optimized_rotation_angle is not None:
                 add("optimized_rotation_angle_deg", self.optimized_rotation_angle)
+            if self.optimized_slice_thicknesses is not None:
+                add("optimized_slice_thicknesses", self.optimized_slice_thicknesses)
 
         elif which == "current":
             current_abers = self.current_aberrations(override_aberration_coefs)
@@ -150,6 +170,8 @@ class HyperparameterState:
                 add("optimized_aberrations", self.optimized_aberrations)
             if self.optimized_rotation_angle is not None:
                 add("optimized_rotation_angle_deg", self.optimized_rotation_angle)
+            if self.optimized_slice_thicknesses is not None:
+                add("optimized_slice_thicknesses", self.optimized_slice_thicknesses)
 
         else:
             raise ValueError(
@@ -196,10 +218,8 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     Methods a subclass must implement:
 
     - ``reconstruct(*, override_aberration_coefs, override_rotation_angle, verbose, ...)``
-      returning ``self``
-    - ``variance_loss()`` returning a scalar tensor (a *method*, not a property --
-      the optimizers call ``float(self.variance_loss())``)
-    - ``corrected_bf`` property returning the reconstructed image, or ``None``
+      returning ``self``, and storing ``_residual`` for :meth:`residual_loss`
+    - ``corrected_bf`` property returning the reconstructed phase, or ``None``
 
     A subclass whose reconstruction spans more than the scan field of view (e.g. a padded
     canvas) must override ``_obj_fov``; upsampling needs no bookkeeping, since
@@ -232,6 +252,18 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         aberrations. Everything that reads the aberration surface -- the parallax kernel,
         the ``sign(sin(chi))`` phase flip, the defocus gradient, any hyperparameter search
         over aberrations -- has no meaning then, and raises.
+
+        ``psi(k)`` is in the scan frame, the frame the aberration coefficients are defined
+        in, and is read at the detector's k-grid rotated by ``rotation_angle``. A rotation
+        that does not map the grid onto itself puts those reads between grid points, so build
+        the probe with ``interpolation="bilinear"`` and refine it with
+        ``FourierProbe.resampled_to`` until the error is acceptable.
+
+        It can be a mixed state, ``FourierProbe.from_array`` of ``(M, Ny, Nx)`` incoherent
+        modes such as a mixed-state ptychographic reconstruction returns. The overlap
+        function is then summed over the modes, for every kernel that reads the probe and
+        for complex and multislice reconstructions alike. The slices are centred on the
+        plane the modes describe.
         """
         return getattr(self, "_fourier_probe", None)
 
@@ -250,11 +282,14 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
                 "`fourier_probe` is for an empirical probe; an analytic one is already "
                 "described by `semiangle_cutoff` and the aberration coefficients."
             )
-        if tuple(value.array.shape) != tuple(self.gpts):
+        shape, gpts = tuple(value.array.shape), tuple(int(n) for n in self.gpts)
+        factors = {n // g for n, g in zip(shape, gpts)}
+        if any(n % g for n, g in zip(shape, gpts)) or len(factors) != 1:
             raise ValueError(
-                f"`fourier_probe` has shape {tuple(value.array.shape)} but the detector grid "
-                f"is {tuple(self.gpts)}. They must match -- crop the probe the same way the "
-                "diffraction patterns were cropped."
+                f"`fourier_probe` has shape {shape} but the detector grid is {gpts}. They must "
+                "match, or the probe must be the same grid refined by a whole number with "
+                "`FourierProbe.resampled_to` -- crop the probe the same way the diffraction "
+                "patterns were cropped."
             )
         self._fourier_probe = value.to(self.device)
 
@@ -280,15 +315,14 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             "`fourier_probe` does not have. Either pass `aberration_coefs` modelling its "
             "phase -- `fit_aberrations_from_probe` fits them and reports whether the phase "
             "is smooth enough to be worth modelling -- or use a deconvolution kernel that "
-            "does not need chi: 'ssb', 'obf' and 'mf' read only the probe itself, and "
+            "does not need chi: 'ssb' and 'obf' read only the probe itself, and "
             "'icom' does not read the probe at all."
         )
 
     def _return_probe(self, aberration_coefs) -> "FourierProbe":
         """The probe object the overlap function samples, empirical or analytic."""
-        probe = self.fourier_probe
-        if probe is not None:
-            return probe
+        if self.fourier_probe is not None:
+            return self.fourier_probe
         return FourierProbe.from_aberrations(
             self.wavelength,
             self.semiangle_cutoff,
@@ -297,16 +331,20 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             self.soft_edges,
         )
 
-    def _return_probe_on_grid(self, k, phi, aberration_coefs):
+    def _return_probe_on_grid(self, k, phi, aberration_coefs, probe=None):
         """``psi(k)`` on the detector grid, whose squared sum is the bright-field weight.
 
         Leaves ``soft_edges`` at ``evaluate_probe``'s default rather than taking
         ``self.soft_edges``, so the normalization matches between the two classes. This is
         an inconsistency, kept for compatibility.
+
+        An array probe, :attr:`fourier_probe` or the ``probe`` given, is in the scan frame, as
+        the aberration surface is, so it is read at the rotated k-grid where the overlap
+        function also reads it. The montage passes the probe it has refined onto its canvas.
         """
-        probe = self.fourier_probe
-        if probe is not None:
-            return probe.array
+        probe = self.fourier_probe if probe is None else probe
+        if probe is not None and probe.array is not None:
+            return probe.read(k * torch.cos(phi), k * torch.sin(phi))
         return evaluate_probe(
             k * self.wavelength,
             phi,
@@ -342,8 +380,168 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     def reconstruct(self, *args, **kwargs):
         raise NotImplementedError(f"{type(self).__name__} does not implement reconstruct().")
 
-    def variance_loss(self):
-        raise NotImplementedError(f"{type(self).__name__} does not implement variance_loss().")
+    def residual_loss(self):
+        """
+        Fraction of the data the reconstruction's forward model leaves unexplained.
+
+        Every kernel is a linear model of the scan-space Fourier transform of the bright-field
+        stack, ``G(q, k)``, with one or more columns per spatial frequency. The least-squares
+        residual of that model is ``sum |G|^2 - sum_q b^H M^+ b``, with ``M`` the Gram matrix
+        of the columns and ``b`` their projections onto the data, and this reports it as a
+        fraction of ``sum |G|^2``. Minimizing it over aberrations, rotation or slice depths is
+        the maximum-likelihood fit of those hyperparameters under white noise.
+
+        The columns are the kernel's own model:
+
+        - ``ssb`` and ``obf``: the weak-object overlap functions,
+          ``Gamma-`` per slice and, for ``obj_type="complex"``, ``Gamma+`` per slice. These
+          kernels share the model, so at the same hyperparameters they report the same value.
+        - ``prlx``: one shifted copy of the image per bright-field pixel, so this is the spread
+          of the parallax-corrected images about their mean, which the earlier
+          ``variance_loss`` measured.
+        - ``icom``: the first moment ``k . q``.
+
+        Only frequencies inside the band limit ``2 alpha / lambda`` and away from ``q = 0``
+        are counted. The value depends on the model, the bright-field mask and the
+        upsampling factor, so compare it only between reconstructions that share those.
+
+        Returns
+        -------
+        float or None
+            ``None`` before :meth:`reconstruct`.
+        """
+        return getattr(self, "_residual", None)
+
+    @property
+    def obj_type(self) -> str | None:
+        """``"pure_phase"`` or ``"complex"``, as last reconstructed; ``None`` before."""
+        return getattr(self, "_obj_type", None)
+
+    @property
+    def num_slices(self) -> int | None:
+        """Number of slices last reconstructed; ``None`` before :meth:`reconstruct`."""
+        return getattr(self, "_num_slices", None)
+
+    @property
+    def slice_depths(self) -> NDArray | None:
+        """Depth of each reconstructed slice in Angstrom, downstream positive, centred on C10."""
+        depths = getattr(self, "_slice_depths", None)
+        return None if depths is None else np.asarray(depths, dtype=np.float64)
+
+    @property
+    def corrected_amplitude(self):
+        """The reconstructed log-amplitude ``ln|t|``, zero-mean, for ``obj_type="complex"``.
+
+        Shaped like :attr:`corrected_bf`; ``None`` for a pure-phase reconstruction.
+        """
+        return getattr(self, "_corrected_amplitude", None)
+
+    # ------------------------------------------------------------------
+    # per-frequency sums -> images, shared by the Fourier and montage FFT routes
+    # ------------------------------------------------------------------
+
+    def _fourier_channels(
+        self,
+        ctx,
+        sums,
+        num_slices,
+        obj_type,
+        ridge=EIGENVALUE_FLOOR,
+    ):
+        """``(phase_q, amplitude_q)``, each ``(num_slices, Ny, Nx)``, before the Butterworth filter."""
+        kernel = ctx["kernel"]
+        bf_weights = ctx["bf_weights"]
+        complex_obj = obj_type == "complex"
+
+        if kernel == "obf":
+            coefficients = solve_normal_equations(
+                sums["gram"],
+                sums["numerator"],
+                bf_weights,
+                num_phase=num_slices,
+                eigenvalue_floor=ridge,
+            ).permute(2, 0, 1)
+            phase_q = coefficients[:num_slices]
+            amplitude_q = coefficients[num_slices:] if complex_obj else None
+        elif kernel == "ssb":
+            if complex_obj:
+                phase_q = -1.0j * sums["phase"] / bf_weights
+                amplitude_q = sums["amplitude"] / 2 / bf_weights
+            else:
+                phase_q = sums["phase"] / bf_weights
+                amplitude_q = None
+            phase_q = phase_q[None]
+            amplitude_q = None if amplitude_q is None else amplitude_q[None]
+        elif kernel == "prlx":
+            phase_q = (sums["phase"] * ctx["sign_sin_chi_q"] / bf_weights)[None]
+            amplitude_q = None
+        else:
+            phase_q = (sums["phase"] / bf_weights)[None]
+            # the zeroth moment: the plain bright-field sum, which sum_k Gamma- = 0 leaves free
+            # of phase for any aberration. Gamma+ -> 2 |psi(k)|^2 as q -> 0, hence the 1/2
+            amplitude_q = (sums["amplitude"] / 2 / bf_weights)[None] if complex_obj else None
+        return phase_q, amplitude_q
+
+    def _residual_from_sums(self, ctx, sums):
+        """The relative least-squares residual of the kernel's own forward model, as a tensor.
+
+        It stays connected to the graph when the sums are, which is what a gradient fit of the
+        aberrations, rotation or slice thicknesses differentiates.
+        """
+        mask = ctx["residual_mask"]
+        kernel = ctx["kernel"]
+        woa = kernel in self._WOA_KERNELS
+        # the weak-object columns model the mean-normalized data as c_k x / |psi(k)|^2, so
+        # their residual is weighted by |psi(k)|^2 (see `woa_kernel_terms`)
+        energy = sums["weighted_energy"] if woa else sums["energy"]
+        total = (energy * mask.to(energy.device)).sum()
+        if woa:
+            gram = sums.get("residual_gram", sums["gram"])
+            explained = explained_energy(gram, sums["numerator"], mask)
+        elif kernel == "prlx":
+            # one column of unit modulus per bright-field pixel
+            count = torch.full_like(energy, float(ctx["bf"].num_bf))
+            explained = explained_energy(count, sums["phase"], mask)
+        else:
+            explained = explained_energy(sums["power"], sums["phase"], mask)
+        return 1 - explained.to(total.device, total.dtype) / total
+
+    def _residual_mask(self, qxa, qya):
+        """Frequencies the residual counts: inside the band the data can carry, away from DC."""
+        q = torch.hypot(qxa, qya)
+        mask = q > 0
+        band = self._return_band_limit()
+        if band is not None:
+            mask &= q <= band
+        return mask
+
+    #: kernels that solve the per-frequency normal equations, and so support several slices
+    _MULTISLICE_KERNELS = frozenset({"obf"})
+
+    #: kernels whose forward model is the weak-object overlap function, which accumulate the
+    #: normal equations and so share :meth:`residual_loss`
+    _WOA_KERNELS = frozenset({"ssb", "obf"})
+
+    def _validate_reconstruction_mode(self, kernel: str, obj_type: str, num_slices: int):
+        """Raise for a combination of kernel, ``obj_type`` and ``num_slices`` with no meaning."""
+        if obj_type not in OBJ_TYPES:
+            raise ValueError(f"`obj_type` must be one of {OBJ_TYPES}, got {obj_type!r}")
+        if obj_type == "complex" and kernel == "prlx":
+            raise ValueError(
+                "The parallax kernel cannot separate amplitude from phase. Tilt-corrected bright "
+                "field sums the two sidebands, so each frequency records only "
+                "cos(chi) Psi_a + sin(chi) Psi_phi (Ma et al., Ultramicroscopy 283, eqs. 18 and "
+                "31), which one dataset cannot split. Use 'obf' or 'ssb' for a complex object, or "
+                "obj_type='pure_phase' for parallax."
+            )
+        if int(num_slices) != num_slices or num_slices < 1:
+            raise ValueError(f"`num_slices` must be a positive integer, got {num_slices!r}")
+        if num_slices > 1 and kernel not in self._MULTISLICE_KERNELS:
+            raise ValueError(
+                f"Several slices need the per-frequency least-squares solve, which only 'obf' "
+                f"uses; got {kernel!r}. SSB normalizes every bright-field pixel on "
+                "its own, and parallax and iCoM have no depth-resolved model."
+            )
 
     def rms_gradient_loss(self):
         """
@@ -351,28 +549,20 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
 
         The classic autofocus metric: a correctly deconvolved image has sharp edges and a
         large gradient, a mis-set aberration blurs them. Negated so that, like
-        :meth:`variance_loss`, it is minimized.
+        :meth:`residual_loss`, it is minimized. Over several slices it averages the gradient of
+        all of them. It is insensitive to how the canvas is sized, so it needs no pinning the
+        way a patch fit does.
 
-        It is better conditioned than the variance loss -- 28% dynamic range against 0.08%
-        over a defocus series, agreeing on the optimum -- because the variance loss compares
-        bright-field images with each other and saturates once they agree, while this
-        measures the reconstruction. It is also insensitive to how the canvas is sized, so it
-        needs no pinning the way a patch fit does.
-
-        Two caveats:
-
-        - It rewards *amplitude*, not only sharpness, since it is not normalized by the
-          image's own spread. Aberrations and rotation barely change the overall scale, so
-          this is safe for the searches here, but a hyperparameter that could inflate the
-          object would game it.
-        - It is defined for every deconvolution kernel, where
-          ``DirectPtychographyMontage.variance_loss`` is defined only for the parallax one.
-          That makes it the way to drive a search over ``"ssb"`` or ``"obf"``.
+        It rewards *amplitude*, not only sharpness, since it is not normalized by the image's
+        own spread. Aberrations and rotation barely change the overall scale, so this is safe
+        for those searches, but a hyperparameter that can inflate the object will game it. Slice
+        thicknesses are one: an assumed spacing ``s`` times too small scales the difference
+        between the slices by ``1 / s``. Fit thicknesses with :meth:`residual_loss` instead.
 
         Returns
         -------
         float or None
-            ``None`` before :meth:`reconstruct`, mirroring :meth:`variance_loss`.
+            ``None`` before :meth:`reconstruct`, mirroring :meth:`residual_loss`.
         """
         obj = self.corrected_bf
         if obj is None:
@@ -387,11 +577,13 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         # factors and samplings rather than only within one search
         spacing = tuple(float(s) for s in self._obj_sampling)
         grad_rows, grad_cols = torch.gradient(obj.to(torch.float32), spacing=spacing, dim=(-2, -1))
-        return -float(torch.sqrt((grad_rows.square() + grad_cols.square()).mean()))
+        value = -torch.sqrt((grad_rows.square() + grad_cols.square()).mean())
+        # a differentiable reconstruction keeps the graph, so a gradient fit can use this too
+        return value if value.requires_grad else float(value)
 
     #: objectives the hyperparameter searches accept by name, all minimized
     _LOSS_FUNCTIONS = {
-        "variance": "variance_loss",
+        "residual": "residual_loss",
         "rms_gradient": "rms_gradient_loss",
     }
 
@@ -399,6 +591,12 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         """Evaluate a search objective on the current reconstruction."""
         if callable(loss):
             return float(loss(self))
+        if loss == "variance":
+            raise ValueError(
+                "loss='variance' has been removed. Use loss='residual', which measures the same "
+                "spread of the parallax-corrected images for 'prlx' and is defined for every "
+                "kernel."
+            )
         try:
             method = self._LOSS_FUNCTIONS[loss]
         except (KeyError, TypeError):
@@ -567,6 +765,10 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     def obj(self) -> np.ndarray | None:
         """Reconstructed object as a numpy array, or ``None`` before :meth:`reconstruct`.
 
+        The phase for ``obj_type="pure_phase"``, and the complex transmission
+        ``exp(a + i phi)`` for ``obj_type="complex"``, with ``a`` the log-amplitude. Shaped
+        ``(Ny, Nx)`` for one slice and ``(num_slices, Ny, Nx)`` for several.
+
         Mirrors ``corrected_bf`` rather than raising: ``AutoSerialize._recursive_load``
         walks ``dir(obj)`` and evaluates every property, so a ``to_numpy(None)`` here made
         save/load fail for a instance that had not been reconstructed yet.
@@ -574,7 +776,11 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         corrected_bf = self.corrected_bf
         if corrected_bf is None:
             return None
-        return to_numpy(corrected_bf)
+        phase = to_numpy(corrected_bf)
+        amplitude = self.corrected_amplitude
+        if amplitude is None:
+            return phase
+        return np.exp(to_numpy(amplitude) + 1j * phase).astype(np.complex64)
 
     # ------------------------------------------------------------------
     # bright-field geometry
@@ -620,8 +826,6 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             "aberration-corrected-bright-field": "ssb",
             "obf": "obf",
             "optimum-bright-field": "obf",
-            "mf": "mf",
-            "matched-filter": "mf",
             "prlx": "prlx",
             "parallax": "prlx",
             "tcbf": "prlx",
@@ -630,13 +834,19 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             "center-of-mass": "icom",
         }
 
+        if kernel in ("mf", "matched-filter"):
+            raise ValueError(
+                "The matched-filter kernel has been removed. Its transfer, s / (s + eps max s), "
+                "sat at 0.7-0.9 rather than one at the default regularization, so its values were "
+                "not the calibrated radians it was kept for. Use 'obf'."
+            )
         if kernel not in aliases:
             raise ValueError(f"Unknown deconvolution kernel '{kernel}'")
 
         return aliases[kernel]
 
     #: kernels carrying a ``gamma`` factor, which is already zero past ``2 alpha / lambda``
-    _BAND_LIMITED_KERNELS = frozenset({"ssb", "obf", "mf"})
+    _BAND_LIMITED_KERNELS = frozenset({"ssb", "obf"})
 
     def _return_band_limit(self) -> float | None:
         """``2 alpha / lambda``, the largest object frequency the data can carry.
@@ -658,8 +868,10 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     def _resolve_q_lowpass(self, q_lowpass, deconvolution_kernel, band_limit=True) -> float | None:
         """Clamp ``q_lowpass`` to the band limit for kernels that do not impose it themselves.
 
-        ``ssb``, ``obf`` and ``mf`` multiply by ``gamma``, so they are already zero beyond
-        ``2 alpha / lambda``. ``prlx`` is a pure shift of unit magnitude at every ``q`` and
+        ``ssb`` and ``obf`` multiply by ``gamma``, so they are already zero beyond
+        ``2 alpha / lambda``; for an array probe, whose ``gamma`` holds round-off there,
+        through :data:`~quantem.diffractive_imaging.direct_ptycho_utils.OVERLAP_FLOOR`.
+        ``prlx`` is a pure shift of unit magnitude at every ``q`` and
         ``icom`` only rolls off as ``1/|q|``, so both would otherwise pass whatever lies past
         it.
 
@@ -712,50 +924,77 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         **kwargs,
     ):
         """
-        Show the reconstructed object and its Hann-windowed Fourier transform.
+        Show the reconstructed object and its Fourier transform.
+
+        One row per slice. A complex reconstruction shows the phase and the log-amplitude,
+        each read from the stored arrays rather than from ``np.angle``, which would wrap.
 
         Parameters
         ----------
-        cbar : bool, optional
-            Whether to show colorbars, by default True.
         return_fig : bool, optional
             If True, return ``(fig, axs)``.
-        fft_norm : str | dict, optional
-            Normalization passed to ``show_2d`` for the object FFT.
+        show_obj_fft : bool, optional
+            Also show the magnitude of each image's Fourier transform.
+        apply_hanning_window : bool, optional
+            Window the images before transforming them.
         **kwargs
-            Additional arguments passed to ``show_2d``.
+            Additional arguments passed to ``show_2d``, e.g. ``cbar`` or ``fft_norm``.
         """
         if self.corrected_bf is None:
             raise RuntimeError("Run reconstruct() before visualize().")
 
-        obj = self.obj
+        phase = to_numpy(self.corrected_bf)
+        amplitude = self.corrected_amplitude
+        amplitude = None if amplitude is None else to_numpy(amplitude)
+        if phase.ndim == 2:
+            phase = phase[None]
+            amplitude = None if amplitude is None else amplitude[None]
+
         obj_sampling = self._obj_sampling
         obj_scalebar = {"sampling": obj_sampling[1], "units": "Å"}
+        fft_sampling = 1 / (obj_sampling[1] * phase.shape[-1])
+        fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
+        window = (
+            np.hanning(phase.shape[-2])[:, None] * np.hanning(phase.shape[-1])[None, :]
+            if apply_hanning_window
+            else 1.0
+        )
+
+        def fourier(image):
+            return np.fft.fftshift(np.abs(np.fft.fft2(image * window)))
+
+        depths = self.slice_depths
+        rows, titles, scalebars = [], [], []
+        for index in range(phase.shape[0]):
+            label = "" if phase.shape[0] == 1 else f", z = {depths[index]:+.1f} Å"
+            channels = [("Object phase", phase[index])]
+            if amplitude is not None:
+                channels.append(("Object log-amplitude", amplitude[index]))
+            row, title, scalebar = [], [], []
+            for name, image in channels:
+                row.append(image)
+                title.append(name + label)
+                scalebar.append(obj_scalebar)
+                if show_obj_fft:
+                    row.append(fourier(image))
+                    title.append(name + " FFT" + label)
+                    scalebar.append(fft_scalebar)
+            rows.append(row)
+            titles.append(title)
+            scalebars.append(scalebar)
+
+        if len(rows) == 1 and len(rows[0]) == 1:
+            fig, axs = show_2d(rows[0][0], title=titles[0][0], scalebar=scalebars[0][0], **kwargs)
+        elif len(rows) == 1:
+            fig, axs = show_2d(rows[0], title=titles[0], scalebar=scalebars[0], **kwargs)
+        else:
+            fig, axs = show_2d(rows, title=titles, scalebar=scalebars, **kwargs)
 
         if show_obj_fft:
-            if apply_hanning_window:
-                window = np.hanning(obj.shape[-2])[:, None] * np.hanning(obj.shape[-1])[None, :]
-                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj * window)))
-            else:
-                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj)))
-
-            fft_sampling = 1 / (obj_sampling[1] * obj.shape[-1])
-            fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
-
-            fig, axs = show_2d(
-                [obj, obj_fft],
-                title=["Object phase", "Object phase FFT"],
-                scalebar=[obj_scalebar, fft_scalebar],
-                **kwargs,
-            )
-            axs[1].set_aspect(obj.shape[-1] / obj.shape[-2])
-        else:
-            fig, axs = show_2d(
-                obj,
-                title="Object phase",
-                scalebar=obj_scalebar,
-                **kwargs,
-            )
+            aspect = phase.shape[-1] / phase.shape[-2]
+            for ax, title in zip(np.ravel(axs), [t for row in titles for t in row]):
+                if title.split(",")[0].endswith("FFT"):
+                    ax.set_aspect(aspect)
 
         if return_fig:
             return fig, axs
@@ -765,13 +1004,30 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     # hyperparameter optimization
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _with_slice_thicknesses(reconstruct_kwargs: dict, thicknesses) -> dict:
+        """``reconstruct_kwargs`` with ``slice_thicknesses`` set, when a search supplies one."""
+        if thicknesses is None:
+            return reconstruct_kwargs
+        return {**reconstruct_kwargs, "slice_thicknesses": thicknesses}
+
+    @staticmethod
+    def _resolved_thicknesses(best, requested):
+        """What a search writes back: the best searched gap, else a fixed one, else ``None``."""
+        if best is not None:
+            return [float(best)]
+        if requested is not None and not isinstance(requested, OptimizationParameter):
+            return [float(t) for t in np.atleast_1d(requested)]
+        return None
+
     def optimize_hyperparameters(
         self,
         aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
         rotation_angle: float | OptimizationParameter | None = None,
+        slice_thicknesses: float | OptimizationParameter | None = None,
         n_trials=50,
         sampler=None,
-        loss="variance",
+        loss="residual",
         verbose=None,
         **reconstruct_kwargs,
     ):
@@ -784,17 +1040,20 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             Dict of aberration names to either fixed values or optimization ranges.
         rotation_angle : float|OptimizationParameter
             Fixed rotation or optimization range, in degrees.
+        slice_thicknesses : float|OptimizationParameter, optional
+            Fixed gap between slices or an optimization range, in Angstrom, for a
+            reconstruction with ``num_slices > 1`` passed in ``reconstruct_kwargs``. One value
+            is used for every gap. Fit ``C10`` with one slice first: the residual of several
+            slices barely depends on the reference plane.
         n_trials : int
             Number of Optuna trials.
         sampler : optuna.samplers.BaseSampler, optional
             Custom Optuna sampler.
-        loss : {"variance", "rms_gradient"} or callable
-            Objective to minimize. ``"variance"`` is :meth:`variance_loss`, the spread
-            between bright-field images. ``"rms_gradient"`` is
-            :meth:`rms_gradient_loss`, an image-sharpness objective that is better
-            conditioned -- 28% dynamic range against 0.08% over a defocus series -- and is
-            defined for every deconvolution kernel. A callable is passed the reconstruction
-            and must return a float to minimize.
+        loss : {"residual", "rms_gradient"} or callable
+            Objective to minimize. ``"residual"`` is :meth:`residual_loss`, the fraction of
+            the data the kernel's forward model leaves unexplained. ``"rms_gradient"`` is
+            :meth:`rms_gradient_loss`, an image-sharpness objective. A callable is passed the
+            reconstruction and must return a float to minimize.
         verbose : bool, optional
             Report the search and show Optuna's progress bar. Defaults to :attr:`verbose`.
         **reconstruct_kwargs :
@@ -825,6 +1084,8 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
 
         if isinstance(rotation_angle, OptimizationParameter):
             state.optimized_keys.add("rotation_angle")
+        if isinstance(slice_thicknesses, OptimizationParameter):
+            state.optimized_keys.add("slice_thicknesses")
 
         def objective(trial):
             trial_aberrations = {}
@@ -843,11 +1104,21 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             else:
                 rot = rotation_angle
 
+            if isinstance(slice_thicknesses, OptimizationParameter):
+                thicknesses = trial.suggest_float(
+                    "slice_thicknesses",
+                    slice_thicknesses.low,
+                    slice_thicknesses.high,
+                    log=slice_thicknesses.log,
+                )
+            else:
+                thicknesses = slice_thicknesses
+
             self.reconstruct(
                 override_aberration_coefs=trial_aberrations,
                 override_rotation_angle=rot,
                 verbose=False,
-                **reconstruct_kwargs,
+                **self._with_slice_thicknesses(reconstruct_kwargs, thicknesses),
             )
             return self._return_loss_value(loss)
 
@@ -857,12 +1128,16 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         # Write back optimized results
         best = study.best_params.copy()
         state.optimized_rotation_angle = best.pop("rotation_angle", None)
+        best_thickness = best.pop("slice_thicknesses", None)
 
         if state.optimized_rotation_angle is None and rotation_angle is not None:
             state.optimized_rotation_angle = rotation_angle  # ty:ignore[invalid-assignment]
 
         state.optimized_aberrations = best
         state.optimized_aberrations = state.current_aberrations(fixed_override_aberrations)
+        state.optimized_slice_thicknesses = self._resolved_thicknesses(
+            best_thickness, slice_thicknesses
+        )
         state.study = study
 
         if verbose:
@@ -875,7 +1150,8 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         self,
         aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
         rotation_angle: float | OptimizationParameter | None = None,
-        loss="variance",
+        slice_thicknesses: float | OptimizationParameter | None = None,
+        loss="residual",
         verbose=None,
         **reconstruct_kwargs,
     ):
@@ -884,8 +1160,10 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
 
         Parameters
         ----------
-        loss : {"variance", "rms_gradient"} or callable
+        loss : {"residual", "rms_gradient"} or callable
             Objective to minimize; see :meth:`optimize_hyperparameters`.
+        slice_thicknesses : float|OptimizationParameter, optional
+            Fixed gap between slices or a grid of them; see :meth:`optimize_hyperparameters`.
         """
         if verbose is None:
             verbose = self.verbose
@@ -920,6 +1198,9 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         # isinstance inline rather than reusing `optimize_rotation`, so the type narrows
         if isinstance(rotation_angle, OptimizationParameter):
             param_grid["rotation_angle"] = rotation_angle.grid_values()
+        if isinstance(slice_thicknesses, OptimizationParameter):
+            param_grid["slice_thicknesses"] = slice_thicknesses.grid_values()
+            state.optimized_keys.add("slice_thicknesses")
 
         # Cartesian product
         keys = list(param_grid.keys())
@@ -934,8 +1215,13 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
 
             trial_aberrations = dict(fixed_override_aberrations)
             trial_aberrations.update(
-                {k: v for k, v in trial_params.items() if k != "rotation_angle"}
+                {
+                    k: v
+                    for k, v in trial_params.items()
+                    if k not in ("rotation_angle", "slice_thicknesses")
+                }
             )
+            thicknesses = trial_params.get("slice_thicknesses", slice_thicknesses)
 
             if optimize_rotation:
                 rot = trial_params["rotation_angle"]
@@ -946,7 +1232,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
                 override_aberration_coefs=trial_aberrations,
                 override_rotation_angle=rot,
                 verbose=False,
-                **reconstruct_kwargs,
+                **self._with_slice_thicknesses(reconstruct_kwargs, thicknesses),
             )
 
             loss_value = self._return_loss_value(loss)
@@ -959,10 +1245,15 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         self._grid_search_results = results
 
         # Write back best optimized values
+        best_thickness = None
         if best_params is not None:
             best_params = best_params.copy()
             state.optimized_rotation_angle = best_params.pop("rotation_angle", None)
+            best_thickness = best_params.pop("slice_thicknesses", None)
             state.optimized_aberrations = best_params
+        state.optimized_slice_thicknesses = self._resolved_thicknesses(
+            best_thickness, slice_thicknesses
+        )
 
         if state.optimized_rotation_angle is None and rotation_angle is not None:
             state.optimized_rotation_angle = rotation_angle  # ty:ignore[invalid-assignment]
