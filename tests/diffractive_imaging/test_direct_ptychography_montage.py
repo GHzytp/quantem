@@ -1431,7 +1431,11 @@ class TestFourierProbe:
         property of the data, not of the method.
         """
         defocus = integer_shift_defocus(1)
-        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        # the mean-pattern mask, so that both reconstructions crop the detector alike: a model
+        # aperture read off the lattice is bilinearly widened by a pixel
+        kwargs = dict(
+            _common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap", intensity_threshold=0.5
+        )
         kwargs["rotation_angle"] = rotation_angle
 
         analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
@@ -1454,7 +1458,9 @@ class TestFourierProbe:
 
     def test_low_oversampling_warns(self, dataset4d):
         defocus = integer_shift_defocus(1)
-        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        kwargs = dict(
+            _common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap", intensity_threshold=0.5
+        )
         kwargs["rotation_angle"] = 15.0
         analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
         empirical = DirectPtychographyMontage.from_dataset4d(
@@ -2053,9 +2059,9 @@ class TestRealSpaceKernels:
     MAX_RADIUS = 15  # canvas half-width for the 32x32 fixture
 
     @staticmethod
-    def _pair(dataset4d):
+    def _pair(dataset4d, **overrides):
         defocus = integer_shift_defocus(1)
-        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, **overrides)
         return (
             DirectPtychography.from_dataset4d(dataset4d, **kwargs),
             DirectPtychographyMontage.from_dataset4d(dataset4d, boundary="wrap", **kwargs),
@@ -2063,7 +2069,9 @@ class TestRealSpaceKernels:
 
     @pytest.mark.parametrize("kernel", KERNELS)
     def test_converges_to_the_fourier_kernel(self, dataset4d, kernel):
-        fourier, montage = self._pair(dataset4d)
+        # the half-intensity mask: the soft edge's pixels, which the model aperture keeps, have
+        # longer-ranged OBF kernels than this 32-pixel canvas can hold (3.9% at radius 15)
+        fourier, montage = self._pair(dataset4d, intensity_threshold=0.5)
         reference = fourier.reconstruct(deconvolution_kernel=kernel, verbose=False).obj
 
         errors = []

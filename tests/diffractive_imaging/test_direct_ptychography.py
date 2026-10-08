@@ -82,10 +82,16 @@ class TestConstruction:
         assert recon.scan_gpts == (N, N)
         assert recon.scan_sampling[0] == pytest.approx(SCAN_SAMPLING)
 
-    def test_bf_mask_is_about_the_aperture_size(self, recon):
-        """The mask is thresholded from the mean pattern, so it should track the BF disk."""
+    def test_bf_mask_is_the_model_aperture(self, recon):
+        """By default the mask is every pixel the soft aperture reaches, half a pixel past alpha."""
+        expected_area = np.pi * (Q_PROBE / recon.reciprocal_sampling[0] + 0.5) ** 2
+        assert recon.num_bf == pytest.approx(expected_area, rel=0.15)
+
+    def test_an_intensity_threshold_masks_the_mean_pattern(self, dataset4d):
+        recon = _build(dataset4d, intensity_threshold=0.5)
         expected_area = np.pi * (Q_PROBE / recon.reciprocal_sampling[0]) ** 2
         assert recon.num_bf == pytest.approx(expected_area, rel=0.35)
+        assert recon.num_bf < _build(dataset4d).num_bf
 
     def test_preprocess_zeroes_the_dc_bin(self, recon):
         assert torch.allclose(
@@ -2461,7 +2467,9 @@ class TestWignerDistributionDeconvolution:
         assert slopes[1e-3] < 0.8
 
     def test_it_warns_when_the_mask_clips_the_aperture(self, weak_scene, strong_scene):
-        clipped = DirectPtychography.from_dataset4d(weak_scene, **ml_kwargs())
+        clipped = DirectPtychography.from_dataset4d(
+            weak_scene, intensity_threshold=0.5, **ml_kwargs()
+        )
         with pytest.warns(UserWarning, match="probe intensity outside"):
             clipped.reconstruct(deconvolution_kernel="wdd", verbose=False)
         recon, _ = strong_scene
@@ -2511,3 +2519,89 @@ class TestWignerDistributionDeconvolution:
     def test_rejects(self, recon, kwargs, match):
         with pytest.raises(ValueError, match=match):
             recon.reconstruct(deconvolution_kernel="wdd", verbose=False, **kwargs)
+
+
+@pytest.fixture(scope="module")
+def half_scan():
+    """``(reconstruction, phase, log_amplitude)``: every other position of a scan whose Nyquist
+    is the band edge, so half the band lies above the scan's Nyquist."""
+    from quantem.core.datastructures import Dataset4d
+
+    phase = _with_rms(white_noise_object_2D(n=64, phi0=1.0), 0.05)
+    amplitude = _with_rms(white_noise_object_2D(n=64, phi0=1.0, seed=1), 0.015)
+    full = thin_layer_4dstem([amplitude + 1j * phase], [0.0], ML_ABERRATIONS, dose=1e5)
+    array = np.asarray(full.array)[::2, ::2].copy()
+    dataset = Dataset4d.from_array(
+        array, sampling=(2 * ML_SAMPLING,) * 2 + tuple(full.sampling[2:]), units=full.units
+    )
+    return DirectPtychography.from_dataset4d(dataset, **ml_kwargs()), phase, amplitude
+
+
+def _extension_correlation(image, truth):
+    """Correlation with ``truth`` over the band above the half scan's Nyquist, 1-2 / A."""
+    q = np.fft.fftfreq(image.shape[0], ML_SAMPLING)
+    radius = np.hypot(q[:, None], q[None, :])
+    keep = (radius > ML_K_PROBE) & (radius <= 2 * ML_K_PROBE)
+    a, b = np.fft.fft2(image) * keep, np.fft.fft2(truth) * keep
+    return float(np.vdot(a, b).real / np.sqrt(np.vdot(a, a).real * np.vdot(b, b).real))
+
+
+class TestUpsampling:
+    """``upsampling_factor`` recovers the band above the scan's Nyquist, for every kernel."""
+
+    def test_alias_tiles_round_trip(self):
+        from quantem.diffractive_imaging.direct_ptycho_utils import alias_tiles, from_alias_tiles
+
+        array = torch.randn(3, 8, 6, 2)
+        tiled = alias_tiles(array, 2)
+
+        assert tiled.shape == (3, 4, 3, 8)
+        # column tile * K + channel: tile (1, 0) of channel 1 at coarse (0, 0) is fine (4, 0)
+        assert tiled[0, 0, 0, 2 * 2 + 1] == array[0, 4, 0, 1]
+        assert torch.equal(from_alias_tiles(tiled, 2, 2), array)
+
+    # correlation over the extension band from the half scan at U = 2; a full scan gives
+    # 0.83, 0.93, 1.00, 0.92, 0.71 and 0.32 for the phase, and 0.82, 0.89, 0.99, 0.92 and 0.24
+    # for the log-amplitude
+    @pytest.mark.parametrize(
+        "kernel, obj_type, phase_min, amplitude_min",
+        [
+            ("ssb", "pure_phase", 0.78, None),
+            ("obf", "pure_phase", 0.86, None),
+            ("wiener", "pure_phase", 0.97, None),
+            ("wdd", "pure_phase", 0.85, None),
+            ("prlx", "pure_phase", 0.64, None),
+            ("icom", "pure_phase", 0.14, None),
+            ("ssb", "complex", 0.78, 0.71),
+            ("obf", "complex", 0.86, 0.85),
+            ("wiener", "complex", 0.97, 0.95),
+            ("wdd", "complex", 0.85, 0.62),
+            ("icom", "complex", 0.14, 0.04),
+        ],
+    )
+    def test_recovers_the_band_above_the_scan_nyquist(
+        self, half_scan, kernel, obj_type, phase_min, amplitude_min
+    ):
+        recon, phase, amplitude = half_scan
+        recon.reconstruct(
+            deconvolution_kernel=kernel, obj_type=obj_type, upsampling_factor=2, verbose=False
+        )
+
+        assert recon.corrected_bf.shape == (64, 64)
+        assert np.isfinite(recon.obj).all()
+        assert _extension_correlation(to_numpy(recon.corrected_bf), phase) > phase_min
+        if amplitude_min is not None:
+            image = to_numpy(recon.corrected_amplitude)
+            assert _extension_correlation(image, amplitude) > amplitude_min
+
+    @pytest.mark.parametrize("kernel", ["wiener", "wdd"])
+    def test_the_object_estimates_keep_their_scale(self, half_scan, kernel):
+        recon, phase, _ = half_scan
+        coarse = to_numpy(recon.reconstruct(deconvolution_kernel=kernel, verbose=False).obj)
+        fine = to_numpy(
+            recon.reconstruct(deconvolution_kernel=kernel, upsampling_factor=2, verbose=False).obj
+        )
+        below_nyquist = np.fft.ifft2(np.fft.fft2(fine) * _band(fine.shape, hi=ML_K_PROBE)).real
+
+        # same values on the coarse grid's pixels, so no 1 / U**2 to undo
+        assert below_nyquist[::2, ::2].std() == pytest.approx(coarse.std(), rel=0.1)

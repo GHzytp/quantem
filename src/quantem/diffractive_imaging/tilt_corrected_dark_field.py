@@ -17,7 +17,7 @@ from quantem.diffractive_imaging.complex_probe import (
 )
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     _rotation_degrees_to_radians,
-    bf_mask_from_mean_pattern,
+    bright_field_mask,
     explained_energy,
     fit_and_shift_diffraction_origin,
     overlap_terms,
@@ -121,7 +121,7 @@ class TiltCorrectedDarkField(DirectPtychographyBase):
         n_angular_bins: int | None = 32,
         inner_radius: float | None = None,
         outer_radius: float | None = None,
-        intensity_threshold: float = 0.5,
+        intensity_threshold: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
         mode: str = "bilinear",
@@ -167,7 +167,19 @@ force_fitted_origin
             force_fitted_origin=force_fitted_origin,
             rotation_angle=rotation_angle,
         )
-        bf_mask = bf_mask_from_mean_pattern(shifted, intensity_threshold)
+        aperture = cls._model_aperture_for(energy, wavelength, semiangle_cutoff, None, device)
+        bf_mask = bright_field_mask(
+            shifted.mean(dim=(0, 1)),
+            intensity_threshold,
+            None
+            if aperture is None
+            else aperture(
+                tuple(shifted.shape[-2:]),
+                tuple(float(v) for v in dataset.sampling[-2:]),
+                tuple(dataset.units[-2:]),
+                rotation_angle,
+            ),
+        )
 
         reciprocal = np.asarray(dataset.sampling[-2:], dtype=np.float64)
         if tuple(dataset.units[-2:])[0] == "mrad":

@@ -387,7 +387,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         mode: str = "bilinear",
         force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
-        intensity_threshold: float = 0.5,
+        intensity_threshold: float | None = None,
         boundary: Literal["wrap", "pad"] = "wrap",
         defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
@@ -420,6 +420,9 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             intensity_threshold=intensity_threshold,
             normalization_order=normalization_order,
             edge_blend_pixels=edge_blend_pixels,
+            aperture=cls._model_aperture_for(
+                energy, wavelength, semiangle_cutoff, fourier_probe, device
+            ),
         )
 
         return cls.from_virtual_bfs(
@@ -464,7 +467,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         mode: str = "bilinear",
         force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
-        intensity_threshold: float = 0.5,
+        intensity_threshold: float | None = None,
         boundary: Literal["wrap", "pad"] = "pad",
         defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
@@ -520,6 +523,9 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             intensity_threshold=intensity_threshold,
             normalization_order=normalization_order,
             bf_mask=bf_mask,
+            aperture=cls._model_aperture_for(
+                energy, wavelength, semiangle_cutoff, fourier_probe, device
+            ),
         )
 
         return cls(
@@ -574,7 +580,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         mode: str = "nearest",
         force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
-        intensity_threshold: float = 0.5,
+        intensity_threshold: float | None = None,
         boundary: Literal["wrap", "pad"] = "pad",
         defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
@@ -704,6 +710,9 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             intensity_threshold=intensity_threshold,
             weight_field=weight_field,
             bf_mask=bf_mask,
+            aperture=cls._model_aperture_for(
+                energy, wavelength, semiangle_cutoff, fourier_probe, device
+            ),
         )
 
         return cls(

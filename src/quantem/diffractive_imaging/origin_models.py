@@ -39,13 +39,17 @@ def fit_origin_from_measured(
         ``(N, 2)`` measured origins in detector pixels.
     probe_positions : torch.Tensor
         ``(N, 2)`` positions the origins are fitted against.
-    fit_method : {"plane", "constant"}
+    fit_method : {"plane", "parabola", "bezier_two", "constant"}
+        ``"parabola"`` is a full quadratic surface over the probe positions and
+        ``"bezier_two"`` a biquadratic Bezier patch, for descan that bends across the field;
+        both are linear in their coefficients and fitted by least squares on positions scaled
+        to the unit square.
     device : str or int
 
     Returns
     -------
     torch.Tensor
-        ``(N, 2)`` fitted origins for ``"plane"``, or the ``(2,)`` mean for ``"constant"``.
+        ``(N, 2)`` fitted origins, or the ``(2,)`` mean for ``"constant"``.
     """
     if fit_method == "plane":
 
@@ -80,7 +84,27 @@ def fit_origin_from_measured(
     if fit_method == "constant":
         return origin_measured.mean(0)
 
-    raise NotImplementedError("only fit_method='plane' and 'constant' are implemented for now.")
+    if fit_method in ("parabola", "bezier_two"):
+        from quantem.diffractive_imaging.ptycho_utils import _bezier_two, _parabola
+
+        model = {"parabola": _parabola, "bezier_two": _bezier_two}[fit_method]
+        positions = probe_positions.detach().to("cpu", torch.float64)
+        low, high = positions.amin(0), positions.amax(0)
+        xy = ((positions - low) / (high - low).clamp_min(1e-12)).T
+        # the model is linear in its coefficients, so its basis is the model at unit vectors
+        num_coefficients = model.__code__.co_argcount - 1
+        unit = torch.eye(num_coefficients, dtype=torch.float64)
+        basis = torch.stack([model(xy, *row) for row in unit], -1)
+        measured = origin_measured.detach().to("cpu", torch.float64)
+        coefficients = torch.linalg.lstsq(basis, measured).solution
+        return (basis @ coefficients).to(
+            device=origin_measured.device, dtype=origin_measured.dtype
+        )
+
+    raise ValueError(
+        "`fit_method` must be one of 'plane', 'parabola', 'bezier_two' or 'constant', "
+        f"got {fit_method!r}"
+    )
 
 
 class CenterOfMassOriginModel(AutoSerialize):

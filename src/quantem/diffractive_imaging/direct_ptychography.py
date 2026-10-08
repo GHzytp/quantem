@@ -216,7 +216,7 @@ class DirectPtychography(DirectPtychographyBase):
         mode: str = "bilinear",
         force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
-        intensity_threshold: float = 0.5,
+        intensity_threshold: float | None = None,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
         bf_mask_padding_px: int = 1,
@@ -240,6 +240,9 @@ class DirectPtychography(DirectPtychographyBase):
             intensity_threshold=intensity_threshold,
             normalization_order=normalization_order,
             edge_blend_pixels=edge_blend_pixels,
+            aperture=cls._model_aperture_for(
+                energy, wavelength, semiangle_cutoff, fourier_probe, device
+            ),
         )
 
         return cls(
@@ -285,7 +288,7 @@ class DirectPtychography(DirectPtychographyBase):
         mode: str = "bilinear",
         force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
-        intensity_threshold: float = 0.5,
+        intensity_threshold: float | None = None,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
         bf_mask_padding_px: int = 1,
@@ -328,6 +331,13 @@ class DirectPtychography(DirectPtychographyBase):
             Grid size. Defaults to whatever just covers the positions at ``scan_sampling``,
             and may only be larger than that -- ``scan_sampling`` stays authoritative, so
             this pads the canvas rather than rescaling the positions into it.
+        intensity_threshold : float, optional
+            By default the bright-field mask is every detector pixel the probe model reaches,
+            from ``semiangle_cutoff`` or ``fourier_probe``, which holds the aperture's soft
+            edge and no dark field whatever the specimen scatters (see
+            :func:`~quantem.diffractive_imaging.direct_ptycho_utils.bright_field_mask`). A
+            value instead keeps the pixels whose mean intensity exceeds that fraction of the
+            mean pattern's peak, as before.
         interpolation : {"nearest", "bilinear"}
             Deposition scheme, matching ``DirectPtychographyMontage.reconstruct``.
             ``"nearest"`` by default; see :func:`regrid_vbf_stack`.
@@ -385,6 +395,9 @@ class DirectPtychography(DirectPtychographyBase):
             intensity_threshold=intensity_threshold,
             normalization_order=normalization_order,
             bf_mask=bf_mask,
+            aperture=cls._model_aperture_for(
+                energy, wavelength, semiangle_cutoff, fourier_probe, device
+            ),
         )
 
         if scan_gpts is None:
@@ -638,7 +651,13 @@ class DirectPtychography(DirectPtychographyBase):
         if q_highpass:
             butterworth_env *= 1 - 1 / (1 + (q / q_highpass) ** (2 * butterworth_order))
 
-        residual_mask = self._residual_mask(qxa, qya)
+        # the weak-object kernels solve the alias tiles of each scan frequency jointly, so their
+        # normal equations, and with them the residual, live on the scan's own grid
+        alias_factor = upsampling_factor if kernel in self._WOA_KERNELS else 1
+        solve_qxa, solve_qya = (
+            self._return_upsampled_qgrid(None) if alias_factor > 1 else (qxa, qya)
+        )
+        residual_mask = self._residual_mask(solve_qxa, solve_qya)
         peak_intensity = float(cmplx_probe_k.detach().abs().max()) ** 2
 
         return dict(
@@ -658,6 +677,7 @@ class DirectPtychography(DirectPtychographyBase):
             butterworth_env=butterworth_env,
             residual_mask=residual_mask,
             peak_intensity=peak_intensity,
+            alias_factor=alias_factor,
         )
 
     def _tiled_vbf_fourier(self, bf, batch_idx, upsampling_factor):
@@ -682,6 +702,9 @@ class DirectPtychography(DirectPtychographyBase):
         shape = qxa.shape
         complex_obj = obj_type == "complex"
         num_columns = len(depths) * (2 if complex_obj else 1)
+        alias_factor = ctx["alias_factor"]
+        solve_shape = tuple(n // alias_factor for n in shape)
+        solve_columns = num_columns * alias_factor**2
 
         if max_batch_size is None:
             max_batch_size = max(
@@ -696,14 +719,18 @@ class DirectPtychography(DirectPtychographyBase):
         woa = kernel in self._WOA_KERNELS
         if woa:
             sums["gram"] = torch.zeros(
-                (*shape, num_columns, num_columns), device=self.device, dtype=complex_dtype
+                (*solve_shape, solve_columns, solve_columns),
+                device=self.device,
+                dtype=complex_dtype,
             )
             sums["numerator"] = torch.zeros(
-                (*shape, num_columns), device=self.device, dtype=complex_dtype
+                (*solve_shape, solve_columns), device=self.device, dtype=complex_dtype
             )
-            if num_columns == 1:
+            if solve_columns == 1:
                 sums["residual_gram"] = torch.zeros_like(sums["gram"])
-            sums["weighted_energy"] = torch.zeros_like(sums["energy"])
+            sums["weighted_energy"] = torch.zeros(
+                solve_shape, device=self.device, dtype=real_dtype
+            )
             probe = self._return_probe(ctx["aberration_coefs"])
             peak_amplitude = float(cmplx_probe_k.detach().abs().max())
             aperture_floor = 1e-6 * peak_amplitude
@@ -749,6 +776,7 @@ class DirectPtychography(DirectPtychographyBase):
                         complex_obj,
                         aperture_floor,
                         peak_amplitude**2,
+                        alias_factor,
                     )
                 )
 
@@ -821,7 +849,16 @@ class DirectPtychography(DirectPtychographyBase):
         override_aberration_coefs : dict, optional
             Aberration coefficients for the probe
         upsampling_factor : int, optional
-            Factor by which to upsample the reconstruction
+            Factor by which to upsample the reconstruction. A scan samples the spectrum only
+            modulo its own grid, so each scan frequency holds ``U^2`` frequencies of the finer
+            grid, its alias tiles, which the bright-field pixels see differently. ``"obf"`` and
+            ``"wiener"`` solve for all of them jointly at each scan frequency, as does the
+            residual of every weak-object kernel; SSB, parallax, iCoM and WDD take each fine
+            frequency on its own. From a scan whose Nyquist was half the band, ``U = 2``
+            recovered the band above it as a full scan did: correlations of 0.90 and 0.999 for
+            the OBF and Wiener phase and 0.89 and 0.98 for their log-amplitude, against 0.90,
+            0.999, 0.89 and 0.99 from the full scan. Solving the tiles one at a time had left
+            the log-amplitude at 0.81 and 0.78; WDD's stays at 0.68 against 0.92.
         override_rotation_angle : float, optional
             Rotation angle for coordinate system, in degrees
         max_batch_size : int, optional
@@ -870,10 +907,9 @@ class DirectPtychography(DirectPtychographyBase):
             calibrated either: for a weak object the transfer is the regularized filter's weight
             at zero offset, a median of 0.68-0.74 over the band at the default ridge and as low
             as 0.39 near its edge. The convolution needs every detector pixel the aperture
-            reaches, so the bright-field mask must hold the aperture's whole soft edge: build
-            with an ``intensity_threshold`` near 0.05 rather than the default (it warns
-            otherwise), which on a strong scatterer also admits some dark field. It solves for
-            one slice, and multiplies the normalized stack back by the bright-field means
+            reaches, which the default bright-field mask, the model aperture, holds; it warns
+            when a mask built with ``intensity_threshold`` does not. It solves for one slice,
+            and multiplies the normalized stack back by the bright-field means
             :meth:`from_dataset4d` recorded, or by ``|psi(k)|^2`` when there are none. :meth:`residual_loss` is the weak-object model's, as for SSB
             and OBF. A mixed-state :attr:`fourier_probe`, :attr:`focal_spread` and
             :attr:`source_size` all enter its overlap function, but its fixed ridge suppresses
@@ -1140,8 +1176,8 @@ class DirectPtychography(DirectPtychographyBase):
             warnings.warn(
                 f"The bright-field mask leaves {outside:.1%} of the probe intensity outside it, "
                 "and WDD's convolution model needs every pixel the aperture reaches. Rebuild "
-                "with a lower `intensity_threshold` (0.05 left 0.1% outside on simulated "
-                "data). On a strongly scattering specimen that also admits dark-field pixels.",
+                "with `intensity_threshold=None`, the default, whose mask is the probe "
+                "model's aperture.",
                 stacklevel=5,
             )
 
@@ -1490,6 +1526,25 @@ class DirectPtychography(DirectPtychographyBase):
         self.reconstruct(verbose=False, **reconstruct_kwargs)
         return self
 
+    def _flat_aperture_mask(self, rotation_angle=None, use_initial_state=False):
+        """The bright-field pixels where the aperture is at least half its peak intensity."""
+        state = self.hyperparameter_state
+        if use_initial_state:
+            aberrations, rotation = state.initial_aberrations, state.initial_rotation_angle
+        else:
+            aberrations, rotation = state.current_aberrations(), state.current_rotation_angle()
+        if rotation_angle is not None:
+            rotation = rotation_angle
+        kxa, kya = spatial_frequencies(
+            self.gpts,
+            self.sampling,
+            rotation_angle=_rotation_degrees_to_radians(rotation),
+            device=self.device,
+        )
+        k, phi = polar_coordinates(kxa, kya)
+        intensity = self._return_probe_on_grid(k, phi, aberrations).detach().abs().square()
+        return self.bf_mask & (intensity >= 0.5 * intensity.max())
+
     def fit_hyperparameters_cross_correlation(
         self,
         bf_mask: torch.Tensor | None = None,
@@ -1512,8 +1567,11 @@ class DirectPtychography(DirectPtychographyBase):
         Parameters
         ----------
         bf_mask: torch.Tensor, optional
-            Subset of bright field mask to use for reconstruction. Note this must be
-            strictly smaller than the bf_mask used for initialization.
+            Subset of the bright-field mask to align. Defaults to the pixels where the
+            aperture is at least half its peak intensity: the alignment treats each image as a
+            shifted copy of the object, which pixels on the aperture's soft edge are not, and
+            with them included the defocus fit on the test fixture landed at -600 A instead of
+            1625 A.
         bin_factors : tuple of int
             Sequence of binning factors from coarse to fine
         pair_connectivity : int
@@ -1548,7 +1606,7 @@ class DirectPtychography(DirectPtychographyBase):
             verbose = self.verbose
 
         if bf_mask is None:
-            bf_mask = self.bf_mask
+            bf_mask = self._flat_aperture_mask(rotation_angle, use_initial_state)
         bf = self._return_bf_context(bf_mask)
         bf_mask = bf.bf_mask
         inds_i, inds_j = bf.bf_inds_i, bf.bf_inds_j

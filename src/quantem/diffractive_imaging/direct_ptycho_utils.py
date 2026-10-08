@@ -1128,9 +1128,10 @@ def build_vbf_stack_from_dataset3d(
     force_measured_origin=None,
     force_fitted_origin=None,
     rotation_angle: float | None = None,
-    intensity_threshold: float = 0.5,
+    intensity_threshold: float | None = None,
     normalization_order: int = 0,
     bf_mask=None,
+    aperture=None,
 ):
     """
     Origin-correct and mask an ungridded diffraction stack into a flat vBF stack.
@@ -1196,7 +1197,9 @@ def build_vbf_stack_from_dataset3d(
     )
 
     if bf_mask is None:
-        bf_mask = bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold)
+        bf_mask = _bright_field_mask_of(
+            shifted_tensor, dataset, intensity_threshold, aperture, rotation_angle
+        )
     else:
         bf_mask = validate_tensor(bf_mask, "bf_mask", dtype=torch.bool).to(shifted_tensor.device)
         if tuple(bf_mask.shape) != tuple(shifted_tensor.shape[-2:]):
@@ -1436,10 +1439,11 @@ def build_event_stack_from_vector(
     force_measured_origin=None,
     force_fitted_origin=None,
     rotation_angle: float | None = None,
-    intensity_threshold: float = 0.5,
+    intensity_threshold: float | None = None,
     weight_field: str | None = None,
     normalization_order: int = 0,
     bf_mask=None,
+    aperture=None,
 ):
     """
     Origin-correct and mask a ragged event list into an :class:`EventStack`.
@@ -1583,7 +1587,12 @@ def build_event_stack_from_vector(
     mean_pattern_t = torch.as_tensor(mean_pattern, dtype=torch.float, device=device)
 
     if bf_mask is None:
-        bf_mask = mean_pattern_t > mean_pattern_t.max() * intensity_threshold
+        amplitude = (
+            None
+            if aperture is None
+            else aperture(gpts, reciprocal_sampling, detector_units, rotation_angle)
+        )
+        bf_mask = bright_field_mask(mean_pattern_t, intensity_threshold, amplitude)
     else:
         bf_mask = validate_tensor(bf_mask, "bf_mask", dtype=torch.bool).to(device)
         if tuple(bf_mask.shape) != gpts:
@@ -1960,6 +1969,77 @@ def bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold: float = 0.5):
     return mean_dp > mean_dp.max() * intensity_threshold
 
 
+#: The mean pattern's fraction of its peak below which ``bright_field_mask`` takes the mean
+#: pattern's view instead of the model's, when no model aperture is available.
+DEFAULT_INTENSITY_THRESHOLD = 0.5
+
+#: A model-aperture pixel whose measured mean intensity is below this fraction of the mean
+#: pattern's peak holds no data to normalize by, so the mask leaves it out. It guards against a
+#: semiangle or origin calibrated slightly too large on experimental data; on simulated data
+#: it removes only the outermost corner of the soft edge.
+EMPTY_PIXEL_FRACTION = 1e-3
+
+
+def model_aperture(
+    gpts,
+    reciprocal_sampling,
+    detector_units,
+    wavelength: float,
+    semiangle_cutoff: float | None = None,
+    fourier_probe=None,
+    rotation_angle: float = 0.0,
+    device="cpu",
+):
+    """``|psi(k)|`` of the probe model on a corner-centred detector grid, or ``None`` without one.
+
+    The analytic probe's soft aperture when ``semiangle_cutoff`` is given, otherwise the
+    ``fourier_probe``'s amplitude (summed over modes), read in the scan frame at the grid
+    rotated by ``rotation_angle`` degrees, as the reconstructions read it.
+    """
+    if fourier_probe is None and semiangle_cutoff is None:
+        return None
+    dk = np.asarray(reciprocal_sampling, dtype=np.float64)
+    if tuple(detector_units)[0] == "mrad":
+        dk = dk * 1e-3 / wavelength
+    sampling = tuple(1 / (n * d) for n, d in zip(gpts, dk))
+    kx, ky = spatial_frequencies(
+        tuple(int(n) for n in gpts),
+        sampling,
+        rotation_angle=_rotation_degrees_to_radians(rotation_angle),
+        device=device,
+    )
+    if fourier_probe is not None:
+        return fourier_probe.to(device).read(kx, ky).abs()
+    from quantem.diffractive_imaging.complex_probe import evaluate_probe
+
+    k, phi = polar_coordinates(kx, ky)
+    angular = tuple(float(d) * wavelength * 1e3 for d in dk)
+    return evaluate_probe(k * wavelength, phi, semiangle_cutoff, angular, wavelength).abs()
+
+
+def bright_field_mask(mean_pattern, intensity_threshold: float | None = None, aperture=None):
+    """The bright-field pixels: those the model aperture reaches, or above a threshold.
+
+    With ``intensity_threshold=None`` and a model ``aperture`` (``|psi(k)|``, as
+    :func:`model_aperture` returns it), the mask is every pixel the aperture reaches, its soft
+    edge included, less any that measured nothing (:data:`EMPTY_PIXEL_FRACTION`). That holds
+    the whole disk whatever the specimen scatters. A threshold on the mean pattern cannot: at
+    half its peak it cuts the soft edge, which WDD's convolution model needs and the double
+    overlaps that separate amplitude from phase sit on, and at 0.05 it admitted 350-380
+    dark-field pixels around thick SrTiO3 and gold nanoparticles, reaching 1.4 and 1.2 alpha.
+
+    With ``intensity_threshold`` given, or no model to read, the mask is the mean pattern above
+    that fraction of its peak (:data:`DEFAULT_INTENSITY_THRESHOLD` without a model).
+    """
+    if intensity_threshold is None and aperture is None:
+        intensity_threshold = DEFAULT_INTENSITY_THRESHOLD
+    if intensity_threshold is not None:
+        return mean_pattern > mean_pattern.max() * intensity_threshold
+    aperture = aperture.to(mean_pattern.device)
+    reached = aperture > OVERLAP_FLOOR * aperture.max()
+    return reached & (mean_pattern > EMPTY_PIXEL_FRACTION * mean_pattern.max())
+
+
 def normalize_vbf_stack(vbf_stack, normalization_order: int, gpts: tuple[int, int]):
     """
     Normalize a ``(*scan_gpts, N_bf)`` virtual bright-field stack.
@@ -1998,6 +2078,21 @@ def normalize_vbf_stack(vbf_stack, normalization_order: int, gpts: tuple[int, in
     return vbf_stack
 
 
+def _bright_field_mask_of(shifted_tensor, dataset, intensity_threshold, aperture, rotation_angle):
+    """:func:`bright_field_mask` of an origin-corrected dense stack, on ``dataset``'s detector."""
+    scan_dims = tuple(range(shifted_tensor.ndim - 2))
+    mean_pattern = shifted_tensor.mean(dim=scan_dims)
+    amplitude = None
+    if aperture is not None:
+        amplitude = aperture(
+            tuple(int(n) for n in shifted_tensor.shape[-2:]),
+            tuple(float(s) for s in dataset.sampling[-2:]),
+            tuple(dataset.units[-2:]),
+            rotation_angle,
+        )
+    return bright_field_mask(mean_pattern, intensity_threshold, amplitude)
+
+
 def build_vbf_stack_from_dataset4d(
     dataset,
     device: str | int = "cpu",
@@ -2007,13 +2102,20 @@ def build_vbf_stack_from_dataset4d(
     force_measured_origin=None,
     force_fitted_origin=None,
     rotation_angle: float | None = None,
-    intensity_threshold: float = 0.5,
+    intensity_threshold: float | None = None,
     normalization_order: int = 0,
     edge_blend_pixels: int = 0,
+    aperture=None,
 ):
     """
     Turn a 4D-STEM dataset into the virtual bright-field stack the direct-ptychography
     classes consume.
+
+    The bright-field mask is every pixel the probe model reaches when ``aperture`` is given
+    and ``intensity_threshold`` is not, and the mean pattern above ``intensity_threshold`` of
+    its peak otherwise; see :func:`bright_field_mask`. ``aperture`` is a callable
+    ``(gpts, reciprocal_sampling, detector_units, rotation_angle) -> |psi(k)|``, such as a
+    partial of :func:`model_aperture`, evaluated once the rotation is known.
 
     Returns
     -------
@@ -2037,7 +2139,9 @@ def build_vbf_stack_from_dataset4d(
         rotation_angle=rotation_angle,
     )
 
-    bf_mask = bf_mask_from_mean_pattern(shifted_tensor, intensity_threshold)
+    bf_mask = _bright_field_mask_of(
+        shifted_tensor, dataset, intensity_threshold, aperture, rotation_angle
+    )
     bf_mask_dataset = Dataset2d.from_array(
         bf_mask.cpu().numpy(),
         name="BF mask",
@@ -2130,6 +2234,31 @@ def depth_phase_factors(qxa, qya, kx, ky, wavelength: float, depths):
     d_plus = ((qx + kx).square() + (qy + ky).square()) - k2
     z = depths.to(d_minus.dtype).view(-1, 1, 1, 1) * (math.pi * wavelength)
     return torch.exp(1j * z * d_minus.unsqueeze(0)), torch.exp(1j * z * d_plus.unsqueeze(0))
+
+
+def alias_tiles(array, factor: int):
+    """``(..., U H, U W, K)`` on an upsampled grid to ``(..., H, W, U^2 K)`` on the scan's.
+
+    A scan of ``H x W`` positions samples the object's spectrum only modulo its own grid, so
+    each of its frequencies holds the sum of ``U^2`` frequencies of the upsampled grid, its
+    alias tiles. Column ``tile * K + channel`` of the result is that tile's ``channel``, with
+    tiles in row-major order of the upsampled grid's blocks. :func:`from_alias_tiles` inverts it.
+    """
+    *lead, rows, cols, k = array.shape
+    h, w = rows // factor, cols // factor
+    n = len(lead)
+    tiled = array.reshape(*lead, factor, h, factor, w, k)
+    order = list(range(n)) + [n + 1, n + 3, n, n + 2, n + 4]
+    return tiled.permute(order).reshape(*lead, h, w, factor * factor * k)
+
+
+def from_alias_tiles(array, factor: int, channels: int):
+    """``(..., H, W, U^2 K)`` alias-tile columns back to ``(..., U H, U W, K)``."""
+    *lead, h, w, _ = array.shape
+    n = len(lead)
+    tiled = array.reshape(*lead, h, w, factor, factor, channels)
+    order = list(range(n)) + [n + 2, n, n + 3, n + 1, n + 4]
+    return tiled.permute(order).reshape(*lead, factor * h, factor * w, channels)
 
 
 def woa_columns(t_minus, t_plus, depth_factors=None, complex_obj: bool = False):
@@ -2249,6 +2378,7 @@ def normal_equation_operator(
     num_phase: int,
     eigenvalue_floor: float = EIGENVALUE_FLOOR,
     amplitude_factor: float = 0.5,
+    channels=None,
 ):
     """``A``, ``(..., K, K)``, with which every channel's Fourier coefficients are ``A @ b``.
 
@@ -2258,7 +2388,7 @@ def normal_equation_operator(
     :func:`solve_normal_equations` for the gains.
     """
     gain, factors, pinv = _channel_scales(
-        gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor
+        gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor, channels
     )
     return (gain * factors)[..., :, None] * pinv
 
@@ -2269,6 +2399,7 @@ def _channel_scales(
     num_phase: int,
     eigenvalue_floor: float,
     amplitude_factor: float,
+    channels=None,
 ):
     """``(gain, factors, M^+)``: each channel's OBF gain ``(..., K)``, its constant factor
     ``(K,)`` (``-i`` on the phase channels) and the regularized inverse, in complex128."""
@@ -2297,11 +2428,19 @@ def _channel_scales(
     peak = power.reshape(-1, power.shape[-1]).amax(0)
     gain = torch.where(power > OVERLAP_FLOOR**2 * peak, gain, torch.zeros_like(gain))
 
-    k = gram.shape[-1]
-    factors = torch.ones(k, dtype=torch.complex128, device=gram.device)
-    factors[:num_phase] = -1j
-    factors[num_phase:] = amplitude_factor
+    factors = column_factors(gram.shape[-1], num_phase, amplitude_factor, gram.device, channels)
     return gain, factors, pinv
+
+
+def column_factors(
+    num_columns: int, num_phase: int, amplitude_factor=1.0, device="cpu", channels=None
+):
+    """``(K,)``: ``-i`` on the phase columns, whose unknown carries a factor ``i``, and
+    ``amplitude_factor`` on the amplitude ones. With ``channels`` per alias tile (see
+    :func:`alias_tiles`) the pattern repeats tile by tile."""
+    index = torch.arange(num_columns, device=device) % (channels or num_columns)
+    phase = torch.full((num_columns,), -1j, dtype=torch.complex128, device=device)
+    return torch.where(index < num_phase, phase, torch.full_like(phase, amplitude_factor))
 
 
 def solve_normal_equations(
@@ -2314,6 +2453,7 @@ def solve_normal_equations(
     prior=None,
     noise_variance=None,
     weighted_gram=None,
+    channels=None,
 ):
     """Fourier coefficients ``(H, W, K)`` of every channel, from the per-frequency normal equations.
 
@@ -2341,18 +2481,21 @@ def solve_normal_equations(
     posterior mean, from ``weighted_gram`` (the inverse-variance Gram matrix, which for one
     column differs from ``gram`` where the aperture is not flat) and ``noise_variance``. It then
     takes the same gain as least squares, so the images compare directly.
+
+    ``channels`` is the number of channels per alias tile when the columns hold several tiles
+    side by side (:func:`alias_tiles`); ``num_phase`` then counts the phase channels per tile.
     """
     device, out_dtype = numerator.device, numerator.dtype
     if prior is None:
         operator = normal_equation_operator(
-            gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor
+            gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor, channels
         )
         numerator = numerator.to(operator.device, torch.complex128)
         return torch.einsum("...ij,...j->...i", operator, numerator).to(device, out_dtype)
     if prior != "ard":
         raise ValueError(f"`prior` must be None or 'ard', got {prior!r}")
     gain, factors, _ = _channel_scales(
-        gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor
+        gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor, channels
     )
     estimate = ard_estimate(
         gram if weighted_gram is None else weighted_gram,
@@ -2451,6 +2594,7 @@ def wiener_estimate(
     rings,
     significance: float = WIENER_SIGNIFICANCE,
     eigenvalue_floor: float = EIGENVALUE_FLOOR,
+    channels=None,
 ):
     """Posterior mean ``(..., K)`` of the normal equations under the data's own radial spectrum.
 
@@ -2468,9 +2612,10 @@ def wiener_estimate(
     and a factor in the columns that depends on ``q`` alone, such as a finite source, is divided
     back out. It has no free parameter but the gate.
 
-    ``rings`` is ``(...)`` integer ring indices, from :func:`frequency_rings`, and frequencies in
-    ring 0 are left out. ``noise_variance`` is as for :func:`ard_estimate`. Computed without
-    gradients.
+    ``rings`` is ``(...)`` integer ring indices, from :func:`frequency_rings`, or ``(..., K)``
+    with one per column, and frequencies in ring 0 are left out. With ``channels`` per alias
+    tile (:func:`alias_tiles`), the columns of one channel in every tile share its spectrum.
+    ``noise_variance`` is as for :func:`ard_estimate`. Computed without gradients.
     """
     with torch.no_grad():
         if gram.dim() == numerator.dim():
@@ -2488,15 +2633,16 @@ def wiener_estimate(
         estimate = torch.einsum("...ij,...j->...i", pinv, numerator)
         variance = sigma2 * torch.diagonal(pinv, dim1=-2, dim2=-1).real
         num_columns = gram.shape[-1]
-        rings = rings[..., None].expand(*rings.shape, num_columns)
+        if rings.dim() == gram.dim() - 2:
+            rings = rings[..., None].expand(*rings.shape, num_columns)
         power = torch.diagonal(gram, dim1=-2, dim2=-1).real
         peak = power.reshape(-1, num_columns).amax(0)
         live = (power > OVERLAP_FLOOR**2 * peak) & (rings > 0)
-        channel = torch.arange(num_columns, device=solver)
+        channel = torch.arange(num_columns, device=solver) % (channels or num_columns)
 
         num_rings = int(rings.max()) + 1
         prior = torch.zeros_like(variance)
-        for n in range(num_columns):
+        for n in range(channels or num_columns):
             selected = live & (channel == n)
             ring_prior = _ring_signal_power(
                 estimate[selected].abs().square(),
@@ -2661,6 +2807,7 @@ def woa_kernel_terms(
     complex_obj: bool,
     aperture_floor: float,
     peak_intensity: float = 1.0,
+    alias_factor: int = 1,
 ) -> dict:
     """One batch's contribution to the sums of the weak-object kernels: ``ssb``, ``obf``,
     ``wiener`` and ``wdd``.
@@ -2683,6 +2830,12 @@ def woa_kernel_terms(
     across the aperture, and comparable between one slice and several. Its sums are
     ``residual_gram``, for one column only (with several it is ``gram``), and
     ``weighted_energy``, ``sum_k |psi(k)|^2 |G_k|^2`` relative to the peak.
+
+    With ``alias_factor = U > 1``, ``qxa, qya`` are a grid ``U`` times finer than the scan and
+    ``vbf_fourier`` the scan's spectra tiled onto it. The normal equations are then accumulated
+    on the scan's own grid, with the columns of all ``U^2`` alias tiles of each frequency side
+    by side (:func:`alias_tiles`), so that the solve separates the tiles jointly rather than
+    treating the others as noise. SSB's own sums stay on the fine grid.
     """
     t_minus, t_plus, psi_minus, psi_plus = overlap_terms(
         probe, cmplx_probe_at_k, kx, ky, qxa, qya, partial_coherence=False
@@ -2696,17 +2849,21 @@ def woa_kernel_terms(
         t_plus = t_plus * env_plus.to(t_plus.real.dtype)
     factors = depth_phase_factors(qxa, qya, kx, ky, wavelength, depths)
     columns = woa_columns(t_minus, t_plus, factors, complex_obj)
+    data = vbf_fourier
+    if alias_factor > 1:
+        columns = alias_tiles(columns, alias_factor)
+        data = vbf_fourier[:, : columns.shape[1], : columns.shape[2]]
     # one column only rescales each frequency, so the single-plane phase keeps the unweighted
     # Gram it has always had; several columns need the exact weights
     intensity = cmplx_probe_at_k.abs().square() / peak_intensity
     several = columns.shape[-1] > 1
     terms = {}
     terms["gram"], terms["numerator"] = accumulate_normal_equations(
-        columns, vbf_fourier, intensity if several else None
+        columns, data, intensity if several else None
     )
     if not several:
         terms["residual_gram"] = weighted_gram(columns, intensity)
-    terms["weighted_energy"] = (intensity * vbf_fourier.abs().square()).sum(0)
+    terms["weighted_energy"] = (intensity * data.abs().square()).sum(0)
 
     if kernel == "ssb":
         # unit-modulus weights from the coherent overlap: the partial-coherence envelope would

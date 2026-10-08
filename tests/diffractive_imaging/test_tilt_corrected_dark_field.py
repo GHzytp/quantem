@@ -153,7 +153,9 @@ class TestFullFieldFusion:
         qx = np.fft.fftfreq(transfer.shape[0], 0.25)
         q = np.hypot(qx[:, None], qx[None, :])
         assert transfer.max() == pytest.approx(1.0)
-        assert np.abs(transfer[q > 2.05 * ML_K_PROBE]).max() < 1e-6
+        # the mask reaches half a pixel past alpha, so the band ends a pixel past 2 alpha
+        pixel = 1 / (ML_N_DET * 0.25)
+        assert np.abs(transfer[q > 2 * ML_K_PROBE + 1.5 * pixel]).max() < 1e-6
 
     def test_the_weight_selects_each_channel(self):
         rng = np.random.default_rng(0)

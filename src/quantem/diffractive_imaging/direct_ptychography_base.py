@@ -29,8 +29,12 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     EIGENVALUE_FLOOR,
     OBJ_TYPES,
     _rotation_degrees_to_radians,
+    alias_tiles,
+    column_factors,
     explained_energy,
     frequency_rings,
+    from_alias_tiles,
+    model_aperture,
     noise_variance_from_residual,
     residual_per_degree_of_freedom,
     solve_normal_equations,
@@ -407,6 +411,31 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             aberration_coefs=aberration_coefs,
         )
 
+    @classmethod
+    def _model_aperture_for(cls, energy, wavelength, semiangle_cutoff, fourier_probe, device):
+        """The probe model's ``|psi(k)|`` as the stack builders evaluate it, or ``None``.
+
+        The builders call it once the detector rotation is known, so that an empirical probe,
+        which lives in the scan frame, is read where the reconstruction will read it.
+        """
+        if fourier_probe is None and (semiangle_cutoff is None or not semiangle_cutoff > 0):
+            return None  # the constructor reports a bad semiangle in its own terms
+        resolved = cls._resolve_wavelength(energy, wavelength)
+
+        def aperture(gpts, reciprocal_sampling, detector_units, rotation_angle):
+            return model_aperture(
+                gpts,
+                reciprocal_sampling,
+                detector_units,
+                resolved,
+                semiangle_cutoff,
+                fourier_probe,
+                rotation_angle,
+                device,
+            )
+
+        return aperture
+
     @staticmethod
     def _resolve_wavelength(energy: float | None, wavelength: float | None) -> float:
         """Wavelength in Angstrom, from an electron accelerating voltage or given directly.
@@ -514,6 +543,15 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         bf_weights = ctx["bf_weights"]
         complex_obj = obj_type == "complex"
         self._noise_variance = None
+        # the normal equations hold every alias tile of a scan frequency side by side when the
+        # reconstruction is upsampled (see `alias_tiles`); each tile has `channels` columns
+        alias_factor = ctx.get("alias_factor", 1)
+        channels = num_slices * (2 if complex_obj else 1)
+
+        def to_grid(coefficients):
+            if alias_factor > 1:
+                coefficients = from_alias_tiles(coefficients, alias_factor, channels)
+            return coefficients.permute(2, 0, 1)
 
         if kernel == "obf":
             # the inverse-variance Gram: for one column the solve keeps the unweighted one
@@ -538,7 +576,9 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
                 prior=prior,
                 noise_variance=noise_variance,
                 weighted_gram=weighted,
-            ).permute(2, 0, 1)
+                channels=channels,
+            )
+            coefficients = to_grid(coefficients)
             phase_q = coefficients[:num_slices]
             amplitude_q = coefficients[num_slices:] if complex_obj else None
         elif kernel == "wiener":
@@ -551,20 +591,27 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
                 noise_variance = float(residual[mask > 0].median())
             self._noise_variance = float(noise_variance)
             numerator = sums["numerator"]
+            rings = frequency_rings(ctx["qxa"], ctx["qya"])
+            if alias_factor > 1:
+                # each tile's columns sit at their own |q| on the upsampled grid
+                rings = alias_tiles(rings[..., None], alias_factor)
+                rings = rings.repeat_interleave(channels, -1)
             estimate = wiener_estimate(
                 weighted,
                 numerator,
                 noise_variance,
-                frequency_rings(ctx["qxa"], ctx["qya"]),
+                rings,
                 eigenvalue_floor=ridge,
+                channels=channels,
             )
             # the columns model the mean-normalized data relative to the peak intensity, and an
             # upsampled grid's inverse transform divides by U^2 more points than the scan holds
             scale = ctx["peak_intensity"] * ctx["upsampling_factor"] ** 2
-            factors = torch.ones(estimate.shape[-1], dtype=estimate.dtype, device=estimate.device)
-            factors[:num_slices] = -1j
+            factors = column_factors(
+                estimate.shape[-1], num_slices, 1.0, estimate.device, channels
+            ).to(estimate.dtype)
             coefficients = (estimate * factors * scale).to(numerator.device, numerator.dtype)
-            coefficients = coefficients.permute(2, 0, 1)
+            coefficients = to_grid(coefficients)
             phase_q = coefficients[:num_slices]
             amplitude_q = coefficients[num_slices:] if complex_obj else None
         elif kernel == "ssb":
