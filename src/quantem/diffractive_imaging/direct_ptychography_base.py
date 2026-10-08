@@ -30,7 +30,11 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     OBJ_TYPES,
     _rotation_degrees_to_radians,
     explained_energy,
+    frequency_rings,
+    noise_variance_from_residual,
+    residual_per_degree_of_freedom,
     solve_normal_equations,
+    wiener_estimate,
 )
 from quantem.diffractive_imaging.ptycho_utils import (
     OptimizationParameter as OptimizationParameter,  # re-export: the documented path
@@ -319,17 +323,66 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             "'icom' does not read the probe at all."
         )
 
+    @property
+    def focal_spread(self) -> float:
+        """Rms spread of defocus in Angstrom, from the energy spread and lens instabilities.
+
+        With :attr:`source_size` it describes partial coherence by a closed-form envelope on
+        the overlap function (see
+        :func:`~quantem.diffractive_imaging.complex_probe.partial_coherence_envelope`), the
+        parametric alternative to a mixed-state :attr:`fourier_probe`. It weights each
+        bright-field pixel differently, so it changes every kernel that reads the overlap
+        function and :meth:`residual_loss`, which can therefore fit it: on simulated data the
+        residual was smallest at the true 50 A. SSB keeps its unit-modulus weights from the
+        coherent overlap, since the envelope gave the in-focus triple overlap a weight it has
+        no signal for and lowered its correlation with the object (0.920 to 0.893).
+        """
+        return getattr(self, "_focal_spread", 0.0)
+
+    @focal_spread.setter
+    def focal_spread(self, value) -> None:
+        self._focal_spread = self._validate_spread(value, "focal_spread")
+
+    @property
+    def source_size(self) -> float:
+        """Rms spread of the probe position per axis in Angstrom, from the finite source.
+
+        It multiplies the data at scan frequency ``q`` by ``exp(-2 pi^2 source_size^2 |q|^2)``
+        whatever the bright-field pixel, so the least-squares fit, :meth:`residual_loss`, SSB
+        and OBF are all unchanged by it, and the data cannot determine it: it must come from a
+        calibration. It matters to the kernel that estimates the object itself, ``"wiener"``,
+        which divides it back out where the signal allows; WDD's fixed ridge does not.
+        """
+        return getattr(self, "_source_size", 0.0)
+
+    @source_size.setter
+    def source_size(self, value) -> None:
+        self._source_size = self._validate_spread(value, "source_size")
+
+    @staticmethod
+    def _validate_spread(value, name):
+        if isinstance(value, torch.Tensor) and value.requires_grad:
+            return value
+        value = float(value)
+        if not value >= 0:
+            raise ValueError(
+                f"`{name}` must be a non-negative rms spread in Angstrom, got {value}"
+            )
+        return value
+
     def _return_probe(self, aberration_coefs) -> "FourierProbe":
-        """The probe object the overlap function samples, empirical or analytic."""
-        if self.fourier_probe is not None:
-            return self.fourier_probe
-        return FourierProbe.from_aberrations(
-            self.wavelength,
-            self.semiangle_cutoff,
-            self.angular_sampling,
-            aberration_coefs,
-            self.soft_edges,
-        )
+        """The probe object the overlap function samples, empirical or analytic, with the
+        partial-coherence envelope of :attr:`focal_spread` and :attr:`source_size`."""
+        probe = self.fourier_probe
+        if probe is None:
+            probe = FourierProbe.from_aberrations(
+                self.wavelength,
+                self.semiangle_cutoff,
+                self.angular_sampling,
+                aberration_coefs,
+                self.soft_edges,
+            )
+        return probe.with_partial_coherence(self.focal_spread, self.source_size)
 
     def _return_probe_on_grid(self, k, phi, aberration_coefs, probe=None):
         """``psi(k)`` on the detector grid, whose squared sum is the bright-field weight.
@@ -393,7 +446,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
 
         The columns are the kernel's own model:
 
-        - ``ssb`` and ``obf``: the weak-object overlap functions,
+        - ``ssb``, ``obf``, ``wiener`` and ``wdd``: the weak-object overlap functions,
           ``Gamma-`` per slice and, for ``obj_type="complex"``, ``Gamma+`` per slice. These
           kernels share the model, so at the same hyperparameters they report the same value.
         - ``prlx``: one shifted copy of the image per bright-field pixel, so this is the spread
@@ -411,6 +464,12 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             ``None`` before :meth:`reconstruct`.
         """
         return getattr(self, "_residual", None)
+
+    @property
+    def noise_variance(self) -> float | None:
+        """The noise variance the last ``prior="ard"`` reconstruction used, per unit weight of
+        the normalized bright-field data; ``None`` otherwise."""
+        return getattr(self, "_noise_variance", None)
 
     @property
     def obj_type(self) -> str | None:
@@ -447,20 +506,65 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         num_slices,
         obj_type,
         ridge=EIGENVALUE_FLOOR,
+        prior=None,
+        noise_variance=None,
     ):
         """``(phase_q, amplitude_q)``, each ``(num_slices, Ny, Nx)``, before the Butterworth filter."""
         kernel = ctx["kernel"]
         bf_weights = ctx["bf_weights"]
         complex_obj = obj_type == "complex"
+        self._noise_variance = None
 
         if kernel == "obf":
+            # the inverse-variance Gram: for one column the solve keeps the unweighted one
+            weighted = sums.get("residual_gram", sums["gram"])
+            if prior is not None and noise_variance is None:
+                noise_variance = noise_variance_from_residual(
+                    weighted,
+                    sums["numerator"],
+                    sums["weighted_energy"],
+                    ctx["bf"].num_bf,
+                    ctx["residual_mask"],
+                    ridge,
+                )
+            if prior is not None:
+                self._noise_variance = float(noise_variance)
             coefficients = solve_normal_equations(
                 sums["gram"],
                 sums["numerator"],
                 bf_weights,
                 num_phase=num_slices,
                 eigenvalue_floor=ridge,
+                prior=prior,
+                noise_variance=noise_variance,
+                weighted_gram=weighted,
             ).permute(2, 0, 1)
+            phase_q = coefficients[:num_slices]
+            amplitude_q = coefficients[num_slices:] if complex_obj else None
+        elif kernel == "wiener":
+            weighted = sums.get("residual_gram", sums["gram"])
+            residual = residual_per_degree_of_freedom(
+                weighted, sums["numerator"], sums["weighted_energy"], ctx["bf"].num_bf, ridge
+            )
+            mask = ctx["residual_mask"].to(residual.device)
+            if noise_variance is None:
+                noise_variance = float(residual[mask > 0].median())
+            self._noise_variance = float(noise_variance)
+            numerator = sums["numerator"]
+            estimate = wiener_estimate(
+                weighted,
+                numerator,
+                noise_variance,
+                frequency_rings(ctx["qxa"], ctx["qya"]),
+                eigenvalue_floor=ridge,
+            )
+            # the columns model the mean-normalized data relative to the peak intensity, and an
+            # upsampled grid's inverse transform divides by U^2 more points than the scan holds
+            scale = ctx["peak_intensity"] * ctx["upsampling_factor"] ** 2
+            factors = torch.ones(estimate.shape[-1], dtype=estimate.dtype, device=estimate.device)
+            factors[:num_slices] = -1j
+            coefficients = (estimate * factors * scale).to(numerator.device, numerator.dtype)
+            coefficients = coefficients.permute(2, 0, 1)
             phase_q = coefficients[:num_slices]
             amplitude_q = coefficients[num_slices:] if complex_obj else None
         elif kernel == "ssb":
@@ -516,11 +620,11 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         return mask
 
     #: kernels that solve the per-frequency normal equations, and so support several slices
-    _MULTISLICE_KERNELS = frozenset({"obf"})
+    _MULTISLICE_KERNELS = frozenset({"obf", "wiener"})
 
     #: kernels whose forward model is the weak-object overlap function, which accumulate the
     #: normal equations and so share :meth:`residual_loss`
-    _WOA_KERNELS = frozenset({"ssb", "obf"})
+    _WOA_KERNELS = frozenset({"ssb", "obf", "wiener", "wdd"})
 
     def _validate_reconstruction_mode(self, kernel: str, obj_type: str, num_slices: int):
         """Raise for a combination of kernel, ``obj_type`` and ``num_slices`` with no meaning."""
@@ -536,11 +640,34 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             )
         if int(num_slices) != num_slices or num_slices < 1:
             raise ValueError(f"`num_slices` must be a positive integer, got {num_slices!r}")
+        if num_slices > 1 and kernel == "wdd":
+            raise ValueError(
+                "WDD deconvolves a single multiplicative object, so it has no slices. Use 'obf' "
+                "or 'wiener' for several."
+            )
         if num_slices > 1 and kernel not in self._MULTISLICE_KERNELS:
             raise ValueError(
                 f"Several slices need the per-frequency least-squares solve, which only 'obf' "
-                f"uses; got {kernel!r}. SSB normalizes every bright-field pixel on "
+                f"and 'wiener' use; got {kernel!r}. SSB normalizes every bright-field pixel on "
                 "its own, and parallax and iCoM have no depth-resolved model."
+            )
+
+    def _validate_prior(self, kernel: str, prior, noise_variance):
+        """Raise for a ``prior`` the kernel cannot use, or a ``noise_variance`` that is not one."""
+        if noise_variance is not None and not float(noise_variance) > 0:
+            raise ValueError(f"`noise_variance` must be positive, got {noise_variance!r}")
+        if prior is None:
+            if noise_variance is not None and kernel != "wiener":
+                raise ValueError(
+                    "`noise_variance` is only used with `prior='ard'` or the 'wiener' kernel."
+                )
+            return
+        if prior != "ard":
+            raise ValueError(f"`prior` must be None or 'ard', got {prior!r}")
+        if kernel != "obf":
+            raise ValueError(
+                f"prior='ard' acts on the per-frequency normal equations of 'obf'; got {kernel!r}. "
+                "The 'wiener' kernel has its own prior, the data's radial spectrum."
             )
 
     def rms_gradient_loss(self):
@@ -826,6 +953,9 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             "aberration-corrected-bright-field": "ssb",
             "obf": "obf",
             "optimum-bright-field": "obf",
+            "wiener": "wiener",
+            "wdd": "wdd",
+            "wigner-distribution-deconvolution": "wdd",
             "prlx": "prlx",
             "parallax": "prlx",
             "tcbf": "prlx",
@@ -846,7 +976,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         return aliases[kernel]
 
     #: kernels carrying a ``gamma`` factor, which is already zero past ``2 alpha / lambda``
-    _BAND_LIMITED_KERNELS = frozenset({"ssb", "obf"})
+    _BAND_LIMITED_KERNELS = frozenset({"ssb", "obf", "wiener", "wdd"})
 
     def _return_band_limit(self) -> float | None:
         """``2 alpha / lambda``, the largest object frequency the data can carry.
@@ -868,8 +998,8 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
     def _resolve_q_lowpass(self, q_lowpass, deconvolution_kernel, band_limit=True) -> float | None:
         """Clamp ``q_lowpass`` to the band limit for kernels that do not impose it themselves.
 
-        ``ssb`` and ``obf`` multiply by ``gamma``, so they are already zero beyond
-        ``2 alpha / lambda``; for an array probe, whose ``gamma`` holds round-off there,
+        ``ssb``, ``obf``, ``wiener`` and ``wdd`` multiply by ``gamma``, so they are already zero
+        beyond ``2 alpha / lambda``; for an array probe, whose ``gamma`` holds round-off there,
         through :data:`~quantem.diffractive_imaging.direct_ptycho_utils.OVERLAP_FLOOR`.
         ``prlx`` is a pure shift of unit magnitude at every ``q`` and
         ``icom`` only rolls off as ``1/|q|``, so both would otherwise pass whatever lies past

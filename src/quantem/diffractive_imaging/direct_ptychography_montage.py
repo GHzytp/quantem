@@ -219,6 +219,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         scan_origin: Tuple[float, float] | None = None,
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         events: "EventStack | None" = None,
         _token: object | None = None,
     ):
@@ -272,6 +274,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         self.fourier_probe = fourier_probe
         self.semiangle_cutoff = semiangle_cutoff
         self.soft_edges = soft_edges
+        self.focal_spread = focal_spread
+        self.source_size = source_size
         self.boundary = boundary
         #: whether the positions lie on a regular lattice; drives the sampling-density
         #: correction that `weight_normalize` applies
@@ -316,6 +320,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         boundary: Literal["wrap", "pad"] = "wrap",
         defocus_gradient: Tuple[float, float] | None = None,
         subtract_frame_mean: bool = False,
@@ -349,6 +355,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             scan_units=tuple(vbf_dataset.units[-2:]),
             scan_gpts=scan_gpts,
             fourier_probe=fourier_probe,
+            focal_spread=focal_spread,
+            source_size=source_size,
             boundary=boundary,
             gridded_scan=True,
             defocus_gradient=defocus_gradient,
@@ -371,6 +379,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -421,6 +431,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             semiangle_cutoff=semiangle_cutoff,
             aberration_coefs=aberration_coefs,
             fourier_probe=fourier_probe,
+            focal_spread=focal_spread,
+            source_size=source_size,
             boundary=boundary,
             defocus_gradient=defocus_gradient,
             subtract_frame_mean=subtract_frame_mean,
@@ -444,6 +456,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         bf_mask: torch.Tensor | NDArray | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -522,6 +536,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             scan_gpts=scan_gpts,
             scan_origin=scan_origin,
             fourier_probe=fourier_probe,
+            focal_spread=focal_spread,
+            source_size=source_size,
             boundary=boundary,
             gridded_scan=False,
             defocus_gradient=defocus_gradient,
@@ -549,6 +565,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         detector_units: Tuple[str, str] | None = None,
         bf_mask: torch.Tensor | NDArray | None = None,
         weight_field: str | None = None,
@@ -703,6 +721,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             scan_gpts=scan_gpts,
             scan_origin=scan_origin,
             fourier_probe=fourier_probe,
+            focal_spread=focal_spread,
+            source_size=source_size,
             boundary=boundary,
             gridded_scan=False,
             defocus_gradient=defocus_gradient,
@@ -915,6 +935,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         self._stencil_info = None
         self._corrected_amplitude = None
         self._residual = None
+        self._noise_variance = None
 
     # ------------------------------------------------------------------
     # reconstruction
@@ -1820,6 +1841,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         num_slices=1,
         slice_thicknesses=None,
         ridge=EIGENVALUE_FLOOR,
+        prior=None,
+        noise_variance=None,
     ):
         """
         Accumulate the canvas and apply the post-hoc Fourier filters.
@@ -1982,6 +2005,13 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             Cap on the automatic radius. Cost scales with its square.
         ridge : float
             Ridge of the joint solve for several columns, as in ``DirectPtychography``.
+        prior : {None, "ard"}
+            Automatic relevance determination on the normal equations, as in
+            ``DirectPtychography.reconstruct``, ``"obf"`` with ``convolution_mode="fft"``
+            only: the estimate is nonlinear in the data, so it has no
+            per-pixel kernel for the stencil route.
+        noise_variance : float, optional
+            The noise level ``prior="ard"`` uses; estimated from the residual by default.
         kernel_batch_size : int
             Bright-field pixels whose real-space kernels are built at once.
         obj_type : {"pure_phase", "complex"}
@@ -2028,11 +2058,18 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             rotation_angle = state.current_rotation_angle(override_rotation_angle)
 
         kernel = self._normalize_kernel_name(deconvolution_kernel)
+        if kernel == "wdd":
+            raise NotImplementedError(
+                "WDD is available on DirectPtychography only. It deconvolves every scan "
+                "frequency over the detector, which needs all bright-field pixels' transforms "
+                "at that frequency at once, while this class transforms one canvas per pixel."
+            )
         if kernel == "prlx":
             # zero aberrations would give zero shifts and quietly sum the bright-field stack
             # into a plain incoherent image, which is not a parallax reconstruction
             self._require_analytic_probe("The parallax kernel", aberration_coefs)
         self._validate_reconstruction_mode(kernel, obj_type, num_slices)
+        self._validate_prior(kernel, prior, noise_variance)
         if ridge is None:
             ridge = EIGENVALUE_FLOOR
         complex_obj = obj_type == "complex"
@@ -2108,7 +2145,17 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         # the weak-object kernels on the FFT route accumulate the per-frequency normal
         # equations, exactly as DirectPtychography does, so every obj_type and slice count
         # works there; the real-space routes carry one phase kernel per bright-field pixel
-        gram_route = mode == "fft" and kernel in ("ssb", "obf")
+        gram_route = mode == "fft" and kernel in ("ssb", "obf", "wiener")
+        if kernel == "wiener" and not gram_route:
+            raise ValueError(
+                "The 'wiener' kernel needs convolution_mode='fft' on this class. Its estimate is "
+                "nonlinear in the data, so there is no per-pixel kernel for a stencil to carry."
+            )
+        if prior is not None and not gram_route:
+            raise ValueError(
+                "prior='ard' needs convolution_mode='fft' on this class. Its estimate is "
+                "nonlinear in the data, so there is no per-pixel kernel for a stencil to carry."
+            )
         if num_slices > 1 and not gram_route:
             raise NotImplementedError(
                 f"num_slices={num_slices} needs convolution_mode='fft' on this class. The "
@@ -2470,9 +2517,19 @@ class DirectPtychographyMontage(DirectPtychographyBase):
                 "bf": bf,
                 "bf_weights": bf_weights,
                 "residual_mask": self._residual_mask(gram_qxa, gram_qya),
+                "qxa": gram_qxa,
+                "qya": gram_qya,
+                "peak_intensity": peak_amplitude**2,
+                "upsampling_factor": upsampling_factor,
             }
             phase_q, amplitude_q = self._fourier_channels(
-                channel_ctx, sums, num_slices, obj_type, ridge
+                channel_ctx,
+                sums,
+                num_slices,
+                obj_type,
+                ridge,
+                prior,
+                noise_variance,
             )
             crop = (Ellipsis, slice(0, canvas_shape[0]), slice(0, canvas_shape[1]))
             obj = torch.fft.ifft2(phase_q).real[crop]

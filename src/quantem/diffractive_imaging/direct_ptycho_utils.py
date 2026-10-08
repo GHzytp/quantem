@@ -21,6 +21,7 @@ from quantem.diffractive_imaging.complex_probe import (
     aberration_surface_cartesian_basis,
     cartesian_to_polar_aberrations,
     overlap_terms,
+    partial_coherence_envelope,
     polar_coordinates,
     spatial_frequencies,
 )
@@ -2047,6 +2048,7 @@ def build_vbf_stack_from_dataset4d(
     # vbf_stack
     vbf_stack = shifted_tensor[..., bf_mask].cpu()
     gpts = vbf_stack.shape[:2]
+    means = vbf_stack.mean((0, 1))
     vbf_stack = normalize_vbf_stack(vbf_stack, normalization_order, gpts)
 
     # smooth window
@@ -2060,6 +2062,10 @@ def build_vbf_stack_from_dataset4d(
         units=("index",) + tuple(dataset.units[:2]),
         sampling=(1,) + tuple(dataset.sampling[:2]),
     )
+    if normalization_order == 0:
+        # what the normalization divided out, which WDD needs back: it deconvolves the
+        # intensities themselves, whose mean pattern a strong object reshapes
+        vbf_dataset.metadata["bright_field_means"] = means.numpy()
 
     return vbf_dataset, bf_mask_dataset, rotation_angle
 
@@ -2305,6 +2311,9 @@ def solve_normal_equations(
     num_phase: int,
     eigenvalue_floor: float = EIGENVALUE_FLOOR,
     amplitude_factor: float = 0.5,
+    prior=None,
+    noise_variance=None,
+    weighted_gram=None,
 ):
     """Fourier coefficients ``(H, W, K)`` of every channel, from the per-frequency normal equations.
 
@@ -2327,13 +2336,297 @@ def solve_normal_equations(
     so they are multiplied by ``-i``. The amplitude channels are halved, since ``Gamma+``
     reaches ``2 |psi|^2`` as ``q -> 0`` where ``Gamma-`` reaches ``|psi|^2`` on a sideband,
     which gives both channels the same transfer there.
+
+    With ``prior="ard"`` the least-squares estimate is replaced by :func:`ard_estimate`'s
+    posterior mean, from ``weighted_gram`` (the inverse-variance Gram matrix, which for one
+    column differs from ``gram`` where the aperture is not flat) and ``noise_variance``. It then
+    takes the same gain as least squares, so the images compare directly.
     """
     device, out_dtype = numerator.device, numerator.dtype
-    operator = normal_equation_operator(
+    if prior is None:
+        operator = normal_equation_operator(
+            gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor
+        )
+        numerator = numerator.to(operator.device, torch.complex128)
+        return torch.einsum("...ij,...j->...i", operator, numerator).to(device, out_dtype)
+    if prior != "ard":
+        raise ValueError(f"`prior` must be None or 'ard', got {prior!r}")
+    gain, factors, _ = _channel_scales(
         gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor
     )
-    numerator = numerator.to(operator.device, torch.complex128)
-    return torch.einsum("...ij,...j->...i", operator, numerator).to(device, out_dtype)
+    estimate = ard_estimate(
+        gram if weighted_gram is None else weighted_gram,
+        numerator,
+        noise_variance,
+        eigenvalue_floor=eigenvalue_floor,
+    ).to(gain.device)
+    return (gain * factors * estimate).to(device, out_dtype)
+
+
+#: Expectation-maximization steps of :func:`ard_estimate`. On two twisted layers at 1e4 and 1e5
+#: electrons per pattern the slices' correlation with their layers changed by less than 0.001
+#: between 10 and 100.
+ARD_ITERATIONS = 30
+
+
+def ard_estimate(
+    gram,
+    numerator,
+    noise_variance: float,
+    iterations: int = ARD_ITERATIONS,
+    eigenvalue_floor: float = EIGENVALUE_FLOOR,
+):
+    """Posterior mean ``(..., K)`` of the normal equations under automatic relevance determination.
+
+    Every coefficient, each channel at each frequency, gets a zero-mean Gaussian prior with its
+    own variance ``gamma``, and the variances are re-estimated from the data by
+    expectation-maximization (sparse Bayesian learning):
+
+        ``Sigma = (M / sigma^2 + diag(1 / gamma))^-1``,  ``mu = Sigma b / sigma^2``,
+        ``gamma <- |mu|^2 + Sigma_nn``.
+
+    A coefficient the data do not support has its variance driven to zero and drops out, so a
+    frequency where only one of several slices carries signal is fitted with that slice's
+    column alone, at the noise of a single plane rather than the ``1 / (1 - rho^2)`` of
+    separating near-parallel columns. Where several coefficients carry signal their variances
+    stay large and the estimate is least squares. With one column it keeps the frequencies whose
+    signal stands above the noise and suppresses the rest, a data-driven Fourier filter.
+
+    It starts from the least-squares estimate and its variance. ``noise_variance`` is the
+    variance of the normalized data per unit weight, for which ``b`` has covariance
+    ``sigma^2 M``; :func:`noise_variance_from_residual` estimates it. The result is nonlinear
+    in the data, so it has no per-pixel kernel, and it is computed without gradients.
+    """
+    with torch.no_grad():
+        if gram.dim() == numerator.dim():
+            gram = gram[..., None, None]
+            numerator = numerator[..., None]
+        solver = _solver_device(gram)
+        gram = gram.detach().to(solver, torch.complex128)
+        numerator = numerator.detach().to(solver, torch.complex128)
+        sigma2 = float(noise_variance)
+        if not sigma2 > 0:
+            raise ValueError(f"`noise_variance` must be positive, got {noise_variance!r}")
+
+        pinv = _pseudo_inverse(gram, eigenvalue_floor)
+        mean = torch.einsum("...ij,...j->...i", pinv, numerator)
+        gamma = mean.abs().square() + sigma2 * torch.diagonal(pinv, dim1=-2, dim2=-1).real
+        floor = 1e-30 * float(gamma.max()) if gamma.numel() and float(gamma.max()) > 0 else 1e-300
+        for _ in range(int(iterations)):
+            mean, covariance = _gaussian_posterior(gram, numerator, sigma2, gamma, floor)
+            gamma = mean.abs().square() + torch.diagonal(covariance, dim1=-2, dim2=-1).real
+        return mean
+
+
+def _gaussian_posterior(gram, numerator, sigma2: float, gamma, floor: float):
+    """``(mean, covariance)`` of ``x`` given ``b ~ N(M x, sigma^2 M)`` and ``x ~ N(0, diag(gamma))``.
+
+    A prior variance at or below ``floor`` is a coefficient fixed at zero.
+    """
+    prior_precision = torch.diag_embed((1 / gamma.clamp_min(floor)).to(gram.dtype))
+    covariance = _hermitian_inverse(gram / sigma2 + prior_precision)
+    return torch.einsum("...ij,...j->...i", covariance, numerator / sigma2), covariance
+
+
+#: How far a ring's power must stand above the noise, in standard errors of the noise power, to
+#: enter :func:`wiener_estimate`'s prior. With some sixty rings per channel, 3 let one through by
+#: chance often enough to matter where a finite source is divided out: the noise there is large
+#: in the object's units, so a chance ring shows as ringing. On one WSe2 layer with a 0.5 A
+#: source at 1e4 electrons per pattern, before the rings were pooled, four noise seeds gave
+#: correlations of 0.62-0.90 at 3 and 0.895-0.898 at 4; across twelve other cases 4 cost at
+#: most 0.003.
+WIENER_SIGNIFICANCE = 4.0
+
+
+def frequency_rings(qxa, qya):
+    """``(H, W)`` ring index ``round(|q| / dq)``, ``dq`` the finer of the grid's two steps."""
+    step = min(float(qxa[1, 0].abs()), float(qya[0, 1].abs()))
+    return torch.round(torch.hypot(qxa, qya) / step).long()
+
+
+def wiener_estimate(
+    gram,
+    numerator,
+    noise_variance: float,
+    rings,
+    significance: float = WIENER_SIGNIFICANCE,
+    eigenvalue_floor: float = EIGENVALUE_FLOOR,
+):
+    """Posterior mean ``(..., K)`` of the normal equations under the data's own radial spectrum.
+
+    Each channel gets a zero-mean Gaussian prior whose variance depends on ``|q|`` alone, the
+    power the data hold in that ring beyond the noise: the ring's mean ``|x_n|^2`` of the
+    least-squares estimate less its mean variance ``sigma^2 (M^+)_nn``. A ring enters only if
+    that excess exceeds ``significance`` standard errors of the noise power; elsewhere the
+    channel is fixed at zero. The posterior mean is then
+
+        ``(M / sigma^2 + diag(1 / P(|q|)))^-1 b / sigma^2``,
+
+    the Wiener filter of the least-squares estimate for one column, ``x P / (P + sigma^2 / M)``,
+    and its multichannel form otherwise. Unlike the OBF gain it estimates the object itself: its
+    transfer is ``P / (P + noise)``, near one wherever the signal stands well above the noise,
+    and a factor in the columns that depends on ``q`` alone, such as a finite source, is divided
+    back out. It has no free parameter but the gate.
+
+    ``rings`` is ``(...)`` integer ring indices, from :func:`frequency_rings`, and frequencies in
+    ring 0 are left out. ``noise_variance`` is as for :func:`ard_estimate`. Computed without
+    gradients.
+    """
+    with torch.no_grad():
+        if gram.dim() == numerator.dim():
+            gram = gram[..., None, None]
+            numerator = numerator[..., None]
+        solver = _solver_device(gram)
+        gram = gram.detach().to(solver, torch.complex128)
+        numerator = numerator.detach().to(solver, torch.complex128)
+        rings = rings.to(solver)
+        sigma2 = float(noise_variance)
+        if not sigma2 > 0:
+            raise ValueError(f"`noise_variance` must be positive, got {noise_variance!r}")
+
+        pinv = _pseudo_inverse(gram, eigenvalue_floor)
+        estimate = torch.einsum("...ij,...j->...i", pinv, numerator)
+        variance = sigma2 * torch.diagonal(pinv, dim1=-2, dim2=-1).real
+        num_columns = gram.shape[-1]
+        rings = rings[..., None].expand(*rings.shape, num_columns)
+        power = torch.diagonal(gram, dim1=-2, dim2=-1).real
+        peak = power.reshape(-1, num_columns).amax(0)
+        live = (power > OVERLAP_FLOOR**2 * peak) & (rings > 0)
+        channel = torch.arange(num_columns, device=solver)
+
+        num_rings = int(rings.max()) + 1
+        prior = torch.zeros_like(variance)
+        for n in range(num_columns):
+            selected = live & (channel == n)
+            ring_prior = _ring_signal_power(
+                estimate[selected].abs().square(),
+                variance[selected],
+                rings[selected],
+                num_rings,
+                significance,
+            )
+            prior = torch.where(selected, ring_prior[rings], prior)
+
+        floor = 1e-30 * float(prior.max()) if float(prior.max()) > 0 else 1e-300
+        mean, _ = _gaussian_posterior(gram, numerator, sigma2, prior, floor)
+        return torch.where(prior > floor, mean, torch.zeros_like(mean))
+
+
+#: Rings are pooled from low ``|q|`` outwards until each bin holds at least this many
+#: frequencies, before :func:`wiener_estimate` estimates their power.
+WIENER_MINIMUM_COUNT = 64
+
+#: Standard errors of the estimated ring power that :func:`wiener_estimate` subtracts from it.
+WIENER_MARGIN = 2.0
+
+
+def _ring_signal_power(
+    power,
+    variance,
+    index,
+    num_rings: int,
+    significance: float,
+    iterations=20,
+    minimum_count=WIENER_MINIMUM_COUNT,
+    margin=WIENER_MARGIN,
+):
+    """``(num_rings,)`` signal power per ring from noisy coefficients, zero where not significant.
+
+    Each coefficient's power is ``P + v`` in expectation, ``v`` its own noise variance. Within a
+    ring ``v`` can span orders of magnitude, near the band edge where a column's power falls to
+    zero, so the coefficients are weighted by ``1 / (P + v)^2``, iterated to the maximum-likelihood
+    ``P``, rather than averaged: a plain mean lets the noisiest few decide. A ring is kept when
+    its excess at ``P = 0`` exceeds ``significance`` standard errors, ``1 / sqrt(sum 1 / v^2)``,
+    which for equal variances is the plain mean's ``v / sqrt(n)``.
+
+    The lowest rings hold a handful of frequencies each, where the noise of a weak column is
+    largest, so a power estimated from them alone is itself very noisy, and an overestimate
+    passes that noise into the image as a slow variation across the field. The rings are
+    therefore pooled from low ``|q|`` until each bin holds ``minimum_count`` frequencies, and the
+    power used is the estimate less ``margin`` of its standard errors. On two random-atom layers 7
+    A apart at 1e4 electrons per pattern this raised the slices' correlation with their layers,
+    counting every frequency, from 0.61 to 0.83, where OBF reached 0.76; one layer was unchanged.
+    """
+    count = torch.bincount(index, minlength=num_rings)
+    bins = torch.zeros(num_rings, dtype=torch.long)
+    label = filled = 0
+    for ring, n in enumerate(count.tolist()):
+        bins[ring] = label
+        filled += n
+        if filled >= minimum_count:
+            label, filled = label + 1, 0
+    bins = bins.to(index.device)
+    pooled = bins[index]
+    num_bins = int(bins.max()) + 1
+    pooled_count = torch.bincount(pooled, minlength=num_bins)
+
+    def weighted_excess(weights):
+        total = torch.bincount(pooled, weights, minlength=num_bins)
+        excess = torch.bincount(pooled, weights * (power - variance), minlength=num_bins)
+        return excess / total.clamp_min(torch.finfo(total.dtype).tiny), total
+
+    null_excess, information = weighted_excess(variance.square().reciprocal())
+    keep = (pooled_count >= 4) & (null_excess * information.sqrt() > significance)
+    signal = null_excess.clamp_min(0)
+    for _ in range(iterations):
+        signal, _ = weighted_excess((signal[pooled] + variance).square().reciprocal())
+        signal = signal.clamp_min(0)
+    _, information = weighted_excess((signal[pooled] + variance).square().reciprocal())
+    signal = signal - margin * information.clamp_min(torch.finfo(information.dtype).tiny).rsqrt()
+    signal = torch.where(keep, signal.clamp_min(0), torch.zeros_like(signal))
+    return signal[bins]
+
+
+def _hermitian_inverse(matrix):
+    """Inverse of Hermitian positive-definite ``(..., K, K)`` matrices, scaled to unit diagonal
+    first so that a pruned coefficient's huge prior precision does not swamp the others."""
+    diagonal = torch.diagonal(matrix, dim1=-2, dim2=-1).real
+    scale = torch.rsqrt(diagonal.clamp_min(torch.finfo(diagonal.dtype).tiny))
+    outer = (scale[..., :, None] * scale[..., None, :]).to(matrix.dtype)
+    return torch.linalg.inv(matrix * outer) * outer
+
+
+def residual_per_degree_of_freedom(
+    gram, numerator, weighted_energy, num_bf: int, eigenvalue_floor=EIGENVALUE_FLOOR
+):
+    """``(...)``: each frequency's least-squares residual over its ``num_bf - K`` degrees of
+    freedom, which is the noise variance per unit weight wherever the model holds."""
+    with torch.no_grad():
+        if gram.dim() == numerator.dim():
+            gram = gram[..., None, None]
+            numerator = numerator[..., None]
+        solver = _solver_device(gram)
+        pinv = _pseudo_inverse(gram.detach().to(solver, torch.complex128), eigenvalue_floor)
+        numerator = numerator.detach().to(solver, torch.complex128)
+        explained = torch.einsum("...i,...ij,...j->...", numerator.conj(), pinv, numerator).real
+        residual = weighted_energy.detach().to(solver, torch.float64) - explained
+        return residual / max(int(num_bf) - gram.shape[-1], 1)
+
+
+def noise_variance_from_residual(
+    gram, numerator, weighted_energy, num_bf: int, mask=None, eigenvalue_floor=EIGENVALUE_FLOOR
+):
+    """The noise variance of the normalized bright-field data per unit weight, from the residual.
+
+    With inverse-variance weights the residual at one frequency,
+    ``sum_k w_k |G_k|^2 - b^H M^+ b``, has expectation ``(num_bf - K) sigma^2`` wherever the
+    model holds. The median over the frequencies in ``mask`` discounts the few where model
+    error inflates it, such as a strong scatterer's Bragg reflections. Model error spread over
+    every frequency still raises it, which makes :func:`ard_estimate` shrink more, not less.
+    """
+    with torch.no_grad():
+        if gram.dim() == numerator.dim():
+            gram = gram[..., None, None]
+            numerator = numerator[..., None]
+        solver = _solver_device(gram)
+        pinv = _pseudo_inverse(gram.detach().to(solver, torch.complex128), eigenvalue_floor)
+        numerator = numerator.detach().to(solver, torch.complex128)
+        explained = torch.einsum("...i,...ij,...j->...", numerator.conj(), pinv, numerator).real
+        residual = weighted_energy.detach().to(solver, torch.float64) - explained
+        if mask is not None:
+            residual = residual[mask.to(solver) > 0]
+        dof = max(int(num_bf) - gram.shape[-1], 1)
+        return float(residual.median()) / dof
 
 
 def explained_energy(gram, numerator, mask=None, eigenvalue_floor: float = EIGENVALUE_FLOOR):
@@ -2369,14 +2662,15 @@ def woa_kernel_terms(
     aperture_floor: float,
     peak_intensity: float = 1.0,
 ) -> dict:
-    """One batch's contribution to the sums of the weak-object kernels, ``ssb`` and ``obf``.
+    """One batch's contribution to the sums of the weak-object kernels: ``ssb``, ``obf``,
+    ``wiener`` and ``wdd``.
 
     Shared by both direct-ptychography classes, which differ only in where ``vbf_fourier``
     (``(B, Ny, Nx)``, the bright-field spectra on the reconstruction's q-grid) comes from: one
     scan FFT, or a splat and an FFT per bright-field image.
 
-    Returns ``gram`` and ``numerator`` for the normal equations, which ``obf`` solves and
-    every kernel's residual reads, and for ``ssb`` its own per-pixel sums ``phase`` and,
+    Returns ``gram`` and ``numerator`` for the normal equations, which ``obf`` and ``wiener``
+    solve and every kernel's residual reads, and for ``ssb`` its own per-pixel sums ``phase`` and,
     for a complex object, ``amplitude``.
 
     ``peak_intensity`` is the largest ``|psi(k)|^2`` over the aperture. The Gram weights are
@@ -2390,7 +2684,16 @@ def woa_kernel_terms(
     ``residual_gram``, for one column only (with several it is ``gram``), and
     ``weighted_energy``, ``sum_k |psi(k)|^2 |G_k|^2`` relative to the peak.
     """
-    t_minus, t_plus, psi_minus, psi_plus = overlap_terms(probe, cmplx_probe_at_k, kx, ky, qxa, qya)
+    t_minus, t_plus, psi_minus, psi_plus = overlap_terms(
+        probe, cmplx_probe_at_k, kx, ky, qxa, qya, partial_coherence=False
+    )
+    coherent = (t_minus, t_plus)
+    if probe.is_partially_coherent:
+        env_minus, env_plus = partial_coherence_envelope(
+            kx, ky, qxa, qya, probe.wavelength, probe.focal_spread, probe.source_size
+        )
+        t_minus = t_minus * env_minus.to(t_minus.real.dtype)
+        t_plus = t_plus * env_plus.to(t_plus.real.dtype)
     factors = depth_phase_factors(qxa, qya, kx, ky, wavelength, depths)
     columns = woa_columns(t_minus, t_plus, factors, complex_obj)
     # one column only rescales each frequency, so the single-plane phase keeps the unweighted
@@ -2406,6 +2709,10 @@ def woa_kernel_terms(
     terms["weighted_energy"] = (intensity * vbf_fourier.abs().square()).sum(0)
 
     if kernel == "ssb":
+        # unit-modulus weights from the coherent overlap: the partial-coherence envelope would
+        # give the in-focus triple overlap, where the coherent Gamma- vanishes, a phase of its
+        # own and admit pixels that carry no signal
+        t_minus, t_plus = coherent
         unit = unit_overlap(t_minus - t_plus, peak_intensity)
         if not complex_obj:
             terms["phase"] = (-1.0j * vbf_fourier * unit).sum(0)
@@ -2418,3 +2725,112 @@ def woa_kernel_terms(
                 double * vbf_fourier * unit_overlap(t_minus + t_plus, peak_intensity)
             ).sum(0)
     return terms
+
+
+# ---------------------------------------------------------------------------
+# Wigner distribution deconvolution
+# ---------------------------------------------------------------------------
+
+#: Default relative Wiener constant of WDD. On simulated data it was best near 1e-8 without
+#: noise, 1e-3 at 1e5 and 1e-2 at 1e4 electrons per Angstrom^2.
+WDD_RIDGE = 1e-3
+
+#: WDD's convolution over the detector is linear, so its transforms run on a grid this many
+#: times the detector's, with the data zero outside it.
+WDD_PADDING = 2
+
+
+def wdd_upsilon(
+    probe,
+    kx,
+    ky,
+    support,
+    rows,
+    cols,
+    vbf_fourier,
+    intensity,
+    dc: float,
+    qxa,
+    qya,
+    ridge: float = WDD_RIDGE,
+    batch_size: int | None = None,
+    verbose: bool = False,
+    return_transfer: bool = False,
+):
+    """``Upsilon(Q, 0) = T~(0) T~*(-Q)`` on the ``(H, W)`` grid ``qxa, qya``, by bright-field WDD.
+
+    For a multiplicative object ``T`` of any strength, the scan transform of the intensity at
+    detector frequency ``k`` is the convolution over the detector
+
+        ``G(Q, k) = sum_kappa Gamma(Q, k - kappa) Upsilon(Q, kappa)``,
+
+    with ``Gamma(Q, k) = psi(k) psi*(k + Q)``, the ``t_plus`` of :func:`overlap_terms` (summed
+    over modes and with the partial-coherence envelope, for a partially coherent probe), and
+    ``Upsilon(Q, kappa) = T~(kappa) T~*(kappa - Q)``. Under the weak-object approximation it
+    reduces to the overlap-function model the other kernels use. Transforming over ``k`` turns
+    the convolution into a product, divided here by the Wiener filter
+    ``Gamma^* / (|Gamma^|^2 + ridge max |Gamma^|^2)``; the ``kappa = 0`` term of the result is
+    its mean over the conjugate variable. By Parseval that is ``sum_k w(Q, k) G(Q, k)`` with
+    ``w`` the transform of the filter, one weight per bright-field pixel and frequency.
+
+    ``kx, ky`` are the scan-frame frequencies of a detector grid :data:`WDD_PADDING` times the
+    detector's at the same spacing, ``support`` the pixels of it the aperture reaches, outside
+    which ``Gamma`` vanishes and is not evaluated, and ``rows, cols`` the bright-field pixels'
+    indices in it.
+    ``vbf_fourier`` is ``(num_bf, Ny, Nx)``, the scan transforms of the mean-normalized
+    bright-field images with the DC removed, which ``intensity`` (``(num_bf,)``, the means the
+    normalization divided out) turns back into intensities and ``dc`` restores at ``Q = 0``. A
+    grid ``qxa, qya`` finer than the scan reads the data tiled, as the other kernels do.
+    Computed without gradients.
+
+    The filter keeps only part of the ``kappa = 0`` term: its weight there is the mean over the
+    conjugate variable of ``|Gamma^|^2 / (|Gamma^|^2 + ridge max |Gamma^|^2)``, below one wherever
+    the probe's ambiguity function ``Gamma^`` is weak. ``return_transfer`` also returns that
+    weight, ``(H, W)``, which is the transfer at each ``Q`` for a weak object.
+    """
+    with torch.no_grad():
+        real_dtype = kx.dtype
+        complex_dtype = torch.complex128 if real_dtype == torch.float64 else torch.complex64
+        support_kx, support_ky = kx[support][None], ky[support][None]
+        psi = probe.read(support_kx, support_ky).to(complex_dtype)
+        scale = float(psi.abs().square().sum()) ** 2
+        num_points = kx.numel()
+        _, num_rows, num_cols = vbf_fourier.shape
+        height, width = qxa.shape
+        device = kx.device
+        qx_all = qxa.reshape(-1).to(device, real_dtype)
+        qy_all = qya.reshape(-1).to(device, real_dtype)
+        q_rows = torch.arange(height, device=device).repeat_interleave(width)
+        q_cols = torch.arange(width, device=device).repeat(height)
+        intensity = intensity.to(device, complex_dtype)[:, None]
+        if batch_size is None:
+            batch_size = max(1, 2**22 // num_points)
+
+        upsilon = torch.zeros(height * width, dtype=complex_dtype, device=device)
+        transfer = torch.zeros(height * width, dtype=real_dtype, device=device)
+        starts = range(0, height * width, batch_size)
+        for start in tqdm(starts, disable=not verbose):
+            batch = slice(start, start + batch_size)
+            qx = qx_all[batch].view(-1, 1, 1)
+            qy = qy_all[batch].view(-1, 1, 1)
+            _, values, _, _ = overlap_terms(
+                probe, psi, support_kx, support_ky, qx[..., 0], qy[..., 0]
+            )
+            gamma = torch.zeros((values.shape[0], *kx.shape), dtype=complex_dtype, device=device)
+            gamma[:, support] = values.to(complex_dtype)
+            gamma_hat = torch.fft.fft2(gamma)
+            power = gamma_hat.abs().square()
+            wiener = gamma_hat.conj() / (power + ridge * scale)
+            transfer[batch] = (power / (power + ridge * scale)).mean((-2, -1))
+            weights = torch.fft.fft2(wiener)[:, rows, cols] / num_points  # (batch, num_bf)
+
+            data_rows, data_cols = q_rows[batch] % num_rows, q_cols[batch] % num_cols
+            data = vbf_fourier[:, data_rows, data_cols].to(complex_dtype) * intensity
+            # the DC was removed from the scan transform; restore it at Q = 0 alone, since on
+            # a finer grid its tiled copies stand for aliases the data never held
+            if start == 0:
+                data[:, 0] = dc * intensity[:, 0]
+            upsilon[batch] = (weights * data.T).sum(-1)
+        if return_transfer:
+            return upsilon.reshape(height, width), transfer.reshape(height, width)
+        return upsilon.reshape(height, width)

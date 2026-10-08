@@ -3287,6 +3287,70 @@ class TestComplexAndMultislice:
         # energies, which agree to 3e-7, set how well it can match
         assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), abs=1e-6)
 
+    @pytest.mark.parametrize("kernel", ["obf"])
+    def test_the_fft_route_takes_the_ard_prior(self, complex_pair, kernel):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel=kernel, obj_type="complex", prior="ard", verbose=False)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        # the data are noiseless, so the estimate is float32 round-off, which the two routes
+        # accumulate in different orders
+        assert montage.noise_variance == pytest.approx(fourier.noise_variance, rel=0.05)
+        for attribute in ("corrected_bf", "corrected_amplitude"):
+            expected = to_numpy(getattr(fourier, attribute))
+            assert _relative_error(to_numpy(getattr(montage, attribute)), expected) < 1e-3
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    def test_the_fft_route_takes_the_wiener_kernel(self, complex_pair, obj_type):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel="wiener", obj_type=obj_type, verbose=False)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        # the data are noiseless, so the noise variance is float32 round-off, which the two
+        # routes accumulate in different orders, and the Wiener's shrinkage follows it
+        assert montage.noise_variance == pytest.approx(fourier.noise_variance, rel=0.05)
+        attributes = ["corrected_bf"] + (["corrected_amplitude"] if obj_type == "complex" else [])
+        for attribute in attributes:
+            expected = to_numpy(getattr(fourier, attribute))
+            assert _relative_error(to_numpy(getattr(montage, attribute)), expected) < 5e-3
+
+    def test_the_stencil_route_refuses_the_wiener_kernel(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(ValueError, match="convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="wiener", convolution_mode="stencil", verbose=False
+            )
+
+    def test_wdd_is_refused(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(NotImplementedError, match="DirectPtychography only"):
+            montage.reconstruct(deconvolution_kernel="wdd", verbose=False)
+
+    def test_the_focal_spread_reaches_the_fft_route(self, complex_pair):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+        coherent = to_numpy(fourier.reconstruct(**kwargs).corrected_bf).copy()
+        for recon in (fourier, montage):
+            recon.focal_spread = 30.0
+        try:
+            fourier.reconstruct(**kwargs)
+            montage.reconstruct(convolution_mode="fft", **kwargs)
+            expected = to_numpy(fourier.corrected_bf)
+            assert _relative_error(to_numpy(montage.corrected_bf), expected) < 1e-3
+            assert _relative_error(expected, coherent) > 1e-2
+        finally:
+            for recon in (fourier, montage):
+                recon.focal_spread = 0.0
+
+    def test_the_stencil_route_refuses_the_ard_prior(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(ValueError, match="convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="obf", convolution_mode="stencil", prior="ard", verbose=False
+            )
+
     @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
     def test_the_fft_route_solves_several_slices(self, complex_pair, obj_type):
         fourier, montage = complex_pair

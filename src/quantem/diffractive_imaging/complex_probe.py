@@ -330,6 +330,11 @@ class FourierProbe:
     :meth:`at` refuses it and :func:`overlap_terms` sums the overlap function over
     :meth:`coherent_modes` instead. Its :attr:`array` is ``sqrt(sum_m |psi_m|^2)``, the
     amplitude whose square the detector sees, which is all the intensity weights need.
+
+    Partial coherence can also be described by two parameters rather than by modes:
+    ``focal_spread`` and ``source_size``, the rms spreads of defocus and of probe position in
+    Angstrom (see :meth:`with_partial_coherence`). Neither changes ``|psi(k)|``, so only the
+    overlap function sees them.
     """
 
     def __init__(
@@ -344,6 +349,8 @@ class FourierProbe:
         soft_edges: bool = True,
         interpolation: str = "exact",
         modes: torch.Tensor | None = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
     ):
         self.wavelength = float(wavelength)
         if modes is not None:
@@ -357,6 +364,8 @@ class FourierProbe:
         self.angular_sampling = angular_sampling
         self.soft_edges = soft_edges
         self.interpolation = interpolation
+        self.focal_spread = focal_spread
+        self.source_size = source_size
 
     @classmethod
     def from_aberrations(
@@ -436,7 +445,11 @@ class FourierProbe:
         return 1 if self.modes is None else int(self.modes.shape[0])
 
     def coherent_modes(self) -> list["FourierProbe"]:
-        """The incoherent modes, each a coherent probe; ``[self]`` for a coherent probe."""
+        """The incoherent modes, each a coherent probe; ``[self]`` for a coherent probe.
+
+        The modes leave out :attr:`focal_spread` and :attr:`source_size`, which
+        :func:`overlap_terms` applies once to their sum.
+        """
         if self.modes is None:
             return [self]
         return [
@@ -448,6 +461,27 @@ class FourierProbe:
             )
             for mode in self.modes
         ]
+
+    def with_partial_coherence(self, focal_spread=0.0, source_size=0.0) -> "FourierProbe":
+        """The same probe with a parametric partial-coherence envelope on its overlap function.
+
+        ``focal_spread`` is the rms spread of defocus, from the energy spread and lens current
+        instabilities, and ``source_size`` the rms spread of the probe position per axis, from
+        the finite source, both Gaussian and in Angstrom. Averaging the overlap function over
+        them has a closed form on each half (see :func:`partial_coherence_envelope`). It
+        multiplies the mode sum of a mixed state as well, so modes that already describe the
+        incoherence should not be given these too. Either may be a tensor that requires grad.
+        """
+        copy = FourierProbe.__new__(FourierProbe)
+        copy.__dict__.update(self.__dict__)
+        copy.focal_spread = focal_spread
+        copy.source_size = source_size
+        return copy
+
+    @property
+    def is_partially_coherent(self) -> bool:
+        """Whether the overlap function carries a focal-spread or source-size envelope."""
+        return _nonzero(self.focal_spread) or _nonzero(self.source_size)
 
     def read(self, kx: torch.Tensor, ky: torch.Tensor) -> torch.Tensor:
         """``psi(k)``, or ``sqrt(sum_m |psi_m(k)|^2)`` for a mixed state, at given frequencies.
@@ -478,12 +512,16 @@ class FourierProbe:
                 modes=self.modes,
                 reciprocal_sampling=self.reciprocal_sampling,
                 interpolation=interpolation,
+                focal_spread=self.focal_spread,
+                source_size=self.source_size,
             )
         return FourierProbe(
             self.wavelength,
             array=self.array,
             reciprocal_sampling=self.reciprocal_sampling,
             interpolation=interpolation,
+            focal_spread=self.focal_spread,
+            source_size=self.source_size,
         )
 
     @property
@@ -504,12 +542,16 @@ class FourierProbe:
                 modes=self.modes.to(device),
                 reciprocal_sampling=self.reciprocal_sampling,
                 interpolation=self.interpolation,
+                focal_spread=self.focal_spread,
+                source_size=self.source_size,
             )
         moved = FourierProbe(
             self.wavelength,
             array=self.array.to(device),
             reciprocal_sampling=self.reciprocal_sampling,
             interpolation=self.interpolation,
+            focal_spread=self.focal_spread,
+            source_size=self.source_size,
         )
         return moved
 
@@ -556,12 +598,16 @@ class FourierProbe:
                 modes=torch.stack([self._refined(mode, factor) for mode in self.modes]),
                 reciprocal_sampling=sampling,
                 interpolation=self.interpolation,
+                focal_spread=self.focal_spread,
+                source_size=self.source_size,
             )
         return FourierProbe(
             self.wavelength,
             array=self._refined(self.array, factor),
             reciprocal_sampling=sampling,
             interpolation=self.interpolation,
+            focal_spread=self.focal_spread,
+            source_size=self.source_size,
         )
 
     @staticmethod
@@ -682,7 +728,44 @@ class FourierProbe:
         )
 
 
-def overlap_terms(probe: FourierProbe, cmplx_probe_at_k, kx, ky, qx, qy):
+def _nonzero(value) -> bool:
+    """Whether a float or tensor parameter is set: a tensor that requires grad always counts."""
+    if isinstance(value, torch.Tensor):
+        return value.requires_grad or bool((value != 0).any())
+    return value is not None and float(value) != 0.0
+
+
+def partial_coherence_envelope(kx, ky, qx, qy, wavelength: float, focal_spread, source_size):
+    """``(env_minus, env_plus)``, the factors partial coherence puts on ``t_minus`` and ``t_plus``.
+
+    A probe whose position spreads by a Gaussian of rms ``source_size`` per axis and whose
+    defocus spreads by a Gaussian of rms ``focal_spread`` illuminates with the cross-spectral
+    density ``J(k, k') = psi*(k) psi(k') mu(k' - k) exp(-(pi lambda sigma)^2 (|k'|^2 - |k|^2)^2 / 2)``.
+    On the two halves of the overlap function this is
+
+        ``exp(-2 pi^2 (source_size^2 |q|^2 + focal_spread^2 qz^2))``,
+
+    with ``qz = lambda (|k|^2 - |k - q|^2) / 2`` for ``t_minus`` and
+    ``lambda (|k + q|^2 - |k|^2) / 2`` for ``t_plus``, the same ``qz`` whose phase
+    :func:`~quantem.diffractive_imaging.direct_ptycho_utils.depth_phase_factors` applies to a
+    slice. The source factor depends on ``q`` alone, the focal factor on each bright-field
+    pixel. It agreed with a 41-mode quadrature of the focal spread to 1e-15.
+    """
+    q2 = qx.square() + qy.square()
+    k2 = kx.square() + ky.square()
+    qz_minus = (k2 - ((kx - qx).square() + (ky - qy).square())) * (wavelength / 2)
+    qz_plus = (((kx + qx).square() + (ky + qy).square()) - k2) * (wavelength / 2)
+    scale = 2 * math.pi**2
+    source = scale * source_size**2 * q2
+    focal = scale * focal_spread**2
+    return torch.exp(-(source + focal * qz_minus.square())), torch.exp(
+        -(source + focal * qz_plus.square())
+    )
+
+
+def overlap_terms(
+    probe: FourierProbe, cmplx_probe_at_k, kx, ky, qx, qy, partial_coherence: bool = True
+):
     """``(t_minus, t_plus, psi_minus, psi_plus)``, the two halves of the overlap function.
 
     ``t_minus = psi(k - q) psi*(k)`` and ``t_plus = psi*(k + q) psi(k)``, so that
@@ -700,6 +783,10 @@ def overlap_terms(probe: FourierProbe, cmplx_probe_at_k, kx, ky, qx, qy):
     ``k`` itself rather than read from ``cmplx_probe_at_k``. ``psi_minus`` and ``psi_plus``
     are then ``sqrt(sum_m |psi_m|^2)`` at ``k -/+ q``, which is all their callers use them for:
     whether the shifted aperture reaches there.
+
+    A probe with :attr:`~FourierProbe.focal_spread` or :attr:`~FourierProbe.source_size` has
+    both terms multiplied by :func:`partial_coherence_envelope`, unless ``partial_coherence``
+    is false.
     """
     kmq = (kx - qx, ky - qy)
     kpq = (kx + qx, ky + qy)
@@ -708,18 +795,25 @@ def overlap_terms(probe: FourierProbe, cmplx_probe_at_k, kx, ky, qx, qy):
         psi_plus = probe.at(*kpq)
         t_minus = psi_minus * cmplx_probe_at_k.conj()
         t_plus = psi_plus.conj() * cmplx_probe_at_k
-        return t_minus, t_plus, psi_minus, psi_plus
+    else:
+        t_minus = t_plus = power_minus = power_plus = 0
+        for mode in probe.coherent_modes():
+            psi_k = mode.at(kx, ky)
+            psi_minus = mode.at(*kmq)
+            psi_plus = mode.at(*kpq)
+            t_minus = t_minus + psi_minus * psi_k.conj()
+            t_plus = t_plus + psi_plus.conj() * psi_k
+            power_minus = power_minus + psi_minus.abs().square()
+            power_plus = power_plus + psi_plus.abs().square()
+        psi_minus, psi_plus = power_minus.sqrt(), power_plus.sqrt()
 
-    t_minus = t_plus = power_minus = power_plus = 0
-    for mode in probe.coherent_modes():
-        psi_k = mode.at(kx, ky)
-        psi_minus = mode.at(*kmq)
-        psi_plus = mode.at(*kpq)
-        t_minus = t_minus + psi_minus * psi_k.conj()
-        t_plus = t_plus + psi_plus.conj() * psi_k
-        power_minus = power_minus + psi_minus.abs().square()
-        power_plus = power_plus + psi_plus.abs().square()
-    return t_minus, t_plus, power_minus.sqrt(), power_plus.sqrt()
+    if partial_coherence and probe.is_partially_coherent:
+        env_minus, env_plus = partial_coherence_envelope(
+            kx, ky, qx, qy, probe.wavelength, probe.focal_spread, probe.source_size
+        )
+        t_minus = t_minus * env_minus.to(t_minus.real.dtype)
+        t_plus = t_plus * env_plus.to(t_plus.real.dtype)
+    return t_minus, t_plus, psi_minus, psi_plus
 
 
 def gamma_factor(

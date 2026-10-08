@@ -30,6 +30,9 @@ else:
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     EIGENVALUE_FLOOR,
+    OVERLAP_FLOOR,
+    WDD_PADDING,
+    WDD_RIDGE,
     _crop_corner_centered_mask,
     _rotation_degrees_to_radians,
     align_vbf_stack_multiscale,
@@ -39,6 +42,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     preferred_float_dtype,
     regrid_vbf_stack,
     slice_depths,
+    wdd_upsilon,
     woa_kernel_terms,
 )
 from quantem.diffractive_imaging.direct_ptychography_base import (
@@ -67,6 +71,10 @@ class DirectPtychography(DirectPtychographyBase):
     for a complex object, one for the log-amplitude, and the other kernels gain what they can
     support. :meth:`residual_loss` scores any reconstruction by how much of the data its model
     leaves unexplained, and :meth:`fit_hyperparameters_gradient` minimizes it by autograd.
+
+    Partial coherence is described either empirically, by a mixed-state :attr:`fourier_probe`,
+    or by two parameters, :attr:`focal_spread` and :attr:`source_size`, which every constructor
+    takes. ``"wiener"`` is the kernel that divides it back out.
 
     Because the multiplication happens in ``q``, the scan has to lie on a regular grid.
     :meth:`from_dataset4d` and :meth:`from_virtual_bfs` are given one; :meth:`from_dataset3d`
@@ -101,6 +109,8 @@ class DirectPtychography(DirectPtychographyBase):
         verbose: int | bool,
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         _token: object | None = None,
     ):
         """ """
@@ -132,7 +142,14 @@ class DirectPtychography(DirectPtychographyBase):
         self.fourier_probe = fourier_probe
         self.semiangle_cutoff = semiangle_cutoff  # ty:ignore[invalid-assignment]
         self.soft_edges = soft_edges
+        self.focal_spread = focal_spread
+        self.source_size = source_size
         self.rng = rng
+        # each bright-field pixel's scan mean before normalization, which WDD multiplies back
+        means = vbf_dataset.metadata.get("bright_field_means")
+        self._bright_field_means = (
+            None if means is None else torch.as_tensor(means, dtype=torch.float32)
+        )
 
         self.hyperparameter_state = HyperparameterState(
             initial_aberrations=aberration_coefs, initial_rotation_angle=rotation_angle
@@ -151,6 +168,8 @@ class DirectPtychography(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
         bf_mask_padding_px: int = 1,
@@ -169,6 +188,8 @@ class DirectPtychography(DirectPtychographyBase):
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
             fourier_probe=fourier_probe,
+            focal_spread=focal_spread,
+            source_size=source_size,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -187,6 +208,8 @@ class DirectPtychography(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -228,6 +251,8 @@ class DirectPtychography(DirectPtychographyBase):
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
             fourier_probe=fourier_probe,
+            focal_spread=focal_spread,
+            source_size=source_size,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -249,6 +274,8 @@ class DirectPtychography(DirectPtychographyBase):
         aberration_coefs: dict = {},
         wavelength: float | None = None,
         fourier_probe: "FourierProbe | None" = None,
+        focal_spread: float = 0.0,
+        source_size: float = 0.0,
         bf_mask: torch.Tensor | NDArray | None = None,
         scan_gpts: Tuple[int, int] | None = None,
         interpolation: Literal["nearest", "bilinear"] = "nearest",
@@ -409,6 +436,8 @@ class DirectPtychography(DirectPtychographyBase):
             semiangle_cutoff=semiangle_cutoff,
             aberration_coefs=aberration_coefs,
             fourier_probe=fourier_probe,
+            focal_spread=focal_spread,
+            source_size=source_size,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -610,6 +639,7 @@ class DirectPtychography(DirectPtychographyBase):
             butterworth_env *= 1 - 1 / (1 + (q / q_highpass) ** (2 * butterworth_order))
 
         residual_mask = self._residual_mask(qxa, qya)
+        peak_intensity = float(cmplx_probe_k.detach().abs().max()) ** 2
 
         return dict(
             aberration_coefs=aberration_coefs,
@@ -627,6 +657,7 @@ class DirectPtychography(DirectPtychographyBase):
             bf_weights=bf_weights,
             butterworth_env=butterworth_env,
             residual_mask=residual_mask,
+            peak_intensity=peak_intensity,
         )
 
     def _tiled_vbf_fourier(self, bf, batch_idx, upsampling_factor):
@@ -776,6 +807,8 @@ class DirectPtychography(DirectPtychographyBase):
         slice_thicknesses=None,
         differentiable=False,
         ridge=None,
+        prior=None,
+        noise_variance=None,
     ):
         """
         Unified reconstruction method supporting multiple deconvolution techniques.
@@ -794,13 +827,60 @@ class DirectPtychography(DirectPtychographyBase):
         max_batch_size : int, optional
             Number of bright-field pixels processed at once. Defaults to as many as keep one
             ``(batch, Ny, Nx, columns)`` buffer near 32 million elements.
-        deconvolution_kernel : str, one of ['ssb', 'obf', 'prlx', 'icom']
+        deconvolution_kernel : str, one of ['ssb', 'obf', 'wiener', 'wdd', 'prlx', 'icom']
             ``"obf"`` solves the per-frequency least-squares problem and divides each channel
             by its noise standard deviation, so the noise is white and the transfer follows the
             signal-to-noise ratio. Its values are not calibrated radians: on a weak
             white-noise object the median transfer over the band was 0.7-0.9 for OBF, 0.5-0.8
             for SSB, and depended on the aberrations for both. At ``upsampling_factor > 1``
-            the output of every kernel carries an extra ``1 / U**2``.
+            the output of every kernel but ``"wiener"`` and ``"wdd"`` carries an extra
+            ``1 / U**2``.
+
+            ``"wiener"`` solves the same normal equations and returns the posterior mean under a
+            Gaussian prior whose spectrum is the data's own: per ring of ``|q|`` and channel,
+            the power the least-squares estimate holds beyond the noise, kept only where that
+            excess is significant (see
+            :func:`~quantem.diffractive_imaging.direct_ptycho_utils.wiener_estimate`). It
+            estimates the object rather than whitening the noise, so its values are radians and
+            nepers: on the same white-noise object its transfer was 0.97-1.02 without noise
+            and had a median of 0.996-0.999 at 1e4 electrons per Angstrom^2, for any aberration.
+            It also divides out the partial coherence of :attr:`source_size` and
+            :attr:`focal_spread` where the signal allows, which OBF cannot: on one simulated
+            WSe2 layer with a 0.5 A source and 50 A of focal spread it reached a correlation of
+            0.95 with the layer at 1e5 electrons per pattern where OBF reached 0.76 (0.99
+            against 0.98 without partial coherence, where the difference is only that OBF does
+            not aim at the object). It supports a complex object and several slices; on two
+            twisted layers 7 A apart at 1e4 electrons per pattern it reached 0.90 on a crystal
+            and 0.83 on random atoms, where ``prior="ard"`` reached 0.93 and 0.81. The noise
+            variance comes from the residual unless ``noise_variance`` is given. The result is
+            nonlinear in the data and carries no gradient.
+
+            It reports the lowest frequencies at full strength, where the phase column is weak.
+            Where the data hold a slow variation the weak-object model does not explain, it
+            shows as a gradient across the field that OBF fades: on gold nanoparticles the two
+            longest wavelengths were left 300-450 times the noise unexplained.
+
+            ``"wdd"`` is Wigner distribution deconvolution over the bright field. It models the
+            intensity itself, a convolution over the detector of the overlap function with the
+            object's Wigner distribution, with no weak-object approximation, so it recovers a
+            strong single-slice transmission ``T(r)``: :attr:`corrected_bf` is ``angle(T)``,
+            wrapped, and :attr:`corrected_amplitude` is ``ln|T|``. On 78 A of simulated SrTiO3
+            its phase correlated 0.77-0.84 with the projected potential where OBF's did
+            0.34-0.49. Its deconvolution is regularized by ``ridge``, so its values are not
+            calibrated either: for a weak object the transfer is the regularized filter's weight
+            at zero offset, a median of 0.68-0.74 over the band at the default ridge and as low
+            as 0.39 near its edge. The convolution needs every detector pixel the aperture
+            reaches, so the bright-field mask must hold the aperture's whole soft edge: build
+            with an ``intensity_threshold`` near 0.05 rather than the default (it warns
+            otherwise), which on a strong scatterer also admits some dark field. It solves for
+            one slice, and multiplies the normalized stack back by the bright-field means
+            :meth:`from_dataset4d` recorded, or by ``|psi(k)|^2`` when there are none. :meth:`residual_loss` is the weak-object model's, as for SSB
+            and OBF. A mixed-state :attr:`fourier_probe`, :attr:`focal_spread` and
+            :attr:`source_size` all enter its overlap function, but its fixed ridge suppresses
+            the frequencies they weaken rather than restoring them: on one WSe2 layer with a
+            0.5 A source and 50 A of focal spread, its correlation with the layer went from 0.73
+            to 0.65 at 1e4 electrons per pattern and stayed at 0.76 at 1e5 when they were
+            modelled, where ``"wiener"`` went from 0.79 to 0.95 at 1e5.
         q_highpass : float, optional
             High-pass filter cutoff
         q_lowpass : float, optional
@@ -811,10 +891,15 @@ class DirectPtychography(DirectPtychographyBase):
             Apply that clamp. Turn it off to inspect the raw kernel.
         ridge : float, optional
             The deconvolution's ridge, relative to the scale of what it inverts. Defaults to
-            1e-5.
+            1e-5 for ``"obf"`` and ``"wiener"`` and to 1e-3 for ``"wdd"``.
 
-            For ``"obf"`` it is the ridge on the unit-diagonal Gram matrix when it solves for
-            several columns: several slices, or phase and amplitude. Near zero, the
+            For ``"wdd"`` it is the Wiener constant, relative to the largest ``|Gamma^|^2``. On
+            simulated data it was best near 1e-3 at 1e5 electrons per Angstrom^2 and near 1e-2
+            at 1e4; much smaller values amplify the noise wherever the probe's ambiguity
+            function is weak.
+
+            For ``"obf"`` and ``"wiener"`` it is the ridge on the unit-diagonal Gram matrix when
+            they solve for several columns: several slices, or phase and amplitude. Near zero, the
             default, is the joint least-squares solve, which separates the columns wherever
             they differ at all, at a noise cost of ``1 / (1 - rho^2)`` for columns with
             correlation ``rho``. Larger values shrink the combinations the data barely tell
@@ -823,6 +908,33 @@ class DirectPtychography(DirectPtychographyBase):
             for two slices 0.1 ``lambda / alpha^2`` apart, 0.01 kept a purity of 0.94 and
             lifted each slice's correlation with its layer from 0.78 to 0.85 at 1e4 electrons
             per pattern, while at 1e5 the default was best.
+        prior : {None, "ard"}
+            ``"ard"`` (``"obf"`` only) replaces the least-squares estimate with the
+            posterior mean under automatic relevance determination: every coefficient, each
+            slice and channel at each frequency, gets its own Gaussian prior variance, learned
+            from the data, and those the data do not support shrink to zero (see
+            :func:`~quantem.diffractive_imaging.direct_ptycho_utils.ard_estimate`). A
+            frequency where only one slice carries signal is then fitted with that slice alone,
+            at the noise of a single plane. On two twisted WSe2 layers 7 A apart at 1e4
+            electrons per pattern it raised each slice's correlation with its layer from 0.77
+            to 0.93 at a purity of 1.00, where the best ridge reached 0.85 at 0.94; on randomly
+            placed atoms it matched the best ridge without tuning. It is a sparsity prior, so
+            it helps most where the spectrum is sparse, as a crystal's is. The OBF gain is then
+            applied to the posterior mean, so the images compare directly with least squares. :meth:`residual_loss`, and so every hyperparameter fit, still uses
+            least squares.
+            The result is nonlinear in the data and carries no gradient.
+
+            On a single plane it is a data-driven Fourier filter and changes little: the phase
+            of one simulated layer moved by less than 0.005 in correlation either way, while a
+            weak log-amplitude gained most (0.76 to 0.89 on a WSe2 layer at 1e4). On gold
+            nanoparticles a pure-phase reconstruction lost 74% of its power at the particles'
+            scale, where the pure-phase column is weak and model error inflates the noise
+            estimate; the complex one kept 99.6% of it. Hence it is off by default.
+        noise_variance : float, optional
+            The noise level ``prior="ard"`` and ``"wiener"`` need, per unit weight of the mean-normalized
+            bright-field data. Defaults to an estimate from the residual at each frequency,
+            stored in :attr:`noise_variance`, which was within 7% of the truth on simulated
+            Poisson data. Model error raises the estimate, which makes the prior shrink more.
         parallax_flip_phase : bool
             Apply the ``sign(sin(chi))`` phase flip to ``"prlx"``.
         verbose : bool, optional
@@ -908,6 +1020,8 @@ class DirectPtychography(DirectPtychographyBase):
                 slice_thicknesses,
                 differentiable,
                 ridge,
+                prior,
+                noise_variance,
             )
 
     def _reconstruct(
@@ -930,6 +1044,8 @@ class DirectPtychography(DirectPtychographyBase):
         slice_thicknesses,
         differentiable,
         ridge=None,
+        prior=None,
+        noise_variance=None,
     ):
         """The body of :meth:`reconstruct`, run with gradients on or off."""
         ctx = self._reconstruction_context(
@@ -948,8 +1064,9 @@ class DirectPtychography(DirectPtychographyBase):
         )
         kernel = ctx["kernel"]
         self._validate_reconstruction_mode(kernel, obj_type, num_slices)
+        self._validate_prior(kernel, prior, noise_variance)
         if ridge is None:
-            ridge = EIGENVALUE_FLOOR
+            ridge = WDD_RIDGE if kernel == "wdd" else EIGENVALUE_FLOOR
         if num_slices > 1:
             slice_thicknesses = self.hyperparameter_state.current_slice_thicknesses(
                 slice_thicknesses
@@ -958,13 +1075,25 @@ class DirectPtychography(DirectPtychographyBase):
 
         sums = self._accumulate_kernel_sums(ctx, depths, obj_type, max_batch_size, verbose)
         env = ctx["butterworth_env"]
-        phase_q, amplitude_q = self._fourier_channels(ctx, sums, num_slices, obj_type, ridge)
-        phase = torch.fft.ifft2(phase_q * env).real.to(torch.float32)
-        amplitude = (
-            None
-            if amplitude_q is None
-            else torch.fft.ifft2(amplitude_q * env).real.to(torch.float32)
-        )
+        if kernel == "wdd":
+            self._noise_variance = None
+            phase, amplitude = self._wdd_channels(ctx, obj_type, ridge, verbose)
+        else:
+            phase_q, amplitude_q = self._fourier_channels(
+                ctx,
+                sums,
+                num_slices,
+                obj_type,
+                ridge,
+                prior,
+                noise_variance,
+            )
+            phase = torch.fft.ifft2(phase_q * env).real.to(torch.float32)
+            amplitude = (
+                None
+                if amplitude_q is None
+                else torch.fft.ifft2(amplitude_q * env).real.to(torch.float32)
+            )
         if num_slices == 1:
             phase = phase[0]
             amplitude = None if amplitude is None else amplitude[0]
@@ -987,6 +1116,109 @@ class DirectPtychography(DirectPtychographyBase):
         gc.collect()
 
         return self
+
+    #: fraction of the probe intensity outside the bright-field mask above which WDD warns
+    _WDD_CLIPPED_INTENSITY = 5e-3
+
+    def _warn_if_mask_clips_aperture(self, cmplx_probe_k, bf_mask):
+        """WDD models the convolution over every pixel the aperture reaches, so a mask that cuts
+        its soft edge leaves the model without data it predicts.
+
+        On a weak white-noise object, a mask at half the mean pattern's peak left 1.8% of the
+        probe intensity outside and the weak-object transfer did not converge to one as the
+        ridge vanished (1.23); at 0.005 of the peak it left none and converged (0.998). On 78 A
+        of SrTiO3, a mask of exactly the aperture's pixels raised the correlation with the exit
+        wave from 0.49-0.51 to 0.51-0.52 in focus and from 0.41 to 0.42-0.44 defocused.
+
+        A lower threshold on the mean pattern is not the same thing on a strongly scattering
+        specimen: at 0.05 of the peak the mask reached 1.4 alpha on that SrTiO3 and 1.2 alpha on
+        gold nanoparticles, so it also admitted 350-380 dark-field pixels, which WDD then uses.
+        """
+        intensity = cmplx_probe_k.detach().abs().square()
+        outside = float(intensity[~bf_mask].sum() / intensity.sum())
+        if outside > self._WDD_CLIPPED_INTENSITY:
+            warnings.warn(
+                f"The bright-field mask leaves {outside:.1%} of the probe intensity outside it, "
+                "and WDD's convolution model needs every pixel the aperture reaches. Rebuild "
+                "with a lower `intensity_threshold` (0.05 left 0.1% outside on simulated "
+                "data). On a strongly scattering specimen that also admits dark-field pixels.",
+                stacklevel=5,
+            )
+
+    def _wdd_channels(self, ctx, obj_type, ridge, verbose):
+        """``(phase, log_amplitude)``, each ``(1, Ny, Nx)``, of the object WDD recovers.
+
+        The object is ``T(r)`` itself rather than a linearized phase, so the phase is
+        ``angle(T)``, wrapped to ``(-pi, pi]``, and the log-amplitude ``ln|T|``. Both are
+        normalized as the other kernels' are: ``T`` is scaled to unit geometric-mean modulus and
+        its mean rotated onto the real axis, which WDD cannot fix itself since it recovers
+        ``T~(0) T~*(-Q)``.
+        """
+        bf = ctx["bf"]
+        probe = self._return_probe(ctx["aberration_coefs"])
+        real_dtype = preferred_float_dtype(self.device)
+        padded = tuple(WDD_PADDING * n for n in self.gpts)
+        kx, ky = spatial_frequencies(
+            padded,
+            tuple(s / WDD_PADDING for s in self.sampling),
+            rotation_angle=_rotation_degrees_to_radians(ctx["rotation_angle"]),
+            device=self.device,
+        )
+
+        def padded_indices(rows, cols):
+            """Detector pixels' signed frequency indices, on the padded grid."""
+            return tuple(
+                torch.where(index >= (n + 1) // 2, index - n, index) % p
+                for index, n, p in zip((rows, cols), self.gpts, padded)
+            )
+
+        rows, cols = padded_indices(bf.bf_inds_i, bf.bf_inds_j)
+        # Gamma vanishes wherever psi(k) does, so it is evaluated on the aperture alone
+        amplitude = ctx["cmplx_probe_k"].detach().abs()
+        aperture = torch.nonzero(amplitude > OVERLAP_FLOOR * amplitude.max(), as_tuple=True)
+        support = torch.zeros(padded, dtype=torch.bool, device=self.device)
+        support[padded_indices(*aperture)] = True
+        self._warn_if_mask_clips_aperture(ctx["cmplx_probe_k"], bf.bf_mask)
+        vbf_fourier = self._vbf_fourier[bf.vbf_index_mapping]
+        if self._bright_field_means is not None:
+            intensity = self._bright_field_means.to(self.device)[bf.vbf_index_mapping]
+        else:
+            intensity = ctx["cmplx_probe_k"][bf.bf_inds_i, bf.bf_inds_j].abs().square()
+
+        upsilon = wdd_upsilon(
+            probe,
+            kx.to(real_dtype),
+            ky.to(real_dtype),
+            support,
+            rows,
+            cols,
+            vbf_fourier,
+            intensity.detach(),
+            float(self._dc_per_image.real),
+            ctx["qxa"],
+            ctx["qya"],
+            ridge,
+            verbose=verbose,
+        )
+        # Upsilon(Q, 0) = T~(0) T~*(-Q), so T~(Q) T~*(0) is its conjugate at -Q
+        height, width = upsilon.shape
+        flip_rows = (-torch.arange(height, device=upsilon.device)) % height
+        flip_cols = (-torch.arange(width, device=upsilon.device)) % width
+        obj = torch.fft.ifft2(upsilon[flip_rows][:, flip_cols].conj())
+        log_modulus = obj.abs().clamp_min(1e-12 * float(obj.abs().max())).log()
+        log_modulus = log_modulus - log_modulus.mean()
+        phase = torch.angle(obj * torch.exp(-1j * torch.angle(obj.mean())))
+
+        env = ctx["butterworth_env"]
+        filtered = not bool((env == 1).all())
+
+        def output(image):
+            if filtered:
+                image = torch.fft.ifft2(torch.fft.fft2(image) * env).real
+            return image.to(torch.float32)[None]
+
+        amplitude = output(log_modulus) if obj_type == "complex" else None
+        return output(phase), amplitude
 
     def _return_parallax_stack(self, bf_mask=None, max_batch_size=None, **reconstruct_kwargs):
         """``(num_bf, Ny, Nx)`` parallax-corrected bright-field images, without the phase flip.
@@ -1411,12 +1643,12 @@ class DirectPtychography(DirectPtychographyBase):
         return self
 
     #: every kernel, in the order :meth:`_reconstruct_all_permutations` returns them
-    _PERMUTATION_KERNELS = ("ssb", "obf", "prlx", "icom")
+    _PERMUTATION_KERNELS = ("ssb", "obf", "wiener", "wdd", "prlx", "icom")
 
     def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
         """Every kernel's :attr:`obj` with the same settings, in :attr:`_PERMUTATION_KERNELS`
-        order, leaving out those that cannot take them: ``"prlx"`` for a complex object and all
-        but ``"obf"`` for several slices."""
+        order, leaving out those that cannot take them: ``"prlx"`` for a complex object, all
+        but ``"obf"`` and ``"wiener"`` for several slices, and all but ``"obf"`` for a prior."""
 
         if verbose is None:
             verbose = self.verbose
@@ -1431,6 +1663,10 @@ class DirectPtychography(DirectPtychographyBase):
             kernels.remove("prlx")
         if safe_kwargs.get("num_slices", 1) > 1:
             kernels = [k for k in kernels if k in self._MULTISLICE_KERNELS]
+        if safe_kwargs.get("prior") is not None:
+            kernels = [k for k in kernels if k == "obf"]
+        elif safe_kwargs.get("noise_variance") is not None:
+            kernels = [k for k in kernels if k == "wiener"]
 
         recons = [
             self.reconstruct(

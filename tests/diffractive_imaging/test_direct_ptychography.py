@@ -26,6 +26,7 @@ from .conftest import (
     ML_N_DET,
     ML_RECIPROCAL_SAMPLING,
     ML_SAMPLING,
+    ML_SEMIANGLE,
     PROBE_ENERGY,
     Q_PROBE,
     SCAN_SAMPLING,
@@ -33,6 +34,7 @@ from .conftest import (
     N,
     analytic_probe_array,
     analytic_psi,
+    band_limit_ml,
     band_limited_phase,
     correlation,
     ctf_band_scores,
@@ -624,15 +626,16 @@ class TestReconstructAllPermutations:
     def test_returns_one_image_per_kernel(self, recon):
         images = recon._reconstruct_all_permutations(verbose=False)
 
-        assert len(images) == len(DECONVOLUTION_KERNELS)
+        assert len(images) == len(DECONVOLUTION_KERNELS) + 2  # with "wiener" and "wdd"
         assert all(image.shape == (N, N) for image in images)
         assert all(np.isfinite(image).all() for image in images)
 
     @pytest.mark.parametrize(
         "kwargs, count",
         [
-            (dict(obj_type="complex"), 3),
-            (dict(num_slices=2, slice_thicknesses=5.0), 1),
+            (dict(obj_type="complex"), 5),
+            (dict(num_slices=2, slice_thicknesses=5.0), 2),
+            (dict(prior="ard"), 1),
         ],
     )
     def test_leaves_out_the_kernels_that_cannot_take_the_settings(self, recon, kwargs, count):
@@ -1697,6 +1700,114 @@ def weak_scene():
     return thin_layer_4dstem([1j * 0.02 * white_noise_object_2D(n=64, phi0=1.0)], [0.0])
 
 
+@pytest.fixture(scope="module")
+def noisy_square_scenes():
+    """``({dose: reconstruction}, layers, spacing)``: the square twisted layers with shot noise,
+    at 300 electrons per A^2, where least squares is noise-limited, and at ten times that."""
+    _, layers, _ = twisted_square_cell()
+    layers, spacing = [0.3 * layer for layer in layers], 6.0
+    recons = {}
+    for dose in (300.0, 3000.0):
+        dataset = thin_layer_4dstem(
+            [1j * layer for layer in layers],
+            [-spacing / 2, spacing / 2],
+            ML_ABERRATIONS,
+            dose=dose,
+        )
+        recons[dose] = DirectPtychography.from_dataset4d(dataset, **ml_kwargs(ML_ABERRATIONS))
+    return recons, layers, spacing
+
+
+class TestArdPrior:
+    """``prior="ard"``: a variance per coefficient, learned from the data."""
+
+    def test_it_lifts_noise_limited_slices(self, noisy_square_scenes):
+        recons, layers, spacing = noisy_square_scenes
+        recon = recons[300.0]
+        kwargs = dict(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=spacing, verbose=False
+        )
+        purity_ls, corr_ls = layer_purity(
+            to_numpy(recon.reconstruct(**kwargs).corrected_bf), layers
+        )
+        recon.reconstruct(prior="ard", **kwargs)
+        purity, corr = layer_purity(to_numpy(recon.corrected_bf), layers)
+
+        # 0.886 and 0.962 at a purity of 0.999 for both
+        assert corr > corr_ls + 0.05
+        assert purity > 0.99
+
+    def test_the_noise_variance_scales_with_the_dose(self, noisy_square_scenes):
+        recons, _, spacing = noisy_square_scenes
+        estimates = {}
+        for dose, recon in recons.items():
+            recon.reconstruct(
+                deconvolution_kernel="obf",
+                num_slices=2,
+                slice_thicknesses=spacing,
+                prior="ard",
+                verbose=False,
+            )
+            estimates[dose] = recon.noise_variance
+
+        # Poisson noise on the mean-normalized data goes as one over the dose
+        assert estimates[300.0] / estimates[3000.0] == pytest.approx(10.0, rel=0.05)
+
+    def test_a_vanishing_noise_variance_is_least_squares(self, square_scene):
+        recon, _, spacing = square_scene
+        kwargs = dict(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=spacing, verbose=False
+        )
+        expected = to_numpy(recon.reconstruct(**kwargs).corrected_bf)
+        estimated = recon.reconstruct(prior="ard", **kwargs).noise_variance
+        recon.reconstruct(prior="ard", noise_variance=1e-6 * estimated, **kwargs)
+
+        error = np.abs(to_numpy(recon.corrected_bf) - expected).max() / np.abs(expected).max()
+        assert error < 1e-2
+
+    def test_the_residual_ignores_the_prior(self, noisy_square_scenes):
+        recons, _, spacing = noisy_square_scenes
+        recon = recons[300.0]
+        kwargs = dict(
+            deconvolution_kernel="obf", num_slices=2, slice_thicknesses=spacing, verbose=False
+        )
+        expected = recon.reconstruct(**kwargs).residual_loss()
+        assert recon.noise_variance is None
+        assert recon.reconstruct(prior="ard", **kwargs).residual_loss() == pytest.approx(expected)
+
+    @pytest.mark.parametrize("kernel", ["obf"])
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    def test_one_plane(self, noisy_square_scenes, kernel, obj_type):
+        recons, _, _ = noisy_square_scenes
+        recon = recons[300.0]
+        kwargs = dict(deconvolution_kernel=kernel, obj_type=obj_type, verbose=False)
+        expected = to_numpy(recon.reconstruct(**kwargs).corrected_bf)
+        image = to_numpy(recon.reconstruct(prior="ard", **kwargs).corrected_bf)
+
+        assert image.shape == expected.shape
+        assert np.isfinite(image).all()
+        assert correlation(image, expected) > 0.9
+        if obj_type == "complex":
+            assert np.isfinite(to_numpy(recon.corrected_amplitude)).all()
+
+    @pytest.mark.parametrize("kernel", ["ssb", "prlx", "icom"])
+    def test_only_the_normal_equation_kernels_take_it(self, recon, kernel):
+        with pytest.raises(ValueError, match="normal equations"):
+            recon.reconstruct(deconvolution_kernel=kernel, prior="ard", verbose=False)
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            (dict(prior="lasso"), "prior"),
+            (dict(noise_variance=1.0), "only used"),
+            (dict(prior="ard", noise_variance=-1.0), "positive"),
+        ],
+    )
+    def test_rejects_bad_arguments(self, recon, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            recon.reconstruct(deconvolution_kernel="obf", verbose=False, **kwargs)
+
+
 class TestOverlapConvention:
     """``t_minus = psi(k - q) psi*(k)``, which matters only for a non-centrosymmetric probe."""
 
@@ -2060,3 +2171,343 @@ class TestSliceThicknessSearch:
 
         assert "slice_thicknesses" in recon.hyperparameter_state.study.best_params
         recon.hyperparameter_state.clear_optimized()
+
+
+# ---------------------------------------------------------------------------
+# partial coherence, the Wiener kernel and Wigner distribution deconvolution
+# ---------------------------------------------------------------------------
+
+
+def _with_rms(image, rms):
+    return rms * image / image.std()
+
+
+def _slope(image, truth):
+    """The least-squares scale of ``image`` on ``truth`` over the band: one when calibrated."""
+    image, truth = band_limit_ml(np.asarray(image)), band_limit_ml(truth)
+    return float((image * truth).sum() / (truth * truth).sum())
+
+
+def _with_source(dataset, source_size, dose, seed=0):
+    """``dataset`` averaged over a Gaussian spread of probe positions, then with shot noise."""
+    from quantem.core.datastructures import Dataset4d
+
+    array = np.asarray(dataset.array)
+    q = np.fft.fftfreq(array.shape[0], dataset.sampling[0])
+    envelope = np.exp(-2 * np.pi**2 * source_size**2 * (q[:, None] ** 2 + q[None, :] ** 2))
+    blurred = np.fft.ifft2(
+        np.fft.fft2(array, axes=(0, 1)) * envelope[..., None, None], axes=(0, 1)
+    )
+    counts = np.random.default_rng(seed).poisson(blurred.real.clip(0) * dose * ML_SAMPLING**2)
+    return Dataset4d.from_array(
+        counts.astype(np.float32), sampling=dataset.sampling, units=dataset.units
+    )
+
+
+def _focal_modes(spread, count=9):
+    """Gauss-Hermite modes of a Gaussian focal spread about ``ML_ABERRATIONS``."""
+    nodes, weights = np.polynomial.hermite_e.hermegauss(count)
+    weights = weights / weights.sum()
+    c10 = ML_ABERRATIONS["C10"]
+    return np.stack(
+        [
+            np.sqrt(w) * library_probe_fourier(dict(ML_ABERRATIONS, C10=c10 + spread * x))
+            for x, w in zip(nodes, weights)
+        ]
+    )
+
+
+@pytest.fixture(scope="module")
+def calibration_scene():
+    """``(reconstruction, phase, log_amplitude)``: independent white noise in both channels,
+    0.05 rad and 0.015 rms, at 1e5 electrons per A^2."""
+    phase = _with_rms(white_noise_object_2D(n=64, phi0=1.0), 0.05)
+    amplitude = _with_rms(white_noise_object_2D(n=64, phi0=1.0, seed=1), 0.015)
+    dataset = thin_layer_4dstem([amplitude + 1j * phase], [0.0], ML_ABERRATIONS, dose=1e5)
+    return DirectPtychography.from_dataset4d(dataset, **ml_kwargs()), phase, amplitude
+
+
+@pytest.fixture(scope="module")
+def source_scene():
+    """``(reconstruction, layer, source_size)``: a square lattice imaged with a 0.5 A source."""
+    _, layers, _ = twisted_square_cell()
+    layer, source_size = 0.3 * layers[0], 0.5
+    clean = thin_layer_4dstem([1j * layer], [0.0], ML_ABERRATIONS)
+    dataset = _with_source(clean, source_size, dose=1e4)
+    recon = DirectPtychography.from_dataset4d(dataset, intensity_threshold=0.05, **ml_kwargs())
+    return recon, layer, source_size
+
+
+class TestPartialCoherence:
+    """``focal_spread`` and ``source_size``: a closed-form envelope on the overlap function."""
+
+    def test_the_focal_envelope_is_the_average_over_defocus(self):
+        from quantem.diffractive_imaging.complex_probe import FourierProbe, overlap_terms
+
+        wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+        angular = ML_RECIPROCAL_SAMPLING * wavelength * 1e3
+        spread = 20.0
+        k = torch.fft.fftfreq(ML_N_DET, ML_SAMPLING, dtype=torch.float64)
+        kx, ky = (g.reshape(-1, 1, 1) for g in torch.meshgrid(k, k, indexing="ij"))
+        q = torch.fft.fftfreq(16, 4 * ML_SAMPLING, dtype=torch.float64)
+        qx, qy = torch.meshgrid(q, q, indexing="ij")
+
+        def terms(probe):
+            t_minus, t_plus, _, _ = overlap_terms(probe, probe.at(kx, ky), kx, ky, qx, qy)
+            return t_minus, t_plus
+
+        def probe_at(c10):
+            aberrations = dict(ML_ABERRATIONS, C10=c10)
+            return FourierProbe.from_aberrations(
+                wavelength, ML_SEMIANGLE, (angular,) * 2, aberrations
+            )
+
+        nodes, weights = np.polynomial.hermite_e.hermegauss(61)
+        weights = weights / weights.sum()
+        average = [0, 0]
+        for x, w in zip(nodes, weights):
+            for i, t in enumerate(terms(probe_at(ML_ABERRATIONS["C10"] + spread * x))):
+                average[i] = average[i] + w * t
+        enveloped = terms(probe_at(ML_ABERRATIONS["C10"]).with_partial_coherence(spread, 0.0))
+
+        for expected, actual in zip(average, enveloped):
+            scale = float(expected.abs().max())
+            assert float((actual - expected).abs().max()) < 1e-6 * scale
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    def test_a_finite_source_leaves_obf_and_the_residual_unchanged(self, weak_scene, obj_type):
+        recon = DirectPtychography.from_dataset4d(weak_scene, **ml_kwargs())
+        kwargs = dict(deconvolution_kernel="obf", obj_type=obj_type, verbose=False)
+        expected = to_numpy(recon.reconstruct(**kwargs).corrected_bf)
+        residual = recon.residual_loss()
+        # small enough that no frequency inside the band falls below the round-off floor
+        recon.source_size = 0.2
+        image = to_numpy(recon.reconstruct(**kwargs).corrected_bf)
+
+        # the source multiplies every column at q by the same factor, which OBF's gain and the
+        # least-squares projection both divide out
+        assert np.abs(image - expected).max() < 1e-4 * np.abs(expected).max()
+        # the data are noiseless and the residual is 1e-7 to 1e-5 of the energy, so only its
+        # absolute round-off is meaningful
+        assert recon.residual_loss() == pytest.approx(residual, abs=1e-8)
+
+    def test_ssb_keeps_its_coherent_weights(self, weak_scene):
+        recon = DirectPtychography.from_dataset4d(weak_scene, **ml_kwargs())
+        expected = to_numpy(recon.reconstruct(deconvolution_kernel="ssb", verbose=False).obj)
+        residual = recon.residual_loss()
+        recon.focal_spread = 40.0
+        recon.reconstruct(deconvolution_kernel="ssb", verbose=False)
+
+        assert np.array_equal(recon.obj, expected)
+        assert recon.residual_loss() != pytest.approx(residual)
+
+    def test_the_residual_finds_the_focal_spread(self):
+        dataset = thin_layer_4dstem(
+            [1j * 0.02 * white_noise_object_2D(n=64, phi0=1.0)],
+            [0.0],
+            probe_modes=_focal_modes(40.0),
+        )
+        recon = DirectPtychography.from_dataset4d(dataset, **ml_kwargs())
+        residuals = {}
+        for spread in (0.0, 40.0, 80.0):
+            recon.focal_spread = spread
+            residuals[spread] = recon.reconstruct(
+                deconvolution_kernel="obf", verbose=False
+            ).residual_loss()
+
+        # 0.13, 5e-7 and 0.16: the envelope is the nine modes' average to quadrature accuracy
+        assert residuals[40.0] < 1e-3 * min(residuals[0.0], residuals[80.0])
+
+    def test_survives_a_round_trip(self, weak_scene, tmp_path):
+        recon = DirectPtychography.from_dataset4d(
+            weak_scene, focal_spread=30.0, source_size=0.2, **ml_kwargs()
+        )
+        path = str(tmp_path / "coherence.zip")
+        recon.save(path, mode="o")
+        restored = load(path)
+
+        assert restored.focal_spread == 30.0
+        assert restored.source_size == 0.2
+
+    @pytest.mark.parametrize("name", ["focal_spread", "source_size"])
+    def test_rejects_a_negative_spread(self, recon, name):
+        with pytest.raises(ValueError, match="non-negative"):
+            setattr(recon, name, -1.0)
+
+
+class TestWienerKernel:
+    """``"wiener"``: the posterior mean under the data's own radial spectrum."""
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    @pytest.mark.parametrize("upsampling_factor", [1, 2])
+    def test_its_values_are_radians_and_nepers(
+        self, calibration_scene, obj_type, upsampling_factor
+    ):
+        recon, phase, amplitude = calibration_scene
+        recon.reconstruct(
+            deconvolution_kernel="wiener",
+            obj_type=obj_type,
+            upsampling_factor=upsampling_factor,
+            verbose=False,
+        )
+        step = upsampling_factor
+
+        # 0.989 and 0.995; a Wiener filter shrinks a little where the signal is near the noise
+        assert _slope(to_numpy(recon.corrected_bf)[::step, ::step], phase) == pytest.approx(
+            1.0, abs=0.03
+        )
+        if obj_type == "complex":
+            amplitude_image = to_numpy(recon.corrected_amplitude)[::step, ::step]
+            assert _slope(amplitude_image, amplitude) == pytest.approx(1.0, abs=0.05)
+
+    def test_it_divides_out_a_finite_source(self, source_scene):
+        recon, layer, source_size = source_scene
+        scores = {}
+        for kernel, size in (("obf", source_size), ("wiener", 0.0), ("wiener", source_size)):
+            recon.source_size = size
+            recon.reconstruct(deconvolution_kernel=kernel, verbose=False)
+            scores[(kernel, size)] = correlation(
+                band_limit_ml(to_numpy(recon.corrected_bf)), band_limit_ml(layer)
+            )
+        recon.source_size = 0.0
+
+        # 0.921 for OBF, 0.898 for the coherent model, 0.986 with the source
+        assert scores[("wiener", source_size)] > scores[("obf", source_size)] + 0.04
+        assert scores[("wiener", source_size)] > scores[("wiener", 0.0)] + 0.04
+
+    def test_it_solves_several_slices(self, noisy_square_scenes):
+        recons, layers, spacing = noisy_square_scenes
+        recon = recons[300.0]
+        kwargs = dict(num_slices=2, slice_thicknesses=spacing, verbose=False)
+        recon.reconstruct(deconvolution_kernel="obf", **kwargs)
+        _, corr_ls = layer_purity(to_numpy(recon.corrected_bf), layers)
+        recon.reconstruct(deconvolution_kernel="wiener", **kwargs)
+        purity, corr = layer_purity(to_numpy(recon.corrected_bf), layers)
+
+        assert recon.corrected_bf.shape[0] == 2
+        assert corr > corr_ls + 0.03
+        assert purity > 0.95
+
+    def test_the_noise_variance(self, calibration_scene):
+        recon, _, _ = calibration_scene
+        recon.reconstruct(deconvolution_kernel="wiener", verbose=False)
+        estimated = recon.noise_variance
+        recon.reconstruct(
+            deconvolution_kernel="wiener", noise_variance=2 * estimated, verbose=False
+        )
+
+        assert estimated > 0
+        assert recon.noise_variance == 2 * estimated
+
+    def test_shares_the_residual_of_obf(self, calibration_scene):
+        recon, _, _ = calibration_scene
+        expected = recon.reconstruct(deconvolution_kernel="obf", verbose=False).residual_loss()
+        recon.reconstruct(deconvolution_kernel="wiener", verbose=False)
+        assert recon.residual_loss() == pytest.approx(expected)
+
+    def test_refuses_the_ard_prior(self, recon):
+        with pytest.raises(ValueError, match="its own prior"):
+            recon.reconstruct(deconvolution_kernel="wiener", prior="ard", verbose=False)
+
+
+@pytest.fixture(scope="module")
+def strong_scene():
+    """``(reconstruction, phase)``: a square lattice with 2 rad peaks, noiseless, the mask
+    reaching the aperture's whole soft edge."""
+    _, layers, _ = twisted_square_cell()
+    phase = 2.0 * layers[0] / layers[0].max()
+    dataset = thin_layer_4dstem([1j * phase], [0.0], ML_ABERRATIONS)
+    recon = DirectPtychography.from_dataset4d(dataset, intensity_threshold=0.005, **ml_kwargs())
+    return recon, phase
+
+
+def _complex_correlation(image, truth):
+    keep = _band(truth.shape, hi=2 * ML_K_PROBE + 1e-9)
+    a, b = np.fft.fft2(image) * keep, np.fft.fft2(truth) * keep
+    a[0, 0] = b[0, 0] = 0
+    return float(np.abs(np.vdot(a, b)) / np.sqrt(np.vdot(a, a).real * np.vdot(b, b).real))
+
+
+class TestWignerDistributionDeconvolution:
+    """``"wdd"``: the intensity as a convolution over the detector, with no weak-object expansion."""
+
+    def test_it_recovers_a_strong_object(self, strong_scene):
+        recon, phase = strong_scene
+        recon.reconstruct(
+            deconvolution_kernel="wdd", obj_type="complex", ridge=1e-6, verbose=False
+        )
+        wdd = _complex_correlation(recon.obj, np.exp(1j * phase))
+        wdd_phase = correlation(band_limit_ml(to_numpy(recon.corrected_bf)), band_limit_ml(phase))
+        recon.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+        obf_phase = correlation(band_limit_ml(to_numpy(recon.corrected_bf)), band_limit_ml(phase))
+
+        # 0.9995 against the transmission; phases 0.9998 against 0.956 for OBF
+        assert wdd > 0.995
+        assert wdd_phase > obf_phase + 0.03
+
+    def test_its_weak_object_transfer_tends_to_one_with_the_ridge(self):
+        phase = _with_rms(white_noise_object_2D(n=64, phi0=1.0), 0.02)
+        dataset = thin_layer_4dstem([1j * phase], [0.0], ML_ABERRATIONS)
+        recon = DirectPtychography.from_dataset4d(
+            dataset, intensity_threshold=0.005, **ml_kwargs()
+        )
+        slopes = {}
+        for ridge in (1e-10, 1e-3):
+            recon.reconstruct(deconvolution_kernel="wdd", ridge=ridge, verbose=False)
+            slopes[ridge] = _slope(to_numpy(recon.corrected_bf), phase)
+
+        # 0.994, and well below one at the default: the regularized filter's weight at zero offset
+        assert slopes[1e-10] == pytest.approx(1.0, abs=0.02)
+        assert slopes[1e-3] < 0.8
+
+    def test_it_warns_when_the_mask_clips_the_aperture(self, weak_scene, strong_scene):
+        clipped = DirectPtychography.from_dataset4d(weak_scene, **ml_kwargs())
+        with pytest.warns(UserWarning, match="probe intensity outside"):
+            clipped.reconstruct(deconvolution_kernel="wdd", verbose=False)
+        recon, _ = strong_scene
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            recon.reconstruct(deconvolution_kernel="wdd", verbose=False)
+
+    def test_one_mode_is_the_coherent_probe(self, weak_scene):
+        recon = DirectPtychography.from_dataset4d(
+            weak_scene, crop_bf_mask=False, intensity_threshold=0.005, **ml_kwargs()
+        )
+        psi = library_probe_fourier(ML_ABERRATIONS)
+        images = []
+        for array in (psi, psi[None]):
+            recon.fourier_probe = _empirical(array)
+            recon.reconstruct(deconvolution_kernel="wdd", obj_type="complex", verbose=False)
+            images.append(recon.obj.copy())
+
+        assert np.allclose(images[0], images[1], atol=1e-5)
+
+    def test_upsampling(self, strong_scene):
+        recon, _ = strong_scene
+        coarse = to_numpy(
+            recon.reconstruct(deconvolution_kernel="wdd", verbose=False).corrected_bf
+        )
+        recon.reconstruct(deconvolution_kernel="wdd", upsampling_factor=2, verbose=False)
+        fine = to_numpy(recon.corrected_bf)
+
+        assert fine.shape == (128, 128)
+        assert correlation(fine[::2, ::2], coarse) > 0.99
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    def test_shares_the_residual_of_obf(self, strong_scene, obj_type):
+        recon, _ = strong_scene
+        kwargs = dict(obj_type=obj_type, verbose=False)
+        expected = recon.reconstruct(deconvolution_kernel="obf", **kwargs).residual_loss()
+        recon.reconstruct(deconvolution_kernel="wdd", **kwargs)
+        assert recon.residual_loss() == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            (dict(num_slices=2, slice_thicknesses=5.0), "single multiplicative object"),
+            (dict(prior="ard"), "normal equations"),
+        ],
+    )
+    def test_rejects(self, recon, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            recon.reconstruct(deconvolution_kernel="wdd", verbose=False, **kwargs)
