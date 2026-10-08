@@ -38,6 +38,12 @@ from quantem.diffractive_imaging.direct_ptychography_base import (
     OptimizationParameter as OptimizationParameter,
 )
 
+from quantem.diffractive_imaging.tilt_corrected_dark_field import (
+    TiltCorrectedDarkField as TiltCorrectedDarkField,
+    bright_field_transfer as bright_field_transfer,
+    fuse_full_field as fuse_full_field,
+)
+
 from quantem.diffractive_imaging.direct_ptychography_montage import (
     DirectPtychographyMontage as DirectPtychographyMontage,
 )
