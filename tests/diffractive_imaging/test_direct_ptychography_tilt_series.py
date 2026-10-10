@@ -56,7 +56,7 @@ def tilted():
     return series, _recon(_acquisition((0, 0), total, seed=99))
 
 
-KWARGS = dict(obj_type="complex", num_slices=2, slice_thicknesses=SPACING)
+KWARGS = dict(obj_type="complex", num_slices=2, slice_mode="joint", slice_thicknesses=SPACING)
 
 
 class TestTiltSeries:
@@ -65,7 +65,9 @@ class TestTiltSeries:
     )
     def test_one_untilted_acquisition_is_its_own_reconstruction(self, kernel, obj_type):
         recon = _recon(_acquisition((0, 0), 300.0, seed=0))
-        kwargs = dict(deconvolution_kernel=kernel, obj_type=obj_type, num_slices=2)
+        kwargs = dict(
+            deconvolution_kernel=kernel, obj_type=obj_type, num_slices=2, slice_mode="joint"
+        )
         expected = recon.reconstruct(slice_thicknesses=SPACING, verbose=False, **kwargs).obj
         series = DirectPtychographyTiltSeries([recon], [(0, 0)])
         series.reconstruct(slice_thicknesses=SPACING, **kwargs)
@@ -218,3 +220,9 @@ class TestTiltSeries:
         series, _ = tilted
         with pytest.raises(ValueError, match="normal"):
             series.reconstruct(deconvolution_kernel=kernel, num_slices=1)
+
+
+def test_a_tilt_series_cannot_be_sectioned(tilted):
+    series, _ = tilted
+    with pytest.raises(ValueError, match="solved jointly"):
+        series.reconstruct(num_slices=2, slice_thicknesses=SPACING, slice_mode="sectioned")

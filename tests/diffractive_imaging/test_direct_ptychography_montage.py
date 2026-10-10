@@ -1487,8 +1487,11 @@ class TestFourierProbe:
         probe = empirical.fourier_probe
         half_pixel = torch.tensor([0.5 * probe.reciprocal_sampling[0]])
 
-        with pytest.raises(ValueError, match="own reciprocal grid"):
+        with pytest.raises(ValueError, match="own reciprocal grid") as error:
             probe.at(half_pixel, torch.zeros(1))
+        # the probe's field of view is 1 / dq, which the message quotes
+        field_of_view = 1 / probe.reciprocal_sampling[0]
+        assert f"{field_of_view:.2f} x" in str(error.value)
 
     def test_bilinear_accepts_off_grid_sampling(self, dataset4d):
         _, empirical = self._pair(dataset4d, DirectPtychographyMontage, interpolation="bilinear")
@@ -3252,7 +3255,12 @@ class TestMixedStateMontage:
         "kwargs",
         [
             {"obj_type": "complex"},
-            {"obj_type": "complex", "num_slices": 2, "slice_thicknesses": 10.0},
+            {
+                "obj_type": "complex",
+                "num_slices": 2,
+                "slice_mode": "joint",
+                "slice_thicknesses": 10.0,
+            },
         ],
     )
     def test_the_fft_route_matches_the_fourier_class(self, mixed_pair, kwargs):
@@ -3359,6 +3367,18 @@ class TestComplexAndMultislice:
                 deconvolution_kernel="obf", convolution_mode="stencil", prior="ard", verbose=False
             )
 
+    @pytest.mark.parametrize("mode", ["fft", "stencil"])
+    def test_sections_are_single_plane_reconstructions(self, complex_pair, mode):
+        _, montage = complex_pair
+        kwargs = dict(deconvolution_kernel="obf", convolution_mode=mode, verbose=False)
+        montage.reconstruct(num_slices=2, slice_thicknesses=20.0, slice_mode="sectioned", **kwargs)
+        stack = to_numpy(montage.corrected_bf).copy()
+        c10 = montage.hyperparameter_state.current_aberrations()["C10"]
+
+        for section, depth in zip(stack, montage.slice_depths):
+            montage.reconstruct(override_aberration_coefs={"C10": c10 + depth}, **kwargs)
+            assert np.array_equal(section, to_numpy(montage.corrected_bf))
+
     @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
     def test_the_fft_route_solves_several_slices(self, complex_pair, obj_type):
         fourier, montage = complex_pair
@@ -3366,6 +3386,7 @@ class TestComplexAndMultislice:
             deconvolution_kernel="obf",
             obj_type=obj_type,
             num_slices=2,
+            slice_mode="joint",
             slice_thicknesses=8.0,
             verbose=False,
         )
@@ -3420,6 +3441,7 @@ class TestComplexAndMultislice:
             montage.reconstruct(
                 deconvolution_kernel="obf",
                 num_slices=2,
+                slice_mode="joint",
                 slice_thicknesses=5.0,
                 convolution_mode="stencil",
                 stencil_radius=4,

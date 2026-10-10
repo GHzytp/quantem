@@ -21,6 +21,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     explained_energy,
     fit_and_shift_diffraction_origin,
     overlap_terms,
+    preferred_float_dtype,
 )
 from quantem.diffractive_imaging.direct_ptychography_base import (
     DirectPtychographyBase,
@@ -156,6 +157,7 @@ class TiltCorrectedDarkField(DirectPtychographyBase):
 force_fitted_origin
             Diffraction-origin fitting, as for ``DirectPtychography.from_dataset4d``.
         """
+        device, _ = config.validate_device(device)
         resolved_wavelength = cls._resolve_wavelength(energy, wavelength)
         shifted, rotation_angle = fit_and_shift_diffraction_origin(
             dataset,
@@ -209,7 +211,10 @@ force_fitted_origin
             segment_masks[torch.arange(len(rows)), rows, cols] = True
         else:
             angle = torch.remainder(theta, 2 * math.pi)
-            index = torch.floor(angle / (2 * math.pi) * n_angular_bins).long()
+            # pixels on a bin edge, along the axes and diagonals, go to the bin above whatever
+            # precision theta was computed in: float32 and float64 otherwise split them differently
+            index = torch.floor(angle / (2 * math.pi) * n_angular_bins + 1e-4).long()
+            index = torch.remainder(index, int(n_angular_bins))
             segment_masks = torch.stack(
                 [annulus & (index == b) for b in range(int(n_angular_bins))]
             )
@@ -361,8 +366,11 @@ force_fitted_origin
         shifts = self._segment_shifts(aberration_coefs, rotation_angle, shift)
 
         num = self.num_segments
-        shifted_sum = torch.zeros(self.scan_gpts, device=self.device, dtype=torch.complex128)
-        energy = torch.zeros(self.scan_gpts, device=self.device, dtype=torch.float64)
+        # the widest precision the device has: MPS has no float64
+        real_dtype = preferred_float_dtype(self.device)
+        complex_dtype = torch.complex64 if real_dtype == torch.float32 else torch.complex128
+        shifted_sum = torch.zeros(self.scan_gpts, device=self.device, dtype=complex_dtype)
+        energy = torch.zeros(self.scan_gpts, device=self.device, dtype=real_dtype)
         batcher = SimpleBatcher(num, batch_size=max_batch_size or num, shuffle=False, rng=self.rng)
         for batch_idx in tqdm(batcher, disable=not verbose):
             spectra = self._vdf_fourier[batch_idx].to(self.device)
@@ -397,7 +405,7 @@ force_fitted_origin
         mask = self._residual_mask(qxa, qya)
         total = (energy * mask).sum()
         explained = explained_energy(torch.full_like(energy, float(num)), shifted_sum, mask)
-        self._residual = float(1 - explained / total) if total > 0 else float("nan")
+        self._residual = 1 - float(explained) / float(total) if total > 0 else float("nan")
         return self
 
 
@@ -432,7 +440,7 @@ def bright_field_transfer(reconstruction, upsampling_factor: int = 1) -> np.ndar
     bf = ctx["bf"]
     probe = reconstruction._return_probe(ctx["aberration_coefs"])
     qxa, qya = ctx["qxa"], ctx["qya"]
-    total = torch.zeros(qxa.shape, device=qxa.device, dtype=torch.float64)
+    total = torch.zeros(qxa.shape, device=qxa.device, dtype=preferred_float_dtype(qxa.device))
     for batch_idx in SimpleBatcher(bf.num_bf, batch_size=256, shuffle=False):
         ind_i, ind_j = bf.bf_inds_i[batch_idx], bf.bf_inds_j[batch_idx]
         kx = ctx["kxa"][ind_i, ind_j].view(-1, 1, 1)

@@ -36,6 +36,8 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     EventStack,
     _crop_corner_centered_mask,
     _rotation_degrees_to_radians,
+    _solver_device,
+    _to,
     allocate_splat_buffers,
     build_event_stack_from_vector,
     build_vbf_stack_from_dataset3d,
@@ -339,6 +341,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         :meth:`DirectPtychography.from_virtual_bfs` takes, so the same stack can be fed to
         both classes; the trailing scan axes are flattened internally.
         """
+        device, _ = config.validate_device(device)
         scan_gpts = tuple(int(n) for n in vbf_dataset.shape[-2:])
         vbf_stack = np.asarray(vbf_dataset.array).reshape(vbf_dataset.shape[0], -1)
 
@@ -408,6 +411,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         :func:`~quantem.diffractive_imaging.direct_ptycho_utils.build_vbf_stack_from_dataset4d`),
         then flattens the scan axes onto an integer position grid.
         """
+        device, _ = config.validate_device(device)
         vbf_dataset, bf_mask_dataset, rotation_angle = build_vbf_stack_from_dataset4d(
             dataset,
             device=device,
@@ -501,6 +505,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         Positions are *not* rotated: the detector rotation already enters through the
         bright-field k-grid, and rotating the positions as well would double-count it.
         """
+        device, _ = config.validate_device(device)
         (
             vbf_stack,
             positions_px,
@@ -667,6 +672,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         .. [1] Lalandec Robert et al., *Ultramicroscopy* 285, 114411 (2026), for the
                count-wise formulation. https://doi.org/10.1016/j.ultramic.2026.114411
         """
+        device, _ = config.validate_device(device)
         if isinstance(detector, Dataset2d):
             if reciprocal_sampling is not None or detector_units is not None:
                 raise ValueError(
@@ -1133,6 +1139,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         """The per-frequency operator ``A`` of the two-column solve, from a pass over the probe."""
         _, _, qxa, qya, kxa, kya, cmplx_probe_k, probe = kernel_args
         gram = None
+        solver = _solver_device(cmplx_probe_k)
         batcher = SimpleBatcher(bf.num_bf, batch_size=batch_size, shuffle=False, rng=self.rng)
         for batch_idx in batcher:
             ind_i, ind_j = bf.bf_inds_i[batch_idx], bf.bf_inds_j[batch_idx]
@@ -1142,10 +1149,12 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             t_minus, t_plus, _, _ = overlap_terms(probe, psi_k, kx, ky, qxa, qya)
             columns = woa_columns(t_minus, t_plus, None, complex_obj=True)
             columns = columns * psi_k.abs().clamp_min(1e-30).reciprocal()[..., None]
-            term = torch.einsum("bhwi,bhwj->hwij", columns.conj(), columns).to(torch.complex128)
+            term = _to(
+                torch.einsum("bhwi,bhwj->hwij", columns.conj(), columns), solver, torch.complex128
+            )
             gram = term if gram is None else gram + term
         operator = normal_equation_operator(gram, bf_weights, 1, ridge)
-        return operator.to(self.device, torch.complex64)
+        return _to(operator, self.device, torch.complex64)
 
     @staticmethod
     def _resolve_convolution_mode(convolution_mode, kernel, stencil_radius, sparse=False):
@@ -1852,6 +1861,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         ridge=EIGENVALUE_FLOOR,
         prior=None,
         noise_variance=None,
+        slice_mode="sectioned",
     ):
         """
         Accumulate the canvas and apply the post-hoc Fourier filters.
@@ -2029,8 +2039,12 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             their caveats are the same. On this class it needs
             ``convolution_mode="fft"`` for ``"ssb"`` and ``"obf"``.
         num_slices, slice_thicknesses
-            Several thin slices solved jointly at each frequency, ``"obf"`` only,
-            with ``convolution_mode="fft"``. See ``DirectPtychography.reconstruct``.
+            Several thin slices. See ``DirectPtychography.reconstruct``.
+        slice_mode : {"sectioned", "joint"}
+            ``"sectioned"``, the default, reconstructs one plane per slice depth with any kernel
+            but ``"icom"`` and on either route. ``"joint"`` solves for the slices together at
+            each frequency, ``"obf"`` and ``"wiener"`` only, with ``convolution_mode="fft"``.
+            See ``DirectPtychography.reconstruct``.
 
         Returns
         -------
@@ -2043,6 +2057,10 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         gridded scan ``DirectPtychography`` computes the same thing with a single scan FFT
         and is faster; see the class docstring for when to prefer which.
         """
+        arguments = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
+        if self._normalize_slice_mode(slice_mode) == "sectioned" and int(num_slices) > 1:
+            return self._reconstruct_sections(self.reconstruct, arguments)
+
         state = self.hyperparameter_state
 
         if verbose is None:
@@ -2607,6 +2625,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         self._obj_type = obj_type
         self._num_slices = int(num_slices)
         self._slice_depths = [float(z) for z in depths.detach().cpu()]
+        self._slice_mode = "joint"
+        self._section_residuals = None
 
         # memory management
         gc.collect()

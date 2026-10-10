@@ -29,6 +29,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     EIGENVALUE_FLOOR,
     OBJ_TYPES,
     _rotation_degrees_to_radians,
+    _to,
     alias_tiles,
     column_factors,
     explained_energy,
@@ -37,6 +38,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     model_aperture,
     noise_variance_from_residual,
     residual_per_degree_of_freedom,
+    slice_depths,
     solve_normal_equations,
     wiener_estimate,
 )
@@ -54,7 +56,13 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 @dataclass
-class HyperparameterState:
+class HyperparameterState(AutoSerialize):
+    """The initial and optimized hyperparameters of a direct reconstruction.
+
+    It saves as a native subtree of its reconstruction, so the values can be read from the file.
+    An optuna ``study``, when an optimization left one, is pickled instead.
+    """
+
     initial_aberrations: dict[str, float] = field(default_factory=dict)
     initial_rotation_angle: float | None = None
     optimized_aberrations: dict[str, float] = field(default_factory=dict)
@@ -490,7 +498,9 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         Returns
         -------
         float or None
-            ``None`` before :meth:`reconstruct`.
+            ``None`` before :meth:`reconstruct`, and after a ``slice_mode="sectioned"`` one,
+            which is a reconstruction per depth rather than one model; see
+            :attr:`section_residuals`.
         """
         return getattr(self, "_residual", None)
 
@@ -610,7 +620,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             factors = column_factors(
                 estimate.shape[-1], num_slices, 1.0, estimate.device, channels
             ).to(estimate.dtype)
-            coefficients = (estimate * factors * scale).to(numerator.device, numerator.dtype)
+            coefficients = _to(estimate * factors * scale, numerator.device, numerator.dtype)
             coefficients = to_grid(coefficients)
             phase_q = coefficients[:num_slices]
             amplitude_q = coefficients[num_slices:] if complex_obj else None
@@ -655,7 +665,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             explained = explained_energy(count, sums["phase"], mask)
         else:
             explained = explained_energy(sums["power"], sums["phase"], mask)
-        return 1 - explained.to(total.device, total.dtype) / total
+        return 1 - _to(explained, total.device, total.dtype) / total
 
     def _residual_mask(self, qxa, qya):
         """Frequencies the residual counts: inside the band the data can carry, away from DC."""
@@ -689,14 +699,116 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             raise ValueError(f"`num_slices` must be a positive integer, got {num_slices!r}")
         if num_slices > 1 and kernel == "wdd":
             raise ValueError(
-                "WDD deconvolves a single multiplicative object, so it has no slices. Use 'obf' "
-                "or 'wiener' for several."
+                "WDD deconvolves a single multiplicative object, so it cannot solve for slices "
+                "jointly. The default, slice_mode='sectioned', reconstructs one plane per depth; "
+                "'obf' and 'wiener' solve for slices jointly."
             )
         if num_slices > 1 and kernel not in self._MULTISLICE_KERNELS:
             raise ValueError(
-                f"Several slices need the per-frequency least-squares solve, which only 'obf' "
-                f"and 'wiener' use; got {kernel!r}. SSB normalizes every bright-field pixel on "
-                "its own, and parallax and iCoM have no depth-resolved model."
+                f"slice_mode='joint' needs the per-frequency least-squares solve, which only "
+                f"'obf' and 'wiener' use; got {kernel!r}. SSB normalizes every bright-field "
+                "pixel on its own, and parallax and iCoM have no depth-resolved model. The "
+                "default, slice_mode='sectioned', reconstructs one plane per depth with any "
+                "kernel but 'icom'."
+            )
+
+    #: spellings of the two ways to reconstruct several slices
+    _SLICE_MODES = {
+        "joint": "joint",
+        "joint-solve": "joint",
+        "sectioned": "sectioned",
+        "section": "sectioned",
+        "depth-section": "sectioned",
+        "depth-sectioning": "sectioned",
+        "sweep": "sectioned",
+    }
+
+    def _normalize_slice_mode(self, slice_mode) -> str:
+        mode = self._SLICE_MODES.get(str(slice_mode).lower())
+        if mode is None:
+            raise ValueError(f"`slice_mode` must be 'joint' or 'sectioned', got {slice_mode!r}")
+        return mode
+
+    @property
+    def slice_mode(self) -> str | None:
+        """``"joint"`` or ``"sectioned"``, as last reconstructed; ``None`` before."""
+        return getattr(self, "_slice_mode", None)
+
+    @property
+    def section_residuals(self):
+        """Each section's :meth:`residual_loss`, after a ``slice_mode="sectioned"``
+        reconstruction; ``None`` otherwise.
+
+        Every section is a single plane fitted to all the data, so this is how well a plane at
+        each depth explains it, smallest near the specimen's mean plane.
+        """
+        return getattr(self, "_section_residuals", None)
+
+    def _reconstruct_sections(self, reconstruct, arguments):
+        """One single-plane reconstruction per slice depth, stacked: ``slice_mode="sectioned"``.
+
+        ``arguments`` are the caller's :meth:`reconstruct` arguments. The slices are placed as
+        for the joint solve, centred on the plane ``C10`` refers to, and slice ``n`` is
+        reconstructed with the probe at ``C10 + z_n``.
+        """
+        kernel = self._normalize_kernel_name(arguments["deconvolution_kernel"])
+        if kernel == "icom":
+            raise ValueError(
+                "iCoM does not depend on the aberrations, so every section of it would be the "
+                "same image. Use another kernel to section in depth."
+            )
+        state = self.hyperparameter_state
+        if arguments.get("use_initial_state"):
+            aberrations = dict(state.initial_aberrations)
+            rotation = state.initial_rotation_angle
+            rotation = 0.0 if rotation is None else rotation
+        else:
+            aberrations = state.current_aberrations(arguments.get("override_aberration_coefs"))
+            rotation = state.current_rotation_angle(arguments.get("override_rotation_angle"))
+        thicknesses = state.current_slice_thicknesses(arguments.get("slice_thicknesses"))
+        depths = slice_depths(int(arguments["num_slices"]), thicknesses, device=self.device)
+        reference = aberrations.get("C10", 0.0)
+
+        phases, amplitudes, residuals = [], [], []
+        for depth in depths:
+            offset = depth if depth.requires_grad else float(depth)
+            reconstruct(
+                **dict(
+                    arguments,
+                    num_slices=1,
+                    slice_thicknesses=None,
+                    slice_mode="joint",
+                    override_aberration_coefs=dict(aberrations, C10=reference + offset),
+                    override_rotation_angle=rotation,
+                    use_initial_state=False,
+                )
+            )
+            phases.append(self._corrected_bf)
+            amplitudes.append(self._corrected_amplitude)
+            residuals.append(self._residual)
+
+        self._corrected_bf = torch.stack(phases)
+        self._corrected_amplitude = None if amplitudes[0] is None else torch.stack(amplitudes)
+        self._num_slices = len(phases)
+        self._slice_depths = [float(z) for z in depths.detach().cpu()]
+        self._slice_mode = "sectioned"
+        self._section_residuals = residuals
+        # one reconstruction per depth, not one model of the data
+        self._residual = None
+        return self
+
+    def _check_loss_for_slice_mode(self, loss, reconstruct_kwargs):
+        """A sectioned stack has no residual of its own, so it cannot be fitted by one."""
+        sectioned = (
+            int(reconstruct_kwargs.get("num_slices", 1)) > 1
+            and self._normalize_slice_mode(reconstruct_kwargs.get("slice_mode", "sectioned"))
+            == "sectioned"
+        )
+        if sectioned and loss == "residual":
+            raise ValueError(
+                "A sectioned stack is one reconstruction per depth rather than one model of the "
+                "data, so it has no residual to minimize. Fit with num_slices=1, with "
+                "slice_mode='joint', or with loss='rms_gradient'."
             )
 
     def _validate_prior(self, kernel: str, prior, noise_variance):
@@ -1219,7 +1331,8 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             Fixed rotation or optimization range, in degrees.
         slice_thicknesses : float|OptimizationParameter, optional
             Fixed gap between slices or an optimization range, in Angstrom, for a
-            reconstruction with ``num_slices > 1`` passed in ``reconstruct_kwargs``. One value
+            reconstruction with ``num_slices > 1`` and ``slice_mode="joint"`` passed in
+            ``reconstruct_kwargs``. One value
             is used for every gap. Fit ``C10`` with one slice first: the residual of several
             slices barely depends on the reference plane.
         n_trials : int
@@ -1237,6 +1350,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
             Extra arguments passed to reconstruct().
         """
 
+        self._check_loss_for_slice_mode(loss, reconstruct_kwargs)
         if verbose is None:
             verbose = self.verbose
 
@@ -1342,6 +1456,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         slice_thicknesses : float|OptimizationParameter, optional
             Fixed gap between slices or a grid of them; see :meth:`optimize_hyperparameters`.
         """
+        self._check_loss_for_slice_mode(loss, reconstruct_kwargs)
         if verbose is None:
             verbose = self.verbose
 

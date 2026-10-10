@@ -164,6 +164,7 @@ class DirectPtychographyTiltSeries(AutoSerialize):
         band_limit=True,
         verbose=None,
         use_initial_state=False,
+        slice_mode="joint",
     ):
         """Solve every acquisition's normal equations together for ``num_slices`` slices.
 
@@ -172,8 +173,15 @@ class DirectPtychographyTiltSeries(AutoSerialize):
         acquisitions; ``prior="ard"`` works with ``"obf"``. Slice thicknesses default to those
         the first acquisition's hyperparameter state holds. The results are stored here as they
         are on a single reconstruction: :attr:`corrected_bf`, :attr:`corrected_amplitude`,
-        :attr:`obj`, :meth:`residual_loss` and :attr:`noise_variance`.
+        :attr:`obj`, :meth:`residual_loss` and :attr:`noise_variance`. ``slice_mode`` is always
+        ``"joint"``, since the tilts tell slices apart only when they are fitted together.
         """
+        if self.reconstructions[0]._normalize_slice_mode(slice_mode) != "joint":
+            raise ValueError(
+                "A tilt series is solved jointly: the tilts tell slices apart only when they "
+                "are fitted together. Section each acquisition on its own with "
+                "`series[n].reconstruct(slice_mode='sectioned')`."
+            )
         first = self.reconstructions[0]
         kernel = first._normalize_kernel_name(deconvolution_kernel)
         if kernel not in self._KERNELS:
@@ -251,11 +259,12 @@ class DirectPtychographyTiltSeries(AutoSerialize):
         """``(N, H, W)``: ``exp(-2 pi i q . (z_n theta + shift))`` for each slice."""
         qxa, qya = ctx["qxa"], ctx["qya"]
         theta = torch.as_tensor(np.asarray(tilt_mrad) * 1e-3, dtype=torch.float64)
-        displacement = depths.to(torch.float64).cpu()[:, None] * theta[None, :]
+        displacement = depths.cpu().to(torch.float64)[:, None] * theta[None, :]
         displacement = displacement + torch.as_tensor(shift, dtype=torch.float64)[None, :]
-        argument = displacement[:, 0, None, None] * qxa.to(torch.float64).cpu()[None]
-        argument = argument + displacement[:, 1, None, None] * qya.to(torch.float64).cpu()[None]
-        return torch.exp(-2j * np.pi * argument).to(qxa.device)
+        argument = displacement[:, 0, None, None] * qxa.cpu().to(torch.float64)[None]
+        argument = argument + displacement[:, 1, None, None] * qya.cpu().to(torch.float64)[None]
+        # narrowed before the move: MPS has no complex128, and the columns are complex64
+        return torch.exp(-2j * np.pi * argument).to(torch.complex64).to(qxa.device)
 
     # ------------------------------------------------------------------
     # results
@@ -301,8 +310,8 @@ def _peak_shift(reference, image, limit=None, upsample_factor=16):
     """``(2,)`` displacement of ``reference`` relative to ``image`` in pixels, from the peak of
     their cross-correlation within ``limit`` pixels, refined on a grid ``1 / upsample_factor``
     of a pixel fine by evaluating the correlation there directly."""
-    reference = reference.to(torch.float64).cpu()
-    image = image.to(torch.float64).cpu()
+    reference = reference.cpu().to(torch.float64)
+    image = image.cpu().to(torch.float64)
     product = (
         torch.fft.fft2(reference - reference.mean()) * torch.fft.fft2(image - image.mean()).conj()
     )

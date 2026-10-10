@@ -353,9 +353,13 @@ class FourierProbe:
         source_size: float = 0.0,
     ):
         self.wavelength = float(wavelength)
+        # complex64, the precision the reconstructions accumulate in and the widest MPS supports
         if modes is not None:
+            modes = modes.to(torch.complex64)
             # the amplitude the detector sees; the phase has no meaning for a mixed state
             array = modes.abs().square().sum(0).sqrt().to(modes.dtype)
+        elif array is not None:
+            array = array.to(torch.complex64)
         self.array = array
         self.modes = modes
         self.reciprocal_sampling = reciprocal_sampling
@@ -402,10 +406,11 @@ class FourierProbe:
             ``psi(k)``, corner-centered to match :func:`spatial_frequencies`. A probe
             saved with its maximum at the array centre needs ``ifftshift`` first. A 3D array
             ``(M, Ny, Nx)`` is a mixed state of ``M`` incoherent modes, each the Fourier
-            transform of one real-space mode of a mixed-state reconstruction.
+            transform of one real-space mode of a mixed-state reconstruction. It is stored
+            as complex64 whatever its input precision.
         reciprocal_sampling : tuple of float
-            ``dq`` per axis, in inverse Angstrom. Its reciprocal, ``1 / (n * dq)`` per axis,
-            is the probe's real-space field of view, which :meth:`at` needs.
+            ``dq`` per axis, in inverse Angstrom. Its reciprocal, ``1 / dq`` per axis, is the
+            probe's real-space field of view, which :meth:`at` needs.
         normalize : bool
             Scale to unit total intensity, summed over modes, matching
             :func:`fourier_space_probe`. The
@@ -683,13 +688,13 @@ class FourierProbe:
         # genuinely incommensurate canvas never slips through
         offset = torch.maximum((row - rounded_row).abs().max(), (col - rounded_col).abs().max())
         if float(offset) > 1e-3:
-            fov = (1 / (n_rows * dq_row), 1 / (n_cols * dq_col))
+            fov = (1 / dq_row, 1 / dq_col)
             raise ValueError(
                 f"An empirical probe can only be sampled on its own reciprocal grid, but the "
                 f"requested frequencies miss it by up to {float(offset):.3f} of a detector "
                 f"pixel. The canvas field of view must divide the probe's, "
-                f"{fov[0]:.1f} x {fov[1]:.1f} Angstrom: either choose one that does, "
-                f"zero-pad the probe in real space to refine its grid, or pass "
+                f"{fov[0]:.2f} x {fov[1]:.2f} Angstrom. Choose a canvas that does, refine the "
+                f"probe's grid with `resampled_to` (zero-padding it in real space), or pass "
                 f"`interpolation='bilinear'` to accept the sampling error."
             )
 

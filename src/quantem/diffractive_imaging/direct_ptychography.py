@@ -66,10 +66,10 @@ class DirectPtychography(DirectPtychographyBase):
     object is recovered by summing those multipliers over bright-field pixels and
     transforming back once.
 
-    ``obj_type="complex"`` and ``num_slices > 1`` extend this: ``"obf"`` then solves
-    a small least-squares problem at every frequency, with a column per slice for the phase and,
-    for a complex object, one for the log-amplitude, and the other kernels gain what they can
-    support. :meth:`residual_loss` scores any reconstruction by how much of the data its model
+    ``obj_type="complex"`` adds a log-amplitude channel, and ``num_slices > 1`` reconstructs
+    several depths: by default one plane per depth, and with ``slice_mode="joint"`` ``"obf"`` and
+    ``"wiener"`` solve a small least-squares problem at every frequency, with a column per slice
+    for the phase and, for a complex object, one for the log-amplitude. :meth:`residual_loss` scores any reconstruction by how much of the data its model
     leaves unexplained, and :meth:`fit_hyperparameters_gradient` minimizes it by autograd.
 
     Partial coherence is described either empirically, by a mixed-state :attr:`fourier_probe`,
@@ -179,6 +179,7 @@ class DirectPtychography(DirectPtychographyBase):
     ):
         """ """
 
+        device, _ = config.validate_device(device)
         return cls(
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
@@ -228,6 +229,7 @@ class DirectPtychography(DirectPtychographyBase):
     ):
         """ """
 
+        device, _ = config.validate_device(device)
         vbf_dataset, bf_mask_dataset, rotation_angle = build_vbf_stack_from_dataset4d(
             dataset,
             device=device,
@@ -419,6 +421,7 @@ class DirectPtychography(DirectPtychographyBase):
         which uses the positions as measured. Prefer it for a scan that is sparse, strongly
         irregular, or both masked and upsampled; see its class docstring for the comparison.
         """
+        device, _ = config.validate_device(device)
         (
             vbf_stack,
             positions_px,
@@ -888,6 +891,7 @@ class DirectPtychography(DirectPtychographyBase):
         ridge=None,
         prior=None,
         noise_variance=None,
+        slice_mode="sectioned",
     ):
         """
         Unified reconstruction method supporting multiple deconvolution techniques.
@@ -1056,12 +1060,10 @@ class DirectPtychography(DirectPtychographyBase):
             does not include, which leaked 1-10% at a scan twice too coarse even with
             upsampling.
         num_slices : int
-            Number of thin slices to solve for jointly, ``"obf"`` only. A slice a
-            distance ``z`` downstream of the plane the aberrations refer to sees the probe at
-            ``C10 + z``, and the slices are solved together at each frequency rather than one
-            defocus at a time, which separates layers far closer than ``lambda / alpha**2``.
-            :attr:`corrected_bf` and :attr:`corrected_amplitude` are then
-            ``(num_slices, Ny, Nx)``.
+            Number of thin slices. A slice a distance ``z`` downstream of the plane the
+            aberrations refer to sees the probe at ``C10 + z``. :attr:`corrected_bf` and
+            :attr:`corrected_amplitude` are then ``(num_slices, Ny, Nx)``, and how the slices
+            are found is set by ``slice_mode``.
         slice_thicknesses : float or sequence of float, optional
             The ``num_slices - 1`` gaps between consecutive slices in Angstrom, or one value
             for all of them. Defaults to those a hyperparameter fit stored, if any. The stack is centred on the plane ``C10`` refers to, so one slice
@@ -1069,10 +1071,25 @@ class DirectPtychography(DirectPtychographyBase):
             quarter of the spacing, while a spacing wrong by 0.5-1.5 times costs little. Fit
             ``C10`` with one slice and :meth:`residual_loss`, which places the mean plane of
             the specimen to a fraction of an Angstrom, then add slices about it. With several
-            slices the residual barely depends on the offset or the spacing, because slices
+            jointly solved slices the residual barely depends on the offset or the spacing, because slices
             far closer than ``lambda / alpha**2`` span nearly the same columns whatever their
             positions: an assumed spacing ``s`` times too small mostly rescales the difference
             between the slices by ``1 / s``.
+        slice_mode : {"sectioned", "joint"}
+            ``"sectioned"``, the default (also ``"depth-section"`` or ``"sweep"``), is depth
+            sectioning: one plane per slice, slice ``n`` reconstructed with the probe at
+            ``C10 + z_n``, with any kernel but ``"icom"``, which does not depend on the
+            aberrations. Each plane is an ordinary single-plane reconstruction, so it costs no
+            extra noise, but it sees every layer within the depth of field
+            ``lambda / alpha**2``: on two layers 0.25 ``lambda / alpha**2`` apart, both sections
+            correlated about equally with both layers. Each section's residual is stored in
+            :attr:`section_residuals`, and :meth:`residual_loss` is ``None``, since the stack
+            is not one model of the data.
+
+            ``"joint"`` solves for all the slices together at each frequency, ``"obf"`` and
+            ``"wiener"`` only. That separates layers far closer than the depth of field, at a
+            noise cost set by how alike the slices' columns are, and gives the stack one
+            residual, which a hyperparameter fit with several slices needs.
         differentiable : bool
             Keep the autograd graph, so that :attr:`corrected_bf`, :attr:`corrected_amplitude`
             and :meth:`residual_loss` (then a tensor) can be backpropagated to aberration
@@ -1084,8 +1101,13 @@ class DirectPtychography(DirectPtychographyBase):
         -------
         self
         """
+        arguments = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
         if verbose is None:
             verbose = self.verbose
+
+        if self._normalize_slice_mode(slice_mode) == "sectioned" and int(num_slices) > 1:
+            with torch.set_grad_enabled(bool(differentiable)):
+                return self._reconstruct_sections(self.reconstruct, arguments)
 
         with torch.set_grad_enabled(bool(differentiable)):
             return self._reconstruct(
@@ -1190,6 +1212,8 @@ class DirectPtychography(DirectPtychographyBase):
         self._obj_type = obj_type
         self._num_slices = int(num_slices)
         self._slice_depths = [float(z) for z in depths.detach().cpu()]
+        self._slice_mode = "joint"
+        self._section_residuals = None
         self._kernel = kernel
         residual = self._residual_from_sums(ctx, sums)
         self._residual = residual if differentiable else float(residual)
@@ -1378,7 +1402,7 @@ class DirectPtychography(DirectPtychographyBase):
             What to fit, each starting from the current state: aberration coefficients such
             as ``"C10"``, ``"C12"`` or ``"phi12"``, ``"rotation_angle"`` for the detector
             rotation, and ``"slice_thicknesses"`` for the gaps between slices when
-            ``num_slices > 1`` is in ``reconstruct_kwargs``. The gaps start from
+            ``reconstruct_kwargs`` has ``num_slices > 1`` and ``slice_mode="joint"``. The gaps start from
             ``reconstruct_kwargs["slice_thicknesses"]`` or the state. When the spacing is far
             below ``lambda / alpha**2`` the residual barely depends on it, so expect a slow,
             weakly determined fit there, and fit ``C10`` with one slice first.
@@ -1406,6 +1430,7 @@ class DirectPtychography(DirectPtychographyBase):
             reconstruction made with them. ``_gradient_fit_history`` holds the loss and
             parameters after every evaluation.
         """
+        self._check_loss_for_slice_mode(loss, reconstruct_kwargs)
         if verbose is None:
             verbose = self.verbose
         state = self.hyperparameter_state
@@ -1617,6 +1642,14 @@ class DirectPtychography(DirectPtychographyBase):
 
         Parameters
         ----------
+        rotation_angle : float, optional
+            Starting rotation in degrees; the stored one by default. The shifts cannot tell a
+            solution from its twin, the detector turned by 180 degrees with ``C10`` and ``C12``
+            negated, so the fit returns the twin nearer this rotation.
+        aberration_coefs : dict
+            Starting aberrations, overriding the stored ones. The bright-field images
+            are first shifted back by this starting point, and the alignment measures what is
+            left.
         bf_mask: torch.Tensor, optional
             Subset of the bright-field mask to align. Defaults to the pixels where the
             aperture is at least half its peak intensity: the alignment treats each image as a
@@ -1682,6 +1715,19 @@ class DirectPtychography(DirectPtychographyBase):
         }
 
         state = self.hyperparameter_state
+        # the starting point, used both to pre-shift the stack and as the shifts already applied
+        # to it: the alignment only adds to these, so the two must be the same aberrations. It
+        # is read before the optimized state is cleared, so a stored fit or rotation is kept.
+        if use_initial_state:
+            aberration_coefs = {
+                **state.initial_aberrations,
+                **validate_aberration_coefficients(aberration_coefs),
+            }
+            if rotation_angle is None:
+                rotation_angle = state.initial_rotation_angle or 0.0
+        else:
+            aberration_coefs = state.current_aberrations(aberration_coefs)
+            rotation_angle = state.current_rotation_angle(rotation_angle)
         state.clear_optimized()
 
         vbf_stack = self._return_parallax_stack(
@@ -1735,6 +1781,7 @@ class DirectPtychography(DirectPtychographyBase):
             self.wavelength,
             self.gpts,
             self.sampling,
+            reference_rotation=rotation_angle,
         )
 
         fitted_aberration_coefs = fit_results.copy()
@@ -1757,7 +1804,8 @@ class DirectPtychography(DirectPtychographyBase):
     def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
         """Every kernel's :attr:`obj` with the same settings, in :attr:`_PERMUTATION_KERNELS`
         order, leaving out those that cannot take them: ``"prlx"`` for a complex object, all
-        but ``"obf"`` and ``"wiener"`` for several slices, and all but ``"obf"`` for a prior."""
+        but ``"obf"`` and ``"wiener"`` for several joint slices, ``"icom"`` for several
+        sectioned ones (the default), and all but ``"obf"`` for a prior."""
 
         if verbose is None:
             verbose = self.verbose
@@ -1771,7 +1819,13 @@ class DirectPtychography(DirectPtychographyBase):
         if safe_kwargs.get("obj_type", "pure_phase") == "complex":
             kernels.remove("prlx")
         if safe_kwargs.get("num_slices", 1) > 1:
-            kernels = [k for k in kernels if k in self._MULTISLICE_KERNELS]
+            if (
+                self._normalize_slice_mode(safe_kwargs.get("slice_mode", "sectioned"))
+                == "sectioned"
+            ):
+                kernels = [k for k in kernels if k != "icom"]
+            else:
+                kernels = [k for k in kernels if k in self._MULTISLICE_KERNELS]
         if safe_kwargs.get("prior") is not None:
             kernels = [k for k in kernels if k == "obf"]
         elif safe_kwargs.get("noise_variance") is not None:

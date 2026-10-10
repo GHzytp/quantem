@@ -517,10 +517,14 @@ def fit_aberrations_from_shifts(
     wavelength: float,
     gpts: tuple[int, int],
     sampling: tuple[float, float],
+    reference_rotation: float | None = None,
 ) -> dict[str, float]:
     """Fit low-order aberrations from lateral shifts.
 
-    Returns ``rotation_angle`` in degrees.
+    Returns ``rotation_angle`` in degrees. The shifts are ``R(theta) A k``, which the twin
+    ``R(theta + 180) (-A) k`` reproduces exactly, so they determine the solution only up to that
+    pair. With ``reference_rotation`` (degrees) the member whose rotation is nearer it is
+    returned; without one, the member with ``|rotation| <= 90``.
     """
     device = shifts_ang.device
 
@@ -537,10 +541,22 @@ def fit_aberrations_from_shifts(
     # Extract rotation angle
     rotation_rad = -torch.arctan2(M_rotation[1, 0], M_rotation[0, 0])
 
-    # Handle angle wrapping and sign conventions
-    if 2 * torch.abs(torch.remainder(rotation_rad + math.pi, 2 * math.pi) - math.pi) > math.pi:
+    # choose between the two members of the twin pair
+    if reference_rotation is None:
+        reference_rad = torch.zeros_like(rotation_rad)
+    else:
+        reference_rad = torch.as_tensor(
+            math.radians(float(reference_rotation)), dtype=rotation_rad.dtype
+        )
+    offset = torch.remainder(rotation_rad - reference_rad + math.pi, 2 * math.pi) - math.pi
+    if torch.abs(offset) > math.pi / 2:
         rotation_rad = torch.remainder(rotation_rad, 2 * math.pi) - math.pi
         M_aberration = -M_aberration
+    rotation_rad = (
+        reference_rad
+        + torch.remainder(rotation_rad - reference_rad + math.pi, 2 * math.pi)
+        - math.pi
+    )
 
     # Extract aberration coefficients from symmetric matrix
     a = M_aberration[0, 0]
@@ -662,10 +678,10 @@ def fit_aberrations_from_probe(
     if not rows:
         raise ValueError("`bf_mask` contains no adjacent pairs to fit.")
 
-    design = torch.cat(rows).to(torch.float64)
-    target = torch.cat(obs).to(torch.float64)
-    weight = torch.cat(weights).to(torch.float64)
-    scale = torch.cat(scales).to(torch.float64)
+    design = torch.cat(rows).cpu().to(torch.float64)
+    target = torch.cat(obs).cpu().to(torch.float64)
+    weight = torch.cat(weights).cpu().to(torch.float64)
+    scale = torch.cat(scales).cpu().to(torch.float64)
 
     solution = torch.linalg.lstsq(
         design * weight[:, None], (target * weight)[:, None], rcond=None
@@ -2323,6 +2339,19 @@ def _solver_device(tensor) -> "torch.device":
     return torch.device("cpu") if tensor.device.type == "mps" else tensor.device
 
 
+def _to(tensor, device, dtype):
+    """``tensor.to(device, dtype)`` in the order MPS needs.
+
+    MPS has no float64 or complex128, and moving a complex64 tensor off it and widening it in
+    one call returns NaN for some elements (torch 2.13). A tensor leaving MPS therefore moves
+    first and changes precision second, and any other tensor changes precision first.
+    """
+    device = torch.device(device)
+    if tensor.device.type == "mps" and device.type != "mps":
+        return tensor.to(device).to(dtype)
+    return tensor.to(dtype).to(device)
+
+
 def _pseudo_inverse(gram, eigenvalue_floor: float):
     """Per-frequency regularized inverse of a Hermitian ``(..., K, K)`` Gram matrix.
 
@@ -2404,7 +2433,7 @@ def _channel_scales(
     """``(gain, factors, M^+)``: each channel's OBF gain ``(..., K)``, its constant factor
     ``(K,)`` (``-i`` on the phase channels) and the regularized inverse, in complex128."""
     solver = _solver_device(gram)
-    gram = gram.to(solver, torch.complex128)
+    gram = _to(gram, solver, torch.complex128)
     pinv = _pseudo_inverse(gram, eigenvalue_floor)
     d = torch.diagonal(pinv, dim1=-2, dim2=-1).real.clamp_min(0)
     if gram.shape[-1] == 1:
@@ -2490,8 +2519,8 @@ def solve_normal_equations(
         operator = normal_equation_operator(
             gram, bf_weights, num_phase, eigenvalue_floor, amplitude_factor, channels
         )
-        numerator = numerator.to(operator.device, torch.complex128)
-        return torch.einsum("...ij,...j->...i", operator, numerator).to(device, out_dtype)
+        numerator = _to(numerator, operator.device, torch.complex128)
+        return _to(torch.einsum("...ij,...j->...i", operator, numerator), device, out_dtype)
     if prior != "ard":
         raise ValueError(f"`prior` must be None or 'ard', got {prior!r}")
     gain, factors, _ = _channel_scales(
@@ -2503,7 +2532,7 @@ def solve_normal_equations(
         noise_variance,
         eigenvalue_floor=eigenvalue_floor,
     ).to(gain.device)
-    return (gain * factors * estimate).to(device, out_dtype)
+    return _to(gain * factors * estimate, device, out_dtype)
 
 
 #: Expectation-maximization steps of :func:`ard_estimate`. On two twisted layers at 1e4 and 1e5
@@ -2545,8 +2574,8 @@ def ard_estimate(
             gram = gram[..., None, None]
             numerator = numerator[..., None]
         solver = _solver_device(gram)
-        gram = gram.detach().to(solver, torch.complex128)
-        numerator = numerator.detach().to(solver, torch.complex128)
+        gram = _to(gram.detach(), solver, torch.complex128)
+        numerator = _to(numerator.detach(), solver, torch.complex128)
         sigma2 = float(noise_variance)
         if not sigma2 > 0:
             raise ValueError(f"`noise_variance` must be positive, got {noise_variance!r}")
@@ -2622,8 +2651,8 @@ def wiener_estimate(
             gram = gram[..., None, None]
             numerator = numerator[..., None]
         solver = _solver_device(gram)
-        gram = gram.detach().to(solver, torch.complex128)
-        numerator = numerator.detach().to(solver, torch.complex128)
+        gram = _to(gram.detach(), solver, torch.complex128)
+        numerator = _to(numerator.detach(), solver, torch.complex128)
         rings = rings.to(solver)
         sigma2 = float(noise_variance)
         if not sigma2 > 0:
@@ -2742,10 +2771,10 @@ def residual_per_degree_of_freedom(
             gram = gram[..., None, None]
             numerator = numerator[..., None]
         solver = _solver_device(gram)
-        pinv = _pseudo_inverse(gram.detach().to(solver, torch.complex128), eigenvalue_floor)
-        numerator = numerator.detach().to(solver, torch.complex128)
+        pinv = _pseudo_inverse(_to(gram.detach(), solver, torch.complex128), eigenvalue_floor)
+        numerator = _to(numerator.detach(), solver, torch.complex128)
         explained = torch.einsum("...i,...ij,...j->...", numerator.conj(), pinv, numerator).real
-        residual = weighted_energy.detach().to(solver, torch.float64) - explained
+        residual = _to(weighted_energy.detach(), solver, torch.float64) - explained
         return residual / max(int(num_bf) - gram.shape[-1], 1)
 
 
@@ -2765,10 +2794,10 @@ def noise_variance_from_residual(
             gram = gram[..., None, None]
             numerator = numerator[..., None]
         solver = _solver_device(gram)
-        pinv = _pseudo_inverse(gram.detach().to(solver, torch.complex128), eigenvalue_floor)
-        numerator = numerator.detach().to(solver, torch.complex128)
+        pinv = _pseudo_inverse(_to(gram.detach(), solver, torch.complex128), eigenvalue_floor)
+        numerator = _to(numerator.detach(), solver, torch.complex128)
         explained = torch.einsum("...i,...ij,...j->...", numerator.conj(), pinv, numerator).real
-        residual = weighted_energy.detach().to(solver, torch.float64) - explained
+        residual = _to(weighted_energy.detach(), solver, torch.float64) - explained
         if mask is not None:
             residual = residual[mask.to(solver) > 0]
         dof = max(int(num_bf) - gram.shape[-1], 1)
@@ -2785,8 +2814,8 @@ def explained_energy(gram, numerator, mask=None, eigenvalue_floor: float = EIGEN
         gram = gram[..., None, None]
         numerator = numerator[..., None]
     solver = _solver_device(numerator)
-    pinv = _pseudo_inverse(gram.to(solver, torch.complex128), eigenvalue_floor)
-    numerator = numerator.to(solver, torch.complex128)
+    pinv = _pseudo_inverse(_to(gram, solver, torch.complex128), eigenvalue_floor)
+    numerator = _to(numerator, solver, torch.complex128)
     energy = torch.einsum("...i,...ij,...j->...", numerator.conj(), pinv, numerator).real
     if mask is not None:
         energy = energy * mask.to(solver)
