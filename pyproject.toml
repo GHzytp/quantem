@@ -48,6 +48,12 @@ dependencies = [
   "optuna>=4.5.0",
   "hdf5plugin>=6.0.0",
   "torchinfo>=1.8.0",
+  "em-database>=0.5",
+]
+
+[project.optional-dependencies]
+dataframe = [
+    "polars>=1.0",
 ]
 
 [tool.hatch.build.targets.sdist]
