@@ -20,6 +20,10 @@ third row of R(q)::
     zone_axis = R(q).T @ [0, 0, 1]
 
 Euler angles use the Z-X-Z convention (Rowenhorst et al., 2015).
+
+Note that `quantem.core.ml.models.so3params.SO3ParamQuat` stores quaternions
+scalar-last (x, y, z, w); convert through rotation matrices, not by passing
+quaternions between the two.
 """
 
 from __future__ import annotations
