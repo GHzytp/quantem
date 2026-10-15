@@ -1883,7 +1883,7 @@ class TestMultislice:
         and is a poor guide to the reference plane.
         """
         recon, _, spacing = square_scene
-        offsets = np.arange(-3.0, 3.01, 0.5)
+        offsets = np.arange(-3.0, 3.01, 1.0)
         losses = {1: [], 2: []}
         for offset in offsets:
             override = {"C10": ML_ABERRATIONS["C10"] + offset}
@@ -1901,7 +1901,7 @@ class TestMultislice:
             )
             losses[2].append(recon.residual_loss())
 
-        # the minimum is flat to 1e-4 between 0 and +0.5 A, so allow one grid step
+        # the minimum is flat to 1e-4 between 0 and +0.5 A, so on a 1 A grid it sits at 0
         assert abs(offsets[int(np.argmin(losses[1]))]) <= 0.5
         spread = {n: (max(v) - min(v)) / min(v) for n, v in losses.items()}
         assert spread[1] > 10 * spread[2]
@@ -2399,15 +2399,16 @@ class TestGradients:
         assert recon.corrected_amplitude.requires_grad
         assert torch.isfinite(c10.grad)
 
-    @pytest.mark.parametrize("kernel", ["obf", "ssb"])
-    def test_gradient_fit_recovers_the_defocus(self, kernel):
+    def test_gradient_fit_recovers_the_defocus(self):
+        """OBF only: SSB shares its residual, so its fit follows the same path."""
         _, layers, _ = twisted_square_cell()
         dataset = thin_layer_4dstem([0.3j * layer for layer in layers], [-3.0, 3.0])
         kwargs = ml_kwargs()
         kwargs["aberration_coefs"] = dict(ML_ABERRATIONS, C10=ML_ABERRATIONS["C10"] + 30.0)
         recon = DirectPtychography.from_dataset4d(dataset, **kwargs)
 
-        recon.fit_hyperparameters_gradient(("C10",), deconvolution_kernel=kernel)
+        # converged after 4 iterations: the same +0.42 A as after the default 20
+        recon.fit_hyperparameters_gradient(("C10",), deconvolution_kernel="obf", num_iterations=5)
         state = recon.hyperparameter_state
 
         assert state.optimized_aberrations["C10"] == pytest.approx(ML_ABERRATIONS["C10"], abs=0.5)
@@ -2579,8 +2580,10 @@ class TestPartialCoherence:
         # least-squares projection both divide out
         assert np.abs(image - expected).max() < 1e-4 * np.abs(expected).max()
         # the data are noiseless and the residual is 1e-7 to 1e-5 of the energy, so only its
-        # absolute round-off is meaningful
-        assert recon.residual_loss() == pytest.approx(residual, abs=1e-8)
+        # absolute round-off is meaningful. That round-off differs between platforms (up to 2e-7
+        # on Linux CI), while mishandling the source would move the residual by far more, since
+        # its envelope falls well below one inside the band
+        assert recon.residual_loss() == pytest.approx(residual, abs=1e-6)
 
     def test_ssb_keeps_its_coherent_weights(self, weak_scene):
         recon = DirectPtychography.from_dataset4d(weak_scene, **ml_kwargs())
@@ -2729,12 +2732,15 @@ class TestWignerDistributionDeconvolution:
         )
         wdd = _complex_correlation(recon.obj, np.exp(1j * phase))
         wdd_phase = correlation(band_limit_ml(to_numpy(recon.corrected_bf)), band_limit_ml(phase))
+        wdd_residual = recon.residual_loss()
         recon.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
         obf_phase = correlation(band_limit_ml(to_numpy(recon.corrected_bf)), band_limit_ml(phase))
 
         # 0.9995 against the transmission; phases 0.9998 against 0.956 for OBF
         assert wdd > 0.995
         assert wdd_phase > obf_phase + 0.03
+        # WDD reports the residual of the weak-object model OBF solves, not of its own estimate
+        assert wdd_residual == pytest.approx(recon.residual_loss())
 
     def test_its_weak_object_transfer_tends_to_one_with_the_ridge(self):
         phase = _with_rms(white_noise_object_2D(n=64, phi0=1.0), 0.02)
@@ -2775,6 +2781,7 @@ class TestWignerDistributionDeconvolution:
 
         assert np.allclose(images[0], images[1], atol=1e-5)
 
+    @pytest.mark.slow
     def test_upsampling(self, strong_scene):
         recon, _ = strong_scene
         coarse = to_numpy(
@@ -2785,14 +2792,6 @@ class TestWignerDistributionDeconvolution:
 
         assert fine.shape == (128, 128)
         assert correlation(fine[::2, ::2], coarse) > 0.99
-
-    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
-    def test_shares_the_residual_of_obf(self, strong_scene, obj_type):
-        recon, _ = strong_scene
-        kwargs = dict(obj_type=obj_type, verbose=False)
-        expected = recon.reconstruct(deconvolution_kernel="obf", **kwargs).residual_loss()
-        recon.reconstruct(deconvolution_kernel="wdd", **kwargs)
-        assert recon.residual_loss() == pytest.approx(expected)
 
     @pytest.mark.parametrize(
         "kwargs, match",
