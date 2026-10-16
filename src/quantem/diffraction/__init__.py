@@ -1,3 +1,4 @@
+from quantem.diffraction.polar import PairDistributionFunction as PairDistributionFunction
 from quantem.diffraction.bragg_vectors import BraggVectors as BraggVectors
 from quantem.diffraction.crystal import Crystal as Crystal
 from quantem.diffraction.crystal_map import CrystalMap as CrystalMap
