@@ -784,28 +784,6 @@ def twisted_square_cell():
     return shape, layers, float(np.degrees(twist))
 
 
-def twisted_honeycomb_cell(a: float = 2.46):
-    """Two honeycombs twisted by 21.79 degrees, the (1, 2) commensurate cell.
-
-    Both layers are periodic in the orthogonal cell of their ``sqrt(7) a`` coincidence lattice,
-    ``sqrt(21) a x sqrt(7) a``, snapped to whole pixels (a 0.1-0.2% strain).
-    """
-    a1, a2 = np.array([a, 0.0]), np.array([a / 2, a * np.sqrt(3) / 2])
-    t, t_image = a1 + 2 * a2, 2 * a1 + a2
-    first = -np.arctan2(t[1], t[0])
-    second = first + np.arctan2(t[1], t[0]) - np.arctan2(t_image[1], t_image[0])
-    side = np.sqrt(7) * a
-    box_true = (side, np.sqrt(3) * side)  # built as (col, row), transposed below
-    shape = (int(round(box_true[1] / ML_SAMPLING)), int(round(box_true[0] / ML_SAMPLING)))
-    strain = np.asarray(shape[::-1]) * ML_SAMPLING / np.asarray(box_true)
-    motif = [(np.zeros(2), 1.0), ((a1 + a2) / 3, 1.0)]
-    layers = []
-    for angle in (first, second):
-        sites, weights = _lattice_in_box((a1, a2), motif, angle, box_true)
-        layers.append(periodic_gaussians((sites * strain)[:, ::-1], shape, weights=weights))
-    return shape, layers, float(np.degrees(np.arccos(13 / 14)))
-
-
 def layer_purity(slices, truths) -> tuple[float, float]:
     """``(purity, correlation)`` averaged over layers, each true layer scored at its own slice.
 
