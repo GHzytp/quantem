@@ -583,17 +583,6 @@ def ctf_interleaved_frames(
     return datasets, positions_A
 
 
-#: every accelerator present, so the same assertions run on CPU, CUDA and MPS
-ACCELERATORS = [
-    device
-    for device, present in (
-        ("cuda", torch.cuda.is_available()),
-        ("mps", torch.backends.mps.is_available()),
-    )
-    if present
-]
-
-
 # ---------------------------------------------------------------------------
 # complex-valued and multislice objects
 #
@@ -782,6 +771,29 @@ def twisted_square_cell():
         sites, weights = _lattice_in_box(basis, motif, angle, box)
         layers.append(periodic_gaussians(sites, shape, weights=weights))
     return shape, layers, float(np.degrees(twist))
+
+
+def periodic_shift(image: np.ndarray, shift, sampling: float = ML_SAMPLING) -> np.ndarray:
+    """``image`` translated by ``shift`` Angstrom, periodically, by the Fourier shift theorem."""
+    q = np.fft.fftfreq(image.shape[0], sampling)
+    ramp = np.exp(-2j * np.pi * (q[:, None] * shift[0] + q[None, :] * shift[1]))
+    return np.fft.ifft2(np.fft.fft2(image) * ramp).real
+
+
+def tilted_layers_4dstem(
+    tilt_mrad=(0.0, 0.0), spacing: float = 6.0, dose=None, seed=0, drift=(0.0, 0.0)
+) -> Dataset4d:
+    """The twisted square layers, ``0.3`` rad strong and ``spacing`` apart about the C10 plane,
+    seen at a specimen tilt: each displaced by its depth times the tilt, and both by ``drift``.
+    """
+    _, layers, _ = twisted_square_cell()
+    theta = np.asarray(tilt_mrad, dtype=float) * 1e-3
+    depths = (-spacing / 2, spacing / 2)
+    logs = [
+        1j * periodic_shift(0.3 * layer, z * theta + np.asarray(drift))
+        for layer, z in zip(layers, depths)
+    ]
+    return thin_layer_4dstem(logs, list(depths), ML_ABERRATIONS, dose=dose, seed=seed)
 
 
 def layer_purity(slices, truths) -> tuple[float, float]:
