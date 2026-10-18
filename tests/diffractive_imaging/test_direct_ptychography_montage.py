@@ -969,19 +969,28 @@ class TestVisualization:
     """The object sampling, and hence `visualize`'s scalebar, must follow the upsampling."""
 
     def test_scalebar_follows_the_upsampling(self, dataset4d):
-        for recon in _build_pair(dataset4d, integer_shift_defocus(1, 2)):
+        for recon in _build_pair(dataset4d, integer_shift_defocus(1)):
             name = type(recon).__name__
             assert recon._obj_sampling[0] == pytest.approx(SCAN_SAMPLING), name
             assert recon.fov == pytest.approx((N * SCAN_SAMPLING, N * SCAN_SAMPLING)), name
             assert recon.scan_origin == (0.0, 0.0), name
 
-            recon.reconstruct(deconvolution_kernel="prlx", upsampling_factor=2, verbose=False)
-            assert recon._obj_sampling[0] == pytest.approx(SCAN_SAMPLING / 2), name
-            # the reported sampling must span the same field of view as the image itself
-            assert recon.obj.shape[0] * recon._obj_sampling[0] == pytest.approx(
-                N * SCAN_SAMPLING
-            ), name
-            assert recon._obj_fov == pytest.approx(recon.fov), name
+            for upsampling_factor in (2, 3):
+                case = f"{name} {upsampling_factor=}"
+                recon.reconstruct(
+                    deconvolution_kernel="prlx",
+                    upsampling_factor=upsampling_factor,
+                    override_aberration_coefs={"C10": integer_shift_defocus(1, upsampling_factor)},
+                    verbose=False,
+                )
+                assert recon._obj_sampling[0] == pytest.approx(
+                    SCAN_SAMPLING / upsampling_factor
+                ), case
+                # the reported sampling must span the same field of view as the image itself
+                assert recon.obj.shape[0] * recon._obj_sampling[0] == pytest.approx(
+                    N * SCAN_SAMPLING
+                ), case
+                assert recon._obj_fov == pytest.approx(recon.fov), case
 
     def test_padded_canvas_keeps_the_scan_sampling(self, fourier_montage):
         """A padded canvas spans more than the scan, so its sampling is not fov/shape.
