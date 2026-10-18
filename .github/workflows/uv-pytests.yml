@@ -32,4 +32,4 @@ jobs:
       # -n logical, not auto: auto counts physical cores, 2 on GitHub's 4-vCPU runners.
       # tests/conftest.py gives each worker cores // workers torch and BLAS threads.
       - name: Run pytests
-        run: uv run pytest tests -n logical
+        run: uv run pytest tests -n logical --dist loadscope
