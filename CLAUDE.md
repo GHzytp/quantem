@@ -18,6 +18,6 @@ every test on every push to every pull request, so each test adds to the CI time
   or `skip` in a way that hides a failure.
 - Use the smallest problem that exercises the code path, such as small arrays, few iterations
   and a coarse orientation plan, and build expensive inputs once in a module-scoped fixture.
-- CI does not run tests marked `@pytest.mark.slow`, so mark a test as slow only when CI does
-  not need to cover it.
+- CI runs tests marked `@pytest.mark.slow` only on pull requests into `main`, once per release,
+  so mark a test as slow only when checking it at each release is enough.
 - When a test duplicates another test, delete it.
