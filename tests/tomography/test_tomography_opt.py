@@ -125,9 +125,13 @@ class TestOptimizerParams:
 @requires_torch
 class TestOptHelpers:
     def test_get_default_lr(self, torch_device):
+        """Each key reads the model's own declared default rather than the fallback, which for
+        the pose happens to have the same value."""
         tomo = _inr_tomography(torch_device)
-        assert tomo._get_default_lr("object") == pytest.approx(8e-6)
-        assert tomo._get_default_lr("pose") == pytest.approx(5e-2)
+        assert tomo._get_default_lr("object") == pytest.approx(
+            tomo.obj_model.DEFAULT_LRS["object"]
+        )
+        assert tomo._get_default_lr("pose") == pytest.approx(tomo.dset.DEFAULT_LRS["pose"])
         with pytest.raises(ValueError):
             tomo._get_default_lr("banana")
 
