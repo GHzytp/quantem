@@ -136,6 +136,15 @@ class TestTomographyINRPretrainDataset:
         assert set(item.keys()) == {"coords", "target"}
         assert item["coords"].shape == (3,)
 
+    def test_takes_obj_view_layout(self):
+        """pretrain_target is [C, X, Z, Y] (obj_view); each target sits at its (x, y, z)."""
+        n = 6
+        x, z, y = torch.meshgrid(*(torch.linspace(-1, 1, n),) * 3, indexing="ij")
+        ds = TomographyINRPretrainDataset(pretrain_target=torch.stack((x + 2, y + 2, z + 2)))
+        targets = ds.targets * torch.quantile(torch.stack((x, y, z)) + 2, 0.95)
+        assert targets.shape == (n**3, 3)
+        assert torch.allclose(targets, ds.coords + 2, atol=1e-5)
+
 
 @requires_torch
 class TestINRRayMath:

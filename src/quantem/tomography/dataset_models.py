@@ -717,8 +717,8 @@ class TomographyINRPretrainDataset(Dataset):
             data_quantile = torch.quantile(data, 0.95)
 
         data = data / data_quantile
-        data = torch.permute(data, (0, 3, 2, 1))
-        # data = torch.flip(data, dims=(2,))
+        # pretrain_target is in the obj_view layout [C, X, Z, Y]; the coordinates are (x, y, z).
+        data = torch.permute(data, (0, 1, 3, 2))
 
         self.volume = data.cpu()
         self.N = pretrain_target.shape[1]  # Assumes cubic volume.
@@ -727,7 +727,8 @@ class TomographyINRPretrainDataset(Dataset):
         coords_1d = torch.linspace(-1, 1, self.N)
         x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
         self.coords = torch.stack([x, y, z], dim=-1).reshape(-1, 3).cpu()
-        self.targets = self.volume.reshape(-1).cpu()
+        # (N^3,) for one channel, (N^3, C) otherwise
+        self.targets = self.volume.reshape(self.volume.shape[0], -1).T.squeeze(-1).cpu()
 
     def __len__(self):
         return self.total_samples
