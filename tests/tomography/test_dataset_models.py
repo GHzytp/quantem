@@ -49,10 +49,11 @@ class TestTomographyPixDataset:
         with pytest.raises(ValueError):
             TomographyPixDataset.from_data(bad, np.linspace(-60, 60, 5).astype(np.float32))
 
-    def test_tilt_angles_are_negated(self):
+    def test_tilt_angles_are_unchanged(self):
+        """Pixel and INR datasets store the same tilts; radon_torch uses the INR sign."""
         angles = np.linspace(-40, 60, 5).astype(np.float32)
         d = TomographyPixDataset.from_data(_stack(), angles)
-        np.testing.assert_allclose(d.tilt_angles.numpy(), -angles, atol=1e-5)
+        np.testing.assert_allclose(d.tilt_angles.numpy(), angles, atol=1e-5)
 
     def test_normalised_by_95th_quantile(self):
         d = TomographyPixDataset.from_data(_stack(), np.linspace(-60, 60, 5).astype(np.float32))
@@ -60,7 +61,7 @@ class TestTomographyPixDataset:
         assert torch.isclose(q95, torch.tensor(1.0), atol=1e-4)
 
     def test_reference_idx_and_learnable_tilts(self):
-        # negated angles -> [40, 15, -10, -35, -60]; smallest |angle| is index 2.
+        # angles -> [-40, -15, 10, 35, 60]; smallest |angle| is index 2.
         angles = np.linspace(-40, 60, 5).astype(np.float32)
         d = TomographyPixDataset.from_data(_stack(), angles)
         assert d.reference_tilt_idx == 2
@@ -72,7 +73,7 @@ class TestTomographyPixDataset:
         out = d.forward(0)
         assert isinstance(out, DatasetValue)
         assert out.target.shape == (12, 12)
-        assert out.tilt_angle == pytest.approx(float(-angles[0]))
+        assert out.tilt_angle == pytest.approx(float(angles[0]))
 
     def test_to_materialises_pose_parameters(self):
         d = TomographyPixDataset.from_data(_stack(), np.linspace(-60, 60, 5).astype(np.float32))

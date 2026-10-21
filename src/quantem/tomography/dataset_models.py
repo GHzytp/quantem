@@ -408,7 +408,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
     ):
         super().__init__(
             tilt_stack=tilt_stack,
-            tilt_angles=-tilt_angles,  # TODO: Flip the tilt angles to be negative to match the convention of INR.
+            tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
             norm_quantile=norm_quantile,
