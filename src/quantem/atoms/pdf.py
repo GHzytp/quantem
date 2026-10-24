@@ -110,12 +110,10 @@ def fit_first_peak(
     """
     r = np.asarray(r, dtype=float)
     g = np.asarray(g, dtype=float)
-    p = np.where(r > 0, g / np.maximum(r, 1e-12) ** 2, 0.0)
     # first significant peak: first local maximum of g above 50% of global max
     i_max = int(np.argmax(g))
     peaks = np.where((g[1:-1] > g[:-2]) & (g[1:-1] >= g[2:]) & (g[1:-1] > 0.5 * g[i_max]))[0] + 1
     i_peak = int(peaks[0]) if peaks.size else i_max
-    del p
     r0 = float(r[i_peak])
     amp0 = float(g[i_peak])
     if r_min is None:
@@ -165,7 +163,7 @@ def find_neighbors(xyz: NDArray, num_neighbors: int) -> tuple[NDArray, NDArray]:
     n = xyz.shape[0]
     k = min(num_neighbors + 1, n)
     tree = cKDTree(xyz)
-    dist, idx = tree.query(xyz, k=k)
+    dist, idx = tree.query(xyz, k=[*range(1, k + 1)])  # list k keeps (N, k) for k = 1
     # drop the query point itself (not necessarily in column 0 when points coincide)
     is_self = idx == np.arange(n)[:, None]
     dist = np.where(is_self, -np.inf, dist)
@@ -189,7 +187,7 @@ _NN_FACTORS = {
     "hcp": 1.0,
     "diamond": np.sqrt(3.0) / 4.0,
     "zincblende": np.sqrt(3.0) / 4.0,
-    "wurtzite": np.sqrt(3.0 / 8.0) * np.sqrt(8.0 / 3.0) * 3.0 / 8.0,  # u*c with c = 1.633a
+    "wurtzite": 3.0 / 8.0 * np.sqrt(8.0 / 3.0),  # u*c with c = 1.633a
 }
 
 

@@ -127,6 +127,10 @@ def _assign_one_to_one(
     return dmin, j, keep
 
 
+def _cpu_tensor(x: NDArray | Tensor) -> Tensor:
+    return x.detach().cpu() if isinstance(x, Tensor) else torch.as_tensor(np.asarray(x))
+
+
 def match_template(
     dxyz: NDArray | Tensor,
     valid: NDArray | Tensor,
@@ -181,8 +185,8 @@ def match_template(
     device = torch.device(device)
     dtype = torch.float32
 
-    p_all = torch.as_tensor(np.asarray(dxyz), dtype=dtype)
-    valid_all = torch.as_tensor(np.asarray(valid), dtype=torch.bool)
+    p_all = _cpu_tensor(dxyz).to(dtype)
+    valid_all = _cpu_tensor(valid).to(torch.bool)
     n, k, _ = p_all.shape
     t = torch.as_tensor(template.vectors, dtype=dtype, device=device)
     m = t.shape[0]
@@ -270,7 +274,7 @@ def match_template(
         score[sl] = (_soft_score(dmin_1to1, score_radius) / m).cpu()
         score_strained[sl] = (_soft_score(dmin_def, score_radius) / m).cpu()
         num_matched[sl] = n_match.cpu()
-        sq = (dmin**2 * w).sum(-1) / n_match.clamp_min(1).to(dtype)
+        sq = torch.where(keep, dmin**2, 0.0).sum(-1) / n_match.clamp_min(1).to(dtype)
         rmsd[sl] = torch.where(n_match > 0, sq.sqrt(), torch.full_like(sq, float("nan"))).cpu()
         rotation[sl] = r_best.cpu()
         deformation[sl] = f_best.cpu()

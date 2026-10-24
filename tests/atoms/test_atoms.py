@@ -81,11 +81,14 @@ def test_find_neighbors_padding():
     assert dist.shape == (5, 8) and idx.shape == (5, 8)
     assert np.all(idx[:, 4:] == -1) and np.all(np.isinf(dist[:, 4:]))
     assert not np.any(idx[:, :4] == np.arange(5)[:, None])
+    dist, idx = find_neighbors(xyz[:1], 3)
+    assert idx.tolist() == [[-1, -1, -1]] and np.all(np.isinf(dist))
 
 
 def test_nn_distance_from_lattice():
     assert np.isclose(nn_distance_from_lattice("fcc", 3.89), 3.89 / np.sqrt(2))
     assert np.isclose(nn_distance_from_lattice("bcc", 2.0), np.sqrt(3))
+    assert np.isclose(nn_distance_from_lattice("wurtzite", 1.0), np.sqrt(3 / 8))
 
 
 # --------------------------------------------------------------------------- #
@@ -220,9 +223,32 @@ def test_atomic_model_pipeline():
     assert abs(np.nanmedian(strain["dilation"])) < 0.02
     model.surface_distance()
     assert model["surface_distance"].min() >= -1e-6
+    # recalibrating rescales the channels stored in calibrated units
+    bond, surf = np.nanmedian(model["bond_mean"]), model["surface_distance"].max()
+    model.calibrate("fcc", lattice_constant=2 * 3.89)
+    assert np.isclose(np.nanmedian(model["bond_mean"]), 2 * bond)
+    assert np.isclose(model["surface_distance"].max(), 2 * surf)
     # selection keeps channels and categories
     sub = model.select(structure == 0)
     assert sub.num_sites == int((structure == 0).sum()) and "structure" in sub.categories
+    # moving the sites drops everything derived from the old geometry
+    sub.positions_native = sub.positions_native
+    assert not sub.templates and not {"structure", "grain", "score_fcc", "bond_mean"} & set(
+        sub.channels
+    )
+
+
+def test_segment_grains_surface_open_structures():
+    # the surface threshold follows the coordination (8 for bcc, 4 for diamond), not 12
+    for name in ("bcc", "diamond"):
+        xyz, interior = make_lattice(name, n=6, noise=0.01)
+        model = AtomicModel.from_array(xyz)
+        model.find_neighbors(20)
+        model.match_templates([name], progress=False, device="cpu")
+        model.segment_grains(name, min_size=20)
+        surface = model["boundary"] == 3
+        assert surface[interior].mean() < 0.05, name
+        assert surface[~interior].mean() > 0.1, name
 
 
 def test_atomic_model_channels_and_shapes():
@@ -248,8 +274,11 @@ def test_merge_close_sites():
     # merged positions are the intensity-weighted mean and the channel is averaged
     model2 = AtomicModel.from_array(dup)
     model2.set_channel("intensity", np.r_[np.ones(xyz.shape[0]), 3.0, 3.0, 3.0, 3.0])
+    model2.set_channel("label", np.r_[np.zeros(xyz.shape[0]), 1, 1, 1, 1], categories=["a", "b"])
     model2.merge_close_sites(min_distance=0.3, weight_channel="intensity")
     assert model2["intensity"].max() == pytest.approx(2.5)
+    # categorical channels come from the heaviest site, not the mean
+    assert set(np.unique(model2["label"])) == {0.0, 1.0}
     model3 = AtomicModel.from_array(dup)
     assert model3.merge_close_sites(min_distance=0.3, mode="remove") == 4
     assert model3.merge_close_sites(min_distance=0.3) == 0
@@ -269,6 +298,7 @@ def test_ideal_structures():
     # mirror symmetry through z = 0
     mirrored = xyz * np.array([1, 1, -1])
     assert cKDTree(xyz).query(mirrored)[0].max() < 1e-6
+    assert (d["sector"] < 0).sum() == 2  # both icosahedron centers stay unassigned
     deca = st.decahedron(3)
     assert deca.num_sites > 100 and len(np.unique(deca["sector"])) == 5
 
@@ -310,6 +340,8 @@ def test_explode_grains():
         assert np.allclose(np.linalg.norm(d, axis=1), 10.0, atol=1e-6)
     assert (labels == 2).sum() > 0
     assert ex.num_sites > (model["grain"] >= 0).sum()
+    ex_array = model.explode_grains(distance=10.0, origin=model.center)
+    assert np.allclose(ex_array.positions, ex.positions)
 
 
 def test_attached_icosahedra_and_growth_steps():

@@ -45,6 +45,8 @@ __all__ = [
     "cuboctahedron",
     "decahedron",
     "icosahedron_vertices",
+    "attached_icosahedra",
+    "growth_steps",
 ]
 
 _MACKAY_TANGENTIAL = 1.0515  # tangential / radial spacing of a Mackay icosahedron
@@ -180,7 +182,8 @@ def double_icosahedron(
     keep_up = upper[:, 2] >= -1e-6
     pts = np.vstack([lower[keep_lo], upper[keep_up]])
     sh = np.concatenate([shell[keep_lo], shell[keep_up]])
-    sec = np.concatenate([sector[keep_lo], sector[keep_up] + 20])
+    sec_up = np.where(sector[keep_up] >= 0, sector[keep_up] + 20, -1)
+    sec = np.concatenate([sector[keep_lo], sec_up])
     pts, (sh, sec) = _dedupe(pts, sh, sec)
     model = AtomicModel.from_array(pts * bond_length, units="A", name=name)
     model.set_channel("shell", sh)

@@ -53,6 +53,18 @@ from quantem.core.io.serialize import AutoSerialize
 __all__ = ["AtomicModel"]
 
 _POSITION_FIELDS = ("x", "y", "z")
+# channels computed from the geometry, dropped when the positions change
+_GEOMETRY_CHANNELS = (
+    "num_neighbors",
+    "bond_mean",
+    "bond_std",
+    "structure",
+    "grain",
+    "misorientation",
+    "boundary",
+    "surface_distance",
+)
+_GEOMETRY_PREFIXES = ("score_", "rmsd_", "matched_", "strain_")
 
 
 class AtomicModel(AutoSerialize):
@@ -97,6 +109,7 @@ class AtomicModel(AutoSerialize):
         self._nn_fit: dict[str, Any] | None = None
         self._neighbor_distances: NDArray | None = None
         self._neighbor_indices: NDArray | None = None
+        self._bond_cutoff: float | None = None
         self._matches: dict[str, TemplateMatch] = {}
         self._template_specs: dict[str, dict[str, Any]] = {}
         self._structure_names: list[str] = []
@@ -346,7 +359,13 @@ class AtomicModel(AutoSerialize):
         self._nn_fit = None
         self._neighbor_distances = None
         self._neighbor_indices = None
+        self._bond_cutoff = None
         self._matches = {}
+        self._template_specs = {}
+        self._structure_names = []
+        for name in self.channels:
+            if name in _GEOMETRY_CHANNELS or name.startswith(_GEOMETRY_PREFIXES):
+                self.remove_channel(name)
 
     # ------------------------------------------------------------------ #
     # Channels
@@ -485,6 +504,11 @@ class AtomicModel(AutoSerialize):
         scale = float(nn_distance) / self.nn_distance
         self._sampling = np.full(3, scale)
         self._units = units
+        # refresh channels stored in calibrated units
+        if self._neighbor_distances is not None and "bond_mean" in self.channels:
+            self._set_bond_channels()
+        if "surface_distance" in self.channels:
+            self.surface_distance()
         return scale
 
     # ------------------------------------------------------------------ #
@@ -507,11 +531,14 @@ class AtomicModel(AutoSerialize):
         dist, idx = find_neighbors(self.positions_native, num_neighbors)
         self._neighbor_distances = dist
         self._neighbor_indices = idx
-        if cutoff is None:
-            cutoff = self.first_shell_cutoff
-        first = dist <= cutoff
+        self._bond_cutoff = self.first_shell_cutoff if cutoff is None else float(cutoff)
+        self._set_bond_channels()
+
+    def _set_bond_channels(self) -> None:
+        assert self._neighbor_distances is not None and self._bond_cutoff is not None
+        first = self._neighbor_distances <= self._bond_cutoff
         scale = float(self._sampling.mean())
-        d_first = np.where(first, dist, np.nan) * scale
+        d_first = np.where(first, self._neighbor_distances, np.nan) * scale
         import warnings
 
         with warnings.catch_warnings(), np.errstate(invalid="ignore"):
@@ -786,7 +813,11 @@ class AtomicModel(AutoSerialize):
         twin_ids = [i for i, n in enumerate(names) if n != structure]
         if twin_ids:
             boundary[np.isin(structure_id, twin_ids)] = 2
-        boundary[first.sum(axis=1) < 9] = 3
+        # surface: under 3/4 of the typical coordination of the grain sites, which
+        # follows the shells inside the RDF cutoff (8 or 14 for bcc)
+        coordination = first.sum(axis=1)
+        if member.any():
+            boundary[coordination < 0.75 * np.median(coordination[member])] = 3
         self.set_channel(
             "boundary", boundary, categories=["interior", "grain_boundary", "twin", "surface"]
         )
@@ -847,10 +878,13 @@ class AtomicModel(AutoSerialize):
         name : str
             Channel name.
         """
-        arr = getattr(volume, "array", volume)
-        if hasattr(arr, "detach"):
-            arr = arr.detach().cpu().numpy()
-        values = meas.sample_volume(np.asarray(arr), self.positions_native, radius=radius)
+        if hasattr(volume, "detach"):
+            arr = volume.detach().cpu().numpy()
+        elif hasattr(volume, "numpy"):  # Dataset3d, numpy- or tensor-backed
+            arr = volume.numpy()
+        else:
+            arr = np.asarray(volume)
+        values = meas.sample_volume(arr, self.positions_native, radius=radius)
         self.set_channel(name, values)
         return values
 
@@ -1128,7 +1162,7 @@ class AtomicModel(AutoSerialize):
         struct = self.get_channel("structure").astype(int)
         num_grains = int(grain.max()) + 1
         centroids = np.array([xyz[grain == g].mean(0) for g in range(num_grains)])
-        if origin is None or origin == "center":
+        if origin is None or (isinstance(origin, str) and origin == "center"):
             origins = np.tile(self.center, (num_grains, 1))
         elif isinstance(origin, str) and origin == "icosahedral":
             info = self._metadata.get("icosahedral_centers")
@@ -1226,10 +1260,11 @@ class AtomicModel(AutoSerialize):
 
         Sites are grouped into clusters by connecting every pair closer than
         ``min_distance``.  With ``mode="merge"`` each cluster is replaced by
-        one site at its (weighted) mean position, with all channels averaged;
-        with ``mode="remove"`` only the site with the largest weight (or the
-        first site) of each cluster is kept.  Neighbor lists, template matches
-        and the RDF are cleared afterwards.
+        one site at its (weighted) mean position, with continuous channels
+        averaged and categorical channels taken from the site with the largest
+        weight (or the first site); with ``mode="remove"`` only that site of
+        each cluster is kept.  Neighbor lists, template matches,
+        the RDF and the channels derived from them are cleared afterwards.
 
         Parameters
         ----------
@@ -1268,16 +1303,20 @@ class AtomicModel(AutoSerialize):
         )
         weights = np.where(np.isfinite(weights) & (weights > 0), weights, 1e-12)
         num_clusters = int(labels.max()) + 1
+        # heaviest site of each cluster, in cluster order
+        order = np.lexsort((-weights, labels))
+        first = np.ones(n, dtype=bool)
+        first[1:] = labels[order][1:] != labels[order][:-1]
+        heaviest = order[first]
         if mode == "merge":
             sums = np.zeros((num_clusters, table.shape[1]))
             np.add.at(sums, labels, table * weights[:, None])
             wsum = np.bincount(labels, weights=weights, minlength=num_clusters)
             new_table = sums / wsum[:, None]
+            cat_cols = [self._sites.fields.index(c) for c in self._categories]
+            new_table[:, cat_cols] = table[heaviest][:, cat_cols]
         elif mode == "remove":
-            order = np.lexsort((-weights, labels))
-            first = np.ones(n, dtype=bool)
-            first[1:] = labels[order][1:] != labels[order][:-1]
-            new_table = table[order][first]
+            new_table = table[heaviest]
         else:
             raise ValueError("mode must be 'merge' or 'remove'")
         sites = Vector.from_shape(
