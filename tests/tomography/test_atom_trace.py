@@ -39,6 +39,6 @@ def test_trace_synthetic_lattice(monkeypatch):
     monkeypatch.setattr(Atoms, "estimate_spacing", no_spacing)
     atoms.find_initial(progress=False)
     atoms.refine(num_iterations=30, update_every=10, progress=False)
-    found = atoms.sites.array[:, :3]
+    found = atoms.sites.numpy()[:, :3]
     assert atoms.num_sites == len(true)
     assert cKDTree(found).query(true)[0].max() < 0.1

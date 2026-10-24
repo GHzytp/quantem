@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 
 from quantem.atoms import measurements as meas
@@ -65,6 +66,15 @@ _GEOMETRY_CHANNELS = (
     "surface_distance",
 )
 _GEOMETRY_PREFIXES = ("score_", "rmsd_", "matched_", "strain_")
+
+
+def _sites_vector(table: NDArray, fields: Sequence[str], units: Sequence[str]) -> Vector:
+    """0-D float64 ``Vector`` holding one row per site."""
+    sites = Vector.from_shape(
+        shape=(), fields=list(fields), units=list(units), name="sites", dtype=torch.float64
+    )
+    sites[...] = np.ascontiguousarray(table, dtype=float)
+    return sites
 
 
 class AtomicModel(AutoSerialize):
@@ -151,13 +161,7 @@ class AtomicModel(AutoSerialize):
             raise ValueError(f"xyz must be (N, 3) or (3, N), got {xyz.shape}")
         if xyz.shape[1] != 3:
             xyz = xyz.T
-        sites = Vector.from_shape(
-            shape=(),
-            fields=list(_POSITION_FIELDS),
-            units=[units] * 3,
-            name="sites",
-        )
-        sites[...] = np.ascontiguousarray(xyz)
+        sites = _sites_vector(xyz, _POSITION_FIELDS, [units] * 3)
         sampling_arr = np.broadcast_to(np.asarray(sampling, dtype=float), (3,)).copy()
         model = cls(
             sites=sites,
@@ -208,7 +212,7 @@ class AtomicModel(AutoSerialize):
         Positions are taken in voxel units together with the traced intensity
         and Gaussian width, and ``sampling`` is copied from the source volume.
         """
-        sites = atoms.sites.array
+        sites = atoms.sites.numpy().astype(np.float64)
         sampling = np.asarray(atoms._sampling, dtype=float)
         xyz = (sites[:, :3] - np.asarray(atoms._origin)[None, :]) / sampling[None, :]
         model = cls.from_array(
@@ -246,7 +250,7 @@ class AtomicModel(AutoSerialize):
     @property
     def num_sites(self) -> int:
         """Number of atomic sites."""
-        return int(self._sites.array.shape[0])
+        return int(self._sites.total_rows)
 
     @property
     def sampling(self) -> NDArray:
@@ -261,7 +265,7 @@ class AtomicModel(AutoSerialize):
     @property
     def positions_native(self) -> NDArray:
         """``(N, 3)`` positions in native (uncalibrated) units."""
-        return np.array(self._sites.select_fields(*_POSITION_FIELDS).array, dtype=float)
+        return self._sites.select_fields(*_POSITION_FIELDS).numpy().astype(np.float64)
 
     @positions_native.setter
     def positions_native(self, value: NDArray) -> None:
@@ -376,7 +380,7 @@ class AtomicModel(AutoSerialize):
             return self.positions[:, _POSITION_FIELDS.index(name)]
         if name not in self._sites.fields:
             raise KeyError(f"Unknown channel {name!r}; available: {self.channels}")
-        return np.array(self._sites.select_fields(name).array[:, 0], dtype=float)
+        return self._sites.select_fields(name).numpy()[:, 0].astype(np.float64)
 
     def set_channel(
         self,
@@ -1181,7 +1185,7 @@ class AtomicModel(AutoSerialize):
         norm = np.linalg.norm(direction, axis=1, keepdims=True)
         shift = distance * direction / np.where(norm > 1e-9, norm, 1.0)
 
-        table = np.array(self._sites.array, dtype=float)
+        table = self._sites.numpy().astype(np.float64)
         pos_cols = [self._sites.fields.index(f) for f in _POSITION_FIELDS]
         scale = self._sampling[None, :]
         rows, labels, source = [], [], []
@@ -1217,10 +1221,7 @@ class AtomicModel(AutoSerialize):
             labels.append(np.full(idx.size, num_grains + 1))
             source.append(idx)
         new_table = np.vstack(rows)
-        sites = Vector.from_shape(
-            shape=(), fields=list(self._sites.fields), units=list(self._sites.units), name="sites"
-        )
-        sites[...] = np.ascontiguousarray(new_table)
+        sites = _sites_vector(new_table, self._sites.fields, self._sites.units)
         out = AtomicModel(
             sites=sites,
             sampling=self._sampling.copy(),
@@ -1295,7 +1296,7 @@ class AtomicModel(AutoSerialize):
             return 0
         graph = coo_matrix((np.ones(pairs.shape[0]), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
         _, labels = connected_components(graph, directed=False)
-        table = np.array(self._sites.array, dtype=float)
+        table = self._sites.numpy().astype(np.float64)
         weights = (
             np.ones(n)
             if weight_channel is None
@@ -1319,10 +1320,7 @@ class AtomicModel(AutoSerialize):
             new_table = table[heaviest]
         else:
             raise ValueError("mode must be 'merge' or 'remove'")
-        sites = Vector.from_shape(
-            shape=(), fields=list(self._sites.fields), units=list(self._sites.units), name="sites"
-        )
-        sites[...] = np.ascontiguousarray(new_table)
+        sites = _sites_vector(new_table, self._sites.fields, self._sites.units)
         self._sites = sites
         self._invalidate()
         return int(n - new_table.shape[0])
@@ -1330,11 +1328,8 @@ class AtomicModel(AutoSerialize):
     def select(self, mask: NDArray) -> "AtomicModel":
         """Return a new model containing only the sites where ``mask`` is True."""
         mask = np.asarray(mask, dtype=bool)
-        table = self._sites.array[mask]
-        sites = Vector.from_shape(
-            shape=(), fields=list(self._sites.fields), units=list(self._sites.units), name="sites"
-        )
-        sites[...] = np.ascontiguousarray(table)
+        table = self._sites.numpy()[mask]
+        sites = _sites_vector(table, self._sites.fields, self._sites.units)
         model = AtomicModel(
             sites=sites,
             sampling=self._sampling.copy(),
