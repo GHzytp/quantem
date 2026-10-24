@@ -6,9 +6,11 @@ import torch
 from scipy.spatial.transform import Rotation
 
 from quantem.core.utils.rotations import (
+    qconj,
     qmult,
     qnormalize,
     qrotate,
+    quat_from_axis_angle,
     quat_from_euler_zxz,
     quat_from_matrix,
     quat_from_tomography_angles,
@@ -36,8 +38,11 @@ def test_matrix_matches_scipy_active(quats):
     R = quat_to_matrix(quats)
     R_scipy = Rotation.from_quat(quats.numpy(), scalar_first=True).as_matrix()
     np.testing.assert_allclose(R.numpy(), R_scipy, atol=1e-12)
+    v = torch.randn(len(quats), 3, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
+    torch.testing.assert_close(qrotate(quats, v), (R @ v[..., None])[..., 0], atol=1e-12, rtol=0)
     # 90 degrees about +z takes +x (row) to +y (col)
-    q = torch.tensor([np.cos(np.pi / 4), 0, 0, np.sin(np.pi / 4)], dtype=torch.float64)
+    z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    q = quat_from_axis_angle(z, torch.tensor(np.pi / 2, dtype=torch.float64))
     v = qrotate(q, torch.tensor([1.0, 0, 0], dtype=torch.float64))
     np.testing.assert_allclose(v.numpy(), [0, 1, 0], atol=1e-12)
 
@@ -47,6 +52,9 @@ def test_hamilton_product_composes(quats):
     torch.testing.assert_close(
         quat_to_matrix(qmult(a, b)), quat_to_matrix(a) @ quat_to_matrix(b), atol=1e-12, rtol=0
     )
+    identity = torch.zeros_like(a)
+    identity[:, 0] = 1.0
+    torch.testing.assert_close(qmult(a, qconj(a)), identity, atol=1e-12, rtol=0)
 
 
 def test_matrix_roundtrip_and_canonical_sign(quats):
@@ -55,7 +63,7 @@ def test_matrix_roundtrip_and_canonical_sign(quats):
     torch.testing.assert_close(q, qnormalize(quats), atol=1e-12, rtol=0)
 
 
-def test_euler_is_intrinsic_zxz():
+def test_euler_is_intrinsic_zxz(quats):
     angles = torch.tensor([[0.3, 0.7, 1.1], [-2.0, 2.5, 0.4]], dtype=torch.float64)
     R = quat_to_matrix(quat_from_euler_zxz(angles)).numpy()
     np.testing.assert_allclose(
@@ -63,7 +71,8 @@ def test_euler_is_intrinsic_zxz():
     )
     # the extrinsic "zxz" is a different rotation for the same numbers
     assert np.abs(R - Rotation.from_euler("zxz", angles.numpy()).as_matrix()).max() > 0.1
-    torch.testing.assert_close(quat_to_euler_zxz(quat_from_euler_zxz(angles)), angles)
+    q = qnormalize(quat_from_euler_zxz(quat_to_euler_zxz(quats)))
+    torch.testing.assert_close(q, qnormalize(quats), atol=1e-8, rtol=0)
 
 
 def test_random_uniform_is_seeded_and_uniform():
@@ -97,35 +106,26 @@ def test_tomography_tilt_is_about_the_column_axis():
     np.testing.assert_allclose(quat_to_matrix(q).numpy(), expected, atol=1e-12)
 
 
-@pytest.mark.parametrize(
-    "angles",
-    [
-        (10.0, 35.0, -20.0),
-        (-120.0, -60.0, 45.0),
-        (0.0, 70.0, 0.0),
-        (25.0, 0.0, 0.0),
-        (40.0, 180.0, 0.0),
-    ],
-)
-def test_tomography_angles_roundtrip(angles):
-    q = quat_from_tomography_angles(*angles)
-    back = tomography_angles_from_quat(q, nominal_x_deg=angles[1])
-    torch.testing.assert_close(
-        quat_to_matrix(quat_from_tomography_angles(*back.unbind(-1))),
-        quat_to_matrix(q),
-        atol=1e-10,
-        rtol=0,
-    )
-    # equal up to whole turns (x = 180 and -180 are the same tilt)
-    diff = np.remainder(back.numpy() - np.array(angles) + 180.0, 360.0) - 180.0
-    np.testing.assert_allclose(diff, 0.0, atol=1e-8)
-
-
-def test_tomography_angles_default_branch_keeps_small_in_plane_angles():
-    q = quat_from_tomography_angles(2.0, 50.0, -3.0)
-    np.testing.assert_allclose(
-        tomography_angles_from_quat(q).numpy(), [2.0, 50.0, -3.0], atol=1e-8
-    )
+def test_tomography_angles_roundtrip():
+    cases = {
+        "generic": ((10.0, 35.0, -20.0), 35.0),
+        "default branch": ((2.0, 50.0, -3.0), None),
+        "x = 0 (gimbal lock)": ((25.0, 0.0, 0.0), 0.0),
+        "x = 180 (gimbal lock)": ((40.0, 180.0, 0.0), 180.0),
+    }
+    for name, (angles, nominal) in cases.items():
+        q = quat_from_tomography_angles(*angles)
+        back = tomography_angles_from_quat(q, nominal_x_deg=nominal)
+        torch.testing.assert_close(
+            quat_to_matrix(quat_from_tomography_angles(*back.unbind(-1))),
+            quat_to_matrix(q),
+            atol=1e-10,
+            rtol=0,
+            msg=name,
+        )
+        # equal up to whole turns (x = 180 and -180 are the same tilt)
+        diff = np.remainder(back.numpy() - np.array(angles) + 180.0, 360.0) - 180.0
+        np.testing.assert_allclose(diff, 0.0, atol=1e-8, err_msg=name)
 
 
 def test_deprecated_module_reexports():

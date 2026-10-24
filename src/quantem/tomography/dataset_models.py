@@ -698,6 +698,10 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 class TomographyINRPretrainDataset(Dataset):
     """
     Dataset class for pretraining INR models.
+
+    `pretrain_target` must be in the reconstruction (`obj_view`, SIRT / FBP) layout
+    [C, X, Z, Y]. A [C, Z, Y, X] volume, such as a phantom, is misoriented unless it is
+    permuted first, ``vol.permute(0, 3, 1, 2)``.
     """
 
     def __init__(

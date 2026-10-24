@@ -20,11 +20,6 @@ class SO3ParamQuat(nn.Module):
     :mod:`quantem.core.utils.rotations`, and `as_matrix()` is the active
     rotation matrix of :func:`~quantem.core.utils.rotations.quat_to_matrix`.
 
-    Models saved before 2026-10 stored the quaternions scalar-last
-    (x, y, z, w). They are recognized by the missing `scalar_first` buffer
-    and reordered when loaded, from a state_dict or a pickled module, so
-    they keep their rotations.
-
     Initialization
     --------------
     "random"  – uniform sampling over SO(3) via Shoemake's method.
@@ -43,8 +38,6 @@ class SO3ParamQuat(nn.Module):
         else:
             raise ValueError(f"Unknown init '{init}'; choose 'random' or 'identity'.")
         self.quats = nn.Parameter(quats)
-        # marks the scalar-first order; absent in models saved scalar-last
-        self.register_buffer("scalar_first", torch.tensor(True))
 
     def as_matrix(self) -> torch.Tensor:
         return quat_to_matrix(self.normalized())
@@ -62,37 +55,17 @@ class SO3ParamQuat(nn.Module):
 
     def load_rotation_state(self, R: torch.Tensor) -> None:
         """Set the rotations from (T, 3, 3) matrices, projected onto SO(3)."""
-        U, _, Vh = torch.linalg.svd(R.to(torch.float64))
-        d = torch.det(U @ Vh)
-        U = torch.cat((U[..., :2], U[..., 2:] * d[..., None, None]), dim=-1)
+        R = R.to(device=self.quats.device, dtype=self.quats.dtype)
+        with torch.autocast(device_type=R.device.type, enabled=False):
+            U, _, Vh = torch.linalg.svd(R)
+            d = torch.det(U @ Vh)
+            U = torch.cat((U[..., :2], U[..., 2:] * d[..., None, None]), dim=-1)
+            q = quat_from_matrix(U @ Vh)
         with torch.no_grad():
-            self.quats.copy_(quat_from_matrix(U @ Vh).to(self.quats))
+            self.quats.copy_(q)
 
     def extra_repr(self) -> str:
         return f"T={self.quats.shape[0]}"
-
-    # ------------------------------------------------------------------
-    # Loading models saved with scalar-last quaternions
-    # ------------------------------------------------------------------
-
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-    ):
-        flag = prefix + "scalar_first"
-        quats = prefix + "quats"
-        if flag not in state_dict and quats in state_dict:
-            state_dict[quats] = state_dict[quats][..., [3, 0, 1, 2]]
-            state_dict[flag] = torch.tensor(True)
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        )
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        if "scalar_first" not in self._buffers:
-            with torch.no_grad():
-                self.quats.copy_(self.quats[..., [3, 0, 1, 2]].clone())
-            self.register_buffer("scalar_first", torch.tensor(True, device=self.quats.device))
 
     # ------------------------------------------------------------------
     # Forward helpers

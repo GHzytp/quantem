@@ -33,7 +33,8 @@ def rot_ZXZ(mags, z1, x, z3, device=None, mode="bilinear"):
 
     Uses the same pose as the INR rays, so ``rot_ZXZ(vol, z1, x, z3).sum(-3)`` is the
     projection they see. The rotation is rigid in voxel units about the array centre, also
-    for non-cubic volumes.
+    for non-cubic volumes. Nothing in the reconstructions calls it; it makes tilt series of
+    phantoms (the tests and the ``tomography_00_generate_phantom`` notebook).
 
     Args:
         mags: Volume of shape [C, Z, Y, X].
