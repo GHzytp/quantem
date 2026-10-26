@@ -2,16 +2,19 @@
 
 Functions here operate on plain arrays so they can be tested independently of
 :class:`~quantem.atoms.AtomicModel`, which wraps them.  Everything is
-vectorized with NumPy / SciPy; nothing loops over atoms in Python.
+vectorized with NumPy, SciPy or torch; nothing loops over atoms in Python.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import ConvexHull
+
+from quantem.core.utils.rotations import misorientation_angle_deg, quat_from_matrix
 
 __all__ = [
     "misorientation",
@@ -25,7 +28,6 @@ __all__ = [
     "sample_volume",
     "kmeans_1d",
     "gaussian_mixture_1d",
-    "rotation_to_quaternion",
 ]
 
 
@@ -54,20 +56,18 @@ def misorientation(
     ndarray
         ``(N, K)`` angles in degrees, ``nan`` for missing neighbors.
     """
-    rotation = np.asarray(rotation, dtype=np.float64)
+    q = quat_from_matrix(torch.as_tensor(np.asarray(rotation, dtype=np.float64)))
+    sym = (
+        None
+        if symmetry is None
+        else quat_from_matrix(torch.as_tensor(np.asarray(symmetry, dtype=np.float64)))
+    )
     n, k = neighbor_index.shape
-    if symmetry is None:
-        symmetry = np.eye(3)[None]
     out = np.full((n, k), np.nan)
-    idx_safe = np.where(neighbor_index >= 0, neighbor_index, 0)
+    idx_safe = torch.as_tensor(np.where(neighbor_index >= 0, neighbor_index, 0))
     for start in range(0, n, chunk_size):
         sl = slice(start, min(start + chunk_size, n))
-        ra = rotation[sl]  # (n,3,3)
-        rb = rotation[idx_safe[sl]]  # (n,k,3,3)
-        delta = np.einsum("nji,nkjl->nkil", ra, rb)  # R_a^T R_b
-        trace = np.einsum("nkij,sji->nks", delta, symmetry).max(-1)
-        ang = np.degrees(np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0)))
-        out[sl] = ang
+        out[sl] = misorientation_angle_deg(q[sl, None], q[idx_safe[sl]], sym).numpy()
     out[neighbor_index < 0] = np.nan
     return out
 
@@ -345,16 +345,6 @@ def gaussian_mixture_1d(
     out = np.full((v.size, num_components), 1.0 / num_components)
     out[finite] = resp
     return means, sigmas, weights, out
-
-
-def rotation_to_quaternion(rotation: NDArray) -> NDArray:
-    """Convert ``(N, 3, 3)`` rotation matrices to ``(N, 4)`` unit quaternions (w, x, y, z)."""
-    from scipy.spatial.transform import Rotation
-
-    q = Rotation.from_matrix(np.asarray(rotation)).as_quat()  # x, y, z, w
-    q = np.roll(q, 1, axis=1)
-    q[q[:, 0] < 0] *= -1
-    return q
 
 
 def fit_plane_intersection(points: NDArray, normals: NDArray) -> tuple[NDArray, NDArray]:
